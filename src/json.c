@@ -4,7 +4,6 @@
 #include <math.h>
 #include <stdlib.h>
 
-#define JSON_MAX_DEPTH 1024
 
 // --- builders and accessors --------------------------------------------------
 
@@ -304,8 +303,15 @@ static Err obj_put_checked(Arena *a, Frame *f, JValue *v) {
     return OK;
 }
 
-static Err parse_doc(Parser *ps, bool parse_numbers, Frame *stack, int *hi, JValue **out) {
-    int depth = 0;
+// The frame stack grows as needed (std.json has no depth limit; memory is O(depth)).
+typedef struct {
+    Frame *f;
+    size_t cap, hi; // hi: frames ever used, whose maps need freeing
+} Stack;
+
+static Err parse_doc(Parser *ps, bool parse_numbers, Stack *st, JValue **out) {
+    size_t depth = 0;
+    Frame *stack = st->f;
     for (;;) {
         // Expecting a value.
         skip_ws(ps);
@@ -313,7 +319,6 @@ static Err parse_doc(Parser *ps, bool parse_numbers, Frame *stack, int *hi, JVal
         unsigned char c = ps->p[ps->i];
         JValue *v = NULL;
         if (c == '{' || c == '[') {
-            if (depth == JSON_MAX_DEPTH) return "NestingTooDeep";
             ps->i++;
             JValue *cont = json_new(ps->a, c == '{' ? J_OBJECT : J_ARRAY);
             skip_ws(ps);
@@ -322,7 +327,14 @@ static Err parse_doc(Parser *ps, bool parse_numbers, Frame *stack, int *hi, JVal
                 ps->i++;
                 v = cont;
             } else {
-                if (depth == *hi) (*hi)++;
+                if (depth == st->cap) {
+                    size_t nc = st->cap * 2;
+                    st->f = xrealloc(st->f, nc * sizeof(Frame));
+                    memset(st->f + st->cap, 0, (nc - st->cap) * sizeof(Frame));
+                    st->cap = nc;
+                    stack = st->f;
+                }
+                if (depth == st->hi) st->hi++;
                 strmap_free(&stack[depth].seen);
                 stack[depth++] = (Frame){cont, {0}, {0}};
                 if (c == '{') {
@@ -393,11 +405,10 @@ static Err parse_doc(Parser *ps, bool parse_numbers, Frame *stack, int *hi, JVal
 
 Err json_parse(Arena *a, Str text, bool parse_numbers, JValue **out) {
     Parser ps = {(const unsigned char *)text.ptr, text.len, 0, a, {0}};
-    Frame *stack = xcalloc(JSON_MAX_DEPTH, sizeof(Frame));
-    int hi = 0;
-    Err e = parse_doc(&ps, parse_numbers, stack, &hi, out);
-    for (int i = 0; i < hi; i++) strmap_free(&stack[i].seen);
-    free(stack);
+    Stack st = {xcalloc(64, sizeof(Frame)), 64, 0};
+    Err e = parse_doc(&ps, parse_numbers, &st, out);
+    for (size_t i = 0; i < st.hi; i++) strmap_free(&st.f[i].seen);
+    free(st.f);
     buf_free(&ps.tmp);
     return e;
 }

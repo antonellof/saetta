@@ -118,7 +118,8 @@ bool strmap_next(const StrMap *m, size_t *it, Str *key, void **val);
 uint64_t hash_bytes(const void *p, size_t n); // wyhash-like 64-bit, never 0
 
 // --- files and environment -------------------------------------------------
-// Reads a whole file (NUL terminated after len). Errors: errno names, "FileTooBig" over limit.
+// Reads a whole file (NUL terminated after len). Errors: errno names, "StreamTooLong" when the
+// file reaches limit bytes (Zig readFileAlloc .limited: a file of exactly limit bytes fails).
 Err read_file(const char *path, size_t limit, char **out, size_t *len);
 Err write_file(const char *path, const void *p, size_t n); // create/truncate
 bool file_exists(const char *path);

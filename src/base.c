@@ -438,20 +438,10 @@ Err read_file(const char *path, size_t limit, char **out, size_t *len) {
     for (;;) {
         if (n == cap) {
             if (cap >= limit) {
-                // One more byte tells whether the file exceeds the limit.
-                char c;
-                ssize_t r = read(fd, &c, 1);
-                if (r < 0 && errno == EINTR) continue;
-                if (r < 0) {
-                    int e = errno;
-                    free(p);
-                    close(fd);
-                    return err_errno(e);
-                }
-                if (r == 0) break;
+                // Zig's readFileAlloc(.limited(n)): reaching the limit is StreamTooLong
                 free(p);
                 close(fd);
-                return "FileTooBig";
+                return "StreamTooLong";
             }
             cap = cap * 2 > limit ? limit : cap * 2;
             p = xrealloc(p, cap + 1);

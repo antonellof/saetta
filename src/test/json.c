@@ -101,11 +101,11 @@ TEST(json_errors) {
     for (int k = 0; k < 100; k++) buf_printf(&b, "\"k%d\":%d,", k, k);
     buf_adds(&b, "\"k42\":0}");
     EXPECT_ERR(json_parse(&a, buf_str(&b), true, &v), "DuplicateField");
-    // Nesting limit.
+    // No nesting limit: 2000 levels parse (std.json has none).
     b.len = 0;
     for (int k = 0; k < 2000; k++) buf_addc(&b, '[');
     for (int k = 0; k < 2000; k++) buf_addc(&b, ']');
-    EXPECT(json_parse(&a, buf_str(&b), true, &v) != OK);
+    EXPECT_OK(json_parse(&a, buf_str(&b), true, &v));
     b.len = 0;
     for (int k = 0; k < 1000; k++) buf_addc(&b, '[');
     for (int k = 0; k < 1000; k++) buf_addc(&b, ']');
@@ -136,5 +136,19 @@ TEST(json_duplicate_reported_at_value) {
     EXPECT_OK(json_parse(&a, buf_str(&big), true, &v));
     EXPECT_EQ(v->obj.len, 40);
     buf_free(&big);
+    arena_reset(&a);
+}
+
+// No nesting limit, as std.json: 5000 nested arrays and objects parse.
+TEST(json_deep_nesting) {
+    Arena a = {0};
+    Buf b = {0};
+    for (int i = 0; i < 5000; i++) buf_adds(&b, i % 2 ? "[" : "{\"k\":");
+    buf_adds(&b, "1");
+    for (int i = 4999; i >= 0; i--) buf_adds(&b, i % 2 ? "]" : "}");
+    JValue *v;
+    EXPECT_OK(json_parse(&a, buf_str(&b), true, &v));
+    EXPECT(v->kind == J_OBJECT);
+    buf_free(&b);
     arena_reset(&a);
 }

@@ -1,6 +1,13 @@
 // Run-time quantization kernels: sources, reference helpers and qgen-bench (see qgen.h).
 #include "qgen.h"
 
+// Zig's {d:.N} for the bench lines (ties round as Zig does, not as printf).
+static const char *fx(char *buf, size_t cap, double x, int prec) {
+    fmt_fixed(buf, cap, x, prec);
+    return buf;
+}
+#define FX(x, prec) fx((char[64]){0}, 64, (x), (prec))
+
 #include <assert.h>
 #include <math.h>
 
@@ -363,8 +370,8 @@ Err qgen_bench(Arena *a, FILE *out) {
                 MvRun r = {p, mats, 24, xb, yb, false};
                 if (!e) e = timed(&x.g, &r, mv_run, &s);
                 if (!e)
-                    fprintf(out, "matvec %5zux%5zu qmatvec_4_32       4/32  %7.2f us  %6.1f GB/s\n", shp[0], shp[1],
-                            s * 1e6 / 24, by / s / 1e9);
+                    fprintf(out, "matvec %5zux%5zu qmatvec_4_32       4/32  %7s us  %6s GB/s\n", shp[0], shp[1],
+                            FX(s * 1e6 / 24, 2), FX(by / s / 1e9, 1));
             }
             if (!e) e = qgen_ctx_pipe(&x, qgen_src, "qmatvec_gen", &p);
             if (!e) {
@@ -372,8 +379,8 @@ Err qgen_bench(Arena *a, FILE *out) {
                 e = timed(&x.g, &r, mv_run, &s);
             }
             if (!e) {
-                fprintf(out, "matvec %5zux%5zu qmatvec_gen        %u/%-3u %7.2f us  %6.1f GB/s\n", shp[0], shp[1], cfg[0],
-                        cfg[1], s * 1e6 / 24, by / s / 1e9);
+                fprintf(out, "matvec %5zux%5zu qmatvec_gen        %u/%-3u %7s us  %6s GB/s\n", shp[0], shp[1], cfg[0],
+                        cfg[1], FX(s * 1e6 / 24, 2), FX(by / s / 1e9, 1));
                 fflush(out);
             }
             for (size_t i = 0; i < 24; i++) qgen_mat_deinit(&mats[i]);
@@ -398,8 +405,8 @@ Err qgen_bench(Arena *a, FILE *out) {
                 ExRun r = {p, &m, xb, yb, idx, slots, reps, false};
                 if (!e) e = timed(&x.g, &r, ex_run, &s);
                 if (!e)
-                    fprintf(out, "expert  640x 2560 x10 qmatvec_expert_4_32 4/32 %7.2f us  %6.1f GB/s\n", s * 1e6 / reps,
-                            by / s / 1e9);
+                    fprintf(out, "expert  640x 2560 x10 qmatvec_expert_4_32 4/32 %7s us  %6s GB/s\n", FX(s * 1e6 / reps, 2),
+                            FX(by / s / 1e9, 1));
             }
             if (!e) e = qgen_ctx_pipe(&x, qgen_src, "qmatvec_expert_gen", &p);
             if (!e) {
@@ -407,8 +414,8 @@ Err qgen_bench(Arena *a, FILE *out) {
                 e = timed(&x.g, &r, ex_run, &s);
             }
             if (!e) {
-                fprintf(out, "expert  640x 2560 x10 qmatvec_expert_gen  %u/%-3u %7.2f us  %6.1f GB/s\n", cfg[0], cfg[1],
-                        s * 1e6 / reps, by / s / 1e9);
+                fprintf(out, "expert  640x 2560 x10 qmatvec_expert_gen  %u/%-3u %7s us  %6s GB/s\n", cfg[0], cfg[1],
+                        FX(s * 1e6 / reps, 2), FX(by / s / 1e9, 1));
                 fflush(out);
             }
             qgen_mat_deinit(&m);
@@ -443,8 +450,8 @@ Err qgen_bench(Arena *a, FILE *out) {
                 GrRun r = {p, &m, xh, yh, tb, nt, E, M, false};
                 if (!e) e = timed(&x.g, &r, gr_run, &s);
                 if (!e)
-                    fprintf(out, "prompt experts 2048x640x2560 qmmh_g_4_32 4/32  %7.1f us  %6.1f TFLOP/s\n", s * 1e6,
-                            flop / s / 1e12);
+                    fprintf(out, "prompt experts 2048x640x2560 qmmh_g_4_32 4/32  %7s us  %6s TFLOP/s\n", FX(s * 1e6, 1),
+                            FX(flop / s / 1e12, 1));
             }
             if (!e) e = qgen_ctx_pipe(&x, qgen_mpp_src, "qmmh_g_gen", &p);
             if (!e) {
@@ -452,8 +459,8 @@ Err qgen_bench(Arena *a, FILE *out) {
                 e = timed(&x.g, &r, gr_run, &s);
             }
             if (!e) {
-                fprintf(out, "prompt experts 2048x640x2560 qmmh_g_gen  %u/%-3u %7.1f us  %6.1f TFLOP/s\n", cfg[0], cfg[1],
-                        s * 1e6, flop / s / 1e12);
+                fprintf(out, "prompt experts 2048x640x2560 qmmh_g_gen  %u/%-3u %7s us  %6s TFLOP/s\n", cfg[0], cfg[1],
+                        FX(s * 1e6, 1), FX(flop / s / 1e12, 1));
                 fflush(out);
             }
             qgen_mat_deinit(&m);

@@ -221,6 +221,7 @@ typedef struct {
     uint64_t off;
     uint64_t *counted;
     bool started;
+    bool full; // the expected size is in: the rest of the body is not read (as Zig)
     Err err;
 } Fetch;
 
@@ -235,6 +236,7 @@ static Err on_status(Fetch *f, int status) {
             *f->counted = 0;
             f->off = 0;
             hasher_init(f->h, f->it);
+            if (ftruncate(f->fd, 0) != 0) return err_errno(errno);
         }
     } else return "HttpStatus";
     return OK;
@@ -248,12 +250,18 @@ static int sink_file(void *ctx, int status, const void *p, size_t n) {
         if (f->err) return 1;
     }
     if (n == 0) return 0;
+    // Zig read while off < size: bytes past the expected size are never written or hashed
+    if (n > f->it->size - f->off) n = (size_t)(f->it->size - f->off);
     f->err = pwrite_all(f->fd, p, n, (off_t)f->off);
     if (f->err) return 1;
     hasher_update(f->h, p, n);
     f->off += n;
     *f->counted += n;
     atomic_fetch_add_explicit(&f->sh->done_bytes, n, memory_order_acq_rel);
+    if (f->off == f->it->size) {
+        f->full = true;
+        return 1; // stop the transfer
+    }
     return 0;
 }
 
@@ -275,7 +283,7 @@ static Err fetch_body(Shared *sh, const Item *it, int fd, Hasher *h, uint64_t *o
     int rc = sx_http("GET", url, hd, nh, NULL, 0, IDLE_TIMEOUT_S, sink_file, &f, &status, err, sizeof err);
     *off = f.off;
     if (f.err) return f.err;
-    if (rc != 0) return f.started ? "ReadFailed" : http_error(err);
+    if (rc != 0 && !f.full) return f.started ? "ReadFailed" : http_error(err);
     if (!f.started) TRY(on_status(&f, status)); // an empty body
     *off = f.off;
     if (*off != it->size) return "ShortBody";
@@ -304,7 +312,14 @@ static Err fetch_one(Shared *sh, const Item *it) {
         goto out;
     }
     uint64_t off = (uint64_t)st.st_size;
-    if (off > it->size) off = 0;
+    if (off > it->size) {
+        // a longer .part than the file: start over from an empty one
+        off = 0;
+        if (ftruncate(fd, 0) != 0) {
+            e = err_errno(errno);
+            goto out;
+        }
+    }
 
     Hasher h;
     hasher_init(&h, it);

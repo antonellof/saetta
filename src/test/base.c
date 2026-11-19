@@ -151,9 +151,10 @@ TEST(base_files) {
     EXPECT_OK(read_file(f, 100, &p, &n));
     EXPECT_STR(str_n(p, n), S("hello"));
     free(p);
-    EXPECT_OK(read_file(f, 5, &p, &n));
+    EXPECT_OK(read_file(f, 6, &p, &n));
     free(p);
-    EXPECT_ERR(read_file(f, 4, &p, &n), "FileTooBig");
+    EXPECT_ERR(read_file(f, 5, &p, &n), "StreamTooLong");
+    EXPECT_ERR(read_file(f, 4, &p, &n), "StreamTooLong");
     EXPECT_ERR(read_file(path_join(&a, dir, "missing"), 100, &p, &n), "FileNotFound");
     EXPECT_ERR(read_file(dir, 100, &p, &n), "IsDir");
     unlink(f);

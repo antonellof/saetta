@@ -2,7 +2,7 @@
 # saetta installer. Downloads the release binary for Apple Silicon, checks its SHA-256
 # and installs it into $SAETTA_PREFIX/bin (default ~/.local).
 #   curl -fsSL https://github.com/antonellof/saetta/releases/latest/download/install.sh | sh
-# SAETTA_VERSION=0.7.0 pins a release (default: the latest).
+# SAETTA_VERSION=0.7.1 pins a release (default: the latest).
 set -eu
 REPO=antonellof/saetta
 ASSET=saetta-macos-arm64.tar.gz

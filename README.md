@@ -52,7 +52,7 @@ brew install saetta                                           # later: brew upgr
 
 Installed with the script, `saetta update` installs a newer release over the binary.
 
-The installer checks your Mac (Apple Silicon, macOS 27.2 or later), verifies the download's SHA-256 and puts the single `saetta` binary in `~/.local/bin` (`SAETTA_PREFIX` to change it, `SAETTA_VERSION=0.7.0` to pin a release). Then download a model and start coding:
+The installer checks your Mac (Apple Silicon, macOS 27.2 or later), verifies the download's SHA-256 and puts the single `saetta` binary in `~/.local/bin` (`SAETTA_PREFIX` to change it, `SAETTA_VERSION=0.7.1` to pin a release). Then download a model and start coding:
 
 ```sh
 saetta download coder           # 76 GB into ~/Models, resumable, every file hash-checked

@@ -1,0 +1,1668 @@
+// HTTP server (see server.h).
+#include "server.h"
+
+#include <errno.h>
+#include <math.h>
+#include <netinet/in.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <stdlib.h>
+#include <sys/socket.h>
+#include <sys/sysctl.h>
+#include <time.h>
+#include <unistd.h>
+
+#include "anthropic.h"
+#include "chat.h"
+#include "config.h"
+#include "gpu.h"
+#include "instance.h"
+#include "json.h"
+#include "metal/shim.h"
+#include "model.h"
+#include "spec.h"
+#include "stats.h"
+#include "tokenizer.h"
+#include "toolcall.h"
+#include "weights.h"
+
+#define MODEL_ID "qwen3.8-flash-next"
+
+#define MAX_CONV 8
+// Capacity a conversation starts with (tokens); it grows in steps of CAP_STEP as needed.
+#define CAP0 ((size_t)32768)
+#define CAP_STEP ((size_t)32768)
+// Room kept for the speculative chunk and the last token past a reply.
+#define CAP_SLACK ((size_t)(KMAX + 8))
+
+// Zig's "{d:.N}" of an f64, in one of 8 rotating buffers.
+static _Thread_local char fx_bufs[8][400];
+static _Thread_local int fx_i;
+static const char *fx(double x, int prec) {
+    char *b = fx_bufs[fx_i++ & 7];
+    fmt_fixed(b, 400, x, prec);
+    return b;
+}
+
+typedef struct {
+    Gpu *g;
+    Model *m;
+    Session *s;
+    const Tokenizer *tok;
+    QgenPrng rng;
+    uint32_t think_end;
+    // Speculation statistics kept across requests: a short reply then starts from what the
+    // session has learned instead of the optimistic defaults (deep drafts with poor
+    // acceptance cost most on short replies).
+    Gate gate;
+    Depth depth;
+    Stats *st;
+    // Conversations: the active one's buffers are in s; held[i] keeps conversation i's
+    // while it is inactive (has[i] false for the active one). A request goes to the
+    // conversation it continues (Conv in src/model.h).
+    Conv held[MAX_CONV];
+    bool has[MAX_CONV];
+    uint64_t used[MAX_CONV];
+    int64_t last_s[MAX_CONV];
+    size_t n_conv;
+    size_t active;
+    uint64_t clock;
+    size_t max_conv;
+} Engine;
+
+// Makes conversation i the active one.
+static void activate(Engine *e, size_t i) {
+    if (i == e->active) return;
+    session_swap_conv(e->s, &e->held[i]);
+    e->held[e->active] = e->held[i];
+    e->has[e->active] = true;
+    memset(&e->held[i], 0, sizeof(Conv));
+    e->has[i] = false;
+    e->active = i;
+}
+
+static const Ckpt *ck_of(Engine *e, size_t i) { return i == e->active ? e->s->ck : e->held[i].ck; }
+
+static bool conv_empty(Engine *e, size_t i) {
+    const Ckpt *ck = ck_of(e, i);
+    return ck[0].tokens.len == 0 && ck[1].tokens.len == 0;
+}
+
+// GPU bytes free under the working-set limit.
+static uint64_t free_bytes(Engine *e) {
+    uint64_t ws = sx_device_recommended_working_set(e->g->dev), al = sx_device_allocated_size(e->g->dev);
+    return ws > al ? ws - al : 0;
+}
+
+// Room for bytes more: under the GPU working-set limit with gpu_margin left, or in the
+// machine's free RAM with 8 GB left (with the full pack the weights alone pass the
+// working-set limit, while RAM has room; inactive pages are not counted, they hold the
+// mapped weights).
+static bool room_for(Engine *e, uint64_t bytes, uint64_t gpu_margin) {
+    if (free_bytes(e) >= bytes + gpu_margin) return true;
+    uint32_t free_pages = 0;
+    uint64_t page = 16384;
+    size_t len = sizeof(uint32_t);
+    if (sysctlbyname("vm.page_free_count", &free_pages, &len, NULL, 0) != 0) return false;
+    len = sizeof(uint64_t);
+    (void)sysctlbyname("hw.pagesize", &page, &len, NULL, 0);
+    return (uint64_t)free_pages * page >= bytes + (8ull << 30);
+}
+
+// Picks the conversation for a prompt: the one it continues; else an empty one, a new
+// one while GPU memory allows (4 GB kept free under the working-set limit), or the least
+// recently used.
+static void route(Engine *e, const uint32_t *ids, size_t nids) {
+    e->clock += 1;
+    size_t best = e->active, best_n = 0;
+    for (size_t i = 0; i < e->n_conv; i++) {
+        size_t n = session_reusable_in(ck_of(e, i), ids, nids).n;
+        if (n > best_n) {
+            best_n = n;
+            best = i;
+        }
+    }
+    if (best_n == 0) {
+        if (conv_empty(e, e->active)) {
+            best = e->active;
+            goto picked;
+        }
+        for (size_t i = 0; i < e->n_conv; i++)
+            if (conv_empty(e, i)) {
+                best = i;
+                goto picked;
+            }
+        if (e->n_conv < e->max_conv) {
+            if (room_for(e, session_conv_bytes(e->s, CAP0), 4ull << 30)) {
+                Conv cv;
+                if (!session_new_conv(e->s, e->g, CAP0, &cv)) {
+                    e->held[e->n_conv] = cv;
+                    e->has[e->n_conv] = true;
+                    e->n_conv += 1;
+                    dbg("saetta: conversation %zu opened (%s GB)\n", e->n_conv,
+                        fx((double)session_conv_bytes(e->s, CAP0) / (double)(1 << 30), 1));
+                    best = e->n_conv - 1;
+                    goto picked;
+                }
+            }
+        }
+        size_t lru = 0;
+        for (size_t i = 0; i < e->n_conv; i++)
+            if (e->used[i] < e->used[lru]) lru = i;
+        best = lru;
+    }
+picked:
+    activate(e, best);
+    e->used[best] = e->clock;
+    e->last_s[best] = (int64_t)(wall_ns() / 1000000000ull);
+    atomic_store_explicit(&e->st->convs, (uint32_t)e->n_conv, memory_order_release);
+}
+
+typedef enum { START_FRESH, START_CKPT, START_OWN, START_SHARED } StartKind;
+typedef struct {
+    size_t n;
+    StartKind kind;
+    size_t src, common;
+} Start;
+
+// Where the active conversation starts reading ids: a restore point it extends, else its
+// own prefix point, else another conversation's prefix point (KV rows copied), else 0.
+static Start plan(Engine *e, const uint32_t *ids, size_t nids) {
+    size_t r = session_reusable(e->s, ids, nids);
+    if (r > 0) return (Start){r, START_CKPT, 0, 0};
+    size_t own = session_shared_point(e->s->ptoks.ptr, e->s->ptoks.len, e->s->pts, ids, nids);
+    Start best = {own, own > 0 ? START_OWN : START_FRESH, 0, 0};
+    for (size_t i = 0; i < e->n_conv; i++) {
+        if (!e->has[i]) continue;
+        const Conv *cv = &e->held[i];
+        size_t n = session_shared_point(cv->ptoks.ptr, cv->ptoks.len, cv->pts, ids, nids);
+        if (n > best.n) {
+            size_t lcp = 0;
+            while (lcp < MIN(cv->ptoks.len, nids) && cv->ptoks.ptr[lcp] == ids[lcp]) lcp++;
+            best = (Start){n, START_SHARED, i, lcp};
+        }
+    }
+    return best;
+}
+
+static Err apply(Engine *e, Start st) {
+    switch (st.kind) {
+    case START_CKPT: session_restore(e->s); break;
+    case START_OWN: session_start_at_own_point(e->s, st.n); break;
+    case START_SHARED:
+        TRY(session_start_from(e->s, e->g, &e->held[st.src], st.n));
+        dbg("saetta: conversation %zu starts from the first %zu tokens of conversation %zu (%zu in common)\n",
+            e->active + 1, st.n, st.src + 1, st.common);
+        break;
+    case START_FRESH: session_reset(e->s); break;
+    }
+    session_invalidate_from(e->s, st.n);
+    return OK;
+}
+
+// Empties the least recently used inactive conversation that holds more than the starting
+// capacity (its buffers shrink back to CAP0, its restore and prefix points are dropped).
+static bool evict_one(Engine *e) {
+    bool found = false;
+    size_t pick = 0;
+    for (size_t i = 0; i < e->n_conv; i++) {
+        if (!e->has[i]) continue;
+        if (e->held[i].cap > MIN(CAP0, e->s->max_cap) && (!found || e->used[i] < e->used[pick])) {
+            pick = i;
+            found = true;
+        }
+    }
+    if (!found) return false;
+    size_t i = pick;
+    Conv *cv = &e->held[i];
+    Conv small;
+    if (session_new_conv(e->s, e->g, MIN(CAP0, e->s->max_cap), &small)) return false;
+    sx_buffer_release(cv->kv);
+    sx_buffer_release(cv->ixk);
+    sx_buffer_release(cv->bk);
+    cv->cap = small.cap;
+    cv->kv = small.kv;
+    cv->ixk = small.ixk;
+    cv->bk = small.bk;
+    for (int k = 0; k < 2; k++) {
+        sx_buffer_release(small.ck[k].gdn);
+        sx_buffer_release(small.ck[k].conv);
+        sx_buffer_release(small.ck[k].ple);
+    }
+    for (int k = 0; k < 2; k++) cv->ck[k].tokens.len = 0;
+    cv->ptoks.len = 0;
+    dbg("saetta: conversation %zu emptied to make room\n", i + 1);
+    return true;
+}
+
+// Grows the active conversation to hold need tokens (in steps of CAP_STEP, at most
+// SAETTA_CTX), emptying other conversations first when GPU memory is short. The active
+// conversation always gets its SAETTA_CTX, as when it was preallocated: the working-set
+// limit only decides whether the others keep their memory (with the full pack, the
+// weights alone already pass it).
+static Err ensure(Engine *e, size_t need) {
+    if (need <= e->s->cap) return OK;
+    size_t cap = MIN(e->s->max_cap, ALIGN_UP(need, CAP_STEP));
+    while (!room_for(e, session_kv_bytes(e->s, cap), 2ull << 30))
+        if (!evict_one(e)) break;
+    return session_grow(e->s, e->g, cap);
+}
+
+// The conversations' sizes for the monitor.
+static void publish_convs(Engine *e) {
+    ConvInfo info[MAX_CONV];
+    for (size_t i = 0; i < e->n_conv; i++) {
+        const Ckpt *ck = ck_of(e, i);
+        info[i] = (ConvInfo){
+            .tokens = (uint32_t)MAX(ck[0].tokens.len, ck[1].tokens.len),
+            .cap = (uint32_t)(i == e->active ? e->s->cap : e->held[i].cap),
+            .last_s = e->last_s[i],
+            .active = i == e->active,
+        };
+    }
+    stats_set_convs(e->st, info, e->n_conv);
+}
+
+// Room for one more prefix point (2 GB kept free under the GPU working-set limit).
+static bool point_room(Engine *e) { return room_for(e, 128ull << 20, 2ull << 30); }
+
+// ---- the connection guard --------------------------------------------------------------------
+
+// Drops a connection whose socket read or write has been blocked too long. The server serves
+// one connection at a time, so a client that connects and sends nothing, or stops reading its
+// stream, would otherwise hold up every other request forever. Each socket call counts seq
+// up on entry and on exit (odd: inside a call); the guard thread samples it, and when it stays
+// odd and unchanged past the limit it shuts the socket down, so the blocked call returns
+// end of stream or a write error and the connection ends normally.
+#define READ_LIMIT_MS 30000u  // head and body of a request: a client sends them at once
+#define WRITE_LIMIT_MS 60000u // a streamed answer the client does not read
+#define TICK_MS 500u
+
+static struct {
+    _Atomic uint64_t seq;
+    _Atomic uint32_t limit_ms;
+    _Atomic int32_t fd;
+    _Atomic bool busy;
+} guard = {0, READ_LIMIT_MS, -1, false};
+
+static void guard_enter(uint32_t limit_ms) {
+    atomic_store_explicit(&guard.limit_ms, limit_ms, memory_order_release);
+    atomic_fetch_add_explicit(&guard.seq, 1, memory_order_acq_rel);
+}
+static void guard_leave(void) { atomic_fetch_add_explicit(&guard.seq, 1, memory_order_acq_rel); }
+
+static void guard_attach(int fd) { atomic_store(&guard.fd, fd); }
+
+// Before the socket closes: the guard is not shutting down this descriptor, and never
+// will (the number may be reused by the next accept).
+static void guard_detach(void) {
+    atomic_store(&guard.fd, -1);
+    while (atomic_load(&guard.busy)) __builtin_arm_yield();
+}
+
+static void *guard_loop(void *arg) {
+    (void)arg;
+    uint64_t last = 0;
+    uint32_t stalled_ms = 0;
+    for (;;) {
+        struct timespec ts = {0, (long)TICK_MS * 1000000L};
+        nanosleep(&ts, NULL);
+        uint64_t s = atomic_load_explicit(&guard.seq, memory_order_acquire);
+        stalled_ms = ((s & 1) == 1 && s == last) ? stalled_ms + TICK_MS : 0;
+        last = s;
+        uint32_t limit = atomic_load_explicit(&guard.limit_ms, memory_order_acquire);
+        if (stalled_ms < limit) continue;
+        stalled_ms = 0;
+        // busy before fd: detach either sees busy and waits, or has cleared fd first
+        atomic_store(&guard.busy, true);
+        int fd = atomic_load(&guard.fd);
+        if (fd >= 0 && atomic_load_explicit(&guard.seq, memory_order_acquire) == s) {
+            shutdown(fd, SHUT_RDWR);
+            dbg("connection: no %s for %u s, dropped\n", limit == READ_LIMIT_MS ? "request" : "reader", limit / 1000);
+        }
+        atomic_store(&guard.busy, false);
+    }
+    return NULL;
+}
+
+// ---- HTTP/1.1 (the parts of std.http.Server the engine used) ----------------------------------
+
+typedef enum { M_GET, M_HEAD, M_POST, M_PUT, M_DELETE, M_CONNECT, M_OPTIONS, M_TRACE, M_PATCH, M_QUERY } Method;
+static const char *const method_names[] = {"GET", "HEAD", "POST", "PUT", "DELETE", "CONNECT", "OPTIONS", "TRACE", "PATCH", "QUERY"};
+
+#define RBUF (1 << 16)
+#define WBUF (1 << 16)
+
+typedef struct {
+    int fd;
+    char rbuf[RBUF];
+    size_t rpos, rend;
+    char wbuf[WBUF];
+    size_t wlen;
+    bool wfail;
+} Conn;
+
+typedef struct {
+    Method method;
+    Str target;
+    bool has_expect;
+    Str expect;
+    bool has_length;
+    uint64_t content_length;
+    bool chunked;
+} Req;
+
+// Reads more bytes into rbuf (compacting it first when full). 1: read, 0: end of stream,
+// -1: read error.
+static int conn_fill(Conn *c) {
+    if (c->rend == RBUF) {
+        memmove(c->rbuf, c->rbuf + c->rpos, c->rend - c->rpos);
+        c->rend -= c->rpos;
+        c->rpos = 0;
+        if (c->rend == RBUF) return -1;
+    }
+    for (;;) {
+        guard_enter(READ_LIMIT_MS);
+        ssize_t n = recv(c->fd, c->rbuf + c->rend, RBUF - c->rend, 0);
+        guard_leave();
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0) return -1;
+        if (n == 0) return 0;
+        c->rend += (size_t)n;
+        return 1;
+    }
+}
+
+static Err conn_flush(Conn *c) {
+    if (c->wfail) return "WriteFailed";
+    size_t off = 0;
+    while (off < c->wlen) {
+        guard_enter(WRITE_LIMIT_MS);
+        ssize_t n = send(c->fd, c->wbuf + off, c->wlen - off, 0);
+        guard_leave();
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) {
+            c->wfail = true;
+            c->wlen = 0;
+            return "WriteFailed";
+        }
+        off += (size_t)n;
+    }
+    c->wlen = 0;
+    return OK;
+}
+
+static Err conn_write(Conn *c, const void *p, size_t n) {
+    const char *s = p;
+    while (n > 0) {
+        if (c->wlen == WBUF) TRY(conn_flush(c));
+        size_t k = MIN(n, WBUF - c->wlen);
+        memcpy(c->wbuf + c->wlen, s, k);
+        c->wlen += k;
+        s += k;
+        n -= k;
+    }
+    return c->wfail ? "WriteFailed" : OK;
+}
+static Err conn_writes(Conn *c, const char *s) { return conn_write(c, s, strlen(s)); }
+
+static bool ieq(Str a, const char *b) {
+    size_t n = strlen(b);
+    if (a.len != n) return false;
+    for (size_t i = 0; i < n; i++) {
+        char x = a.ptr[i], y = b[i];
+        if (x >= 'A' && x <= 'Z') x = (char)(x + 32);
+        if (y >= 'A' && y <= 'Z') y = (char)(y + 32);
+        if (x != y) return false;
+    }
+    return true;
+}
+
+static Str trim_set(Str s, const char *set) {
+    size_t b = 0, e = s.len;
+    while (b < e && strchr(set, s.ptr[b])) b++;
+    while (e > b && strchr(set, s.ptr[e - 1])) e--;
+    return (Str){s.ptr + b, e - b};
+}
+
+static bool content_encoding_known(Str s) {
+    static const char *const names[] = {"zstd", "gzip", "x-gzip", "deflate", "compress", "x-compress", "identity"};
+    for (size_t i = 0; i < COUNT(names); i++)
+        if (str_eqz(s, names[i])) return true;
+    return false;
+}
+
+// std.http.Server.Request.Head.parse.
+static Err parse_head(Str bytes, Req *h) {
+    memset(h, 0, sizeof *h);
+    size_t pos = 0;
+    ptrdiff_t eol = str_find(bytes, S("\r\n"), 0);
+    Str first = eol < 0 ? bytes : str_sub(bytes, 0, (size_t)eol);
+    pos = eol < 0 ? bytes.len + 2 : (size_t)eol + 2;
+    if (first.len < 10) return "HttpHeadersInvalid";
+    ptrdiff_t method_end = str_find_char(first, ' ', 0);
+    if (method_end < 0) return "HttpHeadersInvalid";
+    Str mname = str_sub(first, 0, (size_t)method_end);
+    bool found = false;
+    for (size_t i = 0; i < COUNT(method_names); i++)
+        if (str_eqz(mname, method_names[i])) {
+            h->method = (Method)i;
+            found = true;
+        }
+    if (!found) return "UnknownHttpMethod";
+    ptrdiff_t version_start = -1;
+    for (size_t i = first.len; i > 0; i--)
+        if (first.ptr[i - 1] == ' ') {
+            version_start = (ptrdiff_t)i - 1;
+            break;
+        }
+    if (version_start == method_end) return "HttpHeadersInvalid";
+    Str version = str_sub(first, (size_t)version_start + 1, first.len);
+    if (version.len != 8) return "HttpHeadersInvalid";
+    if (!str_eqz(version, "HTTP/1.0") && !str_eqz(version, "HTTP/1.1")) return "HttpHeadersInvalid";
+    h->target = str_sub(first, (size_t)method_end + 1, (size_t)version_start);
+    bool has_compression = false;
+    while (pos <= bytes.len) {
+        ptrdiff_t e = str_find(bytes, S("\r\n"), pos);
+        Str line = e < 0 ? str_sub(bytes, pos, bytes.len) : str_sub(bytes, pos, (size_t)e);
+        pos = e < 0 ? bytes.len + 1 : (size_t)e + 2;
+        if (line.len == 0) return OK;
+        if (line.ptr[0] == ' ' || line.ptr[0] == '\t') return "HttpHeaderContinuationsUnsupported";
+        ptrdiff_t colon = str_find_char(line, ':', 0);
+        Str name = colon < 0 ? line : str_sub(line, 0, (size_t)colon);
+        Str value = colon < 0 ? S("") : trim_set(str_sub(line, (size_t)colon + 1, line.len), " \t");
+        if (name.len == 0) return "HttpHeadersInvalid";
+        if (ieq(name, "expect")) {
+            h->has_expect = true;
+            h->expect = value;
+        } else if (ieq(name, "content-length")) {
+            if (h->has_length) return "HttpHeadersInvalid";
+            if (parse_u64(value, &h->content_length)) return "InvalidContentLength";
+            h->has_length = true;
+        } else if (ieq(name, "content-encoding")) {
+            if (has_compression) return "HttpHeadersInvalid";
+            Str t = trim_set(value, " ");
+            if (!content_encoding_known(t)) return "HttpTransferEncodingUnsupported";
+            has_compression = !str_eqz(t, "identity");
+        } else if (ieq(name, "transfer-encoding")) {
+            // Transfer-Encoding: second, first (read from the end)
+            Str seg[3];
+            size_t nseg = 0, end = value.len;
+            for (size_t i = value.len + 1; i > 0 && nseg < 3; i--) {
+                if (i - 1 == 0 || value.ptr[i - 2] == ',') {
+                    seg[nseg++] = str_sub(value, i - 1, end);
+                    end = i >= 2 ? i - 2 : 0;
+                }
+            }
+            size_t si = 0;
+            Str first = trim_set(seg[si], " ");
+            bool has_next = true;
+            if (str_eqz(first, "chunked") || str_eqz(first, "none")) {
+                if (h->chunked) return "HttpHeadersInvalid";
+                h->chunked = str_eqz(first, "chunked");
+                si++;
+                has_next = si < nseg;
+            }
+            if (has_next) {
+                Str t = trim_set(seg[si], " ");
+                if (!content_encoding_known(t)) return "HttpTransferEncodingUnsupported";
+                if (has_compression) return "HttpHeadersInvalid";
+                has_compression = !str_eqz(t, "identity");
+                si++;
+            }
+            if (si < nseg) return "HttpTransferEncodingUnsupported";
+        }
+    }
+    return "MissingFinalNewline";
+}
+
+// Reads one request head (std.http.Server.receiveHead): up to RBUF bytes, ending at an
+// empty line. Any failure ends the connection without a response.
+static Err receive_head(Conn *c, Req *h) {
+    for (;;) {
+        Str buf = {c->rbuf + c->rpos, c->rend - c->rpos};
+        ptrdiff_t a = str_find(buf, S("\r\n\r\n"), 0), b = str_find(buf, S("\n\n"), 0);
+        size_t end = 0;
+        if (a >= 0 && (b < 0 || a + 2 <= b)) end = (size_t)a + 4;
+        else if (b >= 0) end = (size_t)b + 2;
+        if (end > 0) {
+            Str head = {buf.ptr, end};
+            c->rpos += end;
+            return parse_head(head, h);
+        }
+        if (buf.len >= RBUF) return "HttpHeadersOversize";
+        int r = conn_fill(c);
+        if (r == 0) return buf.len == 0 ? "HttpConnectionClosing" : "HttpRequestTruncated";
+        if (r < 0) return "ReadFailed";
+    }
+}
+
+// One byte of the body stream; false at end of stream or on a read error.
+static bool conn_byte(Conn *c, char *out) {
+    if (c->rpos == c->rend) {
+        c->rpos = c->rend = 0;
+        if (conn_fill(c) <= 0) return false;
+    }
+    *out = c->rbuf[c->rpos++];
+    return true;
+}
+
+static bool conn_take(Conn *c, Buf *out, uint64_t n) {
+    while (n > 0) {
+        if (c->rpos == c->rend) {
+            c->rpos = c->rend = 0;
+            if (conn_fill(c) <= 0) return false;
+        }
+        size_t k = (size_t)MIN((uint64_t)(c->rend - c->rpos), n);
+        buf_add(out, c->rbuf + c->rpos, k);
+        c->rpos += k;
+        n -= k;
+    }
+    return true;
+}
+
+// The request body (content-length or chunked; none without either), at most limit bytes.
+static bool read_body(Conn *c, const Req *h, uint64_t limit, Buf *out) {
+    if (h->method == M_HEAD) return true;
+    if (h->chunked) {
+        for (;;) {
+            // chunk head: hex size, optional extension, CRLF (or LF)
+            uint64_t len = 0;
+            char ch;
+            int state = 0; // 0 size, 1 extension, 2 after CR
+            for (;;) {
+                if (!conn_byte(c, &ch)) return false;
+                if (state == 0) {
+                    int d;
+                    if (ch >= '0' && ch <= '9') d = ch - '0';
+                    else if (ch >= 'A' && ch <= 'Z') d = ch - 'A' + 10;
+                    else if (ch >= 'a' && ch <= 'z') d = ch - 'a' + 10;
+                    else if (ch == '\r') {
+                        state = 2;
+                        continue;
+                    } else if (ch == '\n') break;
+                    else {
+                        state = 1;
+                        continue;
+                    }
+                    uint64_t nl = len * 16 + (uint64_t)d;
+                    if (nl <= len && len != 0) return false;
+                    len = nl;
+                } else if (state == 1) {
+                    if (ch == '\r') state = 2;
+                    else if (ch == '\n') break;
+                } else {
+                    if (ch != '\n') return false;
+                    break;
+                }
+            }
+            if (len == 0) {
+                // trailers until an empty line
+                size_t line = 0;
+                for (;;) {
+                    if (!conn_byte(c, &ch)) return false;
+                    if (ch == '\n') {
+                        if (line == 0) return true;
+                        line = 0;
+                    } else if (ch != '\r') line++;
+                }
+            }
+            if (out->len + len > limit) return false;
+            if (!conn_take(c, out, len)) return false;
+            char r1, r2;
+            if (!conn_byte(c, &r1) || !conn_byte(c, &r2) || r1 != '\r' || r2 != '\n') return false;
+        }
+    }
+    if (!h->has_length) return true;
+    if (h->content_length > limit) return false;
+    return conn_take(c, out, h->content_length);
+}
+
+static Err write_expect_continue(Conn *c, Req *h) {
+    if (!h->has_expect) return OK;
+    if (!str_eqz(h->expect, "100-continue")) return "HttpExpectationFailed";
+    TRY(conn_writes(c, "HTTP/1.1 100 Continue\r\n\r\n"));
+    h->has_expect = false;
+    return OK;
+}
+
+static const char *phrase(int status) {
+    switch (status) {
+    case 200: return "OK";
+    case 400: return "Bad Request";
+    case 404: return "Not Found";
+    default: return "";
+    }
+}
+
+// Request.respond with keep_alive false: the whole response, then a flush.
+static Err respond(Conn *c, Req *h, int status, Str body, const char *content_type) {
+    TRY(write_expect_continue(c, h));
+    char head[256];
+    int n = snprintf(head, sizeof head, "HTTP/1.1 %d %s\r\nconnection: close\r\ncontent-length: %zu\r\n", status,
+                     phrase(status), body.len);
+    TRY(conn_write(c, head, (size_t)n));
+    if (content_type) {
+        TRY(conn_writes(c, "content-type: "));
+        TRY(conn_writes(c, content_type));
+        TRY(conn_writes(c, "\r\n"));
+    }
+    TRY(conn_writes(c, "\r\n"));
+    if (h->method != M_HEAD && body.len > 0) TRY(conn_write(c, body.ptr, body.len));
+    return conn_flush(c);
+}
+
+static Err json_respond(Conn *c, Req *h, int status, Str body) { return respond(c, h, status, body, "application/json"); }
+
+// ---- request fields ----------------------------------------------------------------------------
+
+// A number field (any JSON number spelling), or false when absent or not a number.
+static bool num(const JValue *v, double *out) {
+    if (!v) return false;
+    switch (v->kind) {
+    case J_INTEGER: *out = (double)v->i; return true;
+    case J_FLOAT: *out = v->f; return true;
+    case J_NUMBER_STRING: {
+        char *end;
+        char tmp[128];
+        if (v->s.len >= sizeof tmp) return false;
+        memcpy(tmp, v->s.ptr, v->s.len);
+        tmp[v->s.len] = 0;
+        double d = strtod(tmp, &end);
+        if (end == tmp || *end) return false;
+        *out = d;
+        return true;
+    }
+    default: return false;
+    }
+}
+
+static JValue *field(const JValue *req, const char *key) {
+    JValue *v = json_get(req, key);
+    return (v && v->kind == J_NULL) ? NULL : v;
+}
+
+// std.json ObjectMap.orderedRemove.
+static void json_remove(JValue *obj, const char *key) {
+    if (!obj || obj->kind != J_OBJECT) return;
+    for (size_t i = 0; i < obj->obj.len; i++)
+        if (str_eqz(obj->obj.items[i].key, key)) {
+            memmove(obj->obj.items + i, obj->obj.items + i + 1, (obj->obj.len - i - 1) * sizeof(JMember));
+            obj->obj.len -= 1;
+            return;
+        }
+}
+
+// ---- sampling ---------------------------------------------------------------------------------
+
+size_t server_top_k(const float *logits, size_t len, size_t k, uint32_t *cand) {
+    // Groups of 16 whose maximum cannot enter the list once it is full are skipped (most of
+    // the vocabulary): the same comparisons in the same order, so the same result as the
+    // plain loop.
+    enum { L = 16 };
+    size_t n = 0, i = 0;
+    while (i < len) {
+        if (n == k && i + L <= len) {
+            float g = logits[i];
+            for (size_t j = 1; j < L; j++) g = logits[i + j] > g ? logits[i + j] : g;
+            if (g <= logits[cand[k - 1]]) {
+                i += L;
+                continue;
+            }
+        }
+        size_t end = MIN(len, i + L);
+        for (; i < end; i++) {
+            float v = logits[i];
+            if (n < k) {
+                cand[n] = (uint32_t)i;
+                n += 1;
+                size_t j = n - 1;
+                for (; j > 0 && logits[cand[j]] > logits[cand[j - 1]]; j--) {
+                    uint32_t t = cand[j];
+                    cand[j] = cand[j - 1];
+                    cand[j - 1] = t;
+                }
+            } else if (v > logits[cand[k - 1]]) {
+                cand[k - 1] = (uint32_t)i;
+                size_t j = k - 1;
+                for (; j > 0 && logits[cand[j]] > logits[cand[j - 1]]; j--) {
+                    uint32_t t = cand[j];
+                    cand[j] = cand[j - 1];
+                    cand[j - 1] = t;
+                }
+            }
+        }
+    }
+    return n;
+}
+
+// The sampling distribution of logits: top-k by partial selection into cand (k is small),
+// softmax at the temperature, then top-p. Fills cand[0..n] and their weights p[0..n]
+// (unnormalized) and returns n.
+static size_t dist(const float *logits, size_t len, Sampling sp, uint32_t *cand, float p[256]) {
+    size_t k = MIN(sp.top_k, (size_t)256);
+    size_t n = server_top_k(logits, len, k, cand);
+    float mx = logits[cand[0]];
+    float sum = 0;
+    for (size_t i = 0; i < n; i++) {
+        p[i] = expf((logits[cand[i]] - mx) / sp.temperature);
+        sum += p[i];
+    }
+    size_t keep = 0;
+    float cum = 0;
+    while (keep < n) {
+        cum += p[keep] / sum;
+        keep += 1;
+        if (cum >= sp.top_p) break;
+    }
+    return keep;
+}
+
+// A draw from weights p[0..n] (total tot) over cand.
+static uint32_t draw(QgenPrng *rng, const uint32_t *cand, const float *p, size_t n, float tot) {
+    float r = qgen_prng_float(rng) * tot;
+    for (size_t i = 0; i < n; i++) {
+        r -= p[i];
+        if (p[i] > 0 && r <= 0) return cand[i];
+    }
+    size_t last = n - 1;
+    while (last > 0 && p[last] <= 0) last -= 1;
+    return cand[last];
+}
+
+static uint32_t sample(Engine *e, const float *logits, size_t len, Sampling sp, uint32_t *cand) {
+    if (sp.temperature <= 0) return model_argmax(logits, len); // vectorized, first index on ties
+    float p[256];
+    size_t n = dist(logits, len, sp, cand, p);
+    float tot = 0;
+    for (size_t i = 0; i < n; i++) tot += p[i];
+    return draw(&e->rng, cand, p, n, tot);
+}
+
+uint32_t server_sample_pick(void *ctx, const float *row, bool has_draft, uint32_t d) {
+    SampleChooser *c = ctx;
+    float p[256];
+    size_t n = dist(row, c->n, c->sp, c->cand, p);
+    float tot = 0;
+    for (size_t i = 0; i < n; i++) tot += p[i];
+    if (has_draft) {
+        for (size_t i = 0; i < n; i++)
+            if (c->cand[i] == d) {
+                if (qgen_prng_float(c->rng) * tot < p[i]) return d;
+                tot -= p[i];
+                p[i] = 0;
+                break;
+            }
+        if (tot <= 0) return d;
+    }
+    return draw(c->rng, c->cand, p, n, tot);
+}
+
+// ---- splitting the answer ---------------------------------------------------------------------
+
+// Incremental split of the generated text into reasoning and answer, emitting only
+// bytes that cannot change: valid UTF-8, no trailing whitespace, no partial tag.
+typedef struct {
+    Buf text;
+    bool thinking;
+    size_t sent_reasoning, sent_content;
+} Splitter;
+
+static Str sp_text(const Splitter *sp) { return buf_str(&sp->text); }
+
+static Str sp_reasoning(const Splitter *sp) {
+    if (!sp->thinking) return S("");
+    Str t = sp_text(sp);
+    ptrdiff_t end = str_find(t, S("</think>"), 0);
+    return str_trim(str_sub(t, 0, end < 0 ? t.len : (size_t)end));
+}
+
+static Str sp_answer(const Splitter *sp) {
+    Str t = sp_text(sp);
+    if (!sp->thinking) return t;
+    ptrdiff_t e = str_find(t, S("</think>"), 0);
+    if (e < 0) return S("");
+    return str_sub(t, (size_t)e + 8, t.len);
+}
+
+static bool ascii_ws(char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == 0x0B || c == 0x0C; }
+static bool trim_ws(char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; }
+
+static size_t lead_ws(Str s) {
+    size_t i = 0;
+    while (i < s.len && trim_ws(s.ptr[i])) i++;
+    return i;
+}
+static size_t trim_end_len(Str s) {
+    size_t n = s.len;
+    while (n > 0 && trim_ws(s.ptr[n - 1])) n--;
+    return n;
+}
+
+// Stable prefix length of s: drop a partial UTF-8 char, trailing whitespace, and a suffix
+// that could start tag.
+static size_t sp_stable(Str s, Str tag) {
+    size_t n = s.len;
+    size_t k = MIN(tag.len - 1, n);
+    for (; k > 0; k--)
+        if (memcmp(s.ptr + n - k, tag.ptr, k) == 0) {
+            n -= k;
+            break;
+        }
+    size_t cut = n, back = 0;
+    while (cut > 0 && back < 4 && ((unsigned char)s.ptr[cut - 1] & 0xC0) == 0x80) {
+        back += 1;
+        cut -= 1;
+    }
+    if (cut > 0 && (unsigned char)s.ptr[cut - 1] >= 0xC0) {
+        unsigned char b = (unsigned char)s.ptr[cut - 1];
+        size_t len = b < 0xE0 ? 2 : b < 0xF0 ? 3 : b < 0xF8 ? 4 : 1;
+        if (back + 1 < len) n = cut - 1;
+    }
+    while (n > 0 && ascii_ws(s.ptr[n - 1])) n -= 1;
+    return n;
+}
+
+typedef struct {
+    Str reasoning, content;
+} Poll;
+
+// New reasoning and content bytes that can be sent now.
+static Poll sp_poll(Splitter *sp, bool final) {
+    Str t = sp_text(sp);
+    Poll r = {S(""), S("")};
+    if (sp->thinking) {
+        ptrdiff_t closed = str_find(t, S("</think>"), 0);
+        Str raw = str_sub(t, 0, closed < 0 ? t.len : (size_t)closed);
+        Str body = str_sub(raw, lead_ws(raw), raw.len);
+        size_t n = (closed >= 0 || final) ? trim_end_len(body) : sp_stable(body, S("</think>"));
+        if (n > sp->sent_reasoning) {
+            r.reasoning = str_sub(body, sp->sent_reasoning, n);
+            sp->sent_reasoning = n;
+        }
+        if (closed < 0) return r;
+    }
+    Str ans = sp_answer(sp);
+    Str body = str_sub(ans, lead_ws(ans), ans.len);
+    ptrdiff_t tool = toolcall_start(body);
+    size_t upto = tool >= 0 ? (size_t)tool : body.len;
+    size_t n = (tool >= 0 || final) ? trim_end_len(str_sub(body, 0, upto)) : sp_stable(body, S("<tool_call>"));
+    if (n > sp->sent_content) {
+        r.content = str_sub(body, sp->sent_content, n);
+        sp->sent_content = n;
+    }
+    return r;
+}
+
+// ---- requests ---------------------------------------------------------------------------------
+
+typedef enum { FMT_OPENAI, FMT_ANTHROPIC } Fmt;
+
+// Request body -> (OpenAI-shaped request, the model name to echo).
+static Err parse_request(Arena *a, Str body, Fmt fmt, JValue **r, Str *model) {
+    JValue *raw;
+    TRY(json_parse(a, body, false, &raw));
+    if (raw->kind != J_OBJECT) return "BadRequest";
+    JValue *m = field(raw, "model");
+    *model = (m && m->kind == J_STRING) ? m->s : S(MODEL_ID);
+    if (fmt == FMT_ANTHROPIC) return anthropic_to_openai(a, raw, r);
+    *r = raw;
+    return OK;
+}
+
+// POST /v1/messages/count_tokens: the rendered prompt's length, without running the model.
+static Err count_tokens(Engine *e, Arena *a, Conn *c, Req *h, Str body) {
+    JValue *r;
+    Str model, prompt;
+    TRY(parse_request(a, body, FMT_ANTHROPIC, &r, &model));
+    TRY(chat_render(a, r, &prompt));
+    VecU32 ids = {0};
+    Err err = tokenizer_encode(e->tok, prompt, &ids);
+    size_t n = ids.len;
+    vec_free(&ids);
+    if (err) return err;
+    return json_respond(c, h, 200, str(arena_printf(a, "{\"input_tokens\":%zu}", n)));
+}
+
+typedef enum { BLOCK_NONE, BLOCK_THINKING, BLOCK_TEXT } Block;
+
+// One streamed response in either API's event format.
+typedef struct {
+    Arena *a;
+    Fmt fmt;
+    Conn *c;
+    const char *id;
+    int64_t created;
+    Str model;
+    uint64_t last;
+    // Anthropic: the open content block and the index of the next one.
+    Block block;
+    size_t index;
+    Buf ev; // the body bytes not yet sent
+} Out;
+
+// Sends the pending body bytes as one chunk and flushes the connection.
+static Err out_flush(Out *o) {
+    if (o->ev.len > 0) {
+        char hd[32];
+        int n = snprintf(hd, sizeof hd, "%zx\r\n", o->ev.len);
+        Err err = conn_write(o->c, hd, (size_t)n);
+        if (!err) err = conn_write(o->c, o->ev.ptr, o->ev.len);
+        if (!err) err = conn_writes(o->c, "\r\n");
+        o->ev.len = 0;
+        TRY(err);
+    }
+    TRY(conn_flush(o->c));
+    o->last = now_ns();
+    return OK;
+}
+
+// BodyWriter.end: the rest of the body and the last chunk.
+static Err out_end(Out *o) {
+    TRY(out_flush(o));
+    TRY(conn_writes(o->c, "0\r\n\r\n"));
+    return conn_flush(o->c);
+}
+
+static Err out_event(Out *o, const char *name, Str data) {
+    buf_printf(&o->ev, "event: %s\ndata: %.*s\n\n", name, (int)data.len, data.ptr);
+    return out_flush(o);
+}
+
+static Err out_chunk(Out *o, Str delta, const char *finish) {
+    buf_printf(&o->ev,
+               "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%lld,\"model\":\"" MODEL_ID
+               "\",\"choices\":[{\"index\":0,\"delta\":%.*s,\"finish_reason\":",
+               o->id, (long long)o->created, (int)delta.len, delta.ptr);
+    if (finish) buf_printf(&o->ev, "\"%s\"}]}\n\n", finish);
+    else buf_adds(&o->ev, "null}]}\n\n");
+    return out_flush(o);
+}
+
+static Err out_begin(Out *o, size_t input, size_t cached) {
+    if (o->fmt == FMT_OPENAI) return out_chunk(o, S("{\"role\":\"assistant\",\"content\":\"\"}"), NULL);
+    Buf d = {0};
+    buf_printf(&d, "{\"type\":\"message_start\",\"message\":{\"id\":\"%s\",\"type\":\"message\",\"role\":\"assistant\",\"model\":",
+               o->id);
+    chat_json_string(&d, o->model);
+    buf_printf(&d,
+               ",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":%zu,\"cache_creation_"
+               "input_tokens\":0,\"cache_read_input_tokens\":%zu,\"output_tokens\":0}}}",
+               input - cached, cached);
+    Err err = out_event(o, "message_start", buf_str(&d));
+    buf_free(&d);
+    return err;
+}
+
+// A keep-alive if the stream has been quiet for ms.
+static Err out_keep_alive(Out *o, int64_t ms) {
+    if ((int64_t)(now_ns() - o->last) < ms * 1000000) return OK;
+    if (o->fmt == FMT_OPENAI) buf_adds(&o->ev, ": keep-alive\n\n");
+    else buf_adds(&o->ev, "event: ping\ndata: {\"type\":\"ping\"}\n\n");
+    return out_flush(o);
+}
+
+static Err out_close(Out *o) {
+    if (o->block == BLOCK_NONE) return OK;
+    TRY(out_event(o, "content_block_stop", str(arena_printf(o->a, "{\"type\":\"content_block_stop\",\"index\":%zu}", o->index))));
+    o->block = BLOCK_NONE;
+    o->index += 1;
+    return OK;
+}
+
+static Err out_open(Out *o, Block kind) {
+    if (o->block == kind) return OK;
+    TRY(out_close(o));
+    const char *cb = kind == BLOCK_THINKING ? "{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}"
+                                            : "{\"type\":\"text\",\"text\":\"\"}";
+    TRY(out_event(o, "content_block_start",
+                  str(arena_printf(o->a, "{\"type\":\"content_block_start\",\"index\":%zu,\"content_block\":%s}", o->index, cb))));
+    o->block = kind;
+    return OK;
+}
+
+static Err out_text(Out *o, Block kind, Str t) {
+    if (t.len == 0) return OK;
+    Buf d = {0};
+    Err err;
+    if (o->fmt == FMT_OPENAI) {
+        buf_adds(&d, kind == BLOCK_THINKING ? "{\"reasoning_content\":" : "{\"content\":");
+        chat_json_string(&d, t);
+        buf_addc(&d, '}');
+        err = out_chunk(o, buf_str(&d), NULL);
+    } else {
+        err = out_open(o, kind);
+        if (!err) {
+            buf_printf(&d, "{\"type\":\"content_block_delta\",\"index\":%zu,\"delta\":{\"type\":\"%s\",\"%s\":", o->index,
+                       kind == BLOCK_THINKING ? "thinking_delta" : "text_delta", kind == BLOCK_THINKING ? "thinking" : "text");
+            chat_json_string(&d, t);
+            buf_adds(&d, "}}");
+            err = out_event(o, "content_block_delta", buf_str(&d));
+        }
+    }
+    buf_free(&d);
+    return err;
+}
+
+// Anthropic stop_reason for a finish reason.
+static const char *stop_reason(const char *finish, bool by_stop) {
+    if (by_stop) return "stop_sequence";
+    if (!strcmp(finish, "tool_calls")) return "tool_use";
+    if (!strcmp(finish, "length")) return "max_tokens";
+    return "end_turn";
+}
+
+// tool_choice of an OpenAI request: "none", "required", or a function's name ({"type":
+// "function", "function": {"name": ...}}); TC_AUTO for auto.
+typedef enum { TC_AUTO, TC_NONE, TC_REQUIRED, TC_NAMED } ToolChoiceKind;
+static ToolChoiceKind tool_choice(const JValue *r, Str *named) {
+    JValue *tc = field(r, "tool_choice");
+    if (!tc) return TC_AUTO;
+    if (tc->kind == J_STRING) {
+        if (str_eqz(tc->s, "none")) return TC_NONE;
+        if (str_eqz(tc->s, "required")) return TC_REQUIRED;
+        return TC_AUTO;
+    }
+    if (tc->kind == J_OBJECT) {
+        JValue *f = field(tc, "function");
+        if (!f) return TC_AUTO;
+        JValue *name = field(f, "name");
+        if (!name || name->kind != J_STRING) return TC_AUTO;
+        *named = name->s;
+        return TC_NAMED;
+    }
+    return TC_AUTO;
+}
+
+static float round_ms(uint64_t t0) { return (float)(now_ns() - t0) / 1e6f; }
+
+// Per-request allocations outside the arena, freed by the caller of handle.
+typedef struct {
+    VecU32 ids;
+    Lookup lk;
+    Splitter split;
+    Out out;
+    bool streaming;
+} Work;
+
+// Prefill hook: a prefix point every PT_EVERY tokens, the monitor's progress, a stream's
+// keep-alive.
+typedef struct {
+    Engine *e;
+    Out *out;
+    const uint32_t *ids;
+    bool points;
+} Hook;
+
+static bool hook_aligned(void *ctx) { return ((Hook *)ctx)->points; }
+static Err hook_chunk_done(void *ctx, size_t pos) {
+    Hook *h = ctx;
+    if (h->points && pos % PT_EVERY == 0 && pos / PT_EVERY <= PT_MAX) {
+        size_t k = pos / PT_EVERY - 1;
+        if (h->e->s->pts[k].gdn != NULL || point_room(h->e)) TRY(session_save_point(h->e->s, h->e->g, h->ids, pos));
+    }
+    atomic_store_explicit(&h->e->st->prompt_done, (uint32_t)pos, memory_order_release);
+    if (h->out) TRY(out_keep_alive(h->out, 0));
+    return OK;
+}
+
+static Err anthropic_end(Arena *a, Conn *c, Req *h, Out *out, Splitter *sp, Parsed parsed, char **call_ids, const char *id,
+                         Str name, size_t n, size_t reused, size_t n_gen, const char *stop, const char *stop_seq);
+
+// The generation after the prompt is routed: prefill, decode, the response.
+static Err generate_reply(Engine *e, Arena *a, Conn *c, Req *h, Work *w, JValue *r, Str model_name, Fmt fmt, Str forced,
+                          bool thinking, Sampling sp, const char **stops, size_t n_stops, bool stream, const JValue *tools,
+                          const char *id, int64_t created, Start start, size_t max_tokens) {
+    const uint32_t *ids = w->ids.ptr;
+    size_t n = w->ids.len;
+    size_t reused = start.n;
+    (void)r;
+    Out *out = NULL;
+    if (stream) {
+        TRY(write_expect_continue(c, h));
+        TRY(conn_writes(c, "HTTP/1.1 200 OK\r\nconnection: close\r\ntransfer-encoding: chunked\r\ncontent-type: "
+                           "text/event-stream\r\ncache-control: no-cache\r\n\r\n"));
+        w->out = (Out){.a = a, .fmt = fmt, .c = c, .id = id, .created = created, .model = model_name, .last = now_ns()};
+        w->streaming = true;
+        out = &w->out;
+        TRY(out_begin(out, n, reused));
+    }
+
+    // prefill
+    uint64_t t0 = now_ns();
+    // prefix reuse: restore the checkpoint when this prompt extends it, then prefill the rest
+    // up to the last token, checkpoint there, and run the last token for the logits. The
+    // prompt is read in one prefill call (its n-gram preparation overlaps the GPU across
+    // chunks; separate calls each paid it). After each chunk the hook keeps a prefix point
+    // every PT_EVERY tokens (which another conversation sharing the prefix can start from),
+    // updates the monitor's progress, and sends a stream's keep-alive.
+    TRY(apply(e, start));
+    const char *pv = getenv("SAETTA_POINTS");
+    bool points_on = pv ? pv[0] != '0' : true;
+    if (n - 1 > reused) {
+        Hook hk = {e, out, ids, points_on};
+        PrefillHook ph = {&hk, hook_aligned, hook_chunk_done};
+        float *lg;
+        TRY(model_prefill_with(e->m, e->s, ids + reused, n - 1 - reused, NULL, &ph, &lg));
+    }
+    if (n - 1 != reused) TRY(session_save_checkpoint(e->s, ids, n - 1));
+    float *logits;
+    TRY(model_prefill(e->m, e->s, ids + n - 1, 1, NULL, &logits));
+    uint64_t t1 = now_ns();
+    atomic_store_explicit(&e->st->prompt_done, (uint32_t)n, memory_order_release);
+    atomic_store_explicit(&e->st->decode_start_ns, stats_now_ns(), memory_order_release);
+    atomic_store_explicit(&e->st->state, STATE_GENERATING, memory_order_release);
+
+    Splitter *spl = &w->split;
+    spl->thinking = thinking;
+    buf_addstr(&spl->text, forced); // the forced opening is part of the answer
+    uint32_t cand[256];
+    size_t n_gen = 0;
+    const char *finish = "length";
+    const char *by_stop = NULL;
+    // greedy requests speculate with prompt lookup (src/spec.h); the accepted drafts are
+    // already consumed by the model and come out of queue without another pass
+    const char *sv = getenv("SAETTA_SPEC");
+    bool spec_on = sv ? sv[0] != '0' : true;
+    // speculation at any temperature: greedy verifies by argmax, sampling by SampleChooser
+    bool greedy = sp.temperature <= 0;
+    Lookup *lk = &w->lk;
+    for (size_t i = 0; i < n; i++) lookup_push(lk, ids[i]);
+    Gate *gate = &e->gate;
+    Depth *depth = &e->depth;
+    uint32_t queue[KMAX];
+    size_t qn = 0, qi = 0;
+    uint32_t next = sample(e, logits, CONFIG_VOCAB_SIZE, sp, cand);
+    size_t passes = 0;
+    uint32_t *gen_ids = ARENA_ARRAY(a, uint32_t, max_tokens + 1);
+    size_t n_gen_ids = 0;
+    while (n_gen < max_tokens) {
+        uint32_t t = next;
+        n_gen += 1;
+        atomic_store_explicit(&e->st->gen, (uint32_t)n_gen, memory_order_release);
+        gen_ids[n_gen_ids++] = t;
+        bool eos = false;
+        for (size_t i = 0; i < CONFIG_N_EOS_TOKEN_IDS; i++)
+            if (t == config_eos_token_ids[i]) eos = true;
+        if (eos) {
+            finish = "stop";
+            break;
+        }
+        tokenizer_decode_append(e->tok, t, &spl->text);
+        bool stopped = false;
+        for (size_t i = 0; i < n_stops; i++) {
+            Str st = str(stops[i]);
+            Str ans = sp_answer(spl);
+            ptrdiff_t cut = st.len > 0 ? str_find(ans, st, 0) : -1;
+            if (cut >= 0) {
+                spl->text.len -= ans.len - (size_t)cut;
+                spl->text.ptr[spl->text.len] = 0;
+                finish = "stop";
+                by_stop = stops[i];
+                stopped = true;
+                break;
+            }
+        }
+        if (stopped) break;
+        if (out) {
+            Poll d = sp_poll(spl, false);
+            TRY(out_text(out, BLOCK_THINKING, d.reasoning));
+            TRY(out_text(out, BLOCK_TEXT, d.content));
+            TRY(out_keep_alive(out, 5000));
+        }
+        if (n_gen >= max_tokens) break;
+        lookup_push(lk, t);
+        if (qi < qn) {
+            next = queue[qi];
+            qi += 1;
+            continue;
+        }
+        passes += 1;
+        atomic_store_explicit(&e->st->passes, (uint32_t)passes, memory_order_release);
+        uint32_t drafts[KMAX - 1];
+        // a long prompt-lookup copy first (no head pass), else the MTP head at the depth the
+        // controller picks (Depth in src/spec.h)
+        uint64_t tr0 = now_ns();
+        size_t nd = spec_on ? lookup_draft(lk, drafts, gate_depth(gate, KMAX - 1)) : 0;
+        bool from_mtp = false;
+        if (spec_on && nd < 3 && e->m->mtp != NULL) {
+            TRY(model_draft_mtp(e->m, e->s, t, depth_pick(depth, KMAX - 1), drafts, &nd));
+            from_mtp = nd > 0;
+        } else if (nd > 0 && !gate_allow(gate)) nd = 0;
+        if (nd > 0) {
+            SpecResult sr;
+            if (greedy) TRY(model_spec_greedy(e->m, e->s, t, drafts, nd, &sr));
+            else {
+                SampleChooser ch = {&e->rng, sp, cand, CONFIG_VOCAB_SIZE};
+                TRY(model_spec_verify(e->m, e->s, t, drafts, nd, server_sample_pick, &ch, &sr));
+            }
+            if (from_mtp) depth_record(depth, nd, sr.accepted, round_ms(tr0));
+            else gate_record(gate, sr.accepted + 1);
+            memcpy(queue, drafts, sr.accepted * sizeof(uint32_t));
+            queue[sr.accepted] = sr.next;
+            qn = sr.accepted + 1;
+            next = queue[0];
+            qi = 1;
+        } else {
+            TRY(model_step(e->m, e->s, t, &logits));
+            next = sample(e, logits, CONFIG_VOCAB_SIZE, sp, cand);
+            if (spec_on && e->m->mtp != NULL) depth_record(depth, 0, 0, round_ms(tr0));
+        }
+    }
+    uint64_t t2 = now_ns();
+    // decode-end restore point: the state after prompt + the generated tokens the model has
+    // consumed, for the next turn whose prompt repeats this reply. When the reply ended with
+    // accepted drafts still queued, the model consumed tokens beyond the emitted ones: the
+    // state rolls back to the emitted ones (the last verification chunk keeps each token's
+    // state), so the point is saved whatever the speculation did.
+    size_t consumed = e->s->pos - n;
+    if (consumed > n_gen_ids) {
+        uint32_t *all = ARENA_ARRAY(a, uint32_t, n + n_gen_ids);
+        memcpy(all, ids, n * sizeof(uint32_t));
+        memcpy(all + n, gen_ids, n_gen_ids * sizeof(uint32_t));
+        consumed = session_roll_to(e->s, n + n_gen_ids, all) ? n_gen_ids : 0;
+    }
+    if (consumed > 0) {
+        uint32_t *all = ARENA_ARRAY(a, uint32_t, n + consumed);
+        memcpy(all, ids, n * sizeof(uint32_t));
+        memcpy(all + n, gen_ids, consumed * sizeof(uint32_t));
+        (void)session_save_checkpoint_at(e->s, 1, all, n + consumed);
+    }
+    int64_t pre_ms = (int64_t)(t1 - t0) / 1000000;
+    int64_t dec_ms = (int64_t)(t2 - t1) / 1000000;
+    Parsed parsed = toolcall_parse(a, str_trim(sp_answer(spl)), tools);
+    if (parsed.n_calls > 0) finish = "tool_calls";
+    dbg("request: %zu prompt tokens (%zu reused) in %lld ms, %zu generated in %lld ms (%s tok/s, %zu passes), finish %s%s, "
+        "conversation %zu/%zu\n",
+        n, reused, (long long)pre_ms, n_gen, (long long)dec_ms, fx((double)n_gen * 1000.0 / (double)MAX(dec_ms, (int64_t)1), 2),
+        passes, finish, fmt == FMT_ANTHROPIC ? " (anthropic)" : "", e->active + 1, e->n_conv);
+    {
+        Done d = {0};
+        d.anthropic = fmt == FMT_ANTHROPIC;
+        d.prompt = (uint32_t)n;
+        d.reused = (uint32_t)reused;
+        d.output = (uint32_t)n_gen;
+        d.passes = (uint32_t)passes;
+        d.prefill_ms = (uint32_t)pre_ms;
+        d.decode_ms = (uint32_t)dec_ms;
+        memcpy(d.finish, finish, MIN(strlen(finish), sizeof d.finish));
+        atomic_store_explicit(&e->st->ck0, (uint32_t)e->s->ck[0].tokens.len, memory_order_release);
+        atomic_store_explicit(&e->st->ck1, (uint32_t)e->s->ck[1].tokens.len, memory_order_release);
+        stats_finish(e->st, d);
+        publish_convs(e);
+    }
+    char **call_ids = ARENA_ARRAY(a, char *, parsed.n_calls + 1);
+    for (size_t i = 0; i < parsed.n_calls; i++)
+        call_ids[i] = arena_printf(a, "%s_%016llx", fmt == FMT_ANTHROPIC ? "toolu" : "call",
+                                   (unsigned long long)qgen_prng_next(&e->rng));
+
+    if (fmt == FMT_ANTHROPIC)
+        return anthropic_end(a, c, h, out, spl, parsed, call_ids, id, model_name, n, reused, n_gen,
+                             stop_reason(finish, by_stop != NULL), by_stop);
+
+    Buf calls = {0};
+    buf_addc(&calls, '[');
+    for (size_t i = 0; i < parsed.n_calls; i++) {
+        if (i > 0) buf_addc(&calls, ',');
+        buf_printf(&calls, "{\"index\":%zu,\"id\":\"%s\",\"type\":\"function\",\"function\":{\"name\":", i, call_ids[i]);
+        chat_json_string(&calls, parsed.calls[i].name);
+        buf_adds(&calls, ",\"arguments\":");
+        chat_json_string(&calls, parsed.calls[i].arguments);
+        buf_adds(&calls, "}}");
+    }
+    buf_addc(&calls, ']');
+    const char *calls_json = arena_strdup(a, calls.ptr);
+    buf_free(&calls);
+    const char *usage = arena_printf(
+        a, "{\"prompt_tokens\":%zu,\"completion_tokens\":%zu,\"total_tokens\":%zu,\"prompt_tokens_details\":{\"cached_tokens\":%zu}}",
+        n, n_gen, n + n_gen, reused);
+
+    if (out) {
+        Poll d = sp_poll(spl, true);
+        TRY(out_text(out, BLOCK_THINKING, d.reasoning));
+        TRY(out_text(out, BLOCK_TEXT, d.content));
+        if (parsed.n_calls > 0) TRY(out_chunk(out, str(arena_printf(a, "{\"tool_calls\":%s}", calls_json)), NULL));
+        TRY(out_chunk(out, S("{}"), finish));
+        buf_printf(&out->ev,
+                   "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%lld,\"model\":\"" MODEL_ID
+                   "\",\"choices\":[],\"usage\":%s}\n\ndata: [DONE]\n\n",
+                   id, (long long)created, usage);
+        return out_end(out);
+    }
+    Buf res = {0};
+    buf_printf(&res,
+               "{\"id\":\"%s\",\"object\":\"chat.completion\",\"created\":%lld,\"model\":\"" MODEL_ID
+               "\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":",
+               id, (long long)created);
+    if (parsed.content.len == 0 && parsed.n_calls > 0) buf_adds(&res, "null");
+    else chat_json_string(&res, parsed.content);
+    Str rc = sp_reasoning(spl);
+    if (rc.len > 0) {
+        buf_adds(&res, ",\"reasoning_content\":");
+        chat_json_string(&res, rc);
+    }
+    if (parsed.n_calls > 0) buf_printf(&res, ",\"tool_calls\":%s", calls_json);
+    buf_printf(&res, "},\"finish_reason\":\"%s\"}],\"usage\":%s}", finish, usage);
+    Err err = json_respond(c, h, 200, buf_str(&res));
+    buf_free(&res);
+    return err;
+}
+
+// The end of an Anthropic response: the rest of the text, the tool_use blocks, message_delta
+// and message_stop when streaming; the whole message object otherwise.
+static Err anthropic_end(Arena *a, Conn *c, Req *h, Out *o, Splitter *sp, Parsed parsed, char **call_ids, const char *id,
+                         Str name, size_t n, size_t reused, size_t n_gen, const char *stop, const char *stop_seq) {
+    Buf seqb = {0};
+    if (stop_seq) chat_json_string(&seqb, str(stop_seq));
+    else buf_adds(&seqb, "null");
+    const char *seq = arena_strdup(a, seqb.ptr);
+    buf_free(&seqb);
+    if (o) {
+        Poll d = sp_poll(sp, true);
+        TRY(out_text(o, BLOCK_THINKING, d.reasoning));
+        TRY(out_text(o, BLOCK_TEXT, d.content));
+        TRY(out_close(o));
+        for (size_t i = 0; i < parsed.n_calls; i++) {
+            Call cl = parsed.calls[i];
+            Buf st = {0};
+            buf_printf(&st, "{\"type\":\"content_block_start\",\"index\":%zu,\"content_block\":{\"type\":\"tool_use\",\"id\":\"%s\",\"name\":",
+                       o->index, call_ids[i]);
+            chat_json_string(&st, cl.name);
+            buf_adds(&st, ",\"input\":{}}}");
+            Err err = out_event(o, "content_block_start", buf_str(&st));
+            buf_free(&st);
+            TRY(err);
+            Buf dl = {0};
+            buf_printf(&dl, "{\"type\":\"content_block_delta\",\"index\":%zu,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":",
+                       o->index);
+            chat_json_string(&dl, cl.arguments);
+            buf_adds(&dl, "}}");
+            err = out_event(o, "content_block_delta", buf_str(&dl));
+            buf_free(&dl);
+            TRY(err);
+            TRY(out_event(o, "content_block_stop", str(arena_printf(a, "{\"type\":\"content_block_stop\",\"index\":%zu}", o->index))));
+            o->index += 1;
+        }
+        TRY(out_event(o, "message_delta",
+                      str(arena_printf(a,
+                                       "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"%s\",\"stop_sequence\":%s},"
+                                       "\"usage\":{\"output_tokens\":%zu}}",
+                                       stop, seq, n_gen))));
+        TRY(out_event(o, "message_stop", S("{\"type\":\"message_stop\"}")));
+        return out_end(o);
+    }
+    Buf res = {0};
+    buf_printf(&res, "{\"id\":\"%s\",\"type\":\"message\",\"role\":\"assistant\",\"model\":", id);
+    chat_json_string(&res, name);
+    buf_adds(&res, ",\"content\":[");
+    bool first = true;
+    Str rc = sp_reasoning(sp);
+    if (rc.len > 0) {
+        buf_adds(&res, "{\"type\":\"thinking\",\"thinking\":");
+        chat_json_string(&res, rc);
+        buf_adds(&res, ",\"signature\":\"\"}");
+        first = false;
+    }
+    if (parsed.content.len > 0) {
+        if (!first) buf_addc(&res, ',');
+        buf_adds(&res, "{\"type\":\"text\",\"text\":");
+        chat_json_string(&res, parsed.content);
+        buf_addc(&res, '}');
+        first = false;
+    }
+    for (size_t i = 0; i < parsed.n_calls; i++) {
+        Call cl = parsed.calls[i];
+        if (!first) buf_addc(&res, ',');
+        first = false;
+        buf_printf(&res, "{\"type\":\"tool_use\",\"id\":\"%s\",\"name\":", call_ids[i]);
+        chat_json_string(&res, cl.name);
+        Str args = cl.arguments.len > 0 ? cl.arguments : S("{}");
+        buf_printf(&res, ",\"input\":%.*s}", (int)args.len, args.ptr);
+    }
+    buf_printf(&res,
+               "],\"stop_reason\":\"%s\",\"stop_sequence\":%s,\"usage\":{\"input_tokens\":%zu,\"cache_creation_input_tokens\":0,"
+               "\"cache_read_input_tokens\":%zu,\"output_tokens\":%zu}}",
+               stop, seq, n - reused, reused, n_gen);
+    Err err = json_respond(c, h, 200, buf_str(&res));
+    buf_free(&res);
+    return err;
+}
+
+static Err handle(Engine *e, Arena *a, Conn *c, Req *h, Str body, Fmt fmt, Work *w) {
+    JValue *r;
+    Str model_name;
+    TRY(parse_request(a, body, fmt, &r, &model_name));
+    // tool_choice: none leaves the tools out of the prompt; required or a named function
+    // starts the answer with the tool call's opening (after an empty thinking block), so
+    // the model continues a call (as Strata does: no grammar)
+    Str named = {0};
+    ToolChoiceKind choice = field(r, "tools") != NULL ? tool_choice(r, &named) : TC_AUTO;
+    if (choice == TC_NONE) json_remove(r, "tools");
+    Str prompt;
+    TRY(chat_render(a, r, &prompt));
+    Str forced = S("");
+    if (choice == TC_REQUIRED || choice == TC_NAMED) {
+        if (str_ends(prompt, S("<think>\n"))) prompt = str(arena_printf(a, "%.*s\n</think>\n\n", (int)prompt.len, prompt.ptr));
+        // with one declared tool, "required" means that tool
+        JValue *tl = field(r, "tools");
+        Str only = {0};
+        bool has_only = false;
+        if (tl->kind == J_ARRAY && tl->arr.len == 1) {
+            JValue *f = field(tl->arr.items[0], "function");
+            if (!f) f = tl->arr.items[0];
+            JValue *nm = field(f, "name");
+            if (nm && nm->kind == J_STRING) {
+                only = nm->s;
+                has_only = true;
+            }
+        }
+        if (choice == TC_NAMED) forced = str(arena_printf(a, "<tool_call>\n<function=%.*s>\n", (int)named.len, named.ptr));
+        else if (has_only) forced = str(arena_printf(a, "<tool_call>\n<function=%.*s>\n", (int)only.len, only.ptr));
+        else forced = S("<tool_call>\n");
+        prompt = str(arena_printf(a, "%.*s%.*s", (int)prompt.len, prompt.ptr, (int)forced.len, forced.ptr));
+    }
+    TRY(tokenizer_encode(e->tok, prompt, &w->ids));
+    bool thinking = forced.len == 0 && str_ends(prompt, S("<think>\n")) && !str_ends(prompt, S("</think>\n\n"));
+    double v;
+    size_t asked = num(field(r, "max_completion_tokens"), &v) ? (size_t)v : num(field(r, "max_tokens"), &v) ? (size_t)v : 4096;
+    Sampling sp;
+    sp.temperature = num(field(r, "temperature"), &v) ? (float)v : 1.0f;
+    sp.top_p = num(field(r, "top_p"), &v) ? (float)v : 0.95f;
+    sp.top_k = (size_t)fmin(256, num(field(r, "top_k"), &v) ? v : 20);
+    if (num(field(r, "seed"), &v)) qgen_prng_init(&e->rng, (uint64_t)v);
+    const char **stops = NULL;
+    size_t n_stops = 0;
+    JValue *stv = field(r, "stop");
+    if (stv && stv->kind == J_STRING) {
+        stops = ARENA_ARRAY(a, const char *, 1);
+        stops[n_stops++] = stv->s.ptr;
+    } else if (stv && stv->kind == J_ARRAY) {
+        stops = ARENA_ARRAY(a, const char *, stv->arr.len + 1);
+        for (size_t i = 0; i < stv->arr.len; i++)
+            if (stv->arr.items[i]->kind == J_STRING) stops[n_stops++] = stv->arr.items[i]->s.ptr;
+    }
+    JValue *sv = field(r, "stream");
+    bool stream = sv && sv->kind == J_BOOL && sv->b;
+    const JValue *tools = field(r, "tools");
+    const char *id;
+    if (fmt == FMT_ANTHROPIC) {
+        uint64_t hi = qgen_prng_next(&e->rng);
+        uint32_t lo = (uint32_t)qgen_prng_next(&e->rng);
+        id = arena_printf(a, "msg_%016llx%08x", (unsigned long long)hi, lo);
+    } else {
+        id = arena_printf(a, "chatcmpl-%llx", (unsigned long long)qgen_prng_next(&e->rng));
+    }
+    int64_t created = (int64_t)(wall_ns() / 1000000000ull);
+    size_t n = w->ids.len;
+    // the reply fits in the context: SAETTA_CTX less the prompt and the speculation slack
+    if (n + CAP_SLACK >= e->s->max_cap) return "PromptTooLong";
+    size_t max_tokens = MIN(asked, e->s->max_cap - n - CAP_SLACK);
+    route(e, w->ids.ptr, n);
+    TRY(ensure(e, n + max_tokens + CAP_SLACK));
+    Start start = plan(e, w->ids.ptr, n);
+    stats_begin(e->st, fmt == FMT_ANTHROPIC, n, start.n, max_tokens);
+    Err err = generate_reply(e, a, c, h, w, r, model_name, fmt, forced, thinking, sp, stops, n_stops, stream, tools, id, created,
+                             start, max_tokens);
+    if (err) atomic_store_explicit(&e->st->state, STATE_IDLE, memory_order_release);
+    return err;
+}
+
+static Err connection(Engine *e, int fd) {
+    Conn *c = xmalloc(sizeof(Conn));
+    c->fd = fd;
+    c->rpos = c->rend = c->wlen = 0;
+    c->wfail = false;
+    guard_attach(fd);
+    Err ret = OK;
+    Req h;
+    if (receive_head(c, &h)) goto done;
+    {
+        Arena a = {0};
+        Str target = h.target;
+        ptrdiff_t q = str_find_char(target, '?', 0);
+        Str path = q >= 0 ? str_sub(target, 0, (size_t)q) : target;
+        if (h.method == M_GET && str_eqz(path, "/health")) {
+            ret = json_respond(c, &h, 200, S("{\"status\":\"ok\"}"));
+        } else if (h.method == M_GET && str_eqz(path, "/v1/models")) {
+            ret = json_respond(c, &h, 200,
+                               S("{\"object\":\"list\",\"data\":[{\"id\":\"" MODEL_ID "\",\"object\":\"model\",\"owned_by\":\"saetta\"}]}"));
+        } else if (h.method == M_HEAD && str_eqz(path, "/api/hello")) {
+            ret = respond(c, &h, 200, S(""), NULL); // Claude Code's startup probe
+        } else if (h.method == M_POST && (str_eqz(path, "/v1/chat/completions") || str_eqz(path, "/v1/messages") ||
+                                          str_eqz(path, "/v1/messages/count_tokens"))) {
+            Fmt fmt = str_starts(path, S("/v1/messages")) ? FMT_ANTHROPIC : FMT_OPENAI;
+            Buf body = {0};
+            // a client that waits for 100 Continue gets it before its body is read
+            Err ex = h.has_expect && str_eqz(h.expect, "100-continue") ? write_expect_continue(c, &h) : OK;
+            if (!ex) ex = conn_flush(c);
+            if (ex || !read_body(c, &h, 64u << 20, &body)) {
+                buf_free(&body);
+                arena_reset(&a);
+                ret = "BodyTooLarge";
+                goto done;
+            }
+            Str bs = str_n(arena_dup(&a, body.ptr ? body.ptr : "", body.len + 1), body.len);
+            buf_free(&body);
+            Work w = {0};
+            Err err = str_ends(path, S("/count_tokens")) ? count_tokens(e, &a, c, &h, bs) : handle(e, &a, c, &h, bs, fmt, &w);
+            vec_free(&w.ids);
+            lookup_free(&w.lk);
+            buf_free(&w.split.text);
+            buf_free(&w.out.ev);
+            if (err) {
+                dbg("request failed: %s\n", err);
+                if (!strcmp(err, "WriteFailed")) ret = err;
+                else {
+                    Buf msg = {0};
+                    buf_adds(&msg, fmt == FMT_ANTHROPIC ? "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":"
+                                                        : "{\"error\":{\"message\":");
+                    chat_json_string(&msg, str(err));
+                    buf_adds(&msg, fmt == FMT_ANTHROPIC ? "}}" : ",\"type\":\"invalid_request_error\"}}");
+                    (void)json_respond(c, &h, 400, buf_str(&msg));
+                    buf_free(&msg);
+                }
+            }
+        } else {
+            ret = json_respond(c, &h, 404, S("{\"error\":{\"message\":\"not found\"}}"));
+        }
+        arena_reset(&a);
+    }
+    // one request per connection (connection: close): agent sessions sharing the server
+    // take turns, and an idle keep-alive connection of one never holds up the others
+done:
+    guard_detach();
+    free(c);
+    return ret;
+}
+
+static const char *basename_of(Arena *a, const char *dir) {
+    size_t n = strlen(dir);
+    while (n > 1 && dir[n - 1] == '/') n--;
+    size_t b = n;
+    while (b > 0 && dir[b - 1] != '/') b--;
+    return arena_strndup(a, dir + b, n - b);
+}
+
+Err server_serve(Arena *arena, const char *dir, uint16_t port) {
+    // one server per machine (src/instance.h); the lock is held until this process ends
+    int lock_fd;
+    TRY(instance_acquire(port, &lock_fd));
+    uint64_t t0 = now_ns();
+    Pack *pack = ARENA_NEW(arena, Pack);
+    TRY(pack_open(arena, dir, pack));
+    Gpu *g = ARENA_NEW(arena, Gpu);
+    TRY(gpu_init(arena, pack, g));
+    // first GPU touch of the mapped pack (not the n-gram table), here instead of on the first request
+    TRY(gpu_warm_except(g, pack, "ngram_embedding"));
+    Model *m = ARENA_NEW(arena, Model);
+    TRY(model_load(arena, pack, g, m));
+    Tokenizer *tok = ARENA_NEW(arena, Tokenizer);
+    TRY(tokenizer_load(arena, dir, tok));
+    Stats *st = ARENA_NEW(arena, Stats);
+    stats_init(st);
+    st->model = MODEL_ID;
+    st->pack = basename_of(arena, dir);
+    st->port = port;
+    st->started_s = (int64_t)(wall_ns() / 1000000000ull);
+    st->dev = g->dev;
+    Engine *e = ARENA_NEW(arena, Engine);
+    e->st = st;
+    e->g = g;
+    e->max_conv = 4;
+    const char *cv = getenv("SAETTA_CONVERSATIONS");
+    if (cv) {
+        uint64_t x;
+        e->max_conv = parse_u64(str(cv), &x) ? 4 : (size_t)CLAMP(x, (uint64_t)1, (uint64_t)MAX_CONV);
+    }
+    e->m = m;
+    {
+        // conversations start small and grow (ensure); SAETTA_CTX is the maximum
+        size_t max_cap = 32768;
+        const char *ctx = getenv("SAETTA_CTX");
+        if (ctx) {
+            uint64_t x;
+            TRY(parse_u64(str(ctx), &x));
+            max_cap = (size_t)x;
+        }
+        TRY(session_create_cap(g, getenv("SAETTA_KV_F32") == NULL, MIN(CAP0, max_cap), max_cap, &e->s));
+    }
+    e->tok = tok;
+    qgen_prng_init(&e->rng, (uint64_t)(int64_t)wall_ns());
+    if (!tokenizer_token_id(tok, S("</think>"), &e->think_end)) return "BadTokenizer";
+    e->gate = GATE_INIT;
+    e->depth = DEPTH_INIT;
+    e->n_conv = 1;
+    e->active = 0;
+    st->ctx = e->s->max_cap;
+    TRY(stats_spawn(st));
+    pthread_t th;
+    if (pthread_create(&th, NULL, guard_loop, NULL) != 0) return "SystemResources";
+    pthread_detach(th);
+    int ls = socket(AF_INET, SOCK_STREAM, 0);
+    if (ls < 0) return err_errno(errno);
+    int one = 1;
+    setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    struct sockaddr_in sa = {0};
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(port);
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (bind(ls, (struct sockaddr *)&sa, sizeof sa) != 0 || listen(ls, 128) != 0) {
+        Err err = err_errno(errno);
+        close(ls);
+        return err;
+    }
+    dbg("saetta: serving %s on http://127.0.0.1:%u (loaded in %llu ms)\n", MODEL_ID, (unsigned)port,
+        (unsigned long long)((now_ns() - t0) / 1000000));
+    for (;;) {
+        int fd = accept(ls, NULL, NULL);
+        if (fd < 0) {
+            if (errno == EINTR) continue;
+            dbg("accept: %s\n", err_errno(errno));
+            continue;
+        }
+        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
+        Err err = connection(e, fd);
+        if (err) dbg("connection: %s\n", err);
+        close(fd);
+    }
+}

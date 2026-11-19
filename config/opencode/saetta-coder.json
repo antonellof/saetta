@@ -1,0 +1,19 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "saetta/qwen3.8-flash-next-coder",
+  "small_model": "saetta/qwen3.8-flash-next-coder",
+  "provider": {
+    "saetta": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "saetta (local, M5 Max)",
+      "options": { "baseURL": "http://127.0.0.1:8080/v1", "timeout": false },
+      "models": {
+        "qwen3.8-flash-next-coder": {
+          "name": "Qwen3.8-Flash-Next Coder (saetta)",
+          "limit": { "context": 204800, "output": 8192 },
+          "options": { "temperature": 0 }
+        }
+      }
+    }
+  }
+}

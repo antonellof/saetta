@@ -1,0 +1,7 @@
+.DS_Store
+.tools/
+.env
+.claude/
+models/
+*.safetensors
+build/

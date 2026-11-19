@@ -607,7 +607,7 @@ static bool read_body(Conn *c, const Req *h, uint64_t limit, Buf *out) {
                     } else if (ch != '\r') line++;
                 }
             }
-            if (out->len + len > limit) return false;
+            if (len > limit || out->len > limit - len) return false; // no wrap on a huge chunk size
             if (!conn_take(c, out, len)) return false;
             char r1, r2;
             if (!conn_byte(c, &r1) || !conn_byte(c, &r2) || r1 != '\r' || r2 != '\n') return false;
@@ -1468,7 +1468,9 @@ static Err handle(Engine *e, Arena *a, Conn *c, Req *h, Str body, Fmt fmt, Work 
     Sampling sp;
     sp.temperature = num(field(r, "temperature"), &v) ? (float)v : 1.0f;
     sp.top_p = num(field(r, "top_p"), &v) ? (float)v : 0.95f;
-    sp.top_k = (size_t)fmin(256, num(field(r, "top_k"), &v) ? v : 20);
+    // top_k below 1 (0 conventionally means no limit) samples from the 256 kept candidates
+    double tk = num(field(r, "top_k"), &v) ? v : 20;
+    sp.top_k = tk < 1 ? 256 : (size_t)fmin(256, tk);
     if (num(field(r, "seed"), &v)) qgen_prng_init(&e->rng, (uint64_t)v);
     const char **stops = NULL;
     size_t n_stops = 0;

@@ -11,6 +11,7 @@
 //   saetta status | stop                     the server on this machine: show it, stop it
 //   saetta update                            install the latest release over this binary
 //   saetta version                           print the version
+#include <signal.h>
 #include <math.h>
 #include <stdlib.h>
 
@@ -694,6 +695,8 @@ static Err run(Arena *arena, int argc, char **argv) {
 }
 
 int main(int argc, char **argv) {
+    // a closed pipe or socket makes write return EPIPE instead of killing the process
+    signal(SIGPIPE, SIG_IGN);
     Arena arena = {0};
     Err err = run(&arena, argc, argv);
     fflush(stdout);

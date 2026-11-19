@@ -69,10 +69,10 @@ static Err acquire_in(Arena *a, uint16_t port, int *out) {
     const char *v = getenv("SAETTA_AUTOSTOP");
     bool autostop = v && strcmp(v, "1") == 0;
     // fixed width, so a longer old record never leaves a tail behind
-    char rec[64];
-    int n = snprintf(rec, sizeof rec, "%d %u %s                                ", (int)getpid(), port,
-                     autostop ? "auto" : "manual");
-    if (n < 48 || (size_t)n >= sizeof rec) {
+    char head[64], rec[64];
+    snprintf(head, sizeof head, "%d %u %s", (int)getpid(), port, autostop ? "auto" : "manual");
+    int n = snprintf(rec, sizeof rec, "%-48s", head); // padded to exactly 48 bytes
+    if (n != 48) {
         close(fd);
         return "NoSpaceLeft";
     }

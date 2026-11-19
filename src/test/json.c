@@ -117,3 +117,24 @@ TEST(json_errors) {
     buf_free(&b);
     arena_reset(&a);
 }
+
+// std.json reports a duplicate key when the duplicate's value is complete, before any
+// later syntax error, in small and large objects alike.
+TEST(json_duplicate_reported_at_value) {
+    Arena a = {0};
+    JValue *v;
+    EXPECT_ERR(json_parse(&a, S("{\"a\":1,\"a\":2,"), true, &v), "DuplicateField");
+    Buf big = {0};
+    buf_adds(&big, "{");
+    for (int i = 0; i < 40; i++) buf_printf(&big, "\"k%d\":%d,", i, i);
+    buf_adds(&big, "\"k7\":0 ,]");
+    EXPECT_ERR(json_parse(&a, buf_str(&big), true, &v), "DuplicateField");
+    big.len = 0;
+    buf_adds(&big, "{");
+    for (int i = 0; i < 40; i++) buf_printf(&big, "%s\"k%d\":{\"x\":%d}", i ? "," : "", i, i);
+    buf_adds(&big, "}");
+    EXPECT_OK(json_parse(&a, buf_str(&big), true, &v));
+    EXPECT_EQ(v->obj.len, 40);
+    buf_free(&big);
+    arena_reset(&a);
+}

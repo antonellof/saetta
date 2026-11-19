@@ -663,13 +663,11 @@ static bool num(const JValue *v, double *out) {
     case J_INTEGER: *out = (double)v->i; return true;
     case J_FLOAT: *out = v->f; return true;
     case J_NUMBER_STRING: {
+        // the parser NUL terminates number literals in the arena, so strtod reads in place
+        // (any length: a long literal is still a number, as in std.json)
         char *end;
-        char tmp[128];
-        if (v->s.len >= sizeof tmp) return false;
-        memcpy(tmp, v->s.ptr, v->s.len);
-        tmp[v->s.len] = 0;
-        double d = strtod(tmp, &end);
-        if (end == tmp || *end) return false;
+        double d = strtod(v->s.ptr, &end);
+        if (end == v->s.ptr || end != v->s.ptr + v->s.len) return false;
         *out = d;
         return true;
     }
@@ -1107,11 +1105,11 @@ static Err hook_chunk_done(void *ctx, size_t pos) {
 }
 
 static Err anthropic_end(Arena *a, Conn *c, Req *h, Out *out, Splitter *sp, Parsed parsed, char **call_ids, const char *id,
-                         Str name, size_t n, size_t reused, size_t n_gen, const char *stop, const char *stop_seq);
+                         Str name, size_t n, size_t reused, size_t n_gen, const char *stop, const Str *stop_seq);
 
 // The generation after the prompt is routed: prefill, decode, the response.
 static Err generate_reply(Engine *e, Arena *a, Conn *c, Req *h, Work *w, JValue *r, Str model_name, Fmt fmt, Str forced,
-                          bool thinking, Sampling sp, const char **stops, size_t n_stops, bool stream, const JValue *tools,
+                          bool thinking, Sampling sp, const Str *stops, size_t n_stops, bool stream, const JValue *tools,
                           const char *id, int64_t created, Start start, size_t max_tokens) {
     const uint32_t *ids = w->ids.ptr;
     size_t n = w->ids.len;
@@ -1159,7 +1157,7 @@ static Err generate_reply(Engine *e, Arena *a, Conn *c, Req *h, Work *w, JValue 
     uint32_t cand[256];
     size_t n_gen = 0;
     const char *finish = "length";
-    const char *by_stop = NULL;
+    const Str *by_stop = NULL; // stop strings are slices: they may contain NUL
     // greedy requests speculate with prompt lookup (src/spec.h); the accepted drafts are
     // already consumed by the model and come out of queue without another pass
     const char *sv = getenv("SAETTA_SPEC");
@@ -1191,14 +1189,14 @@ static Err generate_reply(Engine *e, Arena *a, Conn *c, Req *h, Work *w, JValue 
         tokenizer_decode_append(e->tok, t, &spl->text);
         bool stopped = false;
         for (size_t i = 0; i < n_stops; i++) {
-            Str st = str(stops[i]);
+            Str st = stops[i];
             Str ans = sp_answer(spl);
             ptrdiff_t cut = st.len > 0 ? str_find(ans, st, 0) : -1;
             if (cut >= 0) {
                 spl->text.len -= ans.len - (size_t)cut;
                 spl->text.ptr[spl->text.len] = 0;
                 finish = "stop";
-                by_stop = stops[i];
+                by_stop = &stops[i];
                 stopped = true;
                 break;
             }
@@ -1351,9 +1349,9 @@ static Err generate_reply(Engine *e, Arena *a, Conn *c, Req *h, Work *w, JValue 
 // The end of an Anthropic response: the rest of the text, the tool_use blocks, message_delta
 // and message_stop when streaming; the whole message object otherwise.
 static Err anthropic_end(Arena *a, Conn *c, Req *h, Out *o, Splitter *sp, Parsed parsed, char **call_ids, const char *id,
-                         Str name, size_t n, size_t reused, size_t n_gen, const char *stop, const char *stop_seq) {
+                         Str name, size_t n, size_t reused, size_t n_gen, const char *stop, const Str *stop_seq) {
     Buf seqb = {0};
-    if (stop_seq) chat_json_string(&seqb, str(stop_seq));
+    if (stop_seq) chat_json_string(&seqb, *stop_seq);
     else buf_adds(&seqb, "null");
     const char *seq = arena_strdup(a, seqb.ptr);
     buf_free(&seqb);
@@ -1472,16 +1470,16 @@ static Err handle(Engine *e, Arena *a, Conn *c, Req *h, Str body, Fmt fmt, Work 
     double tk = num(field(r, "top_k"), &v) ? v : 20;
     sp.top_k = tk < 1 ? 256 : (size_t)fmin(256, tk);
     if (num(field(r, "seed"), &v)) qgen_prng_init(&e->rng, (uint64_t)v);
-    const char **stops = NULL;
+    Str *stops = NULL;
     size_t n_stops = 0;
     JValue *stv = field(r, "stop");
     if (stv && stv->kind == J_STRING) {
-        stops = ARENA_ARRAY(a, const char *, 1);
-        stops[n_stops++] = stv->s.ptr;
+        stops = ARENA_ARRAY(a, Str, 1);
+        stops[n_stops++] = stv->s;
     } else if (stv && stv->kind == J_ARRAY) {
-        stops = ARENA_ARRAY(a, const char *, stv->arr.len + 1);
+        stops = ARENA_ARRAY(a, Str, stv->arr.len + 1);
         for (size_t i = 0; i < stv->arr.len; i++)
-            if (stv->arr.items[i]->kind == J_STRING) stops[n_stops++] = stv->arr.items[i]->s.ptr;
+            if (stv->arr.items[i]->kind == J_STRING) stops[n_stops++] = stv->arr.items[i]->s;
     }
     JValue *sv = field(r, "stream");
     bool stream = sv && sv->kind == J_BOOL && sv->b;

@@ -280,32 +280,31 @@ static Err parse_literal(Parser *ps, const char *word) {
 }
 
 // std.json's default duplicate_field_behavior for Value is .error.
-static Err check_dups(const JValue *obj) {
-    size_t n = obj->obj.len;
-    const JMember *m = obj->obj.items;
-    if (n <= 16) {
-        for (size_t i = 1; i < n; i++)
-            for (size_t j = 0; j < i; j++)
-                if (str_eq(m[i].key, m[j].key)) return "DuplicateField";
-        return OK;
-    }
-    StrMap seen = {0};
-    Err e = OK;
-    for (size_t i = 0; i < n && !e; i++) {
-        if (strmap_has(&seen, m[i].key)) e = "DuplicateField";
-        else strmap_put(&seen, m[i].key, NULL);
-    }
-    strmap_free(&seen);
-    return e;
-}
-
 typedef struct {
     JValue *v;
-    Str key; // pending key while the container is an object
+    Str key;     // pending key while the container is an object
+    StrMap seen; // keys of a large object (from 16 members on), for the duplicate check
 } Frame;
 
-static Err parse_doc(Parser *ps, bool parse_numbers, JValue **out) {
-    Frame stack[JSON_MAX_DEPTH];
+// Adds key: value to the object of frame f. A key already present is "DuplicateField" at
+// this point, as std.json's Value parser reports it (when the duplicate's value is complete).
+static Err obj_put_checked(Arena *a, Frame *f, JValue *v) {
+    JValue *obj = f->v;
+    size_t n = obj->obj.len;
+    if (n < 16) {
+        for (size_t j = 0; j < n; j++)
+            if (str_eq(obj->obj.items[j].key, f->key)) return "DuplicateField";
+    } else {
+        if (f->seen.len == 0)
+            for (size_t j = 0; j < n; j++) strmap_put(&f->seen, obj->obj.items[j].key, NULL);
+        if (strmap_has(&f->seen, f->key)) return "DuplicateField";
+        strmap_put(&f->seen, f->key, NULL);
+    }
+    obj_append(a, obj, f->key, v);
+    return OK;
+}
+
+static Err parse_doc(Parser *ps, bool parse_numbers, Frame *stack, int *hi, JValue **out) {
     int depth = 0;
     for (;;) {
         // Expecting a value.
@@ -323,7 +322,9 @@ static Err parse_doc(Parser *ps, bool parse_numbers, JValue **out) {
                 ps->i++;
                 v = cont;
             } else {
-                stack[depth++] = (Frame){cont, {0}};
+                if (depth == *hi) (*hi)++;
+                strmap_free(&stack[depth].seen);
+                stack[depth++] = (Frame){cont, {0}, {0}};
                 if (c == '{') {
                     if (ps->p[ps->i] != '"') return "SyntaxError";
                     ps->i++;
@@ -364,7 +365,7 @@ static Err parse_doc(Parser *ps, bool parse_numbers, JValue **out) {
                 return OK;
             }
             Frame *f = &stack[depth - 1];
-            if (f->v->kind == J_OBJECT) obj_append(ps->a, f->v, f->key, v);
+            if (f->v->kind == J_OBJECT) TRY(obj_put_checked(ps->a, f, v));
             else json_push(ps->a, f->v, v);
             skip_ws(ps);
             if (ps->i >= ps->n) return "UnexpectedEndOfInput";
@@ -384,7 +385,6 @@ static Err parse_doc(Parser *ps, bool parse_numbers, JValue **out) {
                 break; // next value
             }
             if (d != (f->v->kind == J_OBJECT ? '}' : ']')) return "SyntaxError";
-            if (f->v->kind == J_OBJECT) TRY(check_dups(f->v));
             v = f->v;
             depth--;
         }
@@ -393,7 +393,11 @@ static Err parse_doc(Parser *ps, bool parse_numbers, JValue **out) {
 
 Err json_parse(Arena *a, Str text, bool parse_numbers, JValue **out) {
     Parser ps = {(const unsigned char *)text.ptr, text.len, 0, a, {0}};
-    Err e = parse_doc(&ps, parse_numbers, out);
+    Frame *stack = xcalloc(JSON_MAX_DEPTH, sizeof(Frame));
+    int hi = 0;
+    Err e = parse_doc(&ps, parse_numbers, stack, &hi, out);
+    for (int i = 0; i < hi; i++) strmap_free(&stack[i].seen);
+    free(stack);
     buf_free(&ps.tmp);
     return e;
 }

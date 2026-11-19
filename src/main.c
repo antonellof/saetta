@@ -36,7 +36,7 @@
 #include "weights.h"
 
 // Release version; keep equal to the git tag (v<version>).
-#define SAETTA_VERSION "0.7.1"
+#define SAETTA_VERSION "0.7.2"
 
 #define CFG_IN_MAX ((size_t)16384)
 #define CFG_OUT_MAX ((size_t)262144)
@@ -653,6 +653,10 @@ static Err run(Arena *arena, int argc, char **argv) {
         }
         Err err = server_serve(arena, argv[2], port);
         if (err && !strcmp(err, "AlreadyRunning")) exit(1);
+        if (err && !strcmp(err, "AddressInUse")) {
+            dbg("error: port %u is in use by another program; choose another with --port N\n", port);
+            exit(1);
+        }
         return err;
     }
     if (argc == 3 && eq(cmd, "render")) {

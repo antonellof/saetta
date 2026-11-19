@@ -52,7 +52,7 @@ brew install saetta                                           # later: brew upgr
 
 Installed with the script, `saetta update` installs a newer release over the binary.
 
-The installer checks your Mac (Apple Silicon, macOS 27.2 or later), verifies the download's SHA-256 and puts the single `saetta` binary in `~/.local/bin` (`SAETTA_PREFIX` to change it, `SAETTA_VERSION=0.7.1` to pin a release). Then download a model and start coding:
+The installer checks your Mac (Apple Silicon, macOS 27.2 or later), verifies the download's SHA-256 and puts the single `saetta` binary in `~/.local/bin` (`SAETTA_PREFIX` to change it, `SAETTA_VERSION=0.7.2` to pin a release). Then download a model and start coding:
 
 ```sh
 saetta download coder           # 76 GB into ~/Models, resumable, every file hash-checked
@@ -152,12 +152,12 @@ Guides: [Claude Code](docs/claude-code.md) · [opencode](docs/opencode.md)
   <br><sub><code>saetta start pi</code>: pi writes a Mandelbrot renderer on the local model, then it runs. Real time.</sub>
 </p>
 
-`saetta start` joins the saetta server already running on this machine or starts one (with a 204,800-token context, logging to `~/Library/Logs/saetta/`), waits until the model is loaded, and runs the agent pointed at it. Your own agent configuration is not edited: Claude Code gets its settings through environment variables and `--settings`, pi a config folder of its own (`~/.saetta/pi`), opencode a config file of its own (`~/.saetta/opencode`). When the last session exits, the server it started stops; `--keep` leaves it running so the next session starts at once.
+`saetta start` joins the saetta server already running on this machine or starts one (with a 204,800-token context, logging to `~/Library/Logs/saetta/`), waits until the model is loaded (showing the seconds elapsed, and stopping with the server's error if it fails), and runs the agent pointed at it. Your own agent configuration is not edited: Claude Code gets its settings through environment variables and `--settings`, pi a config folder of its own (`~/.saetta/pi`), opencode a config file of its own (`~/.saetta/opencode`). When the last session exits, the server it started stops; `--keep` leaves it running so the next session starts at once.
 
 | option | effect |
 |---|---|
 | `--pack coder\|full\|<dir>` | the model to load (default: the first downloaded of coder, full) |
-| `--port N` | server port (default 8080, or `SAETTA_PORT`) |
+| `--port N` | server port (default 8080, or `SAETTA_PORT`); if another program holds the default port, the next free one is used with a warning, a port you chose is an error |
 | `--ctx N` | context capacity in tokens (default 204800, or `SAETTA_CTX`) |
 | `--keep` | leave the server running when the agent exits |
 

@@ -1587,6 +1587,21 @@ Err server_serve(Arena *arena, const char *dir, uint16_t port) {
     // one server per machine (src/instance.h); the lock is held until this process ends
     int lock_fd;
     TRY(instance_acquire(port, &lock_fd));
+    // the port is bound before the load, so a port in use fails at once instead of after
+    // loading the weights; listen comes after the load, so until then connections are refused
+    int ls = socket(AF_INET, SOCK_STREAM, 0);
+    if (ls < 0) return err_errno(errno);
+    int one = 1;
+    setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    struct sockaddr_in sa = {0};
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(port);
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (bind(ls, (struct sockaddr *)&sa, sizeof sa) != 0) {
+        Err err = err_errno(errno);
+        close(ls);
+        return err;
+    }
     uint64_t t0 = now_ns();
     Pack *pack = ARENA_NEW(arena, Pack);
     TRY(pack_open(arena, dir, pack));
@@ -1638,15 +1653,7 @@ Err server_serve(Arena *arena, const char *dir, uint16_t port) {
     pthread_t th;
     if (pthread_create(&th, NULL, guard_loop, NULL) != 0) return "SystemResources";
     pthread_detach(th);
-    int ls = socket(AF_INET, SOCK_STREAM, 0);
-    if (ls < 0) return err_errno(errno);
-    int one = 1;
-    setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
-    struct sockaddr_in sa = {0};
-    sa.sin_family = AF_INET;
-    sa.sin_port = htons(port);
-    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    if (bind(ls, (struct sockaddr *)&sa, sizeof sa) != 0 || listen(ls, 128) != 0) {
+    if (listen(ls, 128) != 0) {
         Err err = err_errno(errno);
         close(ls);
         return err;

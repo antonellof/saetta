@@ -5,8 +5,10 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <mach-o/dyld.h>
+#include <netinet/in.h>
 #include <signal.h>
 #include <spawn.h>
+#include <sys/socket.h>
 #include <stdlib.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -132,15 +134,45 @@ static int sink_fixed(void *ctx, int status, const void *p, size_t n) {
     return 0;
 }
 
-static bool healthy(const char *base) {
+static bool healthy_within(const char *base, double timeout_s) {
     char url[256];
     if ((size_t)snprintf(url, sizeof url, "%s/health", base) >= sizeof url) return false;
     Sink s = {0};
     int status = 0;
     char err[256];
-    // no timeout of its own in the Zig engine: a busy server answers after its request
-    if (sx_http("GET", url, NULL, 0, NULL, 0, 86400.0, sink_fixed, &s, &status, err, sizeof err) != 0) return false;
+    if (sx_http("GET", url, NULL, 0, NULL, 0, timeout_s, sink_fixed, &s, &status, err, sizeof err) != 0) return false;
     return status == 200;
+}
+
+// A running server: no timeout, a busy server answers after its current request.
+static bool healthy(const char *base) { return healthy_within(base, 86400.0); }
+
+// Whether 127.0.0.1:port can be bound (the server binds it the same way, with SO_REUSEADDR).
+static bool port_free(uint16_t port) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return true; // let the server report it
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    struct sockaddr_in sa = {0};
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(port);
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    bool ok = bind(fd, (struct sockaddr *)&sa, sizeof sa) == 0 || errno != EADDRINUSE;
+    close(fd);
+    return ok;
+}
+
+// The last non-empty line of a small log file, into out ("" if none).
+static void last_line(const char *path, char *out, size_t cap) {
+    out[0] = 0;
+    char *data;
+    size_t len;
+    if (read_file(path, 1 << 20, &data, &len)) return;
+    while (len > 0 && (data[len - 1] == '\n' || data[len - 1] == '\r')) len--;
+    size_t start = len;
+    while (start > 0 && data[start - 1] != '\n') start--;
+    snprintf(out, cap, "%.*s", (int)(len - start), data + start);
+    free(data);
 }
 
 static Err exe_path(Arena *a, char **out) {
@@ -153,7 +185,7 @@ static Err exe_path(Arena *a, char **out) {
     return OK;
 }
 
-static Err start_server(Arena *a, const char *dir, uint16_t port, uint32_t ctx, pid_t *pid) {
+static Err start_server(Arena *a, const char *dir, uint16_t port, uint32_t ctx, pid_t *pid, char **log_out) {
     char *exe;
     TRY(exe_path(a, &exe));
     const char *home = getenv("HOME");
@@ -161,6 +193,7 @@ static Err start_server(Arena *a, const char *dir, uint16_t port, uint32_t ctx, 
     char *log_dir = path_join(a, path_join(a, path_join(a, home, "Library"), "Logs"), "saetta");
     TRY(mkdir_p(log_dir));
     char *log_path = arena_printf(a, "%s/serve-%u.log", log_dir, port);
+    *log_out = log_path;
     int log = open(log_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0666);
     if (log < 0) return err_errno(errno);
     Env senv;
@@ -349,8 +382,8 @@ typedef struct {
 } Session;
 
 // The part of run after registering (the Zig `defer` covers it: cleanup runs on every exit).
-static Err session(Arena *a, Session *ss, Agent agent, const char *pack_arg, uint16_t port, uint32_t ctx,
-                   const char *const *extra, size_t n_extra, const char *base, int *code) {
+static Err session(Arena *a, Session *ss, Agent agent, const char *pack_arg, uint16_t port, bool port_set,
+                   uint32_t ctx, const char *const *extra, size_t n_extra, const char *base, int *code) {
     // join the running server; if it is stopping (its last session just exited), start anew
     bool joined = false;
     Server s;
@@ -376,24 +409,59 @@ static Err session(Arena *a, Session *ss, Agent agent, const char *pack_arg, uin
             *code = 1;
             return OK;
         }
-        TRY(start_server(a, dir, port, ctx, &ss->server));
+        // another program on the port: the default moves to the next free one, a chosen one is an error
+        if (!port_free(port)) {
+            if (port_set) {
+                dbg("saetta: port %u is in use by another program; choose another with --port N or SAETTA_PORT\n", port);
+                *code = 1;
+                return OK;
+            }
+            uint16_t p = port;
+            while (p < port + 100 && p < UINT16_MAX && !port_free(p)) p++;
+            if (!port_free(p)) {
+                dbg("saetta: ports %u to %u are in use; choose one with --port N\n", port, p);
+                *code = 1;
+                return OK;
+            }
+            dbg("saetta: warning: port %u is in use by another program; using port %u\n", port, p);
+            port = p;
+            base = arena_printf(a, "http://127.0.0.1:%u", port);
+        }
+        char *log_path;
+        TRY(start_server(a, dir, port, ctx, &ss->server, &log_path));
         // std.fs.path.basename: the last component, trailing slashes ignored
         size_t end = strlen(dir);
         while (end > 1 && dir[end - 1] == '/') end--;
         size_t start = end;
         while (start > 0 && dir[start - 1] != '/') start--;
-        dbg("saetta: loading %.*s (context %u tokens)...\n", (int)(end - start), dir + start, ctx);
-        for (uint32_t waited = 0; !healthy(base); waited++) {
-            if (waited >= 600) {
-                dbg("saetta: the server did not come up in 5 minutes; see ~/Library/Logs/saetta/serve-%u.log\n", port);
+        bool tty = isatty(2);
+        uint64_t t0 = now_ns();
+        dbg("saetta: loading %.*s (context %u tokens)...%s", (int)(end - start), dir + start, ctx, tty ? "" : "\n");
+        // a loading server refuses connections; the short timeout covers a listener that never answers
+        while (!healthy_within(base, 2.0)) {
+            unsigned secs = (unsigned)((now_ns() - t0) / 1000000000ull);
+            int st;
+            if (waitpid(ss->server, &st, WNOHANG) == ss->server) {
+                ss->server = 0;
+                char line[512];
+                last_line(log_path, line, sizeof line);
+                dbg("%ssaetta: the server stopped while loading%s%s\nsaetta: log: %s\n", tty ? "\n" : "",
+                    line[0] ? ": " : "", line, log_path);
+                *code = 1;
+                return OK;
+            }
+            if (secs >= 300) {
+                dbg("%ssaetta: the server did not come up in 5 minutes; see %s\n", tty ? "\n" : "", log_path);
                 stop_server(ss->server);
                 ss->server = 0;
                 *code = 1;
                 return OK;
             }
+            if (tty) dbg("\rsaetta: loading %.*s (context %u tokens)... %u s", (int)(end - start), dir + start, ctx, secs);
             sleep_ms(500);
         }
-        dbg("saetta: ready at %s\n", base);
+        if (tty) dbg("\n");
+        dbg("saetta: ready at %s (%.1f s)\n", base, (double)(now_ns() - t0) / 1e9);
     }
 
     // the agent
@@ -450,10 +518,11 @@ static Err run_in(Arena *a, const char *const *args, size_t n, int *code) {
     agent = (Agent)ai;
     const char *pack_arg = NULL;
     uint16_t port = 8080;
+    bool port_set = false; // chosen by the user: never moved to another port
     const char *v = getenv("SAETTA_PORT");
     if (v) {
         uint16_t p;
-        if (!parse_u16(v, &p)) port = p;
+        if (!parse_u16(v, &p)) port = p, port_set = true;
     }
     uint32_t ctx = 204800;
     v = getenv("SAETTA_CTX");
@@ -478,6 +547,7 @@ static Err run_in(Arena *a, const char *const *args, size_t n, int *code) {
         } else if (i + 1 < n && strcmp(x, "--port") == 0) {
             i += 1;
             TRY(parse_u16(args[i], &port));
+            port_set = true;
         } else if (i + 1 < n && strcmp(x, "--ctx") == 0) {
             i += 1;
             TRY(parse_u32(args[i], &ctx));
@@ -498,7 +568,7 @@ static Err run_in(Arena *a, const char *const *args, size_t n, int *code) {
     }
     const char *base = arena_printf(a, "http://127.0.0.1:%u", port);
     Session ss = {.keep = keep};
-    Err e = session(a, &ss, agent, pack_arg, port, ctx, extra, n_extra, base, code);
+    Err e = session(a, &ss, agent, pack_arg, port, port_set, ctx, extra, n_extra, base, code);
     // deferred: leave, and stop an auto-started server nobody else uses
     size_t others = instance_unregister();
     bool up = instance_running(&s);

@@ -37,4 +37,30 @@
 // The same bound as TOL_QMM_REL (about 10x headroom on the matmul path).
 #define TOL_LORA_REL 5e-5f // f32
 
+// DeepSeek-V4-Flash attention kernels (src/kernels/dsv4_attn.metal) against the scalar
+// references (src/dsv4_ref_attn.c) on random data, 2026-11-20 (src/test/dsv4_attn.c). BF16
+// outputs; the references sum in f64 where the kernels sum in f32 in another order, so a value
+// can sit on the other side of a rounding boundary.
+// Query tail (per-head norm, each op BF16, RoPE): every value within one BF16 step, at most this
+// fraction not identical. Measured 0 (4 x 64 heads x 512 at 8 position/theta settings).
+#define TOL_DSV4_ATTN_Q_FRAC 1e-3 // f64
+// KV row (RMSNorm, RoPE, FP8 qdq of the nope dims): fraction not identical, and the largest
+// difference relative to the largest value of its 64-block, one e4m3 step (2^-3) when a norm
+// output flips across an FP8 rounding or scale boundary. Measured 0 and 0.
+#define TOL_DSV4_ATTN_KV_FRAC 1e-3 // f64
+#define TOL_DSV4_ATTN_KV_REL 0.125 // f64
+// Sparse attention output o (after de-rotation), per row: the largest difference relative to
+// the largest |o| of its head, and the fraction of BF16 values not identical. An f32 ulp of a
+// score can flip one BF16-rounded probability (2^-8 of that key's weight) and an output
+// rounding is one BF16 step (2^-8 relative at the head's max). Measured 5.9e-3 and 8.3e-3 over
+// 23 cases (window only, HCA and CSA lists, chunks, logits up to about 180, sinks).
+#define TOL_DSV4_ATTN_O_REL 1.5e-2 // f64
+#define TOL_DSV4_ATTN_O_FRAC 3e-2 // f64
+// RMS of (GPU - reference) over RMS of (plain f64 softmax - reference): the GPU must reproduce
+// the blockwise BF16 probability rounding, not just softmax. Measured at most 0.20.
+#define TOL_DSV4_ATTN_O_RMS_RATIO 0.5 // f64
+// wo_a (BF16 grouped matvec, 4096-wide dots): every value within one BF16 step, at most this
+// fraction not identical. Measured 2.4e-4.
+#define TOL_DSV4_ATTN_WOA_FRAC 2e-3 // f64
+
 #endif

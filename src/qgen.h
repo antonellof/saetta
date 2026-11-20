@@ -31,7 +31,8 @@ uint32_t qgen_unpack(const uint8_t *row, size_t row_len, size_t i, size_t bits);
 
 // `saetta qgen-bench`: the generic kernels at 4/32, 4/64 and 5/64 against the templated 4/32
 // kernel, on random packs (no model needed), then the DeepSeek-V4-Flash FP4 routed experts
-// (dsv4_moe.h, T = 1 and 4, GB/s of expert weights and scales). Prints its table to out
+// (dsv4_moe.h, T = 1 and 4, GB/s of expert weights and scales), then the Qwen3.8-27B prompt
+// attention (attn27_bench, src/attn27.h). Prints its table to out
 // (flushed per line).
 Err qgen_bench(Arena *a, FILE *out);
 

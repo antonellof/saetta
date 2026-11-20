@@ -76,8 +76,13 @@ typedef struct {
 
 // Prompt matmuls on the neural accelerators (half inputs), src/kernels/qmm_mpp.metal; NULL
 // fields when a kernel does not compile.
+// attn_q6h / attn_fl: prompt-chunk attention (src/kernels/dense_attn.metal), NULL when it does
+// not compile or SAETTA_ATTN27_SIMD is set (then attn_full_6h serves every chunk); attn_qb is
+// the query tokens per threadgroup of attn_fl.
 typedef struct {
     sx_pipeline *dense, *to_half, *dq, *mmh, *dq_bf16;
+    sx_pipeline *attn_q6h, *attn_fl;
+    uint32_t attn_qb;
 } Mpp;
 
 // Run-time (bits, group) kernels (src/qgen.h): the 27B packs are 4-bit group 64 and 8-bit

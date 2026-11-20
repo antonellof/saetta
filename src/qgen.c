@@ -11,6 +11,7 @@ static const char *fx(char *buf, size_t cap, double x, int prec) {
 #include <assert.h>
 #include <math.h>
 
+#include "attn27.h"
 #include "dsv4_moe.h"
 #include "ops.h"
 
@@ -534,5 +535,6 @@ Err qgen_bench(Arena *a, FILE *out) {
         }
     }
     TRY(dsv4_bench(&x, out));
+    TRY(attn27_bench(a, out)); // Qwen3.8-27B prompt attention (src/attn27.h)
     return OK;
 }

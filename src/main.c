@@ -29,6 +29,7 @@
 #include "model.h"
 #include "monitor.h"
 #include "ops.h"
+#include "attn27.h"
 #include "lora.h"
 #include "qgen.h"
 #include "safetensors.h"
@@ -575,6 +576,12 @@ static Err run(Arena *arena, int argc, char **argv) {
     if (argc >= 2 && eq(cmd, "qgen-bench")) {
         // run-time quantization kernels against the 4-bit/32 templated ones (src/qgen.h)
         TRY(qgen_bench(arena, out));
+        fflush(out);
+        return OK;
+    }
+    if (argc >= 2 && eq(cmd, "attn-bench")) {
+        // Qwen3.8-27B prompt attention, old against new kernel, one layer (src/attn27.h)
+        TRY(attn27_bench(arena, out));
         fflush(out);
         return OK;
     }

@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <time.h>
 
+#include "attn27.h"
 #include "json.h"
 #include "lora.h"
 #include "ops.h"
@@ -39,6 +40,7 @@
 #define NLAYERS CONFIG_NUM_HIDDEN_LAYERS
 #define SMALL MODEL_SMALL
 static_assert(NQ / NKV == 6 && HD == 256); // attn_full_6 shape (src/kernels/dense.metal)
+static_assert(NQ == ATTN27_NQ && NKV == ATTN27_NKV && HD == ATTN27_HD); // attn_fl shape (src/kernels/dense_attn.metal)
 
 // Attention splits: decode and verification chunks up to NSPLIT_DEC (few queries, long rows),
 // prompt chunks NSPLIT_PRE over slices of AB queries.
@@ -112,6 +114,8 @@ constexpr size_t B_xh = B_part + PART_ROWS * (HD + 2); // half copy of a matmul 
 constexpr size_t B_wh = B_xh + CH * FFN / 2 + 16;     // f16 copy of one weight matrix
 constexpr size_t B_lt = B_wh + FFN * H / 2 + 16; // LoRA t = A x, [CH][LORA_MAX_RT]
 constexpr size_t B_total = B_lt + CH * LORA_MAX_RT;
+// attn_fl's permuted half queries [NKV][T rounded up to 16][6][HD] live in B_xh
+static_assert((size_t)NKV * (CH + 16) * (NQ / NKV) * HD <= CH * FFN);
 
 static const char kernel_src[] = {
 #embed "kernels/qmatvec.metal"
@@ -183,6 +187,12 @@ Err model_load(Arena *arena, const Pack *pack, Gpu *g, Model **out) {
             if (gpu_pipeline(g, mpp_src, "qmmh_4_32", &mp.dense)) mp.dense = NULL;
             if (gpu_pipeline(g, mpp_src, "dq_f16_4_32", &mp.dq)) mp.dq = NULL;
             if (gpu_pipeline(g, mpp_src, "dq_bf16_f16", &mp.dq_bf16)) mp.dq_bf16 = NULL;
+            mp.attn_qb = 8;
+            if (getenv("SAETTA_ATTN27_SIMD") == NULL &&
+                (gpu_pipeline(g, attn27_src, "attn_fl_q6h", &mp.attn_q6h) || gpu_pipeline(g, attn27_src, "attn_fl_6_q8", &mp.attn_fl))) {
+                dbg("model: accelerator prompt attention unavailable, attn_full_6h serves every chunk\n");
+                mp.attn_q6h = mp.attn_fl = NULL;
+            }
             mpp = ARENA_NEW(arena, Mpp);
             *mpp = mp;
         }
@@ -715,6 +725,18 @@ static void enc_gdn_t(Enc *e, const Gdn *G, Session *s, size_t T, sx_arg xa, sx_
 static void enc_attn_full(Enc *e, Session *s, sx_arg q, sx_arg kc, sx_arg vc, sx_arg gate, sx_arg att, size_t pos0,
                           size_t T) {
     Model *m = e->m;
+    const Mpp *mp = m->mpp;
+    if (T > KMAX && s->kv_half && m->fast_prefill && mp->attn_fl) {
+        // prompt chunks: every query block of a kv head shares its K / V tiles, on the
+        // accelerators (src/kernels/dense_attn.metal), the gate fused; queries to half in B_xh
+        Attn27P p = {(uint32_t)pos0, (uint32_t)T, attn27_tq(T, mp->attn_qb)};
+        sx_arg qh = barg(m->bscratch, B_xh);
+        sx_arg a[] = {q, qh, BYTES(p)};
+        D1(e, mp->attn_q6h, a, (size_t)NKV * p.tq * (NQ / NKV) * HD / 4);
+        sx_arg b[] = {qh, kc, vc, gate, att, BYTES(p)};
+        D(e, mp->attn_fl, b, NKV, p.tq / mp->attn_qb, mp->attn_qb * 32);
+        return;
+    }
     size_t nsplit = T <= KMAX ? NSPLIT_DEC : NSPLIT_PRE;
     size_t slice = T <= KMAX ? T : AB;
     AttnSP p = {(uint32_t)pos0, 0, 1, (uint32_t)HD, (uint32_t)(NKV * HD), (uint32_t)(NQ / NKV), (uint32_t)(2 * HD),

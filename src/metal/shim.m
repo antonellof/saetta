@@ -294,6 +294,21 @@ int sx_event_wait(const sx_event *e, uint64_t v) {
     return 0;
 }
 
+int sx_event_wait_cmd(const sx_event *e, uint64_t v, const sx_cmd *c) {
+    id<MTLSharedEvent> ev = (__bridge id<MTLSharedEvent>)e->ev;
+    id<MTLCommandBuffer> cb = (__bridge id<MTLCommandBuffer>)c->cb;
+    const uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    for (uint32_t spin = 0; ev.signaledValue < v; spin++) {
+        if ((spin & 1023) == 0) {
+            if (cb.status >= MTLCommandBufferStatusCompleted && ev.signaledValue < v) return 2;
+            uint64_t dt = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
+            if (dt > 60000000000ull) return 1;
+            if (dt > 50000000ull) usleep(50);
+        }
+    }
+    return 0;
+}
+
 static void cmd_end_encoder(sx_cmd *c) {
     id<MTLComputeCommandEncoder> old = CFBridgingRelease(c->enc);
     [old endEncoding];

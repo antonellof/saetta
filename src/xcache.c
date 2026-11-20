@@ -42,6 +42,10 @@ struct XCache {
     XcJob *jobs;       // [max_ne * nt]
     uint32_t njobs;
     _Atomic uint32_t next_job, done_jobs, failed;
+    // Workers that finished the current batch. run_jobs returns only when every loader has
+    // acknowledged it, so no worker can still be reading jobs[] or njobs when the next
+    // xc_map refills them (a worker done with its last job used to race with the refill).
+    _Atomic uint32_t acked;
     pthread_t *threads;
     uint32_t nthreads;
     // Per worker (the loader threads, then the calling thread): a page-aligned staging buffer
@@ -106,10 +110,14 @@ static void *loader(void *arg) {
     for (;;) {
         pthread_mutex_lock(&c->mu);
         while (!c->stop && c->gen == seen) pthread_cond_wait(&c->cv, &c->mu);
-        if (c->stop) { pthread_mutex_unlock(&c->mu); return NULL; }
+        if (c->stop) {
+            pthread_mutex_unlock(&c->mu);
+            return NULL;
+        }
         seen = c->gen;
         pthread_mutex_unlock(&c->mu);
         work(c, w);
+        atomic_fetch_add_explicit(&c->acked, 1, memory_order_release);
     }
 }
 
@@ -119,31 +127,57 @@ static bool run_jobs(XCache *c) {
     atomic_store(&c->next_job, 0);
     atomic_store(&c->done_jobs, 0);
     atomic_store(&c->failed, 0);
-    pthread_mutex_lock(&c->mu);
+    atomic_store(&c->acked, 0);
+    pthread_mutex_lock(&c->mu); // publishes jobs[] and njobs to the workers it wakes
     c->gen++;
     pthread_cond_broadcast(&c->cv);
     pthread_mutex_unlock(&c->mu);
     work(c, c->nthreads);
-    while (atomic_load(&c->done_jobs) < c->njobs) {
+    // every job finished and every loader out of work(): only then may the caller refill
+    while (atomic_load_explicit(&c->acked, memory_order_acquire) < c->nthreads) {
     }
-    return atomic_load(&c->failed) == 0;
+    return atomic_load(&c->done_jobs) == c->njobs && atomic_load(&c->failed) == 0;
+}
+
+static Err open_impl(Arena *a, const Pack *p, sx_device *d, const XcLayer *layers, uint32_t nlayers, uint32_t nt,
+                     uint64_t cache_bytes, uint32_t threads, XCache **out, XCache **partial);
+
+// Releases what a failed open_impl acquired (files, slab regions, staging); no thread runs yet.
+static void open_cleanup(XCache *c) {
+    if (!c) return;
+    for (uint32_t r = 0; r < XC_MAX_TENSORS; r++)
+        if (c->region[r]) sx_buffer_release(c->region[r]);
+    if (c->files)
+        for (size_t f = 0; f < c->nfiles; f++)
+            if (c->files[f] >= 0) close(c->files[f]);
+    if (c->stage)
+        for (uint32_t i = 0; i <= c->nthreads; i++) free(c->stage[i]);
 }
 
 Err xc_open(Arena *a, const Pack *p, sx_device *d, const XcLayer *layers, uint32_t nlayers, uint32_t nt,
             uint64_t cache_bytes, uint32_t threads, XCache **out) {
+    XCache *partial = NULL;
+    Err e = open_impl(a, p, d, layers, nlayers, nt, cache_bytes, threads, out, &partial);
+    if (e) open_cleanup(partial);
+    return e;
+}
+
+static Err open_impl(Arena *a, const Pack *p, sx_device *d, const XcLayer *layers, uint32_t nlayers, uint32_t nt,
+                     uint64_t cache_bytes, uint32_t threads, XCache **out, XCache **partial) {
     if (nt == 0 || nt > XC_MAX_TENSORS || nlayers == 0) return "BadExpertLayout";
     XCache *c = ARENA_NEW(a, XCache);
     if (!c) return "OutOfMemory";
+    *partial = c;
     c->nlayers = nlayers;
     c->nt = nt;
     c->fd = ARENA_ARRAY(a, int, nlayers * nt);
     c->off0 = ARENA_ARRAY(a, uint64_t, nlayers * nt);
     c->per = ARENA_ARRAY(a, uint64_t, nlayers * nt);
     c->ne = ARENA_ARRAY(a, uint32_t, nlayers);
-    c->nfiles = p->nfiles;
     c->files = ARENA_ARRAY(a, int, p->nfiles ? p->nfiles : 1);
     if (!c->fd || !c->off0 || !c->per || !c->ne || !c->files) return "OutOfMemory";
     for (size_t f = 0; f < p->nfiles; f++) c->files[f] = -1;
+    c->nfiles = p->nfiles; // only now: cleanup closes files[0..nfiles), which must be -1 or open
     for (uint32_t l = 0; l < nlayers; l++) {
         uint32_t ne = layers[l].ne;
         if (ne == 0) return "BadExpertLayout";
@@ -244,12 +278,16 @@ void xc_reset_stats(XCache *c) { memset(&c->stats, 0, sizeof c->stats); }
 
 Err xc_map(XCache *c, uint32_t layer, const uint32_t *ids, uint32_t n, uint32_t *slots_out) {
     if (layer >= c->nlayers) return "BadExpertId";
+    // reject bad ids before any state changes: a miss is recorded in slot_of before its read
+    // runs, so returning half way would leave slots that look cached but hold other bytes
+    for (uint32_t i = 0; i < n; i++)
+        if (ids[i] >= c->ne[layer]) return "BadExpertId";
     const uint64_t ep = ++c->epoch;
+    Err err = OK;
     c->njobs = 0;
     uint64_t missed = 0, bytes = 0;
     for (uint32_t i = 0; i < n; i++) {
         uint32_t e = ids[i];
-        if (e >= c->ne[layer]) return "BadExpertId";
         size_t k = (size_t)layer * c->max_ne + e;
         int32_t s = c->slot_of[k];
         c->stats.requests++;
@@ -265,7 +303,12 @@ Err xc_map(XCache *c, uint32_t layer, const uint32_t *ids, uint32_t n, uint32_t 
         // victim: least recently used slot not returned by this call
         uint32_t v = c->tail;
         while (v != NIL && c->mark[v] == ep) v = c->prev[v];
-        if (v == NIL) return "CacheTooSmall";
+        if (v == NIL) {
+            // more distinct experts than slots (not reachable: slots >= ne); still read what
+            // was queued so every recorded slot holds its expert
+            err = "CacheTooSmall";
+            break;
+        }
         if (c->key[v] != NIL) c->slot_of[c->key[v]] = -1;
         c->key[v] = (uint32_t)k;
         c->slot_of[k] = (int32_t)v;
@@ -298,5 +341,5 @@ Err xc_map(XCache *c, uint32_t layer, const uint32_t *ids, uint32_t n, uint32_t 
         }
         return "ReadFailed";
     }
-    return OK;
+    return err;
 }

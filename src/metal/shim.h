@@ -106,6 +106,9 @@ void sx_event_release(sx_event *e);
 void sx_event_set(sx_event *e, uint64_t v);
 uint64_t sx_event_value(const sx_event *e);
 int sx_event_wait(const sx_event *e, uint64_t v);
+// The same while command buffer c runs: returns 2 if c completes or fails first (its stop can
+// then never be reached, e.g. a GPU fault), instead of waiting out the timeout.
+int sx_event_wait_cmd(const sx_event *e, uint64_t v, const sx_cmd *c);
 // GPU side, in command-buffer order: signal sets the value once every dispatch encoded before
 // it has completed; wait holds every dispatch encoded after it until the value reaches v.
 // Both end the current compute encoder and open a new serial one.

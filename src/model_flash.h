@@ -206,6 +206,7 @@ struct Model {
     XCache *xc;
     sx_event *xev;
     uint64_t xev_val;
+    bool xfault; // a stop failed (GPU fault or timeout): streamed work is refused from then on
 };
 
 static_assert(MODEL_NG_HEADS == SESSION_NG_HEADS);

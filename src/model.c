@@ -779,10 +779,12 @@ static Enc enc_begin(Model *m) { return (Enc){.m = m, .cmd = sx_cmd_begin(m->g->
 
 // Streamed layer: stop the command buffer once E's expert ids are written, until the host has
 // turned them into cache slots (enc_xservice).
+static_assert(MODEL_MAX_XSVC >= NLAYERS, "one stop per streamed layer of a pass");
+
 static void enc_xstop(Enc *e, const Moe *E, XsKind kind, uint32_t n) {
     Model *m = e->m;
     if (!E->xl1 || !m->xc) return;
-    if (e->nxs >= MODEL_MAX_XSVC) {
+    if (e->nxs >= MODEL_MAX_XSVC || m->xfault) {
         e->failed = true;
         return;
     }
@@ -802,7 +804,7 @@ static Err enc_xservice(Enc *e) {
     for (uint32_t i = 0; i < e->nxs; i++) {
         const XSvc *s = &e->xs[i];
         double t0 = now_s();
-        int wrc = sx_event_wait(m->xev, s->sig);
+        int wrc = sx_event_wait_cmd(m->xev, s->sig, e->cmd);
         double t1 = now_s();
         xs_wait_s += t1 - t0;
         xs_stops++;
@@ -811,10 +813,13 @@ static Err enc_xservice(Enc *e) {
             else { xs_wait_after_hit_s += t1 - t0; xs_after_hit++; }
         }
         if (wrc != 0) {
-            // the GPU never reached this stop: release every later one so nothing waits forever
+            // the GPU never reached this stop (fault or timeout): release every later one so
+            // nothing waits forever, and refuse further streamed work, since the event's
+            // values can no longer be trusted
             sx_event_set(m->xev, e->xs[e->nxs - 1].sig + 1);
             e->nxs = 0;
-            return "GpuTimeout";
+            m->xfault = true;
+            return wrc == 2 ? "GpuFailed" : "GpuTimeout";
         }
         Err err = OK;
         if (s->kind == XS_DECODE || s->kind == XS_ROWS) {
@@ -865,6 +870,11 @@ static Err enc_xservice(Enc *e) {
 
 static Err enc_finish(Enc *e) {
     char err[512];
+    if (e->failed) {
+        // a stop could not be encoded: the buffer would read raw expert ids as slots
+        sx_cmd_discard(e->cmd);
+        return e->m->xfault ? "StreamingFault" : "TooManyStops";
+    }
     if (e->nxs) {
         sx_cmd_commit(e->cmd);
         Err xe = enc_xservice(e);
@@ -2288,6 +2298,10 @@ Err model_verify_chunk(Model *m, Session *s, const uint32_t *toks, size_t n, flo
 // Commits e, encodes the verification chunk of T tokens that will follow (inputs written by
 // model_verify_chunk) while the GPU runs e, then waits for e.
 static Err commit_preparing_verify(Model *m, Session *s, Enc *e, size_t T) {
+    if (e->failed) {
+        sx_cmd_discard(e->cmd);
+        return m->xfault ? "StreamingFault" : "TooManyStops";
+    }
     sx_cmd_commit(e->cmd);
     // streamed layers: serve this command buffer's stops before encoding the next one
     Err xe = e->nxs ? enc_xservice(e) : OK;

@@ -37,4 +37,13 @@
 // The same bound as TOL_QMM_REL (about 10x headroom on the matmul path).
 #define TOL_LORA_REL 5e-5f // f32
 
+// DeepSeek-V4-Flash FP8 linears (src/kernels/dsv4_fp8.metal), GPU against the scalar
+// reference on the same activation codes (act_quant is bit-exact), max error relative to the
+// largest output. Products of e4m3 codes are exact in f32 and the scales are powers of two, so
+// only the summation order differs. Measured 2026-11-20 on random
+// weights at the model's shapes, T 1 to 512: 5.4e-7 (matvec and accelerator matmul), 2.6e-6
+// (wo_a, f32 inputs of either sign); at most 14 units of 2^-24 sum |terms| per output. The
+// same bound as TOL_QMM_REL (about 20x headroom).
+#define TOL_DSV4_FP8_REL 5e-5f // f32
+
 #endif

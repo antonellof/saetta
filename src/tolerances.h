@@ -30,4 +30,11 @@
 #define TOL_PREFILL_FAST_KL 1e-3 // f64
 #define TOL_PREFILL_FAST_LAYER_REL 0.2f // f32
 
+// Run-time LoRA (src/kernels/lora.metal: down t = A x, up y += scale * B t, f16 weights, f32
+// accumulation), GPU against the scalar f64 reference, max error relative to the largest output.
+// Measured 2026-11-20 on random f16 weights in [-1, 1): down 2.2e-7 (T <= 8, tree sum) and
+// 4.7e-6 (lora_mm, in 17408 summed in one accumulator), up 5.3e-7; f32 summation order only.
+// The same bound as TOL_QMM_REL (about 10x headroom on the matmul path).
+#define TOL_LORA_REL 5e-5f // f32
+
 #endif

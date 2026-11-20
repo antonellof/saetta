@@ -122,7 +122,7 @@ It listens on 127.0.0.1, prints one `request:` line per request, and stops with 
 | `SAETTA_SPEC` | 1 | `0` turns speculative decoding off |
 | `SAETTA_MTP` | 1 | `0` drafts with prompt lookup only, not the MTP head (Flash-Next) |
 | `SAETTA_KV_F32` | unset | f32 instead of f16 KV cache |
-| `SAETTA_EXPERT_CACHE_GB` | unset | experimental: keep only this many GB of routed experts in memory and read the rest from the SSD on demand (Flash-Next today; slower than fully resident) |
+| `SAETTA_EXPERT_CACHE_GB` | unset | experimental: keep only this many GB of routed experts in memory and read the rest from the SSD on demand (Flash-Next: slower than fully resident; DeepSeek-V4-Flash always streams, and without this variable takes the largest cache that fits) |
 
 ```sh
 curl -s localhost:8080/v1/chat/completions -H 'content-type: application/json' -d '{

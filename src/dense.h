@@ -1,9 +1,13 @@
-// Qwen3.8-27B internals, included by model.h in the 27B build (CONFIG_ARCH_27B). The public API
-// is model.h's; the forward is src/dense.c. Pre-norm decoder with plain residuals: 64 layers,
+// Qwen3.8-27B internals (src/dense.c), compiled against src/config_27b.h. Only dense.c
+// includes this; the public API is model.h's. Pre-norm decoder with plain residuals: 64 layers,
 // three Gated DeltaNet blocks then one gated attention block, each followed by a dense SwiGLU
 // MLP (docs/model.md, "Qwen3.8-27B").
 #ifndef SAETTA_DENSE_H
 #define SAETTA_DENSE_H
+
+#include "config_27b.h"
+#include "model.h"
+#include "model_arch.h"
 
 // Residual width: one stream of hidden_size (Flash-Next has 4); verify's golden shapes use it.
 #define HCW CONFIG_HIDDEN_SIZE
@@ -103,8 +107,6 @@ typedef struct {
 
 #define MODEL_MAX_LORA 8
 
-typedef struct Model Model;
-typedef struct Session Session;
 
 typedef struct {
     Model *m;
@@ -116,6 +118,7 @@ typedef struct {
 } Enc;
 
 struct Model {
+    const ModelArch *arch; // first: model_api.c dispatches on it
     Gen *gen;
     const Pack *pack;
     Gpu *g;
@@ -139,49 +142,6 @@ struct Model {
     size_t n_lora;
     int lora_on;
     sx_buffer *stage;   // [CH][H] chunk embeddings, written by the host
-};
-
-// Recurrent state of a restore point.
-typedef struct {
-    sx_buffer *gdn, *conv;
-    VecU32 tokens;
-} Ckpt;
-
-// A prefix point; absent while gdn is NULL.
-typedef struct {
-    sx_buffer *gdn, *conv;
-} Point;
-
-// The per-conversation part of a session: KV cache and restore points (see the Flash-Next
-// Conv in model.h for the sharing scheme).
-typedef struct {
-    size_t cap;
-    sx_buffer *kv;
-    Ckpt ck[2];
-    Point pts[PT_MAX];
-    VecU32 ptoks;
-} Conv;
-
-struct Session {
-    size_t pos;
-    size_t cap, max_cap;
-    bool kv_half;
-    sx_buffer *gdn_state; // [n_gdn][NV][DV][DK]
-    sx_buffer *gdn_conv;  // [n_gdn][3][CONV]
-    sx_buffer *kv;        // [n_attn][2][cap][NKV*HD], f16 or f32
-    sx_buffer *rope;      // [max_cap][ROT/2] (cos, sin)
-    float *trace;
-    size_t trace_len;
-    sx_buffer *trace_buf;
-    bool spec;
-    sx_buffer *sp_gdn;  // [KMAX][n_gdn][NV][DV][DK]
-    sx_buffer *sp_conv; // [KMAX][n_gdn][3][CONV]
-    size_t roll;
-    Ckpt ck[2];
-    size_t ck_pick;
-    Point pts[PT_MAX];
-    VecU32 ptoks;
-    size_t chunk_pos0, chunk_t;
 };
 
 #endif

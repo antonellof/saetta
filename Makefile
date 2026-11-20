@@ -1,10 +1,11 @@
-# saetta: C engine with Metal kernels. One build per model: `make` builds
-# $(BUILD)/bin/saetta (Qwen3.8-Flash-Next) and $(BUILD)/bin/saetta-27b (Qwen3.8-27B);
-# MODEL=27b selects the 27B build for verify and test. Each binary hands a pack of the other
-# architecture to its sibling.
+# saetta: C engine with Metal kernels. `make` builds $(BUILD)/bin/saetta, which runs
+# Qwen3.8-Flash-Next and Qwen3.8-27B (each model's code compiled against its own constants,
+# src/config_flash.h and src/config_27b.h; src/model_api.c picks one by the pack).
 CC      := clang
 BUILD   ?= build
-MODEL   ?= flash
+GOLDEN  ?= tests/golden
+# the 27B goldens next to GOLDEN (each names its pack in manifest.json); absent ones are skipped
+GOLDENS_27B := golden-27b-4bit golden-27b-4bit-pi
 
 CFLAGS  := -std=c23 -O3 -ffp-contract=off -mcpu=native -mmacosx-version-min=27.2 \
            -Wall -Wextra -Wno-unused-parameter
@@ -13,19 +14,8 @@ DEPFLAGS = -MMD -MP
 LDFLAGS := -mmacosx-version-min=27.2
 LDLIBS  := -framework Metal -framework Foundation -framework Accelerate -lpthread
 
-ifeq ($(MODEL),27b)
-CFLAGS  += -DSAETTA_27B
-OBJCFLAGS += -DSAETTA_27B
-OBJ  := $(BUILD)/obj-27b
-BIN  := $(BUILD)/bin/saetta-27b
-GOLDEN ?= tests/golden-27b-4bit
-else ifeq ($(MODEL),flash)
 OBJ  := $(BUILD)/obj
 BIN  := $(BUILD)/bin/saetta
-GOLDEN ?= tests/golden
-else
-$(error MODEL must be flash or 27b)
-endif
 SRCS := $(wildcard src/*.c)
 OBJS := $(SRCS:src/%.c=$(OBJ)/%.o) $(OBJ)/metal/shim.o
 TEST_SRCS := $(wildcard src/test/*.c)
@@ -36,15 +26,12 @@ LIB_OBJS  := $(filter-out $(OBJ)/main.o,$(OBJS))
 .DELETE_ON_ERROR:
 
 all: $(BIN)
-ifeq ($(MODEL),flash)
-	@$(MAKE) --no-print-directory MODEL=27b $(BUILD)/bin/saetta-27b
-endif
 
 $(BIN): $(OBJS)
 	@mkdir -p $(@D)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
-$(BUILD)/bin/saetta-test$(if $(filter 27b,$(MODEL)),-27b): $(LIB_OBJS) $(TEST_OBJS)
+$(BUILD)/bin/saetta-test: $(LIB_OBJS) $(TEST_OBJS)
 	@mkdir -p $(@D)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
@@ -59,12 +46,14 @@ $(OBJ)/metal/shim.o: src/metal/shim.m
 
 # Runs every test, or those whose name contains T (make test T=json). SAETTA_PACK passes
 # through the environment.
-TEST_BIN := $(BUILD)/bin/saetta-test$(if $(filter 27b,$(MODEL)),-27b)
-test: $(TEST_BIN)
-	$(TEST_BIN) $(T)
+test: $(BUILD)/bin/saetta-test
+	$(BUILD)/bin/saetta-test $(T)
 
+# Flash-Next against GOLDEN, then Qwen3.8-27B against the goldens beside it that exist
 verify: $(BIN)
 	$(BIN) verify $(GOLDEN)
+	@for g in $(GOLDENS_27B); do d="$(dir $(abspath $(GOLDEN)))$$g"; \
+	  if [ -d "$$d" ]; then echo "verify: $$d"; env -u SAETTA_PACK $(BIN) verify "$$d" || exit 1; fi; done
 
 bench: $(BIN)
 	$(BIN) qgen-bench

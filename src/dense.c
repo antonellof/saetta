@@ -1,11 +1,12 @@
-// Qwen3.8-27B forward pass (see model.h and dense.h). Empty in the Flash-Next build.
+// Qwen3.8-27B forward pass (see model.h and dense.h). Exports dense_arch (model_arch.h).
 // Formulas follow vendor/transformers/src/transformers/models/qwen3_5/modeling_qwen3_5.py
 // (M27) on an MLX pack (norm weights stored as 1 + w, mlx-lm qwen3_5.py sanitize) and are
 // checked against tools/ref27.py by `saetta verify`. The encoder helpers, the GDN and the
 // session code follow src/model.c; the hyper-connections, MoE, PLE and the QSA indexer are
 // not in this model.
-#include "model.h"
-#if CONFIG_ARCH_27B
+#include "dense.h"
+#define ARCH_PFX dense_
+#include "model_rename.h"
 
 #include <math.h>
 #include <stdlib.h>
@@ -167,7 +168,7 @@ static const char *const pipe_names[] = {
 #define NPIPES COUNT(pipe_names)
 static_assert(sizeof(Pipes) == NPIPES * sizeof(sx_pipeline *));
 
-Err model_load(Arena *arena, const Pack *pack, Gpu *g, Model *out) {
+Err model_load(Arena *arena, const Pack *pack, Gpu *g, Model **out) {
     Pipes pipes;
     sx_pipeline **pp = (sx_pipeline **)&pipes;
     for (size_t i = 0; i < NPIPES; i++) TRY(gpu_pipeline(g, kernel_src, pipe_kernels[i], &pp[i]));
@@ -183,8 +184,10 @@ Err model_load(Arena *arena, const Pack *pack, Gpu *g, Model *out) {
         }
     }
     if (mpp == NULL) dbg("model: accelerator matmul kernels unavailable, prefill stays f32\n");
-    Model *m = out;
+    Model *m = ARENA_NEW(arena, Model);
     *m = (Model){0};
+    m->arch = &dense_arch;
+    *out = m;
     for (int t = 1; t <= SMALL; t++) {
         char nm[64];
         snprintf(nm, sizeof nm, "qmv_rows_4_32_%d", t);
@@ -834,40 +837,6 @@ static void rope_row(float *cs, size_t pos) {
     }
 }
 
-uint32_t model_argmax(const float *v, size_t n) {
-    enum { L = 16 };
-    typedef float V __attribute__((ext_vector_type(L)));
-    if (n < L) {
-        size_t best = 0;
-        for (size_t i = 0; i < n; i++)
-            if (v[i] > v[best]) best = i;
-        return (uint32_t)best;
-    }
-    V mx;
-    memcpy(&mx, v, sizeof mx);
-    size_t i = L;
-    for (; i + L <= n; i += L) {
-        V x;
-        memcpy(&x, v + i, sizeof x);
-        mx = __builtin_elementwise_max(mx, x);
-    }
-    float m = __builtin_reduce_max(mx);
-    for (; i < n; i++) m = __builtin_fmaxf(m, v[i]);
-    V mv = m;
-    i = 0;
-    for (; i + L <= n; i += L) {
-        V x;
-        memcpy(&x, v + i, sizeof x);
-        if (__builtin_reduce_or(x == mv)) {
-            for (size_t j = 0; j < L; j++)
-                if (v[i + j] == m) return (uint32_t)(i + j);
-        }
-    }
-    for (; i < n; i++)
-        if (v[i] == m) return (uint32_t)i;
-    return 0;
-}
-
 // ---- Model passes ---------------------------------------------------------------------------
 
 Err model_step(Model *m, Session *s, uint32_t token, float **logits) {
@@ -1027,6 +996,7 @@ static size_t kv_bytes(size_t cap, size_t elem) { return n_attn * 2 * cap * NKV 
 
 Err session_create_cap(Gpu *g, bool kv_half, size_t cap, size_t max_cap, Session **out) {
     Session *s = xcalloc(1, sizeof *s);
+    s->arch = &dense_arch;
     s->cap = cap;
     s->max_cap = max_cap;
     s->roll = SESSION_NO_ROLL;
@@ -1097,19 +1067,6 @@ size_t session_reusable(Session *s, const uint32_t *prompt, size_t n) {
     return r.n;
 }
 
-Reusable session_reusable_in(const Ckpt ck[2], const uint32_t *prompt, size_t np) {
-    size_t best = 0, pick = 0;
-    for (size_t i = 0; i < 2; i++) {
-        size_t n = ck[i].tokens.len;
-        if (n == 0 || n >= np || n <= best) continue;
-        if (memcmp(ck[i].tokens.ptr, prompt, n * sizeof(uint32_t)) == 0) {
-            best = n;
-            pick = i;
-        }
-    }
-    return (Reusable){best, pick};
-}
-
 size_t session_conv_bytes(const Session *s, size_t cap) {
     return session_kv_bytes(s, cap) + 2 * (GDN_STATE_N * 4 + GDN_CONV_N * 4);
 }
@@ -1157,7 +1114,6 @@ bool session_roll_to(Session *s, size_t p, const uint32_t *toks) {
     return true;
 }
 
-void session_keep_points(Session *s, size_t n) { s->ptoks.len = MIN(s->ptoks.len, n); }
 
 Err session_save_point(Session *s, Gpu *g, const uint32_t *toks, size_t n) {
     if (!(s->pos % PT_EVERY == 0 && n == s->pos)) die("session_save_point: %zu tokens at position %zu\n", n, s->pos);
@@ -1170,16 +1126,6 @@ Err session_save_point(Session *s, Gpu *g, const uint32_t *toks, size_t n) {
     return OK;
 }
 
-size_t session_shared_point(const uint32_t *ptoks, size_t nptoks, const Point pts[PT_MAX], const uint32_t *prompt,
-                            size_t n) {
-    size_t lcp = 0;
-    size_t lim = MIN(nptoks, n - 1);
-    while (lcp < lim && ptoks[lcp] == prompt[lcp]) lcp += 1;
-    size_t k = MIN(lcp / PT_EVERY, (size_t)PT_MAX);
-    while (k > 0 && pts[k - 1].gdn == NULL) k -= 1;
-    return k * PT_EVERY;
-}
-
 static void start_at(Session *s, const Point *pt, size_t n) {
     s->roll = SESSION_NO_ROLL;
     memcpy(gpu_floats(s->gdn_state), gpu_floats(pt->gdn), GDN_STATE_N * 4);
@@ -1189,12 +1135,6 @@ static void start_at(Session *s, const Point *pt, size_t n) {
 
 void session_start_at_own_point(Session *s, size_t n) {
     start_at(s, &s->pts[n / PT_EVERY - 1], n);
-    session_keep_points(s, n);
-}
-
-void session_invalidate_from(Session *s, size_t n) {
-    for (int i = 0; i < 2; i++)
-        if (s->ck[i].tokens.len > n) s->ck[i].tokens.len = 0;
     session_keep_points(s, n);
 }
 
@@ -1469,4 +1409,70 @@ static void dequant_row(const Pack *pack, const Linear *l, size_t r, float *out)
     }
 }
 
-#endif // CONFIG_ARCH_27B
+
+// ---- the table model_api.c dispatches through ----------------------------------------------
+
+bool model_has_mtp(const Model *m) { return m->mtp != NULL; }
+bool model_fast_prefill(const Model *m) { return m->fast_prefill; }
+bool model_fast_prefill_available(const Model *m) { return m->mpp != NULL; }
+void model_set_fast_prefill(Model *m, bool on) { m->fast_prefill = on && m->mpp != NULL; }
+
+size_t model_check_pack(Arena *a, const Pack *pack, FILE *out) {
+    fprintf(out, "model: Qwen3.8-27B (%s), %zu layers, hidden %zu, dense MLP %zu\n", CONFIG_MODEL_TYPE, NLAYERS, H, FFN);
+    size_t n = 0, bad = 0;
+    for (size_t l = 0; l <= NLAYERS; l++) {
+        struct {
+            const char *name;
+            uint64_t out, in;
+        } want[8];
+        size_t k = 0;
+        if (l == NLAYERS) {
+            want[k++] = (typeof(want[0])){"language_model.lm_head", VOCAB, H};
+            want[k++] = (typeof(want[0])){WEIGHTS_PREFIX "embed_tokens", VOCAB, H};
+        } else {
+            if (config_layer_kinds[l] == LAYER_KIND_GDN) {
+                want[k++] = (typeof(want[0])){"linear_attn.in_proj_qkv", CONV, H};
+                want[k++] = (typeof(want[0])){"linear_attn.in_proj_z", VD, H};
+                want[k++] = (typeof(want[0])){"linear_attn.in_proj_a", NV, H};
+                want[k++] = (typeof(want[0])){"linear_attn.in_proj_b", NV, H};
+                want[k++] = (typeof(want[0])){"linear_attn.out_proj", H, VD};
+            } else {
+                want[k++] = (typeof(want[0])){"self_attn.q_proj", 2 * NQ * HD, H};
+                want[k++] = (typeof(want[0])){"self_attn.k_proj", NKV * HD, H};
+                want[k++] = (typeof(want[0])){"self_attn.v_proj", NKV * HD, H};
+                want[k++] = (typeof(want[0])){"self_attn.o_proj", H, NQ * HD};
+            }
+            want[k++] = (typeof(want[0])){"mlp.gate_proj", FFN, H};
+            want[k++] = (typeof(want[0])){"mlp.up_proj", FFN, H};
+            want[k++] = (typeof(want[0])){"mlp.down_proj", H, FFN};
+        }
+        for (size_t i = 0; i < k; i++) {
+            const char *mod = l == NLAYERS ? want[i].name : arena_printf(a, "%slayers.%zu.%s", WEIGHTS_PREFIX, l, want[i].name);
+            Linear lin;
+            Err err = pack_linear(pack, str(mod), &lin);
+            n++;
+            if (err) {
+                fprintf(out, "  MISSING %s: %s\n", mod, err);
+                bad++;
+            } else if (lin.out_features != want[i].out || lin.in_features != want[i].in) {
+                fprintf(out, "  SHAPE %s: got %llux%llu, want %llux%llu\n", mod, (unsigned long long)lin.out_features,
+                        (unsigned long long)lin.in_features, (unsigned long long)want[i].out, (unsigned long long)want[i].in);
+                bad++;
+            }
+        }
+    }
+    fprintf(out, "linears: %zu checked, %zu problems\n", n, bad);
+    return bad;
+}
+
+const ModelArch dense_arch = MODEL_ARCH_TABLE({
+    .model_type = CONFIG_MODEL_TYPE,
+    .id = "qwen3.8-27b",
+    .name = "Qwen3.8-27B",
+    .layers = NLAYERS,
+    .width = HCW,
+    .vocab = VOCAB,
+    .hidden = H,
+    .eos = config_eos_token_ids,
+    .n_eos = CONFIG_N_EOS_TOKEN_IDS,
+});

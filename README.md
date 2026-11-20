@@ -80,7 +80,7 @@ Weights are under the Qwen Community License 1.0 and are not part of this reposi
 
 ### Qwen3.8-27B
 
-The dense Qwen3.8-27B runs in a second build, `saetta-27b`, installed next to `saetta`: give `saetta` a 27B pack and it hands it over, so the commands are the same. It reads LoRA adapters too (see [LoRA adapters](#lora-adapters)).
+The same binary runs the dense Qwen3.8-27B: give any command a 27B pack. It reads LoRA adapters too (see [LoRA adapters](#lora-adapters)).
 
 | pack | `saetta download` | folder under `~/Models` | on disk |
 |---|---|---|---|
@@ -267,11 +267,11 @@ saetta version
 
 ```sh
 git clone https://github.com/antonellof/saetta.git && cd saetta
-make                                # ./build/bin/saetta and ./build/bin/saetta-27b
+make                                # ./build/bin/saetta
 ./build/bin/saetta download coder   # or full, or all
 ```
 
-`make test` runs the unit tests (kernels against scalar references; `SAETTA_PACK=<pack>` for the tests that read real tensors); `make MODEL=27b test` runs them in the 27B build.
+`make test` runs the unit tests (kernels against scalar references; `SAETTA_PACK=<pack>` for the tests that read real tensors).
 
 | path | what |
 |---|---|

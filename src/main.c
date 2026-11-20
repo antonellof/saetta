@@ -1,5 +1,5 @@
 // saetta: single-model inference engine for Qwen3.8-Flash-Next on Apple M5 Max.
-//   saetta info <model-dir>                  check the pack against src/config.h and the GPU
+//   saetta info <model-dir>                  check the pack against its model's shapes and the GPU
 //   saetta verify [golden-dir]                    compare with golden reference output (pack: $SAETTA_PACK or ~/Models/...)
 //   saetta serve <model-dir> [--port N]           OpenAI-compatible API on 127.0.0.1 (default 8080)
 //   saetta render <request.json>                  print the chat prompt for an OpenAI request body
@@ -21,7 +21,6 @@
 
 #include "base.h"
 #include "chat.h"
-#include "config.h"
 #include "control.h"
 #include "download.h"
 #include "gpu.h"
@@ -72,6 +71,13 @@ typedef struct {
     size_t n_ver[8];
 } GenStats;
 
+static bool is_eos(const Model *m, uint32_t t) {
+    const ModelInfo *mi = model_info(m);
+    for (size_t i = 0; i < mi->n_eos; i++)
+        if (t == mi->eos[i]) return true;
+    return false;
+}
+
 // The decode loop: greedy, with prompt-lookup or MTP speculation unless SAETTA_SPEC=0.
 static Err decode_loop(Model *m, Session *s, float *logits, const uint32_t *toks, size_t ntoks, size_t n, GenStats *gs,
                        Lookup *lk) {
@@ -80,19 +86,18 @@ static Err decode_loop(Model *m, Session *s, float *logits, const uint32_t *toks
     Gate gate = GATE_INIT;
     Depth depth = DEPTH_INIT;
     for (size_t i = 0; i < ntoks; i++) lookup_push(lk, toks[i]);
-    uint32_t x = model_argmax(logits, CONFIG_VOCAB_SIZE);
+    uint32_t x = model_argmax(logits, model_info(m)->vocab);
     while (gs->done < n) {
         printf("%u\n", x);
         fflush(stdout);
-        for (size_t i = 0; i < CONFIG_N_EOS_TOKEN_IDS; i++)
-            if (x == config_eos_token_ids[i]) return OK;
+        if (is_eos(m, x)) return OK;
         lookup_push(lk, x);
         uint32_t drafts[KMAX - 1];
         // a long prompt-lookup copy first (no head pass needed), else the MTP head
         uint64_t tr0 = now_ns();
         size_t nd = use_spec ? lookup_draft(lk, drafts, gate_depth(&gate, KMAX - 1)) : 0;
         bool from_mtp = false;
-        if (use_spec && nd < 3 && m->mtp != NULL) {
+        if (use_spec && nd < 3 && model_has_mtp(m)) {
             // SAETTA_MTP_K fixes the depth; otherwise the controller picks it
             size_t k;
             const char *kv = getenv("SAETTA_MTP_K");
@@ -107,8 +112,8 @@ static Err decode_loop(Model *m, Session *s, float *logits, const uint32_t *toks
         gs->steps += 1;
         if (nd == 0) {
             TRY(model_step(m, s, x, &logits));
-            x = model_argmax(logits, CONFIG_VOCAB_SIZE);
-            if (use_spec && m->mtp != NULL) depth_record(&depth, 0, 0, (float)(now_ns() - tr0) / 1e6f);
+            x = model_argmax(logits, model_info(m)->vocab);
+            if (use_spec && model_has_mtp(m)) depth_record(&depth, 0, 0, (float)(now_ns() - tr0) / 1e6f);
             gs->done += 1;
             continue;
         }
@@ -124,8 +129,7 @@ static Err decode_loop(Model *m, Session *s, float *logits, const uint32_t *toks
             uint32_t d = drafts[i];
             if (gs->done >= n) break;
             printf("%u\n", d);
-            for (size_t j = 0; j < CONFIG_N_EOS_TOKEN_IDS; j++)
-                if (d == config_eos_token_ids[j]) return OK;
+            if (is_eos(m, d)) return OK;
             lookup_push(lk, d);
             gs->done += 1;
         }
@@ -139,16 +143,16 @@ static Err generate_in(Arena *arena, Pack *pack, Gpu *g, const char *dir, size_t
     uint64_t tw = now_ns();
     TRY(gpu_warm_except(g, pack, "ngram_embedding"));
     dbg("generate: warm %llu ms\n", (unsigned long long)((now_ns() - tw) / 1000000));
-    Model *m = ARENA_NEW(arena, Model);
-    TRY(model_load(arena, pack, g, m));
-    // SAETTA_LORA=<adapter dir>: apply a LoRA adapter (27B build)
+    Model *m;
+    TRY(model_load(arena, pack, g, &m));
+    // SAETTA_LORA=<adapter dir>: apply a LoRA adapter (Qwen3.8-27B)
     const char *lora = getenv("SAETTA_LORA");
     if (lora && *lora) {
         TRY(model_lora_load(arena, m, "lora", lora));
         model_lora_select(m, 0);
     }
     Session *s;
-    TRY(session_create(g, &s));
+    TRY(session_create(m, g, &s));
     float *logits;
     model_prof_init();
     uint64_t t0 = now_ns();
@@ -201,9 +205,9 @@ static Err generate_in(Arena *arena, Pack *pack, Gpu *g, const char *dir, size_t
         for (size_t i = ntoks - nn; i < ntoks; i++) {
             uint32_t tk = toks[i];
             float mx = -INFINITY;
-            for (size_t j = 0; j < CONFIG_VOCAB_SIZE; j++) mx = fmaxf(mx, lg[j]);
+            for (size_t j = 0; j < model_info(m)->vocab; j++) mx = fmaxf(mx, lg[j]);
             double se = 0;
-            for (size_t j = 0; j < CONFIG_VOCAB_SIZE; j++) se += exp((double)(lg[j] - mx));
+            for (size_t j = 0; j < model_info(m)->vocab; j++) se += exp((double)(lg[j] - mx));
             tot += log(se) - (double)(lg[tk] - mx);
             TRY(model_step(m, s, tk, &lg));
         }
@@ -214,16 +218,16 @@ static Err generate_in(Arena *arena, Pack *pack, Gpu *g, const char *dir, size_t
     const char *dump = getenv("SAETTA_DUMP_LOGITS");
     if (dump) {
         // debug: the prompt's last logits as raw f32, to compare paths offline
-        TRY(write_file(dump, logits, CONFIG_VOCAB_SIZE * sizeof(float)));
+        TRY(write_file(dump, logits, model_info(m)->vocab * sizeof(float)));
     }
     const char *only = getenv("SAETTA_CHUNK_COST");
     if (only) {
         // cost of a decode step against verification chunks of 1..KMAX tokens (state slots on)
-        uint32_t tk = model_argmax(logits, CONFIG_VOCAB_SIZE);
+        uint32_t tk = model_argmax(logits, model_info(m)->vocab);
         float *lg;
         for (int i = 0; i < 3; i++) {
             TRY(model_step(m, s, tk, &lg));
-            tk = model_argmax(lg, CONFIG_VOCAB_SIZE);
+            tk = model_argmax(lg, model_info(m)->vocab);
         }
         model_prof_init();
         model_prof_reset();
@@ -231,7 +235,7 @@ static Err generate_in(Arena *arena, Pack *pack, Gpu *g, const char *dir, size_t
         if (!eq(only, "2"))
             for (int i = 0; i < 20; i++) {
                 TRY(model_step(m, s, tk, &lg));
-                tk = model_argmax(lg, CONFIG_VOCAB_SIZE);
+                tk = model_argmax(lg, model_info(m)->vocab);
             }
         dbg("chunk-cost: step %s ms\n", fx((double)(now_ns() - ts) / 20e6, 2));
         s->spec = true;
@@ -296,83 +300,6 @@ static Err generate(Arena *arena, const char *dir, size_t n, char **ids, size_t 
 
 // ---- info --------------------------------------------------------------------------------------
 
-typedef struct {
-    const char *module;
-    uint64_t out, in;
-} Expect;
-typedef VEC(Expect) VecExpect;
-
-static void add_lin(VecExpect *b, Arena *a, size_t l, const char *name, uint64_t o, uint64_t i) {
-    vec_push(b, ((Expect){arena_printf(a, "%slayers.%zu.%s", WEIGHTS_PREFIX, l, name), o, i}));
-}
-
-#if CONFIG_ARCH_27B
-static void expected_linears(VecExpect *buf, Arena *a, size_t layer) {
-    const uint64_t h = CONFIG_HIDDEN_SIZE;
-    if (config_layer_kinds[layer] == LAYER_KIND_GDN) {
-        const uint64_t kd = CONFIG_LINEAR_NUM_KEY_HEADS * CONFIG_LINEAR_KEY_HEAD_DIM;
-        const uint64_t vd = CONFIG_LINEAR_NUM_VALUE_HEADS * CONFIG_LINEAR_VALUE_HEAD_DIM;
-        add_lin(buf, a, layer, "linear_attn.in_proj_qkv", 2 * kd + vd, h);
-        add_lin(buf, a, layer, "linear_attn.in_proj_z", vd, h);
-        add_lin(buf, a, layer, "linear_attn.in_proj_a", CONFIG_LINEAR_NUM_VALUE_HEADS, h);
-        add_lin(buf, a, layer, "linear_attn.in_proj_b", CONFIG_LINEAR_NUM_VALUE_HEADS, h);
-        add_lin(buf, a, layer, "linear_attn.out_proj", h, vd);
-    } else {
-        const uint64_t qd = CONFIG_NUM_ATTENTION_HEADS * CONFIG_HEAD_DIM;
-        const uint64_t kvd = CONFIG_NUM_KEY_VALUE_HEADS * CONFIG_HEAD_DIM;
-        add_lin(buf, a, layer, "self_attn.q_proj", 2 * qd, h);
-        add_lin(buf, a, layer, "self_attn.k_proj", kvd, h);
-        add_lin(buf, a, layer, "self_attn.v_proj", kvd, h);
-        add_lin(buf, a, layer, "self_attn.o_proj", h, qd);
-    }
-    add_lin(buf, a, layer, "mlp.gate_proj", CONFIG_INTERMEDIATE_SIZE, h);
-    add_lin(buf, a, layer, "mlp.up_proj", CONFIG_INTERMEDIATE_SIZE, h);
-    add_lin(buf, a, layer, "mlp.down_proj", h, CONFIG_INTERMEDIATE_SIZE);
-}
-#else
-static void expected_linears(VecExpect *buf, Arena *a, size_t layer) {
-    const uint64_t h = CONFIG_HIDDEN_SIZE;
-    const uint64_t hcw = CONFIG_HC_COUNT * h;
-    const char *hcs[2] = {"attn_hyper_connection", "mlp_hyper_connection"};
-    for (int k = 0; k < 2; k++) {
-        add_lin(buf, a, layer, arena_printf(a, "%s.input_mix_weight_down", hcs[k]), CONFIG_HC_LOWRANK, hcw);
-        add_lin(buf, a, layer, arena_printf(a, "%s.input_mix_weight_up", hcs[k]), hcw, CONFIG_HC_LOWRANK);
-        add_lin(buf, a, layer, arena_printf(a, "%s.block_inject_weight", hcs[k]), CONFIG_HC_COUNT, hcw);
-    }
-    if (config_layer_kinds[layer] == LAYER_KIND_GDN) {
-        const uint64_t kd = CONFIG_LINEAR_NUM_KEY_HEADS * CONFIG_LINEAR_KEY_HEAD_DIM;
-        const uint64_t vd = CONFIG_LINEAR_NUM_VALUE_HEADS * CONFIG_LINEAR_VALUE_HEAD_DIM;
-        add_lin(buf, a, layer, "linear_attn.in_proj_qkv", 2 * kd + vd, h);
-        add_lin(buf, a, layer, "linear_attn.in_proj_z", vd, h);
-        add_lin(buf, a, layer, "linear_attn.in_proj_a", CONFIG_LINEAR_NUM_VALUE_HEADS, h);
-        add_lin(buf, a, layer, "linear_attn.in_proj_b", CONFIG_LINEAR_NUM_VALUE_HEADS, h);
-        add_lin(buf, a, layer, "linear_attn.out_proj", h, vd);
-    } else {
-        const uint64_t qd = CONFIG_NUM_ATTENTION_HEADS * CONFIG_HEAD_DIM;
-        const uint64_t kvd = CONFIG_NUM_KEY_VALUE_HEADS * CONFIG_HEAD_DIM;
-        add_lin(buf, a, layer, "self_attn.q_proj", 2 * qd, h);
-        add_lin(buf, a, layer, "self_attn.k_proj", kvd, h);
-        add_lin(buf, a, layer, "self_attn.v_proj", kvd, h);
-        add_lin(buf, a, layer, "self_attn.o_proj", h, qd);
-        add_lin(buf, a, layer, "self_attn.indexer.index_qk_proj",
-                (CONFIG_INDEXER_N_HEADS + CONFIG_INDEXER_KV_HEADS) * CONFIG_INDEXER_HEAD_DIM, h);
-    }
-    add_lin(buf, a, layer, "mlp.gate", CONFIG_NUM_EXPERTS, h);
-    add_lin(buf, a, layer, "mlp.shared_expert_gate", 1, h);
-    add_lin(buf, a, layer, "mlp.shared_expert.gate_proj", CONFIG_SHARED_EXPERT_INTERMEDIATE_SIZE, h);
-    add_lin(buf, a, layer, "mlp.shared_expert.up_proj", CONFIG_SHARED_EXPERT_INTERMEDIATE_SIZE, h);
-    add_lin(buf, a, layer, "mlp.shared_expert.down_proj", h, CONFIG_SHARED_EXPERT_INTERMEDIATE_SIZE);
-    add_lin(buf, a, layer, "mlp.switch_mlp.gate_proj", CONFIG_MOE_INTERMEDIATE_SIZE, h);
-    add_lin(buf, a, layer, "mlp.switch_mlp.up_proj", CONFIG_MOE_INTERMEDIATE_SIZE, h);
-    add_lin(buf, a, layer, "mlp.switch_mlp.down_proj", h, CONFIG_MOE_INTERMEDIATE_SIZE);
-    for (size_t i = 0; i < CONFIG_N_PLE_LAYERS; i++)
-        if (config_ple_layers[i] == layer) {
-            add_lin(buf, a, layer, "ple.key_proj", hcw, h);
-            add_lin(buf, a, layer, "ple.value_proj", h, h);
-        }
-}
-#endif
-
 static Err gpu_self_test(sx_device *dev, FILE *out) {
     const char *src = "#include <metal_stdlib>\n"
                       "using namespace metal;\n"
@@ -414,14 +341,6 @@ out:
 }
 
 static Err info(Arena *arena, FILE *out, const char *dir) {
-#if CONFIG_ARCH_27B
-    fprintf(out, "model: %s (%s), %zu layers, hidden %zu, dense MLP %zu\n", dir, CONFIG_MODEL_TYPE,
-            CONFIG_NUM_HIDDEN_LAYERS, CONFIG_HIDDEN_SIZE, CONFIG_INTERMEDIATE_SIZE);
-#else
-    fprintf(out, "model: %s (%s), %zu layers, hidden %zu, %zu experts top-%zu, quant %s %u-bit group %u\n", dir,
-            CONFIG_MODEL_TYPE, CONFIG_NUM_HIDDEN_LAYERS, CONFIG_HIDDEN_SIZE, CONFIG_NUM_EXPERTS, CONFIG_NUM_EXPERTS_PER_TOK,
-            CONFIG_QUANT_MODE, CONFIG_QUANT_BITS, CONFIG_QUANT_GROUP_SIZE);
-#endif
     Pack pack;
     TRY(pack_open(arena, dir, &pack));
     uint64_t per_dtype[DTYPE_COUNT] = {0};
@@ -438,31 +357,12 @@ static Err info(Arena *arena, FILE *out, const char *dir) {
         if (per_dtype[d] > 0) fprintf(out, "  %s: %llu bytes\n", dtype_name((DType)d), (unsigned long long)per_dtype[d]);
 
     // Every quantized linear of every layer, with its expected (out, in) shape.
-    VecExpect exp = {0};
-    for (size_t l = 0; l < CONFIG_NUM_HIDDEN_LAYERS; l++) expected_linears(&exp, arena, l);
-    vec_push(&exp, ((Expect){"language_model.lm_head", CONFIG_VOCAB_SIZE, CONFIG_HIDDEN_SIZE}));
-    vec_push(&exp, ((Expect){WEIGHTS_PREFIX "embed_tokens", CONFIG_VOCAB_SIZE, CONFIG_HIDDEN_SIZE}));
-    size_t bad = 0;
-    for (size_t i = 0; i < exp.len; i++) {
-        Expect e = exp.ptr[i];
-        Linear lin;
-        Err err = pack_linear(&pack, str(e.module), &lin);
-        if (err) {
-            // a plain BF16 matrix (the Coder routers) is requantized at load: accept it
-            const TensorInfo *t = pack_get(&pack, str(arena_printf(arena, "%s.weight", e.module)));
-            if (t && t->dtype == DTYPE_BF16 && t->rank == 2) continue;
-            fprintf(out, "  MISSING %s: %s\n", e.module, err);
-            bad += 1;
-            continue;
-        }
-        if (lin.out_features != e.out || lin.in_features != e.in) {
-            fprintf(out, "  SHAPE %s: got %llux%llu, want %llux%llu\n", e.module, (unsigned long long)lin.out_features,
-                    (unsigned long long)lin.in_features, (unsigned long long)e.out, (unsigned long long)e.in);
-            bad += 1;
-        }
+    if (!model_info_for(arena, &pack)) {
+        fprintf(out, "model: %s is not a Qwen3.8-Flash-Next or Qwen3.8-27B pack\n", dir);
+        pack_close(&pack);
+        return "UnknownModelType";
     }
-    fprintf(out, "linears: %zu checked, %zu problems\n", exp.len, bad);
-    vec_free(&exp);
+    size_t bad = model_check_pack(arena, &pack, out);
 
     // GPU: wrap every shard as a no-copy buffer, then run one tiny kernel.
     Err ret = OK;
@@ -588,65 +488,7 @@ static Err mv_bench(Arena *arena, FILE *out, const char *dir) {
 
 // ---- commands ----------------------------------------------------------------------------------
 
-// ---- one build per model --------------------------------------------------------------------
-
-// The text model_type of the pack at dir (config.json text_config.model_type, else
-// model_type), or NULL when it cannot be read.
-static const char *pack_model_type(Arena *a, const char *dir) {
-    char *text;
-    size_t len;
-    if (read_file(path_join(a, dir, "config.json"), 4u << 20, &text, &len)) return NULL;
-    JValue *root;
-    Err e = json_parse(a, str_n(text, len), false, &root);
-    free(text);
-    if (e) return NULL;
-    const JValue *tc = json_get(root, "text_config");
-    const JValue *mt = tc ? json_get(tc, "model_type") : NULL;
-    if (!mt) mt = json_get(root, "model_type");
-    if (!mt || mt->kind != J_STRING) return NULL;
-    return arena_strndup(a, mt->s.ptr, mt->s.len);
-}
-
-// The pack a command reads (NULL for commands without one).
-static const char *command_pack(Arena *a, int argc, char **argv) {
-    if (argc < 2) return NULL;
-    const char *cmd = argv[1];
-    if (argc >= 3 && (!strcmp(cmd, "info") || !strcmp(cmd, "mv-bench") || !strcmp(cmd, "serve") ||
-                      !strcmp(cmd, "generate")))
-        return argv[2];
-    if (!strcmp(cmd, "verify")) return getenv("SAETTA_PACK");
-    (void)a;
-    return NULL;
-}
-
-// A pack of the other architecture runs in the sibling binary next to this one: saetta-27b for
-// Qwen3.8-27B (qwen3_5_text), saetta for Flash-Next. Returns only when this binary is the one.
-static void exec_sibling_for_pack(Arena *a, int argc, char **argv) {
-    const char *dir = command_pack(a, argc, argv);
-    if (!dir) return;
-    const char *mt = pack_model_type(a, dir);
-    if (!mt || !strcmp(mt, CONFIG_MODEL_TYPE)) return;
-    bool want27 = !strcmp(mt, "qwen3_5_text") || !strcmp(mt, "qwen3_5");
-    if (want27 == (bool)CONFIG_ARCH_27B) return;
-    char sym[4096], self[PATH_MAX];
-    uint32_t sz = sizeof sym;
-    if (_NSGetExecutablePath(sym, &sz) != 0) die("saetta: executable path too long\n");
-    // the real file: a link (Homebrew's bin/saetta) has no sibling next to it
-    if (!realpath(sym, self)) die("saetta: %s: %s\n", sym, err_errno(errno));
-    size_t n = strlen(self);
-    const char *sib;
-    if (CONFIG_ARCH_27B) {
-        if (n < 4 || strcmp(self + n - 4, "-27b") != 0) die("saetta: %s is a %s pack; run it with saetta\n", dir, mt);
-        sib = arena_strndup(a, self, n - 4);
-    } else
-        sib = arena_printf(a, "%s-27b", self);
-    if (access(sib, X_OK) != 0) die("saetta: %s is a %s pack, which needs %s (not found)\n", dir, mt, sib);
-    execv(sib, argv);
-    die("saetta: cannot run %s: %s\n", sib, err_errno(errno));
-}
-
 static Err run(Arena *arena, int argc, char **argv) {
-    exec_sibling_for_pack(arena, argc, argv);
     FILE *out = stdout;
     const char *const *rest = (const char *const *)argv + 2;
     size_t nrest = argc >= 2 ? (size_t)argc - 2 : 0;
@@ -736,13 +578,24 @@ static Err run(Arena *arena, int argc, char **argv) {
     }
     if (argc >= 2 && eq(cmd, "verify")) {
         const char *golden = argc >= 3 ? argv[2] : "tests/golden";
+        // the pack: $SAETTA_PACK, else the one the golden names (manifest "pack") under
+        // ~/Models/mlx-community
         const char *pack = getenv("SAETTA_PACK");
         if (!pack) {
             const char *home = getenv("HOME");
             if (!home) return "NoHome";
-            pack = path_join(arena, home,
-                             CONFIG_ARCH_27B ? "Models/mlx-community/Qwen3.8-27B-4bit"
-                                             : "Models/mlx-community/Qwen3.8-Flash-Next-4bit-mtp");
+            const char *name = "Qwen3.8-Flash-Next-4bit-mtp";
+            char *mt;
+            size_t ml;
+            if (!read_file(path_join(arena, golden, "manifest.json"), 1u << 20, &mt, &ml)) {
+                JValue *man;
+                if (!json_parse(arena, str_n(mt, ml), false, &man)) {
+                    const char *pn = json_str(json_get(man, "pack"));
+                    if (pn) name = pn;
+                }
+                free(mt);
+            }
+            pack = path_join(arena, path_join(arena, home, "Models/mlx-community"), name);
         }
         bool ok;
         TRY(verify_run(arena, out, pack, golden, &ok));

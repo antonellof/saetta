@@ -5,7 +5,7 @@
 #include <math.h>
 #include <stdlib.h>
 
-#include "config.h"
+#include "config_flash.h" // the compiled-in fallback table: the Flash-Next pack's
 #include "json.h"
 #include "metal/shim.h"
 

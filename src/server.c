@@ -15,7 +15,6 @@
 
 #include "anthropic.h"
 #include "chat.h"
-#include "config.h"
 #include "download.h"
 #include "gpu.h"
 #include "instance.h"
@@ -28,11 +27,11 @@
 #include "toolcall.h"
 #include "weights.h"
 
-#if CONFIG_ARCH_27B
-#define MODEL_ID "qwen3.8-27b"
-#else
-#define MODEL_ID "qwen3.8-flash-next"
-#endif
+// The served model id (the loaded model's, model_info) and the one the current request's
+// response names: the base id, or the LoRA adapter's name the request selected (one request at
+// a time).
+static const char *base_id = "saetta";
+static const char *reply_id = "saetta";
 
 #define MAX_CONV 8
 // Capacity a conversation starts with (tokens); it grows in steps of CAP_STEP as needed.
@@ -906,7 +905,7 @@ static Err parse_request(Arena *a, Str body, Fmt fmt, JValue **r, Str *model) {
     TRY(json_parse(a, body, false, &raw));
     if (raw->kind != J_OBJECT) return "BadRequest";
     JValue *m = field(raw, "model");
-    *model = (m && m->kind == J_STRING) ? m->s : S(MODEL_ID);
+    *model = (m && m->kind == J_STRING) ? m->s : str(base_id);
     if (fmt == FMT_ANTHROPIC) return anthropic_to_openai(a, raw, r);
     *r = raw;
     return OK;
@@ -973,9 +972,9 @@ static Err out_event(Out *o, const char *name, Str data) {
 
 static Err out_chunk(Out *o, Str delta, const char *finish) {
     buf_printf(&o->ev,
-               "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%lld,\"model\":\"" MODEL_ID
+               "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%lld,\"model\":\"%s"
                "\",\"choices\":[{\"index\":0,\"delta\":%.*s,\"finish_reason\":",
-               o->id, (long long)o->created, (int)delta.len, delta.ptr);
+               o->id, (long long)o->created, reply_id, (int)delta.len, delta.ptr);
     if (finish) buf_printf(&o->ev, "\"%s\"}]}\n\n", finish);
     else buf_adds(&o->ev, "null}]}\n\n");
     return out_flush(o);
@@ -1174,7 +1173,7 @@ static Err generate_reply(Engine *e, Arena *a, Conn *c, Req *h, Work *w, JValue 
     Depth *depth = &e->depth;
     uint32_t queue[KMAX];
     size_t qn = 0, qi = 0;
-    uint32_t next = sample(e, logits, CONFIG_VOCAB_SIZE, sp, cand);
+    uint32_t next = sample(e, logits, model_info(e->m)->vocab, sp, cand);
     size_t passes = 0;
     uint32_t *gen_ids = ARENA_ARRAY(a, uint32_t, max_tokens + 1);
     size_t n_gen_ids = 0;
@@ -1184,8 +1183,9 @@ static Err generate_reply(Engine *e, Arena *a, Conn *c, Req *h, Work *w, JValue 
         atomic_store_explicit(&e->st->gen, (uint32_t)n_gen, memory_order_release);
         gen_ids[n_gen_ids++] = t;
         bool eos = false;
-        for (size_t i = 0; i < CONFIG_N_EOS_TOKEN_IDS; i++)
-            if (t == config_eos_token_ids[i]) eos = true;
+        const ModelInfo *mi = model_info(e->m);
+        for (size_t i = 0; i < mi->n_eos; i++)
+            if (t == mi->eos[i]) eos = true;
         if (eos) {
             finish = "stop";
             break;
@@ -1227,7 +1227,7 @@ static Err generate_reply(Engine *e, Arena *a, Conn *c, Req *h, Work *w, JValue 
         uint64_t tr0 = now_ns();
         size_t nd = spec_on ? lookup_draft(lk, drafts, gate_depth(gate, KMAX - 1)) : 0;
         bool from_mtp = false;
-        if (spec_on && nd < 3 && e->m->mtp != NULL) {
+        if (spec_on && nd < 3 && model_has_mtp(e->m)) {
             TRY(model_draft_mtp(e->m, e->s, t, depth_pick(depth, KMAX - 1), drafts, &nd));
             from_mtp = nd > 0;
         } else if (nd > 0 && !gate_allow(gate)) nd = 0;
@@ -1235,7 +1235,7 @@ static Err generate_reply(Engine *e, Arena *a, Conn *c, Req *h, Work *w, JValue 
             SpecResult sr;
             if (greedy) TRY(model_spec_greedy(e->m, e->s, t, drafts, nd, &sr));
             else {
-                SampleChooser ch = {&e->rng, sp, cand, CONFIG_VOCAB_SIZE};
+                SampleChooser ch = {&e->rng, sp, cand, model_info(e->m)->vocab};
                 TRY(model_spec_verify(e->m, e->s, t, drafts, nd, server_sample_pick, &ch, &sr));
             }
             if (from_mtp) depth_record(depth, nd, sr.accepted, round_ms(tr0));
@@ -1247,8 +1247,8 @@ static Err generate_reply(Engine *e, Arena *a, Conn *c, Req *h, Work *w, JValue 
             qi = 1;
         } else {
             TRY(model_step(e->m, e->s, t, &logits));
-            next = sample(e, logits, CONFIG_VOCAB_SIZE, sp, cand);
-            if (spec_on && e->m->mtp != NULL) depth_record(depth, 0, 0, round_ms(tr0));
+            next = sample(e, logits, model_info(e->m)->vocab, sp, cand);
+            if (spec_on && model_has_mtp(e->m)) depth_record(depth, 0, 0, round_ms(tr0));
         }
     }
     uint64_t t2 = now_ns();
@@ -1326,16 +1326,16 @@ static Err generate_reply(Engine *e, Arena *a, Conn *c, Req *h, Work *w, JValue 
         if (parsed.n_calls > 0) TRY(out_chunk(out, str(arena_printf(a, "{\"tool_calls\":%s}", calls_json)), NULL));
         TRY(out_chunk(out, S("{}"), finish));
         buf_printf(&out->ev,
-                   "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%lld,\"model\":\"" MODEL_ID
+                   "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%lld,\"model\":\"%s"
                    "\",\"choices\":[],\"usage\":%s}\n\ndata: [DONE]\n\n",
-                   id, (long long)created, usage);
+                   id, (long long)created, reply_id, usage);
         return out_end(out);
     }
     Buf res = {0};
     buf_printf(&res,
-               "{\"id\":\"%s\",\"object\":\"chat.completion\",\"created\":%lld,\"model\":\"" MODEL_ID
+               "{\"id\":\"%s\",\"object\":\"chat.completion\",\"created\":%lld,\"model\":\"%s"
                "\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":",
-               id, (long long)created);
+               id, (long long)created, reply_id);
     if (parsed.content.len == 0 && parsed.n_calls > 0) buf_adds(&res, "null");
     else chat_json_string(&res, parsed.content);
     Str rc = sp_reasoning(spl);
@@ -1518,6 +1518,7 @@ static Err handle(Engine *e, Arena *a, Conn *c, Req *h, Str body, Fmt fmt, Work 
     // the request's model: a LoRA adapter's name selects it, anything else the base model
     int lora = model_name.len > 0 ? model_lora_find(e->m, arena_strndup(a, model_name.ptr, model_name.len)) : -1;
     route(e, w->ids.ptr, n, lora);
+    reply_id = lora >= 0 ? model_lora_name(e->m, (size_t)lora) : base_id;
     TRY(ensure(e, n + max_tokens + CAP_SLACK));
     Start start = plan(e, w->ids.ptr, n);
     stats_begin(e->st, fmt == FMT_ANTHROPIC, n, start.n, max_tokens);
@@ -1545,11 +1546,11 @@ static Err connection(Engine *e, int fd) {
             ret = json_respond(c, &h, 200, S("{\"status\":\"ok\"}"));
         } else if (h.method == M_GET && str_eqz(path, "/v1/models")) {
             Buf mb = {0};
-            buf_adds(&mb, "{\"object\":\"list\",\"data\":[{\"id\":\"" MODEL_ID "\",\"object\":\"model\",\"owned_by\":\"saetta\"}");
+            buf_printf(&mb, "{\"object\":\"list\",\"data\":[{\"id\":\"%s\",\"object\":\"model\",\"owned_by\":\"saetta\"}", base_id);
             for (size_t i = 0; i < model_lora_count(e->m); i++) {
                 buf_adds(&mb, ",{\"id\":");
                 json_write_string(&mb, str(model_lora_name(e->m, i)));
-                buf_adds(&mb, ",\"object\":\"model\",\"owned_by\":\"saetta\",\"parent\":\"" MODEL_ID "\"}");
+                buf_printf(&mb, ",\"object\":\"model\",\"owned_by\":\"saetta\",\"parent\":\"%s\"}", base_id);
             }
             buf_adds(&mb, "]}");
             ret = json_respond(c, &h, 200, buf_str(&mb));
@@ -1645,8 +1646,9 @@ Err server_serve(Arena *arena, const char *dir, uint16_t port, const char *const
     TRY(gpu_init(arena, pack, g));
     // first GPU touch of the mapped pack (not the n-gram table), here instead of on the first request
     TRY(gpu_warm_except(g, pack, "ngram_embedding"));
-    Model *m = ARENA_NEW(arena, Model);
-    TRY(model_load(arena, pack, g, m));
+    Model *m;
+    TRY(model_load(arena, pack, g, &m));
+    base_id = reply_id = model_info(m)->id;
     // --lora-modules name=dir: each adapter, served under its name next to the base model
     for (size_t i = 0; i < nloras; i++) {
         const char *eq = strchr(loras[i], '=');
@@ -1673,7 +1675,7 @@ Err server_serve(Arena *arena, const char *dir, uint16_t port, const char *const
     TRY(tokenizer_load(arena, dir, tok));
     Stats *st = ARENA_NEW(arena, Stats);
     stats_init(st);
-    st->model = MODEL_ID;
+    st->model = base_id;
     st->pack = basename_of(arena, dir);
     st->port = port;
     st->started_s = (int64_t)(wall_ns() / 1000000000ull);
@@ -1697,7 +1699,7 @@ Err server_serve(Arena *arena, const char *dir, uint16_t port, const char *const
             TRY(parse_u64(str(ctx), &x));
             max_cap = (size_t)x;
         }
-        TRY(session_create_cap(g, getenv("SAETTA_KV_F32") == NULL, MIN(CAP0, max_cap), max_cap, &e->s));
+        TRY(session_create_cap(m, g, getenv("SAETTA_KV_F32") == NULL, MIN(CAP0, max_cap), max_cap, &e->s));
     }
     e->tok = tok;
     qgen_prng_init(&e->rng, (uint64_t)(int64_t)wall_ns());
@@ -1718,7 +1720,7 @@ Err server_serve(Arena *arena, const char *dir, uint16_t port, const char *const
         close(ls);
         return err;
     }
-    dbg("saetta: serving %s on http://127.0.0.1:%u (loaded in %llu ms)\n", MODEL_ID, (unsigned)port,
+    dbg("saetta: serving %s on http://127.0.0.1:%u (loaded in %llu ms)\n", base_id, (unsigned)port,
         (unsigned long long)((now_ns() - t0) / 1000000));
     for (;;) {
         int fd = accept(ls, NULL, NULL);

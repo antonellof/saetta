@@ -1,6 +1,8 @@
-// Qwen3.8-Flash-Next forward pass (see model.h). Empty in the 27B build (src/dense.c).
-#include "model.h"
-#if !CONFIG_ARCH_27B
+// Qwen3.8-Flash-Next forward pass (see model.h; internals model_flash.h, constants
+// config_flash.h). Exports flash_arch (model_arch.h).
+#include "model_flash.h"
+#define ARCH_PFX flash_
+#include "model_rename.h"
 
 #include <math.h>
 #include <pthread.h>
@@ -240,7 +242,7 @@ static_assert(sizeof(Pipes) == NPIPES * sizeof(sx_pipeline *));
 
 static bool quant_fast(Quant q) { return (q.bits == 4 && q.group_size == 32) || (q.bits == 8 && q.group_size == 64); }
 
-Err model_load(Arena *arena, const Pack *pack, Gpu *g, Model *out) {
+Err model_load(Arena *arena, const Pack *pack, Gpu *g, Model **out) {
     Pipes pipes;
     sx_pipeline **pp = (sx_pipeline **)&pipes;
     for (size_t i = 0; i < NPIPES; i++) TRY(gpu_pipeline(g, kernel_src, pipe_kernels[i], &pp[i]));
@@ -289,8 +291,10 @@ Err model_load(Arena *arena, const Pack *pack, Gpu *g, Model *out) {
         rows_p[i][0] = rows_p[i][1];
         rows1_p[i][0] = rows1_p[i][1];
     }
-    Model *m = out;
+    Model *m = ARENA_NEW(arena, Model);
     *m = (Model){0};
+    m->arch = &flash_arch;
+    *out = m;
     memcpy(m->rows_p, rows_p, sizeof rows_p);
     memcpy(m->rows1_p, rows1_p, sizeof rows1_p);
     m->pack = pack;
@@ -1710,43 +1714,6 @@ static void rope_row(float *cs, size_t pos) {
     }
 }
 
-// Index of the first largest value (as a scalar `x > best` scan): the maximum in one vector
-// pass, then its first position (the scalar loop took 0.38 ms per 248K-logit row, three rows
-// per speculative pass).
-uint32_t model_argmax(const float *v, size_t n) {
-    enum { L = 16 };
-    typedef float V __attribute__((ext_vector_type(L)));
-    if (n < L) {
-        size_t best = 0;
-        for (size_t i = 0; i < n; i++)
-            if (v[i] > v[best]) best = i;
-        return (uint32_t)best;
-    }
-    V mx;
-    memcpy(&mx, v, sizeof mx);
-    size_t i = L;
-    for (; i + L <= n; i += L) {
-        V x;
-        memcpy(&x, v + i, sizeof x);
-        mx = __builtin_elementwise_max(mx, x);
-    }
-    float m = __builtin_reduce_max(mx);
-    for (; i < n; i++) m = __builtin_fmaxf(m, v[i]);
-    V mv = m;
-    i = 0;
-    for (; i + L <= n; i += L) {
-        V x;
-        memcpy(&x, v + i, sizeof x);
-        if (__builtin_reduce_or(x == mv)) {
-            for (size_t j = 0; j < L; j++)
-                if (v[i + j] == m) return (uint32_t)(i + j);
-        }
-    }
-    for (; i < n; i++)
-        if (v[i] == m) return (uint32_t)i;
-    return 0;
-}
-
 // The token's 16 n-gram table rows (global row indices, M:1030-1178), and the history update.
 static void ple_row_ids(const Ple *P, Session *s, uint32_t token, uint64_t rows[NG_HEADS]) {
     int64_t t0 = token;
@@ -2274,6 +2241,7 @@ static Err new_state(Gpu *g, sx_buffer **gdn, sx_buffer **conv, sx_buffer **ple)
 
 Err session_create_cap(Gpu *g, bool kv_half, size_t cap, size_t max_cap, Session **out) {
     Session *s = xcalloc(1, sizeof *s);
+    s->arch = &flash_arch;
     s->cap = cap;
     s->max_cap = max_cap;
     s->prev[0] = s->prev[1] = EOS_PLE;
@@ -2372,19 +2340,6 @@ size_t session_reusable(Session *s, const uint32_t *prompt, size_t n) {
     return r.n;
 }
 
-Reusable session_reusable_in(const Ckpt ck[2], const uint32_t *prompt, size_t np) {
-    size_t best = 0, pick = 0;
-    for (size_t i = 0; i < 2; i++) {
-        size_t n = ck[i].tokens.len;
-        if (n == 0 || n >= np || n <= best) continue;
-        if (memcmp(ck[i].tokens.ptr, prompt, n * sizeof(uint32_t)) == 0) {
-            best = n;
-            pick = i;
-        }
-    }
-    return (Reusable){best, pick};
-}
-
 size_t session_conv_bytes(const Session *s, size_t cap) {
     size_t ckb = GDN_STATE_N * 4 + GDN_CONV_N * 4 + PLE_HIST_N * 4;
     return session_kv_bytes(s, cap) + 2 * ckb;
@@ -2453,7 +2408,6 @@ bool session_roll_to(Session *s, size_t p, const uint32_t *toks) {
     return true;
 }
 
-void session_keep_points(Session *s, size_t n) { s->ptoks.len = MIN(s->ptoks.len, n); }
 
 Err session_save_point(Session *s, Gpu *g, const uint32_t *toks, size_t n) {
     if (!(s->pos % PT_EVERY == 0 && n == s->pos)) die("session_save_point: %zu tokens at position %zu\n", n, s->pos);
@@ -2475,16 +2429,6 @@ Err session_save_point(Session *s, Gpu *g, const uint32_t *toks, size_t n) {
     return OK;
 }
 
-size_t session_shared_point(const uint32_t *ptoks, size_t nptoks, const Point pts[PT_MAX], const uint32_t *prompt,
-                            size_t n) {
-    size_t lcp = 0;
-    size_t lim = MIN(nptoks, n - 1);
-    while (lcp < lim && ptoks[lcp] == prompt[lcp]) lcp += 1;
-    size_t k = MIN(lcp / PT_EVERY, (size_t)PT_MAX);
-    while (k > 0 && pts[k - 1].gdn == NULL) k -= 1;
-    return k * PT_EVERY;
-}
-
 // The recurrent state and history of point pt into the live state, at position n.
 static void start_at(Session *s, const Point *pt, size_t n) {
     s->roll = SESSION_NO_ROLL;
@@ -2501,12 +2445,6 @@ static void start_at(Session *s, const Point *pt, size_t n) {
 
 void session_start_at_own_point(Session *s, size_t n) {
     start_at(s, &s->pts[n / PT_EVERY - 1], n);
-    session_keep_points(s, n);
-}
-
-void session_invalidate_from(Session *s, size_t n) {
-    for (int i = 0; i < 2; i++)
-        if (s->ck[i].tokens.len > n) s->ck[i].tokens.len = 0;
     session_keep_points(s, n);
 }
 
@@ -2800,4 +2738,105 @@ const char *model_lora_name(const Model *m, size_t i) {
     return NULL;
 }
 
-#endif // !CONFIG_ARCH_27B
+
+// ---- the table model_api.c dispatches through ----------------------------------------------
+
+bool model_has_mtp(const Model *m) { return m->mtp != NULL; }
+bool model_fast_prefill(const Model *m) { return m->fast_prefill; }
+bool model_fast_prefill_available(const Model *m) { return m->mpp != NULL; }
+void model_set_fast_prefill(Model *m, bool on) { m->fast_prefill = on && m->mpp != NULL; }
+
+typedef struct {
+    const char *module;
+    uint64_t out, in;
+} Expect;
+typedef VEC(Expect) VecExpect;
+
+static void add_lin(VecExpect *b, Arena *a, size_t l, const char *name, uint64_t o, uint64_t i) {
+    vec_push(b, ((Expect){arena_printf(a, "%slayers.%zu.%s", WEIGHTS_PREFIX, l, name), o, i}));
+}
+
+static void expected_linears(VecExpect *buf, Arena *a, size_t layer) {
+    const uint64_t h = CONFIG_HIDDEN_SIZE;
+    const uint64_t hcw = CONFIG_HC_COUNT * h;
+    const char *hcs[2] = {"attn_hyper_connection", "mlp_hyper_connection"};
+    for (int k = 0; k < 2; k++) {
+        add_lin(buf, a, layer, arena_printf(a, "%s.input_mix_weight_down", hcs[k]), CONFIG_HC_LOWRANK, hcw);
+        add_lin(buf, a, layer, arena_printf(a, "%s.input_mix_weight_up", hcs[k]), hcw, CONFIG_HC_LOWRANK);
+        add_lin(buf, a, layer, arena_printf(a, "%s.block_inject_weight", hcs[k]), CONFIG_HC_COUNT, hcw);
+    }
+    if (config_layer_kinds[layer] == LAYER_KIND_GDN) {
+        const uint64_t kd = CONFIG_LINEAR_NUM_KEY_HEADS * CONFIG_LINEAR_KEY_HEAD_DIM;
+        const uint64_t vd = CONFIG_LINEAR_NUM_VALUE_HEADS * CONFIG_LINEAR_VALUE_HEAD_DIM;
+        add_lin(buf, a, layer, "linear_attn.in_proj_qkv", 2 * kd + vd, h);
+        add_lin(buf, a, layer, "linear_attn.in_proj_z", vd, h);
+        add_lin(buf, a, layer, "linear_attn.in_proj_a", CONFIG_LINEAR_NUM_VALUE_HEADS, h);
+        add_lin(buf, a, layer, "linear_attn.in_proj_b", CONFIG_LINEAR_NUM_VALUE_HEADS, h);
+        add_lin(buf, a, layer, "linear_attn.out_proj", h, vd);
+    } else {
+        const uint64_t qd = CONFIG_NUM_ATTENTION_HEADS * CONFIG_HEAD_DIM;
+        const uint64_t kvd = CONFIG_NUM_KEY_VALUE_HEADS * CONFIG_HEAD_DIM;
+        add_lin(buf, a, layer, "self_attn.q_proj", 2 * qd, h);
+        add_lin(buf, a, layer, "self_attn.k_proj", kvd, h);
+        add_lin(buf, a, layer, "self_attn.v_proj", kvd, h);
+        add_lin(buf, a, layer, "self_attn.o_proj", h, qd);
+        add_lin(buf, a, layer, "self_attn.indexer.index_qk_proj",
+                (CONFIG_INDEXER_N_HEADS + CONFIG_INDEXER_KV_HEADS) * CONFIG_INDEXER_HEAD_DIM, h);
+    }
+    add_lin(buf, a, layer, "mlp.gate", CONFIG_NUM_EXPERTS, h);
+    add_lin(buf, a, layer, "mlp.shared_expert_gate", 1, h);
+    add_lin(buf, a, layer, "mlp.shared_expert.gate_proj", CONFIG_SHARED_EXPERT_INTERMEDIATE_SIZE, h);
+    add_lin(buf, a, layer, "mlp.shared_expert.up_proj", CONFIG_SHARED_EXPERT_INTERMEDIATE_SIZE, h);
+    add_lin(buf, a, layer, "mlp.shared_expert.down_proj", h, CONFIG_SHARED_EXPERT_INTERMEDIATE_SIZE);
+    add_lin(buf, a, layer, "mlp.switch_mlp.gate_proj", CONFIG_MOE_INTERMEDIATE_SIZE, h);
+    add_lin(buf, a, layer, "mlp.switch_mlp.up_proj", CONFIG_MOE_INTERMEDIATE_SIZE, h);
+    add_lin(buf, a, layer, "mlp.switch_mlp.down_proj", h, CONFIG_MOE_INTERMEDIATE_SIZE);
+    for (size_t i = 0; i < CONFIG_N_PLE_LAYERS; i++)
+        if (config_ple_layers[i] == layer) {
+            add_lin(buf, a, layer, "ple.key_proj", hcw, h);
+            add_lin(buf, a, layer, "ple.value_proj", h, h);
+        }
+}
+
+size_t model_check_pack(Arena *a, const Pack *pack, FILE *out) {
+    fprintf(out, "model: Qwen3.8-Flash-Next (%s), %zu layers, hidden %zu, %zu experts top-%zu\n", CONFIG_MODEL_TYPE,
+            CONFIG_NUM_HIDDEN_LAYERS, CONFIG_HIDDEN_SIZE, CONFIG_NUM_EXPERTS, CONFIG_NUM_EXPERTS_PER_TOK);
+    VecExpect exp = {0};
+    for (size_t l = 0; l < CONFIG_NUM_HIDDEN_LAYERS; l++) expected_linears(&exp, a, l);
+    vec_push(&exp, ((Expect){"language_model.lm_head", CONFIG_VOCAB_SIZE, CONFIG_HIDDEN_SIZE}));
+    vec_push(&exp, ((Expect){WEIGHTS_PREFIX "embed_tokens", CONFIG_VOCAB_SIZE, CONFIG_HIDDEN_SIZE}));
+    size_t bad = 0;
+    for (size_t i = 0; i < exp.len; i++) {
+        Expect e = exp.ptr[i];
+        Linear lin;
+        Err err = pack_linear(pack, str(e.module), &lin);
+        if (err) {
+            // a plain BF16 matrix (the Coder routers) is requantized at load: accept it
+            const TensorInfo *t = pack_get(pack, str(arena_printf(a, "%s.weight", e.module)));
+            if (t && t->dtype == DTYPE_BF16 && t->rank == 2) continue;
+            fprintf(out, "  MISSING %s: %s\n", e.module, err);
+            bad += 1;
+            continue;
+        }
+        if (lin.out_features != e.out || lin.in_features != e.in) {
+            fprintf(out, "  SHAPE %s: got %llux%llu, want %llux%llu\n", e.module, (unsigned long long)lin.out_features,
+                    (unsigned long long)lin.in_features, (unsigned long long)e.out, (unsigned long long)e.in);
+            bad += 1;
+        }
+    }
+    fprintf(out, "linears: %zu checked, %zu problems\n", exp.len, bad);
+    vec_free(&exp);
+    return bad;
+}
+
+const ModelArch flash_arch = MODEL_ARCH_TABLE({
+    .model_type = CONFIG_MODEL_TYPE,
+    .id = "qwen3.8-flash-next",
+    .name = "Qwen3.8-Flash-Next",
+    .layers = CONFIG_NUM_HIDDEN_LAYERS,
+    .width = HCW,
+    .vocab = CONFIG_VOCAB_SIZE,
+    .hidden = CONFIG_HIDDEN_SIZE,
+    .eos = config_eos_token_ids,
+    .n_eos = CONFIG_N_EOS_TOKEN_IDS,
+});

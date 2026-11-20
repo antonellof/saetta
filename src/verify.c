@@ -4,7 +4,6 @@
 #include <math.h>
 #include <stdlib.h>
 
-#include "config.h"
 #include "gpu.h"
 #include "json.h"
 #include "model.h"
@@ -176,7 +175,7 @@ Err verify_run(Arena *a, FILE *out, const char *pack_dir, const char *golden, bo
     size_t layers = (size_t)json_get(man, "layers")->i;
     size_t width = (size_t)json_get(man, "width")->i;
     size_t vocab = (size_t)json_get(man, "vocab")->i;
-    if (layers != CONFIG_NUM_HIDDEN_LAYERS || width != HCW || vocab != CONFIG_VOCAB_SIZE) return "GoldenShapeMismatch";
+    // checked against the model once it is loaded
     const float *xs, *ls;
     TRY(read_f32(a, golden, "x_layers.f32", npos * layers * width, &xs));
     TRY(read_f32(a, golden, "logits.f32", npos * vocab, &ls));
@@ -201,8 +200,11 @@ Err verify_run(Arena *a, FILE *out, const char *pack_dir, const char *golden, bo
             return e_;                   \
         }                                \
     } while (0)
-    Model *m = ARENA_NEW(a, Model);
-    FAIL_CLOSE(model_load(a, &pack, &g, m));
+    Model *m;
+    FAIL_CLOSE(model_load(a, &pack, &g, &m));
+    const ModelInfo *mi = model_info(m);
+    if (layers != mi->layers || width != mi->width || vocab != mi->vocab) FAIL_CLOSE("GoldenShapeMismatch");
+    fprintf(out, "model: %s, pack %s\n", mi->name, pack_dir);
     // a golden made with a LoRA adapter (tools/ref27.py --lora): the same adapter, from
     // $SAETTA_LORA or the manifest's path
     const JValue *lora = json_get(man, "lora");
@@ -215,7 +217,7 @@ Err verify_run(Arena *a, FILE *out, const char *pack_dir, const char *golden, bo
         fprintf(out, "lora: %s\n", dir);
     }
     Session *s;
-    FAIL_CLOSE(session_create_kv(&g, false, &s)); // exact checks: f32 KV cache
+    FAIL_CLOSE(session_create_kv(m, &g, false, &s)); // exact checks: f32 KV cache
     float *trace = ARENA_ARRAY(a, float, layers * width);
 
     float *worst_layer = ARENA_ARRAY(a, float, layers);
@@ -254,8 +256,8 @@ Err verify_run(Arena *a, FILE *out, const char *pack_dir, const char *golden, bo
     }
     // prefill path: the whole prompt as one chunk, exact f32 first, then the accelerator path
     if (ntok > CH) FAIL_CLOSE("GoldenLongerThanChunk");
-    bool fast_available = m->fast_prefill;
-    m->fast_prefill = false;
+    bool fast_available = model_fast_prefill(m);
+    model_set_fast_prefill(m, false);
     session_reset(s);
     uint32_t *tokens = ARENA_ARRAY(a, uint32_t, ntok);
     for (size_t t = 0; t < ntok; t++) tokens[t] = (uint32_t)toks->arr.items[t]->i;
@@ -288,9 +290,9 @@ Err verify_run(Arena *a, FILE *out, const char *pack_dir, const char *golden, bo
 
     // accelerator prefill (half inputs): quality gate on KL of the last-token distribution
     if (fast_available) {
-        m->fast_prefill = true;
+        model_set_fast_prefill(m, true);
         Session *sf;
-        FAIL_CLOSE(session_create_kv(&g, true, &sf)); // the default: f16 KV cache
+        FAIL_CLOSE(session_create_kv(m, &g, true, &sf)); // the default: f16 KV cache
         float *flog;
         FAIL_CLOSE(model_prefill(m, sf, tokens, ntok, tb, &flog));
         float fworst = 0;
@@ -312,9 +314,9 @@ Err verify_run(Arena *a, FILE *out, const char *pack_dir, const char *golden, bo
                 "KL(ref||engine) %s, argmax %s%s\n",
                 e3(b1, fworst), e3d(b2, fkl), fbest == plast ? "equal" : "DIFFERENT", fok ? "" : "  FAIL");
         // default decode: step by step on an f16-KV session, every greedy token and the last KL
-        m->fast_prefill = fast_available;
+        model_set_fast_prefill(m, fast_available);
         Session *sd;
-        FAIL_CLOSE(session_create_kv(&g, true, &sd));
+        FAIL_CLOSE(session_create_kv(m, &g, true, &sd));
         size_t dbad = 0;
         float *dlog = NULL;
         for (size_t t = 0; t < ntok; t++) {
@@ -329,7 +331,7 @@ Err verify_run(Arena *a, FILE *out, const char *pack_dir, const char *golden, bo
                 e3d(b1, dkl), dok ? "" : "  FAIL");
         // speculative verification chunk: logits of every position from one chunk
         Session *sv;
-        FAIL_CLOSE(session_create_kv(&g, true, &sv));
+        FAIL_CLOSE(session_create_kv(m, &g, true, &sv));
         size_t nv = MIN(ntok, (size_t)KMAX);
         float *vl;
         FAIL_CLOSE(model_verify_chunk(m, sv, tokens, nv, &vl));

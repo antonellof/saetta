@@ -1,6 +1,6 @@
 // The model pack: an MLX safetensors directory (model.safetensors.index.json plus
 // shards), mapped read-only and never copied. Quantized linear layers are
-// affine: w = q * scale + bias per group (bits and group size from src/config.h).
+// affine: w = q * scale + bias per group (bits and group size from the pack's config.json).
 #ifndef SAETTA_WEIGHTS_H
 #define SAETTA_WEIGHTS_H
 
@@ -32,7 +32,7 @@ typedef struct {
     StrMap tensors;    // name -> TensorInfo * (count: tensors.len)
     // Per-module quantization from the pack's config.json ("quantization": default bits and
     // group_size plus one entry per module that differs): module name -> Quant *. Empty when
-    // the pack has none, and then the compiled-in table (config.h) applies. Packs mix 4/5/6/8
+    // the pack has none, and then the compiled-in table (Flash-Next's, config_flash.h) applies. Packs mix 4/5/6/8
     // bits and groups of 32/64/128 (the Coder conversion).
     StrMap quant;
     bool has_quant_default;

@@ -3,21 +3,11 @@
 #include "../test.h"
 #include "../weights.h"
 
-#include "../config.h"
-
-#if CONFIG_ARCH_27B
-TEST(weights_quant_overrides) {
-    // 27B packs: one quantization for every linear (4-bit group 64 compiled in)
-    EXPECT_EQ(weights_quant_for(S("language_model.model.layers.3.mlp.gate_proj")).bits, 4);
-    EXPECT_EQ(weights_quant_for(S("language_model.model.layers.3.mlp.gate_proj")).group_size, 64);
-}
-#else
 TEST(weights_quant_overrides) {
     EXPECT_EQ(weights_quant_for(S("language_model.model.layers.3.mlp.gate")).bits, 8);
     EXPECT_EQ(weights_quant_for(S("language_model.model.layers.3.mlp.shared_expert_gate")).bits, 8);
     EXPECT_EQ(weights_quant_for(S("language_model.model.layers.3.mlp.switch_mlp.up_proj")).bits, 4);
 }
-#endif
 
 static uint16_t rd16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
 static float bf(uint16_t b) {

@@ -37,8 +37,6 @@ src=$(find "$tmp" -maxdepth 1 -type d -name 'saetta-*' | head -1)
 
 mkdir -p "$PREFIX/bin"
 install -m 755 "$src/bin/saetta" "$PREFIX/bin/saetta"
-# Qwen3.8-27B runs in its own build next to saetta, which hands 27B packs to it
-[ -x "$src/bin/saetta-27b" ] && install -m 755 "$src/bin/saetta-27b" "$PREFIX/bin/saetta-27b"
 say "installed $("$PREFIX/bin/saetta" version) into $PREFIX/bin"
 
 case ":$PATH:" in *":$PREFIX/bin:"*) ;; *)

@@ -7,6 +7,7 @@
 #include "model.h"
 #include "model_arch.h"
 #include "xcache.h"
+#include "xstream.h"
 
 // Width of the hyper-connection streams: hc_count x hidden_size (10240).
 #define HCW (CONFIG_HC_COUNT * CONFIG_HIDDEN_SIZE)
@@ -137,15 +138,10 @@ typedef struct {
 } Gen;
 
 
-// A point where the command buffer stops until the host has mapped one layer's expert ids to
-// cache slots (streamed packs): the GPU signals sig once the ids are written, the host remaps
-// them in place, loads the missing experts and sets sig + 1.
+// The kinds of stop (src/xstream.h) where the command buffer waits until the host has mapped
+// one layer's expert ids to cache slots (streamed packs): decode ids, verify-chunk rows (n ids
+// to map), or the prefill tile table.
 typedef enum { XS_DECODE, XS_ROWS, XS_TILES } XsKind;
-typedef struct {
-    uint8_t kind;
-    uint32_t layer, n; // cache layer; ids to map (XS_DECODE, XS_ROWS)
-    uint64_t sig;
-} XSvc;
 #define MODEL_MAX_XSVC 160
 
 // Encoder for one token: dispatches go into one serial command buffer.
@@ -201,12 +197,9 @@ struct Model {
     // (draft_mtp), committed by verify_chunk once the drafts are known; any other call drops it.
     bool has_pend;
     PendVerify pend;
-    // Streamed experts (SAETTA_EXPERT_CACHE_GB): the cache, the event the command buffers stop
-    // on, and its last value handed out. NULL when every expert is resident.
-    XCache *xc;
-    sx_event *xev;
-    uint64_t xev_val;
-    bool xfault; // a stop failed (GPU fault or timeout): streamed work is refused from then on
+    // Streamed experts (SAETTA_EXPERT_CACHE_GB): the cache (xs.xc NULL when every expert is
+    // resident), the event the command buffers stop on.
+    XStream xs;
 };
 
 static_assert(MODEL_NG_HEADS == SESSION_NG_HEADS);

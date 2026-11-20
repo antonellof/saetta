@@ -13,13 +13,6 @@
 #include "qgen.h"
 // The streamed-expert cache of the loaded model, for model_prof_report (one model per process).
 static XCache *xc_report;
-// Host time in the service loop: waiting for the GPU to reach a stop, and mapping (with reads).
-static double xs_wait_s, xs_map_s;
-static uint64_t xs_stops;
-// the same wait split by whether the previous stop read from the SSD (diagnostic)
-static double xs_wait_after_miss_s, xs_wait_after_hit_s;
-static uint64_t xs_after_miss, xs_after_hit, xs_prev_misses;
-static bool xs_prev_had_miss;
 
 #define H CONFIG_HIDDEN_SIZE // 2560
 #define HC CONFIG_HC_COUNT   // 4
@@ -417,16 +410,10 @@ Err model_load(Arena *arena, const Pack *pack, Gpu *g, Model **out) {
             uint64_t keep = 0;
             Str k;
             void *v;
-            for (size_t it = 0; strmap_next(&pack->tensors, &it, &k, &v);) {
-                bool streamed = str_find(k, S("mlp.switch_mlp."), 0) >= 0 && str_find(k, S("mtp."), 0) != 0;
-                if (!streamed && str_find(k, S("ngram_embedding"), 0) < 0) keep += ((const TensorInfo *)v)->nbytes;
-            }
-            uint64_t ws = sx_device_recommended_working_set(g->dev);
-            if (xbytes + keep + 8000000000ull > ws) {
-                dbg("model: expert cache of %.1f GB does not fit: %.1f GB stay resident, working set %.1f GB\n",
-                    (double)xbytes / 1e9, (double)keep / 1e9, (double)ws / 1e9);
-                return "CacheTooLarge";
-            }
+            for (size_t it = 0; strmap_next(&pack->tensors, &it, &k, &v);)
+                if (!gpu_streamed_tensor(k) && str_find(k, S("ngram_embedding"), 0) < 0)
+                    keep += ((const TensorInfo *)v)->nbytes;
+            TRY(xs_fits(g, xbytes, keep));
         }
         XcLayer *xl = ARENA_ARRAY(arena, XcLayer, NLAYERS);
         if (!xl) return "OutOfMemory";
@@ -440,14 +427,7 @@ Err model_load(Arena *arena, const Pack *pack, Gpu *g, Model **out) {
             }
             xl[i].ne = E->ne;
         }
-        TRY(xc_open(arena, pack, g->dev, xl, NLAYERS, 9, xbytes, 0, &m->xc));
-        {
-            sx_buffer *rb[9];
-            for (uint32_t r = 0; r < 9; r++) rb[r] = xc_region(m->xc, r);
-            TRY(gpu_touch_buffers(g, rb, 9));
-        }
-        m->xev = sx_event_new(g->dev);
-        if (!m->xev) return "GpuFailed";
+        TRY(xs_open(arena, pack, g, xl, NLAYERS, 9, xbytes, &m->xs));
         for (size_t i = 0; i < NLAYERS; i++) {
             Moe *E = &m->layers[i].moe;
             E->eg.xr = 1;
@@ -455,8 +435,8 @@ Err model_load(Arena *arena, const Pack *pack, Gpu *g, Model **out) {
             E->ed.xr = 7;
             E->xl1 = (uint32_t)i + 1;
         }
-        xc_report = m->xc;
-        dbg("model: streamed experts, cache of %u slots (%.1f GB)\n", xc_slots(m->xc), (double)xc_bytes(m->xc) / 1e9);
+        xc_report = m->xs.xc;
+        dbg("model: streamed experts, cache of %u slots (%.1f GB)\n", xc_slots(m->xs.xc), (double)xc_bytes(m->xs.xc) / 1e9);
     }
     const char *mv = getenv("SAETTA_MTP");
     bool mtp_on = mv ? mv[0] != '0' : true;
@@ -486,14 +466,14 @@ static inline sx_arg offa(sx_arg a, size_t floats) {
 // pack's stacked tensor, or for a streamed layer the cache region holding it, at the cache's
 // slot stride (the ids the kernels read are then slot numbers).
 static sx_arg xarg(Model *m, const Linear *l, int k, uint32_t *sh) {
-    if (l->xr && m->xc) {
+    if (l->xr && m->xs.xc) {
         *sh = 0;
-        return (sx_arg){.buffer = xc_region(m->xc, (uint32_t)(l->xr - 1 + k)), .offset = 0};
+        return (sx_arg){.buffer = xc_region(m->xs.xc, (uint32_t)(l->xr - 1 + k)), .offset = 0};
     }
     return gpu_tensor_arg(m->g, k == 0 ? &l->weight : k == 1 ? &l->scales : &l->biases, sh);
 }
 static uint32_t xstride(Model *m, const Linear *l, int k) {
-    if (l->xr && m->xc) return xc_stride(m->xc, (uint32_t)(l->xr - 1 + k));
+    if (l->xr && m->xs.xc) return xc_stride(m->xs.xc, (uint32_t)(l->xr - 1 + k));
     const TensorInfo *t = k == 0 ? &l->weight : &l->scales;
     return (uint32_t)(t->nbytes / t->shape[0]);
 }
@@ -644,20 +624,7 @@ static const char *prof_gbs(char *buf, size_t cap, uint64_t b, double t) {
 }
 
 void model_prof_report(size_t tokens) {
-    if (xc_report) {
-        XcStats st = xc_stats(xc_report);
-        double hit = st.requests ? 100.0 * (double)st.hits / (double)st.requests : 0;
-        dbg("experts: %llu requests, %.1f%% hits, %llu misses, %.2f GB read in %.1f ms (%.2f GB/s), %.2f MB/token\n",
-            (unsigned long long)st.requests, hit, (unsigned long long)st.misses, (double)st.bytes_read / 1e9,
-            st.read_seconds * 1e3, st.read_seconds > 0 ? (double)st.bytes_read / 1e9 / st.read_seconds : 0,
-            tokens ? (double)st.bytes_read / 1e6 / (double)tokens : 0);
-        dbg("experts: %llu stops, host waiting for the GPU %.1f ms, mapping %.1f ms (%.1f us per stop)\n",
-            (unsigned long long)xs_stops, xs_wait_s * 1e3, xs_map_s * 1e3,
-            xs_stops ? (xs_wait_s + xs_map_s) * 1e6 / (double)xs_stops : 0);
-        dbg("experts: wait after a stop that read %.1f us (%llu), after an all-hit stop %.1f us (%llu)\n",
-            xs_after_miss ? xs_wait_after_miss_s * 1e6 / (double)xs_after_miss : 0, (unsigned long long)xs_after_miss,
-            xs_after_hit ? xs_wait_after_hit_s * 1e6 / (double)xs_after_hit : 0, (unsigned long long)xs_after_hit);
-    }
+    if (xc_report) xs_report(xc_report, tokens);
     if (!prof.on) return;
     double total = prof.mpp_secs[0] + prof.mpp_secs[1] + prof.mpp_secs[2] + prof.other_secs;
     for (size_t i = 0; i < NPIPES; i++) total += prof.secs[i];
@@ -783,97 +750,62 @@ static_assert(MODEL_MAX_XSVC >= NLAYERS, "one stop per streamed layer of a pass"
 
 static void enc_xstop(Enc *e, const Moe *E, XsKind kind, uint32_t n) {
     Model *m = e->m;
-    if (!E->xl1 || !m->xc) return;
-    if (e->nxs >= MODEL_MAX_XSVC || m->xfault) {
-        e->failed = true;
-        return;
-    }
-    uint64_t sig = m->xev_val + 1;
-    m->xev_val += 2;
-    sx_cmd_signal(e->cmd, m->xev, sig);
-    sx_cmd_wait_event(e->cmd, m->xev, sig + 1);
-    e->xs[e->nxs++] = (XSvc){.kind = (uint8_t)kind, .layer = E->xl1 - 1, .n = n, .sig = sig};
+    if (!E->xl1 || !m->xs.xc) return;
+    if (!xs_stop(&m->xs, e->cmd, e->xs, &e->nxs, MODEL_MAX_XSVC, (uint8_t)kind, E->xl1 - 1, n)) e->failed = true;
 }
 
-// After commit, before waiting: serve every stop of e's command buffer in order. Each stop is
-// released even when mapping fails (with slot 0, a valid slot), so the GPU never hangs; the
-// first error is returned.
-static Err enc_xservice(Enc *e) {
-    Model *m = e->m;
-    Err first = OK;
-    for (uint32_t i = 0; i < e->nxs; i++) {
-        const XSvc *s = &e->xs[i];
-        double t0 = now_s();
-        int wrc = sx_event_wait_cmd(m->xev, s->sig, e->cmd);
-        double t1 = now_s();
-        xs_wait_s += t1 - t0;
-        xs_stops++;
-        if (i > 0) {
-            if (xs_prev_had_miss) { xs_wait_after_miss_s += t1 - t0; xs_after_miss++; }
-            else { xs_wait_after_hit_s += t1 - t0; xs_after_hit++; }
-        }
-        if (wrc != 0) {
-            // the GPU never reached this stop (fault or timeout): release every later one so
-            // nothing waits forever, and refuse further streamed work, since the event's
-            // values can no longer be trusted
-            sx_event_set(m->xev, e->xs[e->nxs - 1].sig + 1);
-            e->nxs = 0;
-            m->xfault = true;
-            return wrc == 2 ? "GpuFailed" : "GpuTimeout";
-        }
-        Err err = OK;
-        if (s->kind == XS_DECODE || s->kind == XS_ROWS) {
-            uint32_t *ids = s->kind == XS_DECODE ? (uint32_t *)sx_buffer_contents(m->scratch) + S_topi
-                                                 : (uint32_t *)sx_buffer_contents(m->bscratch) + B_topi;
-            err = xc_map(m->xc, s->layer, ids, s->n, ids);
-            if (err) memset(ids, 0, s->n * sizeof *ids);
-        } else {
-            // the tile table of moe_group: map its distinct experts, then rewrite tiles[].x
-            uint32_t *bs = (uint32_t *)sx_buffer_contents(m->bscratch);
-            uint32_t nt = bs[B_gnt];
-            uint32_t *tiles = bs + B_gtiles;
-            uint32_t ids[NE], slot_of[NE];
-            uint32_t nid = 0;
-            bool seen[NE] = {0};
-            for (uint32_t t = 0; t < nt && !err; t++) {
-                uint32_t x = tiles[4 * t];
-                if (x >= NE) err = "BadExpertId";
-                else if (!seen[x]) {
-                    seen[x] = true;
-                    ids[nid++] = x;
-                }
+// The ids of stop s to cache slots, in place (XS_DECODE, XS_ROWS: the top-k ids; XS_TILES: the
+// expert of each tile of moe_group's table).
+static Err xmap(void *ctx, XCache *xc, const XSvc *s) {
+    Model *m = ctx;
+    Err err = OK;
+    if (s->kind == XS_DECODE || s->kind == XS_ROWS) {
+        uint32_t *ids = s->kind == XS_DECODE ? (uint32_t *)sx_buffer_contents(m->scratch) + S_topi
+                                             : (uint32_t *)sx_buffer_contents(m->bscratch) + B_topi;
+        err = xc_map(xc, s->layer, ids, s->n, ids);
+        if (err) memset(ids, 0, s->n * sizeof *ids);
+    } else {
+        // the tile table of moe_group: map its distinct experts, then rewrite tiles[].x
+        uint32_t *bs = (uint32_t *)sx_buffer_contents(m->bscratch);
+        uint32_t nt = bs[B_gnt];
+        uint32_t *tiles = bs + B_gtiles;
+        uint32_t ids[NE], slot_of[NE];
+        uint32_t nid = 0;
+        bool seen[NE] = {0};
+        for (uint32_t t = 0; t < nt && !err; t++) {
+            uint32_t x = tiles[4 * t];
+            if (x >= NE) err = "BadExpertId";
+            else if (!seen[x]) {
+                seen[x] = true;
+                ids[nid++] = x;
             }
-            if (!err) err = xc_map(m->xc, s->layer, ids, nid, ids);
-            if (!err) {
-                // ids now holds the slots, in the order the experts were first seen
-                for (uint32_t t = 0, j = 0; t < nt; t++) {
-                    uint32_t x = tiles[4 * t];
-                    if (seen[x]) {
-                        slot_of[x] = ids[j++];
-                        seen[x] = false;
-                    }
-                    tiles[4 * t] = slot_of[x];
-                }
-            } else
-                for (uint32_t t = 0; t < nt; t++) tiles[4 * t] = 0;
         }
-        if (err && !first) first = err;
-        xs_map_s += now_s() - t1;
-        uint64_t mnow = xc_stats(m->xc).misses;
-        xs_prev_had_miss = mnow != xs_prev_misses;
-        xs_prev_misses = mnow;
-        sx_event_set(m->xev, s->sig + 1);
+        if (!err) err = xc_map(xc, s->layer, ids, nid, ids);
+        if (!err) {
+            // ids now holds the slots, in the order the experts were first seen
+            for (uint32_t t = 0, j = 0; t < nt; t++) {
+                uint32_t x = tiles[4 * t];
+                if (seen[x]) {
+                    slot_of[x] = ids[j++];
+                    seen[x] = false;
+                }
+                tiles[4 * t] = slot_of[x];
+            }
+        } else
+            for (uint32_t t = 0; t < nt; t++) tiles[4 * t] = 0;
     }
-    e->nxs = 0;
-    return first;
+    return err;
 }
+
+// After commit, before waiting: serve every stop of e's command buffer in order.
+static Err enc_xservice(Enc *e) { return xs_service(&e->m->xs, e->cmd, e->xs, &e->nxs, xmap, e->m); }
 
 static Err enc_finish(Enc *e) {
     char err[512];
     if (e->failed) {
         // a stop could not be encoded: the buffer would read raw expert ids as slots
         sx_cmd_discard(e->cmd);
-        return e->m->xfault ? "StreamingFault" : "TooManyStops";
+        return e->m->xs.fault ? "StreamingFault" : "TooManyStops";
     }
     if (e->nxs) {
         sx_cmd_commit(e->cmd);
@@ -2300,7 +2232,7 @@ Err model_verify_chunk(Model *m, Session *s, const uint32_t *toks, size_t n, flo
 static Err commit_preparing_verify(Model *m, Session *s, Enc *e, size_t T) {
     if (e->failed) {
         sx_cmd_discard(e->cmd);
-        return m->xfault ? "StreamingFault" : "TooManyStops";
+        return m->xs.fault ? "StreamingFault" : "TooManyStops";
     }
     sx_cmd_commit(e->cmd);
     // streamed layers: serve this command buffer's stops before encoding the next one

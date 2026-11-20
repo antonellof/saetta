@@ -2,11 +2,11 @@
   <img src="docs/assets/saetta-banner.png" alt="saetta" width="900">
 </p>
 
-<h3 align="center">Qwen3.8-Flash-Next at full speed on an M5 Max.</h3>
-<p align="center">A single-model inference engine in C and hand-written Metal, tuned for coding agents.</p>
+<h3 align="center">Qwen3.8-Flash-Next and Qwen3.8-27B at full speed on an M5 Max.</h3>
+<p align="center">An inference engine in C and hand-written Metal, tuned for coding agents, now with LoRA adapters.</p>
 
 <p align="center">
-  <a href="#install"><b>Install</b></a> · <a href="#models">Models</a> · <a href="#run-the-server">Server</a> ·
+  <a href="#install"><b>Install</b></a> · <a href="#models">Models</a> · <a href="#lora-adapters">LoRA adapters</a> · <a href="#run-the-server">Server</a> ·
   <a href="#coding-agents">Coding agents</a> · <a href="#monitor">Monitor</a> · <a href="#performance">Performance</a> · <a href="#build-from-source">Build from source</a>
 </p>
 
@@ -21,12 +21,24 @@
   <br><sub><code>saetta start claude</code> on an M5 Max: Claude Code, running on the local model, writes a snake game and checks it. Real time, no cloud.</sub>
 </p>
 
-**One model, one machine, no compromises.** saetta does not try to run everything everywhere. It runs Qwen3.8-Flash-Next on an Apple M5 Max with 128 GB, and every kernel is written for that pair: long shared-prefix prompts (20K to 200K tokens), short answers and XML tool calls, served through an OpenAI-compatible API.
+> [!IMPORTANT]
+> **New in 0.8.0: Qwen3.8-27B with LoRA adapters, and the pi agent adapter in one command.**
+> The same `saetta` binary now also runs the dense [Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B), and applies LoRA adapters at run time with vLLM's flags (`--lora-modules`). First up: harness-hub's [**Qwen3.8-27B-pi-adapted**](https://huggingface.co/harness-hub/Qwen3.8-27B-pi-adapted), trained with RL to drive the [pi](https://pi.dev) coding agent. Its card reports SWE-bench Pro (hard 51) 39.2% to 64.7% and Terminal-Bench 2.1 39.5% to 55.8% with thinking off, at about 4.5x fewer tokens than thinking (harness-hub's numbers, not measured here).
+>
+> ```sh
+> saetta download 27b-8bit && saetta download 27b-pi
+> saetta start pi --pack 27b-8bit --lora qwen3.8-pi=harness-hub/Qwen3.8-27B-pi-adapted
+> ```
+>
+> See [Qwen3.8-27B](#qwen38-27b) and [LoRA adapters](#lora-adapters).
 
-- **Fast prompt reading:** about 1,650 to 1,950 tokens/s from 4K to 70K tokens, on the GPU's neural accelerators.
-- **Fast answers:** 63 to 82 tokens/s, with speculative decoding from the model's own MTP head, also when the agent samples; edits that repeat code go faster.
+**Two models, one machine, no compromises.** saetta does not try to run everything everywhere. It runs Qwen3.8-Flash-Next and Qwen3.8-27B on an Apple M5 Max with 128 GB, and every kernel is written for that machine: long shared-prefix prompts (20K to 200K tokens), short answers and XML tool calls, served through an OpenAI-compatible API. Each model's code is compiled for its exact shapes; one binary holds both.
+
+- **Fast prompt reading:** about 1,650 to 1,950 tokens/s from 4K to 70K tokens on Flash-Next, on the GPU's neural accelerators.
+- **Fast answers:** 63 to 82 tokens/s on Flash-Next, with speculative decoding from the model's own MTP head, also when the agent samples; edits that repeat code go faster.
 - **Agent turns that do not re-read:** a prompt that extends the previous one reads only its new tokens (a follow-up turn on a 16K conversation answers in 0.2 s), several agent sessions keep their own conversations, and a new session reuses the prefix it shares with the others.
-- **Checked:** every layer is checked against a numpy reference of the model, and speculation keeps the model's own choices (greedy output matches decoding without it up to rounding at near ties).
+- **Checked:** every layer of both models (and the LoRA path) is checked against a numpy reference, and speculation keeps the model's own choices (greedy output matches decoding without it up to rounding at near ties).
+- **LoRA adapters:** PEFT adapters on Qwen3.8-27B, applied per request next to the base model, with prompt caches kept per adapter; or merged into a pack ahead of time.
 - **One command to code:** `saetta start claude` (or `pi`, `opencode`) starts the server and your coding agent together. Claude Code connects through saetta's Anthropic-compatible API.
 - **See it work:** `saetta monitor` shows the model's state, speed, GPU, memory and prompt-cache reuse live, like btop.
 - **Small:** one binary that also downloads the model, no Python, no runtime dependencies beyond macOS.

@@ -39,6 +39,8 @@
 #define FF CONFIG_MOE_INTERMEDIATE_SIZE
 #define HC CONFIG_HC_MULT
 
+#define DSV4_DEFAULT_CACHE 80000000000ull
+
 static const uint32_t dsv4_eos[1] = {(uint32_t)CONFIG_EOS_TOKEN_ID};
 
 // ---- pack check -------------------------------------------------------------------------
@@ -507,7 +509,9 @@ Err model_load(Arena *a, const Pack *pack, Gpu *g, Model **out) {
         free(fb);
         dbg("model: SAETTA_DSV4_FORCE: layer inputs from %s for the first %zu positions\n", fp, m->force_n);
     }
-    // the expert cache: SAETTA_EXPERT_CACHE_GB, else the largest that fits less a margin
+    // the expert cache: SAETTA_EXPERT_CACHE_GB, else the largest that fits less a margin, at
+    // most DSV4_DEFAULT_CACHE: a cache close to the whole working set pushes the resident weights
+    // and the rest of the system out of memory (a 110 GiB cache swapped on a 128 GB machine)
     uint64_t keep = 0;
     Str k;
     void *v;
@@ -517,8 +521,9 @@ Err model_load(Arena *a, const Pack *pack, Gpu *g, Model **out) {
     if (!xbytes) {
         const uint64_t margin = 4000000000ull;
         xbytes = xs_fit_bytes(g, keep, margin);
-        dbg("model: SAETTA_EXPERT_CACHE_GB unset: expert cache of %.1f GB, the largest that fits next to %.1f GB "
-            "resident, less %.1f GB\n",
+        if (xbytes > DSV4_DEFAULT_CACHE) xbytes = DSV4_DEFAULT_CACHE;
+        dbg("model: SAETTA_EXPERT_CACHE_GB unset: expert cache of %.1f GB (at most 80, and what fits next to %.1f GB "
+            "resident, less %.1f GB)\n",
             (double)xbytes / 1e9, (double)keep / 1e9, (double)margin / 1e9);
     }
     TRY(xs_fits(g, xbytes, keep));

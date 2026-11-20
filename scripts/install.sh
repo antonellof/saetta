@@ -2,7 +2,8 @@
 # saetta installer. Downloads the release binary for Apple Silicon, checks its SHA-256
 # and installs it into $SAETTA_PREFIX/bin (default ~/.local).
 #   curl -fsSL https://github.com/antonellof/saetta/releases/latest/download/install.sh | sh
-# SAETTA_VERSION=0.7.2 pins a release (default: the latest).
+# SAETTA_VERSION=0.8.0 pins a release (default: the latest). With saetta already installed by
+# Homebrew it stops (brew upgrade saetta keeps one copy); SAETTA_FORCE=1 installs anyway.
 set -eu
 REPO=antonellof/saetta
 ASSET=saetta-macos-arm64.tar.gz
@@ -23,6 +24,11 @@ fi
 mem=$(( $(sysctl -n hw.memsize) / 1073741824 ))
 [ "$mem" -ge 128 ] || say "warning: built for 128 GB of memory, this Mac has $mem GB; the model may not fit."
 
+# one copy: a Homebrew install is upgraded by Homebrew
+if [ -z "${SAETTA_FORCE:-}" ] && command -v brew >/dev/null 2>&1 && brew list --formula saetta >/dev/null 2>&1; then
+  die "saetta is installed with Homebrew: upgrade it with  brew upgrade saetta  (SAETTA_FORCE=1 installs a second copy)."
+fi
+
 if [ "$VERSION" = latest ]; then base="https://github.com/$REPO/releases/latest/download"
 else base="https://github.com/$REPO/releases/download/v${VERSION#v}"; fi
 
@@ -42,6 +48,15 @@ say "installed $("$PREFIX/bin/saetta" version) into $PREFIX/bin"
 case ":$PATH:" in *":$PREFIX/bin:"*) ;; *)
   say "add it to your PATH:  echo 'export PATH=\"$PREFIX/bin:\$PATH\"' >> ~/.zshrc && exec zsh" ;;
 esac
+# another saetta on the PATH: name it, and say when it runs instead of this one
+first=$(command -v saetta 2>/dev/null || true)
+for other in $(which -a saetta 2>/dev/null | sort -u); do
+  [ "$other" = "$PREFIX/bin/saetta" ] && continue
+  say "warning: another saetta is installed at $other ($("$other" version 2>/dev/null || echo unknown version)); remove it to keep one copy."
+done
+if [ -n "$first" ] && [ "$first" != "$PREFIX/bin/saetta" ]; then
+  say "warning: \`saetta\` runs $first, which comes first in your PATH."
+fi
 cat <<MSG
 
 Next:

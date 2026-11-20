@@ -324,6 +324,13 @@ static Err run_quiet(const char *const *argv, bool *success) {
 }
 
 static Err update_in(Arena *a, FILE *out, const char *current, int *code, Got *latest, Got *tgz, Got *sum) {
+    // a Homebrew install is Homebrew's to replace (its Cellar, its links)
+    char *self;
+    if (!exe_path(a, &self) && strstr(self, "/Cellar/saetta/") != NULL) {
+        fprintf(out, "saetta update: installed with Homebrew (%s); run: brew upgrade saetta\n", self);
+        *code = 1;
+        return OK;
+    }
     // the latest release tag, from the GitHub API
     TRY(get("https://api.github.com/repos/" REPO "/releases/latest", latest));
     if (latest->status != 200) {

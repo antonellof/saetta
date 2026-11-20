@@ -1,7 +1,10 @@
-# saetta: C engine with Metal kernels. `make` builds $(BUILD)/bin/saetta.
+# saetta: C engine with Metal kernels. One build per model: `make` builds
+# $(BUILD)/bin/saetta (Qwen3.8-Flash-Next) and $(BUILD)/bin/saetta-27b (Qwen3.8-27B);
+# MODEL=27b selects the 27B build for verify and test. Each binary hands a pack of the other
+# architecture to its sibling.
 CC      := clang
 BUILD   ?= build
-GOLDEN  ?= tests/golden
+MODEL   ?= flash
 
 CFLAGS  := -std=c23 -O3 -ffp-contract=off -mcpu=native -mmacosx-version-min=27.2 \
            -Wall -Wextra -Wno-unused-parameter
@@ -10,7 +13,19 @@ DEPFLAGS = -MMD -MP
 LDFLAGS := -mmacosx-version-min=27.2
 LDLIBS  := -framework Metal -framework Foundation -framework Accelerate -lpthread
 
+ifeq ($(MODEL),27b)
+CFLAGS  += -DSAETTA_27B
+OBJCFLAGS += -DSAETTA_27B
+OBJ  := $(BUILD)/obj-27b
+BIN  := $(BUILD)/bin/saetta-27b
+GOLDEN ?= tests/golden-27b-4bit
+else ifeq ($(MODEL),flash)
 OBJ  := $(BUILD)/obj
+BIN  := $(BUILD)/bin/saetta
+GOLDEN ?= tests/golden
+else
+$(error MODEL must be flash or 27b)
+endif
 SRCS := $(wildcard src/*.c)
 OBJS := $(SRCS:src/%.c=$(OBJ)/%.o) $(OBJ)/metal/shim.o
 TEST_SRCS := $(wildcard src/test/*.c)
@@ -20,13 +35,16 @@ LIB_OBJS  := $(filter-out $(OBJ)/main.o,$(OBJS))
 .PHONY: all test verify bench clean
 .DELETE_ON_ERROR:
 
-all: $(BUILD)/bin/saetta
+all: $(BIN)
+ifeq ($(MODEL),flash)
+	@$(MAKE) --no-print-directory MODEL=27b $(BUILD)/bin/saetta-27b
+endif
 
-$(BUILD)/bin/saetta: $(OBJS)
+$(BIN): $(OBJS)
 	@mkdir -p $(@D)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
-$(BUILD)/bin/saetta-test: $(LIB_OBJS) $(TEST_OBJS)
+$(BUILD)/bin/saetta-test$(if $(filter 27b,$(MODEL)),-27b): $(LIB_OBJS) $(TEST_OBJS)
 	@mkdir -p $(@D)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
@@ -41,14 +59,15 @@ $(OBJ)/metal/shim.o: src/metal/shim.m
 
 # Runs every test, or those whose name contains T (make test T=json). SAETTA_PACK passes
 # through the environment.
-test: $(BUILD)/bin/saetta-test
-	$(BUILD)/bin/saetta-test $(T)
+TEST_BIN := $(BUILD)/bin/saetta-test$(if $(filter 27b,$(MODEL)),-27b)
+test: $(TEST_BIN)
+	$(TEST_BIN) $(T)
 
-verify: $(BUILD)/bin/saetta
-	$(BUILD)/bin/saetta verify $(GOLDEN)
+verify: $(BIN)
+	$(BIN) verify $(GOLDEN)
 
-bench: $(BUILD)/bin/saetta
-	$(BUILD)/bin/saetta qgen-bench
+bench: $(BIN)
+	$(BIN) qgen-bench
 
 clean:
 	rm -rf $(BUILD)

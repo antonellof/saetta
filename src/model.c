@@ -1,5 +1,6 @@
-// Qwen3.8-Flash-Next forward pass (see model.h).
+// Qwen3.8-Flash-Next forward pass (see model.h). Empty in the 27B build (src/dense.c).
 #include "model.h"
+#if !CONFIG_ARCH_27B
 
 #include <math.h>
 #include <pthread.h>
@@ -2403,6 +2404,26 @@ Err session_new_conv(const Session *s, Gpu *g, size_t cap, Conv *out) {
     return OK;
 }
 
+Err session_conv_shrink(const Session *s, Gpu *g, Conv *cv, size_t cap) {
+    Conv small;
+    TRY(session_new_conv(s, g, cap, &small));
+    sx_buffer_release(cv->kv);
+    sx_buffer_release(cv->ixk);
+    sx_buffer_release(cv->bk);
+    cv->cap = small.cap;
+    cv->kv = small.kv;
+    cv->ixk = small.ixk;
+    cv->bk = small.bk;
+    for (int k = 0; k < 2; k++) {
+        sx_buffer_release(small.ck[k].gdn);
+        sx_buffer_release(small.ck[k].conv);
+        sx_buffer_release(small.ck[k].ple);
+    }
+    for (int k = 0; k < 2; k++) cv->ck[k].tokens.len = 0;
+    cv->ptoks.len = 0;
+    return OK;
+}
+
 #define SWAP(T, a, b) do { T t_ = (a); (a) = (b); (b) = t_; } while (0)
 
 void session_swap_conv(Session *s, Conv *cv) {
@@ -2754,3 +2775,29 @@ static void dequant_row(const Pack *pack, const Linear *l, size_t r, float *out)
         out[i] = (float)q * sc + bi;
     }
 }
+
+// ---- LoRA (27B only, docs/dense-lora.md) -------------------------------------------------------
+
+Err model_lora_load(Arena *a, Model *m, const char *name, const char *dir) {
+    (void)a, (void)m, (void)name, (void)dir;
+    return "LoraUnsupported";
+}
+int model_lora_find(const Model *m, const char *name) {
+    (void)m, (void)name;
+    return -1;
+}
+void model_lora_select(Model *m, int idx) { (void)m, (void)idx; }
+int model_lora_selected(const Model *m) {
+    (void)m;
+    return -1;
+}
+size_t model_lora_count(const Model *m) {
+    (void)m;
+    return 0;
+}
+const char *model_lora_name(const Model *m, size_t i) {
+    (void)m, (void)i;
+    return NULL;
+}
+
+#endif // !CONFIG_ARCH_27B

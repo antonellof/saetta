@@ -12,8 +12,12 @@
 //   saetta update                            install the latest release over this binary
 //   saetta version                           print the version
 #include <signal.h>
+#include <errno.h>
+#include <limits.h>
+#include <mach-o/dyld.h>
 #include <math.h>
 #include <stdlib.h>
+#include <unistd.h>
 
 #include "base.h"
 #include "chat.h"
@@ -137,6 +141,12 @@ static Err generate_in(Arena *arena, Pack *pack, Gpu *g, const char *dir, size_t
     dbg("generate: warm %llu ms\n", (unsigned long long)((now_ns() - tw) / 1000000));
     Model *m = ARENA_NEW(arena, Model);
     TRY(model_load(arena, pack, g, m));
+    // SAETTA_LORA=<adapter dir>: apply a LoRA adapter (27B build)
+    const char *lora = getenv("SAETTA_LORA");
+    if (lora && *lora) {
+        TRY(model_lora_load(arena, m, "lora", lora));
+        model_lora_select(m, 0);
+    }
     Session *s;
     TRY(session_create(g, &s));
     float *logits;
@@ -296,6 +306,30 @@ static void add_lin(VecExpect *b, Arena *a, size_t l, const char *name, uint64_t
     vec_push(b, ((Expect){arena_printf(a, "%slayers.%zu.%s", WEIGHTS_PREFIX, l, name), o, i}));
 }
 
+#if CONFIG_ARCH_27B
+static void expected_linears(VecExpect *buf, Arena *a, size_t layer) {
+    const uint64_t h = CONFIG_HIDDEN_SIZE;
+    if (config_layer_kinds[layer] == LAYER_KIND_GDN) {
+        const uint64_t kd = CONFIG_LINEAR_NUM_KEY_HEADS * CONFIG_LINEAR_KEY_HEAD_DIM;
+        const uint64_t vd = CONFIG_LINEAR_NUM_VALUE_HEADS * CONFIG_LINEAR_VALUE_HEAD_DIM;
+        add_lin(buf, a, layer, "linear_attn.in_proj_qkv", 2 * kd + vd, h);
+        add_lin(buf, a, layer, "linear_attn.in_proj_z", vd, h);
+        add_lin(buf, a, layer, "linear_attn.in_proj_a", CONFIG_LINEAR_NUM_VALUE_HEADS, h);
+        add_lin(buf, a, layer, "linear_attn.in_proj_b", CONFIG_LINEAR_NUM_VALUE_HEADS, h);
+        add_lin(buf, a, layer, "linear_attn.out_proj", h, vd);
+    } else {
+        const uint64_t qd = CONFIG_NUM_ATTENTION_HEADS * CONFIG_HEAD_DIM;
+        const uint64_t kvd = CONFIG_NUM_KEY_VALUE_HEADS * CONFIG_HEAD_DIM;
+        add_lin(buf, a, layer, "self_attn.q_proj", 2 * qd, h);
+        add_lin(buf, a, layer, "self_attn.k_proj", kvd, h);
+        add_lin(buf, a, layer, "self_attn.v_proj", kvd, h);
+        add_lin(buf, a, layer, "self_attn.o_proj", h, qd);
+    }
+    add_lin(buf, a, layer, "mlp.gate_proj", CONFIG_INTERMEDIATE_SIZE, h);
+    add_lin(buf, a, layer, "mlp.up_proj", CONFIG_INTERMEDIATE_SIZE, h);
+    add_lin(buf, a, layer, "mlp.down_proj", h, CONFIG_INTERMEDIATE_SIZE);
+}
+#else
 static void expected_linears(VecExpect *buf, Arena *a, size_t layer) {
     const uint64_t h = CONFIG_HIDDEN_SIZE;
     const uint64_t hcw = CONFIG_HC_COUNT * h;
@@ -337,6 +371,7 @@ static void expected_linears(VecExpect *buf, Arena *a, size_t layer) {
             add_lin(buf, a, layer, "ple.value_proj", h, h);
         }
 }
+#endif
 
 static Err gpu_self_test(sx_device *dev, FILE *out) {
     const char *src = "#include <metal_stdlib>\n"
@@ -379,9 +414,14 @@ out:
 }
 
 static Err info(Arena *arena, FILE *out, const char *dir) {
+#if CONFIG_ARCH_27B
+    fprintf(out, "model: %s (%s), %zu layers, hidden %zu, dense MLP %zu\n", dir, CONFIG_MODEL_TYPE,
+            CONFIG_NUM_HIDDEN_LAYERS, CONFIG_HIDDEN_SIZE, CONFIG_INTERMEDIATE_SIZE);
+#else
     fprintf(out, "model: %s (%s), %zu layers, hidden %zu, %zu experts top-%zu, quant %s %u-bit group %u\n", dir,
             CONFIG_MODEL_TYPE, CONFIG_NUM_HIDDEN_LAYERS, CONFIG_HIDDEN_SIZE, CONFIG_NUM_EXPERTS, CONFIG_NUM_EXPERTS_PER_TOK,
             CONFIG_QUANT_MODE, CONFIG_QUANT_BITS, CONFIG_QUANT_GROUP_SIZE);
+#endif
     Pack pack;
     TRY(pack_open(arena, dir, &pack));
     uint64_t per_dtype[DTYPE_COUNT] = {0};
@@ -548,7 +588,65 @@ static Err mv_bench(Arena *arena, FILE *out, const char *dir) {
 
 // ---- commands ----------------------------------------------------------------------------------
 
+// ---- one build per model --------------------------------------------------------------------
+
+// The text model_type of the pack at dir (config.json text_config.model_type, else
+// model_type), or NULL when it cannot be read.
+static const char *pack_model_type(Arena *a, const char *dir) {
+    char *text;
+    size_t len;
+    if (read_file(path_join(a, dir, "config.json"), 4u << 20, &text, &len)) return NULL;
+    JValue *root;
+    Err e = json_parse(a, str_n(text, len), false, &root);
+    free(text);
+    if (e) return NULL;
+    const JValue *tc = json_get(root, "text_config");
+    const JValue *mt = tc ? json_get(tc, "model_type") : NULL;
+    if (!mt) mt = json_get(root, "model_type");
+    if (!mt || mt->kind != J_STRING) return NULL;
+    return arena_strndup(a, mt->s.ptr, mt->s.len);
+}
+
+// The pack a command reads (NULL for commands without one).
+static const char *command_pack(Arena *a, int argc, char **argv) {
+    if (argc < 2) return NULL;
+    const char *cmd = argv[1];
+    if (argc >= 3 && (!strcmp(cmd, "info") || !strcmp(cmd, "mv-bench") || !strcmp(cmd, "serve") ||
+                      !strcmp(cmd, "generate")))
+        return argv[2];
+    if (!strcmp(cmd, "verify")) return getenv("SAETTA_PACK");
+    (void)a;
+    return NULL;
+}
+
+// A pack of the other architecture runs in the sibling binary next to this one: saetta-27b for
+// Qwen3.8-27B (qwen3_5_text), saetta for Flash-Next. Returns only when this binary is the one.
+static void exec_sibling_for_pack(Arena *a, int argc, char **argv) {
+    const char *dir = command_pack(a, argc, argv);
+    if (!dir) return;
+    const char *mt = pack_model_type(a, dir);
+    if (!mt || !strcmp(mt, CONFIG_MODEL_TYPE)) return;
+    bool want27 = !strcmp(mt, "qwen3_5_text") || !strcmp(mt, "qwen3_5");
+    if (want27 == (bool)CONFIG_ARCH_27B) return;
+    char sym[4096], self[PATH_MAX];
+    uint32_t sz = sizeof sym;
+    if (_NSGetExecutablePath(sym, &sz) != 0) die("saetta: executable path too long\n");
+    // the real file: a link (Homebrew's bin/saetta) has no sibling next to it
+    if (!realpath(sym, self)) die("saetta: %s: %s\n", sym, err_errno(errno));
+    size_t n = strlen(self);
+    const char *sib;
+    if (CONFIG_ARCH_27B) {
+        if (n < 4 || strcmp(self + n - 4, "-27b") != 0) die("saetta: %s is a %s pack; run it with saetta\n", dir, mt);
+        sib = arena_strndup(a, self, n - 4);
+    } else
+        sib = arena_printf(a, "%s-27b", self);
+    if (access(sib, X_OK) != 0) die("saetta: %s is a %s pack, which needs %s (not found)\n", dir, mt, sib);
+    execv(sib, argv);
+    die("saetta: cannot run %s: %s\n", sib, err_errno(errno));
+}
+
 static Err run(Arena *arena, int argc, char **argv) {
+    exec_sibling_for_pack(arena, argc, argv);
     FILE *out = stdout;
     const char *const *rest = (const char *const *)argv + 2;
     size_t nrest = argc >= 2 ? (size_t)argc - 2 : 0;
@@ -642,7 +740,9 @@ static Err run(Arena *arena, int argc, char **argv) {
         if (!pack) {
             const char *home = getenv("HOME");
             if (!home) return "NoHome";
-            pack = path_join(arena, home, "Models/mlx-community/Qwen3.8-Flash-Next-4bit-mtp");
+            pack = path_join(arena, home,
+                             CONFIG_ARCH_27B ? "Models/mlx-community/Qwen3.8-27B-4bit"
+                                             : "Models/mlx-community/Qwen3.8-Flash-Next-4bit-mtp");
         }
         bool ok;
         TRY(verify_run(arena, out, pack, golden, &ok));

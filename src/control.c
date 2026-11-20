@@ -383,8 +383,16 @@ static Err update_in(Arena *a, FILE *out, const char *current, int *code, Got *l
         e = "UnpackFailed";
         goto out;
     }
+    // both builds (saetta, saetta-27b), whichever of them runs the update
+    size_t el = strlen(exe);
+    char *self = (el > 4 && !strcmp(exe + el - 4, "-27b")) ? arena_strndup(a, exe, el - 4) : exe;
     char *newbin = arena_printf(a, "%s/saetta-%s/bin/saetta", tmp, ver);
-    if (rename(newbin, exe) != 0) {
+    if (rename(newbin, self) != 0) {
+        e = err_errno(errno);
+        goto out;
+    }
+    char *new27 = arena_printf(a, "%s/saetta-%s/bin/saetta-27b", tmp, ver);
+    if (access(new27, F_OK) == 0 && rename(new27, arena_printf(a, "%s-27b", self)) != 0) {
         e = err_errno(errno);
         goto out;
     }

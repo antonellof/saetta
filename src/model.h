@@ -1,4 +1,5 @@
-// Qwen3.8-Flash-Next forward pass, one token per step.
+// Forward pass, one token per step: Qwen3.8-Flash-Next (src/model.c) or, in the 27B build
+// (CONFIG_ARCH_27B), Qwen3.8-27B (src/dense.c, internals in src/dense.h). Below: Flash-Next.
 // The whole token is one serial Metal command buffer: quantized matvecs
 // (src/kernels/qmatvec.metal) and the small ops (src/kernels/decode.metal) run on the
 // GPU in order. The host writes only what it knows before encoding: the embedding row,
@@ -22,8 +23,6 @@
 #include "safetensors.h"
 #include "weights.h"
 
-// Width of the hyper-connection streams: hc_count x hidden_size (10240).
-#define HCW (CONFIG_HC_COUNT * CONFIG_HIDDEN_SIZE)
 // Prefill chunk: tokens per pass.
 #define CH 4096
 // Most tokens a speculative verification chunk carries (the drafted ones plus the last).
@@ -32,12 +31,21 @@
 #define PT_EVERY 4096
 #define PT_MAX 8
 
-// n-gram heads of the PLE layer (16), and chunks of at most MODEL_SMALL tokens use the
-// decode-style kernels.
-#define MODEL_NG_HEADS ((CONFIG_NGRAM_SIZE - 1) * CONFIG_HEADS_PER_NGRAM)
+// Chunks of at most MODEL_SMALL tokens use the decode-style kernels.
 #define MODEL_SMALL 8
 
-// ---- internals ---------------------------------------------------------------------------
+#define SESSION_NO_ROLL ((size_t)-1)
+
+#if CONFIG_ARCH_27B
+// Qwen3.8-27B internals (src/dense.c).
+#include "dense.h"
+#else
+// ---- internals (Flash-Next, src/model.c) ---------------------------------------------------
+
+// Width of the hyper-connection streams: hc_count x hidden_size (10240).
+#define HCW (CONFIG_HC_COUNT * CONFIG_HIDDEN_SIZE)
+// n-gram heads of the PLE layer (16).
+#define MODEL_NG_HEADS ((CONFIG_NGRAM_SIZE - 1) * CONFIG_HEADS_PER_NGRAM)
 
 // An f32 parameter (norm weight, conv weight, ...) in the GPU parameter buffer: float offset
 // off, n values at s.
@@ -243,8 +251,6 @@ typedef struct {
     VecU32 ptoks;
 } Conv;
 
-#define SESSION_NO_ROLL ((size_t)-1)
-
 // Per-session state, in GPU buffers.
 struct Session {
     size_t pos;
@@ -302,6 +308,7 @@ struct Session {
     // in the speculation slots until the next chunk (session_roll_to).
     size_t chunk_pos0, chunk_t;
 };
+#endif // CONFIG_ARCH_27B
 
 // ---- Model -------------------------------------------------------------------------------
 
@@ -367,6 +374,21 @@ Err model_spec_verify(Model *m, Session *s, uint32_t x, const uint32_t *drafts, 
 // the head's own stream and the previous draft. *nd gets the number of drafts (0 without a head).
 Err model_draft_mtp(Model *m, Session *s, uint32_t x, size_t k, uint32_t *out, size_t *nd);
 
+// LoRA adapters applied at run time (27B build; the Flash-Next build returns
+// "LoraUnsupported"). model_lora_load reads a PEFT adapter directory (adapter_config.json,
+// adapter_model.safetensors) as adapter `name`. Errors: "LoraUnsupported", "TooManyAdapters",
+// "BadAdapterConfig", "LoraTargetUnsupported", "LoraShapeMismatch", "LoraUnmatchedTensor",
+// "MapFailed", safetensors_parse errors, "AllocFailed".
+Err model_lora_load(Arena *a, Model *m, const char *name, const char *dir);
+// Index of the adapter called name, or -1.
+int model_lora_find(const Model *m, const char *name);
+// The adapter the following passes apply: an index from model_lora_find, or -1 for none.
+void model_lora_select(Model *m, int idx);
+// The selected adapter (-1: none), the count and the names of the loaded ones.
+int model_lora_selected(const Model *m);
+size_t model_lora_count(const Model *m);
+const char *model_lora_name(const Model *m, size_t i);
+
 // Index of the first largest value of v[0..n) (as a scalar `x > best` scan), vectorized.
 uint32_t model_argmax(const float *v, size_t n);
 
@@ -414,6 +436,9 @@ Reusable session_reusable_in(const Ckpt ck[2], const uint32_t *prompt, size_t n)
 size_t session_conv_bytes(const Session *s, size_t cap);
 // Allocates the buffers of another conversation at capacity cap, empty. Errors: "AllocFailed".
 Err session_new_conv(const Session *s, Gpu *g, size_t cap, Conv *out);
+// Empties held conversation cv: its buffers reallocated at capacity cap, its restore points and
+// prefix tokens dropped. Errors: "AllocFailed" (cv unchanged).
+Err session_conv_shrink(const Session *s, Gpu *g, Conv *cv, size_t cap);
 // Swaps the session's conversation with cv (between requests only).
 void session_swap_conv(Session *s, Conv *cv);
 

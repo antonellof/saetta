@@ -1,4 +1,5 @@
-// `saetta download [coder|full|all]`: fetches a model pack from Hugging Face at its pinned
+// `saetta download [coder|full|all|27b-8bit|27b-4bit|27b-pi]`: fetches a model pack (or the pi
+// LoRA adapter for Qwen3.8-27B) from Hugging Face at its pinned
 // revision into $SAETTA_MODELS (default ~/Models) as <org>/<repo>, so other apps can share
 // the files. Lists the revision's files through the Hub's tree API, downloads several at a
 // time, resumes partial files (`<name>.part`, HTTP Range), and checks each file against the
@@ -19,8 +20,10 @@ typedef struct {
     const char *note;
 } DownloadPack;
 
-#define DOWNLOAD_NPACKS 2
-extern const DownloadPack download_packs[DOWNLOAD_NPACKS]; // coder, full
+#define DOWNLOAD_NPACKS 5
+// The first DOWNLOAD_NFLASH are the Flash-Next packs ("all", and saetta start's default).
+#define DOWNLOAD_NFLASH 2
+extern const DownloadPack download_packs[DOWNLOAD_NPACKS]; // coder, full, 27b-8bit, 27b-4bit, 27b-pi
 
 // The pack named `name`, or NULL.
 const DownloadPack *download_find(const char *name);

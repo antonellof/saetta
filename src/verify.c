@@ -203,6 +203,17 @@ Err verify_run(Arena *a, FILE *out, const char *pack_dir, const char *golden, bo
     } while (0)
     Model *m = ARENA_NEW(a, Model);
     FAIL_CLOSE(model_load(a, &pack, &g, m));
+    // a golden made with a LoRA adapter (tools/ref27.py --lora): the same adapter, from
+    // $SAETTA_LORA or the manifest's path
+    const JValue *lora = json_get(man, "lora");
+    if (lora && lora->kind == J_OBJECT) {
+        const char *dir = getenv("SAETTA_LORA");
+        if (!dir) dir = json_str(json_get(lora, "path"));
+        if (!dir) FAIL_CLOSE("GoldenLoraPath");
+        FAIL_CLOSE(model_lora_load(a, m, "golden", dir));
+        model_lora_select(m, 0);
+        fprintf(out, "lora: %s\n", dir);
+    }
     Session *s;
     FAIL_CLOSE(session_create_kv(&g, false, &s)); // exact checks: f32 KV cache
     float *trace = ARENA_ARRAY(a, float, layers * width);

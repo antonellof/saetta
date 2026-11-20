@@ -20,6 +20,9 @@
 const DownloadPack download_packs[DOWNLOAD_NPACKS] = {
     {.name = "coder", .repo = "mbrown-uno/Qwen3.8-Flash-Next-GSQ-RCO-Coder-MLX", .rev = "50fa68c5e9cebf53276d8eae8af594fa8b3de9e4", .note = "256 experts, pruned for code, 76 GB"},
     {.name = "full", .repo = "mlx-community/Qwen3.8-Flash-Next-4bit-mtp", .rev = "825df623302aeebc434f44ca9122827b04f9a0f1", .note = "512 experts, the original model, 105 GB"},
+    {.name = "27b-8bit", .repo = "mlx-community/Qwen3.8-27B-8bit", .rev = "1159008f24a3f97d7afd366fcfee9a79f3bd2b94", .note = "Qwen3.8-27B dense, 8-bit, 29 GB (for LoRA adapters)"},
+    {.name = "27b-4bit", .repo = "mlx-community/Qwen3.8-27B-4bit", .rev = "b935172e4bb5dcd0543774a34748fb92422e3027", .note = "Qwen3.8-27B dense, 4-bit, 16 GB"},
+    {.name = "27b-pi", .repo = "harness-hub/Qwen3.8-27B-pi-adapted", .rev = "80d05c9051dfd2ae464e1daf4329cb15524caf60", .note = "LoRA adapter for the pi agent on Qwen3.8-27B, 0.6 GB"},
 };
 
 // Idle timeout of a transfer (between bytes); a stalled connection fails and is retried.
@@ -51,7 +54,8 @@ Err download_pack_dir(Arena *a, const DownloadPack *p, char **out) {
 }
 
 const char *download_usage(void) {
-    return "usage: saetta download [coder|full|all] [--jobs N]   (default coder; into $SAETTA_MODELS, default ~/Models)\n";
+    return "usage: saetta download [coder|full|all|27b-8bit|27b-4bit|27b-pi] [--jobs N]   (default coder; all = coder and "
+           "full; into $SAETTA_MODELS, default ~/Models)\n";
 }
 
 typedef struct {
@@ -493,7 +497,7 @@ static Err run_in(Arena *a, const char *const *args, size_t n) {
     }
     const char *token = hf_token(a);
     if (strcmp(which, "all") == 0) {
-        for (size_t i = 0; i < DOWNLOAD_NPACKS; i++) TRY(one(a, &download_packs[i], token, jobs));
+        for (size_t i = 0; i < DOWNLOAD_NFLASH; i++) TRY(one(a, &download_packs[i], token, jobs));
         return OK;
     }
     const DownloadPack *p = download_find(which);

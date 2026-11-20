@@ -105,7 +105,7 @@ static Err pack_for(Arena *a, const char *arg, const char **out) {
         dbg("saetta: no model at %s; download it with: saetta download %s\n", dir, pk ? arg : "coder");
         return OK;
     }
-    for (size_t i = 0; i < DOWNLOAD_NPACKS; i++) {
+    for (size_t i = 0; i < DOWNLOAD_NFLASH; i++) {
         char *dir;
         TRY(download_pack_dir(a, &download_packs[i], &dir));
         if (has_config(a, dir)) {

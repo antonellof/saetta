@@ -78,6 +78,22 @@ Two MLX packs of Qwen3.8-Flash-Next run on the same binary. `saetta download cod
 
 Weights are under the Qwen Community License 1.0 and are not part of this repository.
 
+### Qwen3.8-27B
+
+The dense Qwen3.8-27B runs in a second build, `saetta-27b`, installed next to `saetta`: give `saetta` a 27B pack and it hands it over, so the commands are the same. It reads LoRA adapters too (see [LoRA adapters](#lora-adapters)).
+
+| pack | `saetta download` | folder under `~/Models` | on disk |
+|---|---|---|---|
+| 8-bit · recommended with adapters | `27b-8bit` | `mlx-community/Qwen3.8-27B-8bit` | 29 GB |
+| 4-bit | `27b-4bit` | `mlx-community/Qwen3.8-27B-4bit` | 16 GB |
+| pi adapter (LoRA, r 32) | `27b-pi` | `harness-hub/Qwen3.8-27B-pi-adapted` | 0.6 GB |
+
+Qwen3.8-27B weights and the pi adapter (harness-hub/Qwen3.8-27B-pi-adapted, card metadata) are under Apache-2.0.
+
+### LoRA adapters
+
+`SAETTA_LORA=<adapter folder>` applies a PEFT LoRA adapter (`adapter_config.json`, `adapter_model.safetensors`) to `saetta generate` on a 27B pack. Supported: LoRA on the attention and MLP projections, any rank that is a multiple of 8 up to 128, rsLoRA; not DoRA, biases or saved modules. Flash-Next packs take no adapters.
+
 ## Run the server
 
 `saetta start` runs it for you (see [Coding agents](#coding-agents)). To run it by hand:
@@ -210,6 +226,7 @@ Prompt reading 1,650 to 1,820 tokens/s (full) and 1,700 to 1,950 (Coder); answer
 
 ```sh
 saetta download coder|full|all          # fetch a pack (pinned revision, resumable, hash-checked)
+saetta download 27b-8bit|27b-4bit|27b-pi  # Qwen3.8-27B packs and the pi LoRA adapter
 saetta start claude|pi|opencode         # a coding agent on saetta (starts the server)
 saetta monitor                          # live view of the server, GPU, memory, prompt cache
 saetta status | stop                    # show or stop the server on this machine
@@ -231,19 +248,19 @@ saetta version
 
 ```sh
 git clone https://github.com/antonellof/saetta.git && cd saetta
-make                                # ./build/bin/saetta
+make                                # ./build/bin/saetta and ./build/bin/saetta-27b
 ./build/bin/saetta download coder   # or full, or all
 ```
 
-`make test` runs the unit tests (kernels against scalar references; `SAETTA_PACK=<pack>` for the tests that read real tensors).
+`make test` runs the unit tests (kernels against scalar references; `SAETTA_PACK=<pack>` for the tests that read real tensors); `make MODEL=27b test` runs them in the 27B build.
 
 | path | what |
 |---|---|
-| `src/` | the engine in C23: `model.c` forward pass, `kernels/` Metal, `server.c` API, `tokenizer.c`, `chat.c`, `toolcall.c`, `metal/shim.*` |
+| `src/` | the engine in C23: `model.c` Flash-Next forward pass, `dense.c` Qwen3.8-27B forward pass, `lora.c` LoRA kernels, `kernels/` Metal, `server.c` API, `tokenizer.c`, `chat.c`, `toolcall.c`, `metal/shim.*` |
 | `scripts/` | curl installer |
 | `config/` | agent configurations: Claude Code, pi, opencode |
 | `docs/` | guides: [Claude Code](docs/claude-code.md), [opencode](docs/opencode.md) |
 
 ## License
 
-[MIT](LICENSE). Parts are adapted from the MIT-licensed engines sushi, qwental and Strata; each adapted file names its source in its header, and their notices are in [LICENSE](LICENSE). Qwen3.8-Flash-Next weights are under the Qwen Community License 1.0.
+[MIT](LICENSE). Parts are adapted from the MIT-licensed engines sushi, qwental and Strata; each adapted file names its source in its header, and their notices are in [LICENSE](LICENSE). Qwen3.8-Flash-Next weights are under the Qwen Community License 1.0; Qwen3.8-27B weights under Apache-2.0.

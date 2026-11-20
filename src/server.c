@@ -215,22 +215,7 @@ static bool evict_one(Engine *e) {
     if (!found) return false;
     size_t i = pick;
     Conv *cv = &e->held[i];
-    Conv small;
-    if (session_new_conv(e->s, e->g, MIN(CAP0, e->s->max_cap), &small)) return false;
-    sx_buffer_release(cv->kv);
-    sx_buffer_release(cv->ixk);
-    sx_buffer_release(cv->bk);
-    cv->cap = small.cap;
-    cv->kv = small.kv;
-    cv->ixk = small.ixk;
-    cv->bk = small.bk;
-    for (int k = 0; k < 2; k++) {
-        sx_buffer_release(small.ck[k].gdn);
-        sx_buffer_release(small.ck[k].conv);
-        sx_buffer_release(small.ck[k].ple);
-    }
-    for (int k = 0; k < 2; k++) cv->ck[k].tokens.len = 0;
-    cv->ptoks.len = 0;
+    if (session_conv_shrink(e->s, e->g, cv, MIN(CAP0, e->s->max_cap))) return false;
     dbg("saetta: conversation %zu emptied to make room\n", i + 1);
     return true;
 }

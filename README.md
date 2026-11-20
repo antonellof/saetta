@@ -2,12 +2,12 @@
   <img src="docs/assets/saetta-banner.png" alt="saetta" width="900">
 </p>
 
-<h3 align="center">Qwen3.8-Flash-Next and Qwen3.8-27B at full speed on an M5 Max.</h3>
-<p align="center">An inference engine in C and hand-written Metal, tuned for coding agents, with LoRA adapters.</p>
+<h3 align="center">Qwen3.8-Flash-Next, Qwen3.8-27B and DeepSeek-V4-Flash on an M5 Max.</h3>
+<p align="center">An inference engine in C and hand-written Metal, tuned for coding agents.</p>
 
 <p align="center">
-  <a href="#install"><b>Install</b></a> · <a href="#models">Models</a> · <a href="#lora-adapters">LoRA adapters</a> · <a href="#coding-agents">Coding agents</a> ·
-  <a href="#run-the-server">Server</a> · <a href="#monitor">Monitor</a> · <a href="#performance">Performance</a> · <a href="#build-from-source">Build from source</a>
+  <a href="#install"><b>Install</b></a> · <a href="#models">Models</a> · <a href="#coding-agents">Coding agents</a> ·
+  <a href="#server">Server</a> · <a href="#performance">Performance</a> · <a href="#build-from-source">Build from source</a>
 </p>
 
 <p align="center">
@@ -16,82 +16,64 @@
   <img src="https://img.shields.io/badge/Apple%20Silicon-M5%20Max%20128%20GB-111" alt="Apple M5 Max 128 GB">
 </p>
 
-<p align="center">
-  <img src="docs/assets/demo.gif" width="900" alt="saetta start claude: Claude Code on saetta writes a snake game in Python, checks it, and the game runs">
-  <br><sub><code>saetta start claude</code> on an M5 Max: Claude Code, running on the local model, writes a snake game and checks it. Real time, no cloud.</sub>
-</p>
+saetta runs a few models on one machine, an Apple M5 Max with 128 GB, with every kernel written for it and for coding agents: long shared-prefix prompts (20K to 200K tokens), short answers, tool calls, through OpenAI- and Anthropic-compatible APIs.
 
-**Two models, one machine, no compromises.** saetta runs Qwen3.8-Flash-Next and Qwen3.8-27B on an Apple M5 Max with 128 GB, and nothing else: every kernel is written for that machine and for coding agents (long shared-prefix prompts of 20K to 200K tokens, short answers, XML tool calls), served through OpenAI- and Anthropic-compatible APIs.
-
-- **Fast:** on Flash-Next, prompts read at 1,650 to 1,950 tokens/s from 4K to 70K tokens and answers come at 63 to 82 tokens/s, with speculative decoding from the model's MTP head.
-- **Agent turns that do not re-read:** a prompt that extends the previous one reads only its new tokens (a follow-up turn on a 16K conversation answers in 0.2 s), and new sessions reuse the prefix they share with others.
-- **LoRA adapters** on Qwen3.8-27B, per request, next to the base model: for example the [pi agent adapter](#lora-adapters).
-- **One command to code:** `saetta start claude` (or `pi`, `opencode`) starts the server and the agent.
-- **Checked:** every layer of every model, and the LoRA path, against a numpy reference.
-- **Small:** one binary that also downloads the models; no Python, no dependencies beyond macOS.
-- **New, preview:** [DeepSeek-V4-Flash](#deepseek-v4-flash-preview) (284B, official FP4/FP8 checkpoint), with its routed experts streamed from the SSD into a GPU-side cache. It decodes and passes its checks; serving it to agents comes next.
+- **Fast:** Flash-Next reads prompts at 1,650 to 1,950 tokens/s and answers at 63 to 82 tokens/s, with speculative decoding.
+- **Follow-up turns read only what is new:** a second turn on a 16K conversation answers in 0.2 s.
+- **One command to code:** `saetta start claude` (or `pi`, `opencode`).
+- **LoRA adapters** on Qwen3.8-27B, per request.
+- **Bigger than memory:** DeepSeek-V4-Flash (preview) streams its experts from the SSD.
+- **Checked** layer by layer against numpy references; one binary, no Python.
 
 ## Install
 
 ```sh
 curl -fsSL https://github.com/antonellof/saetta/releases/latest/download/install.sh | sh   # into ~/.local/bin
-brew install antonellof/saetta/saetta                                                     # or with Homebrew
-```
-
-Keep one of the two: the installer stops if Homebrew already has saetta. Update with `saetta update` (curl install) or `brew upgrade saetta`. Then:
-
-```sh
 saetta download coder    # 76 GB into ~/Models, resumable, hash-checked
 saetta start claude      # or: saetta start pi, saetta start opencode
 ```
 
-Needs an Apple M5 Max with 128 GB and macOS 27.2 or later. `SAETTA_PREFIX` changes the install folder, `SAETTA_VERSION=0.9.0` pins a release, `HF_TOKEN` raises Hugging Face's download limits.
+Needs an M5 Max with 128 GB and macOS 27.2 or later. Update with `saetta update`. `SAETTA_PREFIX` changes the install folder, `SAETTA_VERSION=0.9.0` pins a release, `HF_TOKEN` raises Hugging Face's limits.
 
 ## Models
 
-`saetta download <name>` fetches a pack at a pinned revision into the models folder (`~/Models`, or `SAETTA_MODELS`), as `<org>/<repo>` so other apps can share it, four files at a time, resuming and checking every file's hash. `all` fetches both Flash-Next packs.
+`saetta download <name>` fetches a pack at a pinned revision into `~/Models` (or `SAETTA_MODELS`). Commands take a pack by name (`saetta serve coder`) or folder.
 
-| name | model | Hugging Face | on disk |
-|---|---|---|---|
-| **`coder`** · recommended for agents | Flash-Next, 256 experts pruned for code (ISTA-DASLab), mixed 4/5/6/8-bit | [mbrown-uno/…-Coder-MLX](https://huggingface.co/mbrown-uno/Qwen3.8-Flash-Next-GSQ-RCO-Coder-MLX) | 76 GB |
-| `full` | Flash-Next, the original 512 experts, 4-bit | [mlx-community/…-4bit-mtp](https://huggingface.co/mlx-community/Qwen3.8-Flash-Next-4bit-mtp) | 105 GB |
-| `27b-8bit` · recommended with adapters | Qwen3.8-27B, dense, 8-bit | [mlx-community/Qwen3.8-27B-8bit](https://huggingface.co/mlx-community/Qwen3.8-27B-8bit) | 29 GB |
-| `27b-4bit` | Qwen3.8-27B, dense, 4-bit | [mlx-community/Qwen3.8-27B-4bit](https://huggingface.co/mlx-community/Qwen3.8-27B-4bit) | 16 GB |
-| `27b-pi` | the pi LoRA adapter for Qwen3.8-27B (r 32) | [harness-hub/Qwen3.8-27B-pi-adapted](https://huggingface.co/harness-hub/Qwen3.8-27B-pi-adapted) | 0.6 GB |
+| name | model | on disk |
+|---|---|---|
+| **`coder`** · for agents | [Flash-Next](https://huggingface.co/mbrown-uno/Qwen3.8-Flash-Next-GSQ-RCO-Coder-MLX), 256 experts pruned for code, mixed 4/5/6/8-bit | 76 GB |
+| `full` | [Flash-Next](https://huggingface.co/mlx-community/Qwen3.8-Flash-Next-4bit-mtp), all 512 experts, 4-bit | 105 GB |
+| `27b-8bit` · with adapters | [Qwen3.8-27B](https://huggingface.co/mlx-community/Qwen3.8-27B-8bit), dense, 8-bit | 29 GB |
+| `27b-4bit` | [Qwen3.8-27B](https://huggingface.co/mlx-community/Qwen3.8-27B-4bit), dense, 4-bit | 16 GB |
+| `27b-pi` | [the pi LoRA adapter](https://huggingface.co/harness-hub/Qwen3.8-27B-pi-adapted) for Qwen3.8-27B | 0.6 GB |
+
+Licenses: Flash-Next Qwen Community License 1.0, Qwen3.8-27B and the pi adapter Apache-2.0, DeepSeek-V4-Flash MIT; no weights are part of this repository.
+
+### LoRA adapters
+
+PEFT LoRA adapters run on Qwen3.8-27B at run time, with vLLM's flags. The [pi adapter](https://huggingface.co/harness-hub/Qwen3.8-27B-pi-adapted) is trained to drive the [pi](https://pi.dev) agent (its card: SWE-bench Pro hard 39.2% to 64.7% over the base model).
+
+```sh
+saetta download 27b-8bit && saetta download 27b-pi
+saetta start pi --pack 27b-8bit --lora qwen3.8-pi=27b-pi                    # pi on it
+saetta serve 27b-8bit --lora-modules qwen3.8-pi=27b-pi \
+    --default-chat-template-kwargs '{"enable_thinking": false}'            # or any client
+```
+
+A request whose `model` is the adapter's name runs with it, any other with the base model. Supported: LoRA on attention and MLP projections, rank a multiple of 8 up to 128, rsLoRA. `SAETTA_LORA=<folder>` applies one to `saetta generate`.
 
 ### DeepSeek-V4-Flash (preview)
 
-saetta runs [DeepSeek-V4-Flash-0731](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731) from its official checkpoint, read in place (167 GB: FP8 dense weights, FP4 routed experts). The pack does not fit in 128 GB, so the dense weights stay resident and the routed experts are read from the SSD on demand into a GPU-visible cache (80 GB by default, `SAETTA_EXPERT_CACHE_GB` to change it). Replaying the routing of a coding prompt, about 92% of the expert reads while answering hit a cache of that size.
-
-What works in this release: `saetta info`, `saetta generate <pack> <n> <token ids>` (without speculative decoding) and `make verify-dsv4`, which checks every layer against a numpy port of the checkpoint's own reference code. Not yet: the tokenizer and chat template, so `saetta serve` refuses this pack and the agents cannot use it; speculative decoding; prefix reuse; fast prompt reading. This preview is about correctness: its speed has not been tuned or benchmarked yet.
+[DeepSeek-V4-Flash-0731](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731) runs from its official checkpoint (167 GB: FP8 dense, FP4 experts), read in place. It does not fit in 128 GB, so the dense weights stay in memory and the experts stream from the SSD into a GPU-visible cache (80 GB by default, `SAETTA_EXPERT_CACHE_GB`); on a coding prompt about 92% of the expert reads hit it.
 
 ```sh
 hf download deepseek-ai/DeepSeek-V4-Flash-0731 --revision 7872f01b1d1fe23eabc4c98b48bffcef5a386062 \
   --local-dir ~/Models/deepseek-ai/DeepSeek-V4-Flash-0731
 saetta info ~/Models/deepseek-ai/DeepSeek-V4-Flash-0731
+saetta generate ~/Models/deepseek-ai/DeepSeek-V4-Flash-0731 32 <token ids...>
 ```
 
-Commands take a pack by its name (`saetta serve coder`) or its folder; the model is read from the pack. Flash-Next weights are under the Qwen Community License 1.0, [Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) and the pi adapter under Apache-2.0; none are part of this repository. DeepSeek-V4-Flash is under the MIT license.
-
-### LoRA adapters
-
-PEFT LoRA adapters run on Qwen3.8-27B, applied at run time with vLLM's flags. [harness-hub/Qwen3.8-27B-pi-adapted](https://huggingface.co/harness-hub/Qwen3.8-27B-pi-adapted) is trained with RL to drive the [pi](https://pi.dev) coding agent with thinking off; its card reports SWE-bench Pro (hard 51) 39.2% to 64.7% and Terminal-Bench 2.1 39.5% to 55.8% over the base model (harness-hub's numbers). pi on it, in one command:
-
-```sh
-saetta download 27b-8bit && saetta download 27b-pi
-saetta start pi --pack 27b-8bit --lora qwen3.8-pi=27b-pi
-```
-
-Or serve it for any client:
-
-```sh
-saetta serve 27b-8bit --lora-modules qwen3.8-pi=27b-pi \
-    --default-chat-template-kwargs '{"enable_thinking": false}'
-```
-
-A request whose `model` is an adapter's name (`qwen3.8-pi`) runs with it, any other with the base model (`qwen3.8-27b`); `/v1/models` lists both, and prompt caches are kept per adapter. An adapter is a download name, a folder, or a Hugging Face id (`org/repo`) in the models folder. Supported: LoRA on the attention and MLP projections, rank a multiple of 8 up to 128, rsLoRA (not DoRA, biases or saved modules). An adapter adds about 0.3 GB of reads per generated token. `SAETTA_LORA=<folder>` applies one to `saetta generate`.
-
-<a id="coding-agents"></a>
+In this release: `info`, `generate` (no speculative decoding; token ids from the pack's `tokenizer.json`, for example with Hugging Face `tokenizers`: saetta's tokenizer does not read this pack yet) and `make verify-dsv4`. **Agents (Claude Code, pi, opencode) cannot use it yet:** `saetta serve` refuses the pack until its tokenizer, chat template and DSML tool calls land; then it will be `saetta start claude --pack ~/Models/deepseek-ai/DeepSeek-V4-Flash-0731`, as for the other models. Speed is not tuned or benchmarked yet.
 
 ## Coding agents
 
@@ -103,67 +85,49 @@ saetta start claude -- -p "fix the failing test"   # anything after -- goes to t
 ```
 
 <p align="center">
-  <img src="docs/assets/demo-pi.gif" width="900" alt="saetta start pi: pi on saetta writes a Mandelbrot renderer, which then draws the set in color">
-  <br><sub><code>saetta start pi</code>: pi writes a Mandelbrot renderer on the local model, then it runs. Real time.</sub>
+  <img src="docs/assets/demo.gif" width="900" alt="saetta start claude: Claude Code on saetta writes a snake game in Python, checks it, and the game runs">
+  <br><sub><code>saetta start claude</code>: Claude Code on the local model writes a snake game and checks it. Real time, no cloud.</sub>
 </p>
 
-`saetta start` joins the server running on this machine or starts one (logs in `~/Library/Logs/saetta/`), waits for the model to load and runs the agent pointed at it, without editing your own agent configuration. The server it started stops when the last session exits.
+`saetta start` joins the server on this machine or starts one, waits for the model and runs the agent pointed at it, without touching your agent configuration; the server it started stops with the last session. Several sessions share one server (up to 4 conversations, `SAETTA_CONVERSATIONS`).
 
 | option | effect |
 |---|---|
-| `--pack coder\|full\|27b-8bit\|27b-4bit\|<dir>` | the model (default: the first downloaded of coder, full) |
-| `--lora name=adapter` | a LoRA adapter on a 27B pack, thinking off, the agent pointed at it |
-| `--port N` | server port (default 8080, or `SAETTA_PORT`; a taken default moves to the next free port) |
-| `--ctx N` | context in tokens (default 204800, or `SAETTA_CTX`) |
+| `--pack <name or dir>` | the model (default: the first downloaded of coder, full) |
+| `--lora name=adapter` | a LoRA adapter on a 27B pack |
+| `--port N`, `--ctx N` | server port (8080) and context (204800 tokens) |
 | `--keep` | leave the server running when the agent exits |
 
-Several sessions, of any agents, share the one server and take turns; it keeps up to 4 conversations (`SAETTA_CONVERSATIONS`), each growing from 32K tokens as needed, so each session keeps its fast follow-up turns.
+<p align="center">
+  <img src="docs/assets/demo-pi.gif" width="900" alt="saetta start pi: pi on saetta writes a Mandelbrot renderer, which then draws the set in color">
+  <br><sub><code>saetta start pi</code>: pi writes a Mandelbrot renderer, then it runs.</sub>
+</p>
 
-Without `saetta start`: run the server, then point the agent at `http://127.0.0.1:8080/v1` (OpenAI) or `http://127.0.0.1:8080` (Anthropic) with any API key and the model id from `/v1/models`. Ready configs: [`config/claude-code/settings.json`](config/claude-code/settings.json) ([guide](docs/claude-code.md)), [`config/pi/models.json`](config/pi/models.json), [`config/opencode/saetta-coder.json`](config/opencode/saetta-coder.json) ([guide](docs/opencode.md)).
+Without `saetta start`, point any agent at `http://127.0.0.1:8080/v1` (OpenAI) or `http://127.0.0.1:8080` (Anthropic), any API key: configs in [`config/`](config) ([Claude Code](docs/claude-code.md), [opencode](docs/opencode.md)).
 
-## Run the server
+## Server
 
 ```sh
-SAETTA_CTX=204800 saetta serve coder --port 8080    # or any pack name or folder; loads in about 5 to 10 s
+SAETTA_CTX=204800 saetta serve coder     # loads in 5 to 10 s, one request at a time, Ctrl-C stops
+saetta monitor | status | stop           # live view, state, stop
 ```
 
-It listens on 127.0.0.1, prints one `request:` line per request, and stops with Ctrl-C. One server runs per machine (`~/.saetta/run/serve.lock`). The model id is `qwen3.8-flash-next` for the Flash-Next packs and `qwen3.8-27b` for 27B.
+Endpoints: `POST /v1/chat/completions` (streaming, `tool_calls`, `reasoning_content`; `enable_thinking`, `reasoning_effort` in `chat_template_kwargs`), `POST /v1/messages` and `/v1/messages/count_tokens` (Anthropic), `GET /v1/models`, `GET /health`. Model ids: `qwen3.8-flash-next`, `qwen3.8-27b`.
 
 | variable | default | effect |
 |---|---|---|
-| `SAETTA_CTX` | 32768 | context capacity in tokens (Flash-Next about 35 KB per token, 27B 64 KB); use 204800 for agents |
-| `SAETTA_SPEC` | 1 | `0` turns speculative decoding off |
-| `SAETTA_MTP` | 1 | `0` drafts with prompt lookup only, not the MTP head (Flash-Next) |
-| `SAETTA_KV_F32` | unset | f32 instead of f16 KV cache |
-| `SAETTA_EXPERT_CACHE_GB` | unset | experimental: keep only this many GB of routed experts in memory and read the rest from the SSD on demand (Flash-Next: slower than fully resident; DeepSeek-V4-Flash always streams, by default with an 80 GB cache) |
-
-```sh
-curl -s localhost:8080/v1/chat/completions -H 'content-type: application/json' -d '{
-  "model": "qwen3.8-flash-next", "temperature": 0, "max_tokens": 300,
-  "chat_template_kwargs": {"enable_thinking": false},
-  "messages": [{"role": "user", "content": "Write a Python function that checks if a string is a palindrome."}]
-}' | python3 -m json.tool
-```
-
-Endpoints: `POST /v1/chat/completions` (OpenAI, JSON or SSE streaming, `tool_calls`, `tool_choice`, `reasoning_content`, sampling options; `enable_thinking`, `reasoning_effort` in `chat_template_kwargs`), `POST /v1/messages` and `/v1/messages/count_tokens` (Anthropic), `GET /v1/models`, `GET /health`. One request at a time. Speculation drafts with the MTP head (Flash-Next) or prompt lookup; greedy output matches decoding without it up to rounding at near ties, and sampled output follows the same distribution.
-
-## Monitor
-
-```sh
-saetta monitor          # live view: r requests, c conversations, l server log, q quits
-saetta status           # the server on this machine: pid, port, model, sessions
-saetta stop             # stop it
-```
+| `SAETTA_CTX` | 32768 | context in tokens (Flash-Next about 35 KB per token, 27B 64 KB) |
+| `SAETTA_SPEC` / `SAETTA_MTP` | 1 / 1 | `0` turns speculative decoding / the MTP head off |
+| `SAETTA_KV_F32` | unset | f32 KV cache |
+| `SAETTA_EXPERT_CACHE_GB` | unset | experimental: keep this many GB of experts in memory, read the rest from the SSD (Flash-Next: slower; DeepSeek always streams, 80 GB by default) |
 
 <p align="center">
-  <img src="docs/assets/monitor.png" width="900" alt="saetta monitor: model state, speed, GPU load, GPU and system memory, prompt cache, speculation, context, sessions and recent requests">
+  <img src="docs/assets/monitor.png" width="900" alt="saetta monitor: model state, speed, GPU load, memory, prompt cache, speculation, sessions and recent requests">
 </p>
-
-What the model is doing, decode speed, GPU load and memory, prompt reuse, speculation, sessions and the last requests, live; quitting leaves the server running.
 
 ## Performance
 
-Flash-Next on an M5 Max with 128 GB and macOS 27.2, a six-request coding-agent workload: time to first token and total per request, in seconds.
+Flash-Next on an M5 Max with 128 GB, a six-request coding-agent workload, seconds:
 
 | request | prompt tokens | full: first token | full: total | Coder: first token | Coder: total |
 |---|---:|---:|---:|---:|---:|
@@ -174,23 +138,7 @@ Flash-Next on an M5 Max with 128 GB and macOS 27.2, a six-request coding-agent w
 | turn 2 (reuses turn 1) | 15,948 | 0.20 | 0.90 | 0.20 | 1.01 |
 | edit (tool call, 400 tokens out) | 18,245 | 10.10 | 12.93 | 9.32 | 12.19 |
 
-Prompt reading 1,650 to 1,820 tokens/s (full) and 1,700 to 1,950 (Coder); answers 72 to 82 and 63 to 70 tokens/s; speculative decoding reaches 141 tokens/s on the edit (full). Qwen3.8-27B is not benchmarked yet; long 27B prompts (past about 32K tokens) read slowly for now.
-
-## Command line
-
-```sh
-saetta download <name>                  # coder | full | all | 27b-8bit | 27b-4bit | 27b-pi
-saetta start claude|pi|opencode         # an agent on saetta [--pack <pack>] [--lora name=adapter]
-saetta serve <pack> [--port N]          # the API server [--lora-modules name=adapter ...]
-                                        #   [--default-chat-template-kwargs JSON]
-saetta monitor | status | stop          # watch, show or stop the server
-saetta update                           # newer release over a curl install
-saetta info <pack>                      # check a pack and the GPU path (<pack>: a name or a folder)
-saetta render request.json              # chat prompt for an OpenAI request body
-saetta tokenize <pack> prompt.txt       # token ids, one per line
-saetta generate <pack> 8 <token ids...> # greedy, new ids and timing (@file.ids reads a file)
-saetta version
-```
+Answers at 72 to 82 (full) and 63 to 70 (Coder) tokens/s, 141 tokens/s on the edit with speculation. Qwen3.8-27B and DeepSeek-V4-Flash are not benchmarked yet.
 
 ## Build from source
 
@@ -198,15 +146,14 @@ Needs full Xcode with the Metal Toolchain (`xcodebuild -downloadComponent MetalT
 
 ```sh
 git clone https://github.com/antonellof/saetta.git && cd saetta
-make                                # ./build/bin/saetta
-make test                           # unit tests (SAETTA_PACK=<pack> for those reading real tensors)
-make verify GOLDEN=<dir>/golden     # engine against reference outputs (Flash-Next, then Qwen3.8-27B)
-make verify-dsv4 GOLDEN=<dir>/golden  # DeepSeek-V4-Flash: per-layer check on the reference's inputs,
-                                    # then greedy agreement; needs its pack (DSV4_PACK), cache 40 GB
+make                                    # ./build/bin/saetta
+make test                               # unit tests (SAETTA_PACK=<pack> for real tensors)
+make verify GOLDEN=<dir>/golden         # Flash-Next and Qwen3.8-27B against reference outputs
+make verify-dsv4 GOLDEN=<dir>/golden    # DeepSeek-V4-Flash (needs its pack, DSV4_PACK)
 ```
 
-`src/` is the engine: `model.c` (Flash-Next), `dense.c` (Qwen3.8-27B) and `dsv4.c` (DeepSeek-V4-Flash, streamed experts) forward passes, `model_api.c` picks one per pack, `lora.c` and `kernels/` Metal, `server.c` the API, `tokenizer.c`, `chat.c`, `toolcall.c`. `scripts/` holds the installer, `config/` the agent configurations, `docs/` the guides.
+`src/`: `model.c` (Flash-Next), `dense.c` (27B), `dsv4.c` (DeepSeek-V4-Flash), `model_api.c` picks one per pack; `kernels/` Metal; `server.c`, `tokenizer.c`, `chat.c`, `toolcall.c`. `saetta help` lists every command.
 
 ## License
 
-[MIT](LICENSE). Parts are adapted from the MIT-licensed engines sushi, qwental and Strata; each adapted file names its source in its header, and their notices are in [LICENSE](LICENSE).
+[MIT](LICENSE). Parts are adapted from the MIT-licensed engines sushi, qwental, Strata and ds4 and from DeepSeek's reference code; each adapted file names its source, and their notices are in [LICENSE](LICENSE).

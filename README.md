@@ -48,17 +48,17 @@ Needs an Apple M5 Max with 128 GB and macOS 27.2 or later. `SAETTA_PREFIX` chang
 
 ## Models
 
-`saetta download <name>` fetches a pack at a pinned revision into `~/Models/<org>/<repo>` (`SAETTA_MODELS` to change it), four files at a time, resuming and checking every file's hash. `all` fetches both Flash-Next packs.
+`saetta download <name>` fetches a pack at a pinned revision into the models folder (`~/Models`, or `SAETTA_MODELS`), as `<org>/<repo>` so other apps can share it, four files at a time, resuming and checking every file's hash. `all` fetches both Flash-Next packs.
 
-| name | model | folder under `~/Models` | on disk |
+| name | model | Hugging Face | on disk |
 |---|---|---|---|
-| **`coder`** · recommended for agents | Flash-Next, 256 experts pruned for code (ISTA-DASLab), mixed 4/5/6/8-bit | `mbrown-uno/Qwen3.8-Flash-Next-GSQ-RCO-Coder-MLX` | 76 GB |
-| `full` | Flash-Next, the original 512 experts, 4-bit | `mlx-community/Qwen3.8-Flash-Next-4bit-mtp` | 105 GB |
-| `27b-8bit` · recommended with adapters | Qwen3.8-27B, dense, 8-bit | `mlx-community/Qwen3.8-27B-8bit` | 29 GB |
-| `27b-4bit` | Qwen3.8-27B, dense, 4-bit | `mlx-community/Qwen3.8-27B-4bit` | 16 GB |
-| `27b-pi` | the pi LoRA adapter for Qwen3.8-27B (r 32) | `harness-hub/Qwen3.8-27B-pi-adapted` | 0.6 GB |
+| **`coder`** · recommended for agents | Flash-Next, 256 experts pruned for code (ISTA-DASLab), mixed 4/5/6/8-bit | [mbrown-uno/…-Coder-MLX](https://huggingface.co/mbrown-uno/Qwen3.8-Flash-Next-GSQ-RCO-Coder-MLX) | 76 GB |
+| `full` | Flash-Next, the original 512 experts, 4-bit | [mlx-community/…-4bit-mtp](https://huggingface.co/mlx-community/Qwen3.8-Flash-Next-4bit-mtp) | 105 GB |
+| `27b-8bit` · recommended with adapters | Qwen3.8-27B, dense, 8-bit | [mlx-community/Qwen3.8-27B-8bit](https://huggingface.co/mlx-community/Qwen3.8-27B-8bit) | 29 GB |
+| `27b-4bit` | Qwen3.8-27B, dense, 4-bit | [mlx-community/Qwen3.8-27B-4bit](https://huggingface.co/mlx-community/Qwen3.8-27B-4bit) | 16 GB |
+| `27b-pi` | the pi LoRA adapter for Qwen3.8-27B (r 32) | [harness-hub/Qwen3.8-27B-pi-adapted](https://huggingface.co/harness-hub/Qwen3.8-27B-pi-adapted) | 0.6 GB |
 
-Every command takes either model's pack; the model is read from the pack. Flash-Next weights are under the Qwen Community License 1.0, [Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) and the pi adapter under Apache-2.0; none are part of this repository.
+Commands take a pack by its name (`saetta serve coder`) or its folder; the model is read from the pack. Flash-Next weights are under the Qwen Community License 1.0, [Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) and the pi adapter under Apache-2.0; none are part of this repository.
 
 ### LoRA adapters
 
@@ -66,18 +66,17 @@ PEFT LoRA adapters run on Qwen3.8-27B, applied at run time with vLLM's flags. [h
 
 ```sh
 saetta download 27b-8bit && saetta download 27b-pi
-saetta start pi --pack 27b-8bit --lora qwen3.8-pi=harness-hub/Qwen3.8-27B-pi-adapted
+saetta start pi --pack 27b-8bit --lora qwen3.8-pi=27b-pi
 ```
 
 Or serve it for any client:
 
 ```sh
-saetta serve ~/Models/mlx-community/Qwen3.8-27B-8bit \
-    --lora-modules qwen3.8-pi=harness-hub/Qwen3.8-27B-pi-adapted \
+saetta serve 27b-8bit --lora-modules qwen3.8-pi=27b-pi \
     --default-chat-template-kwargs '{"enable_thinking": false}'
 ```
 
-A request whose `model` is an adapter's name (`qwen3.8-pi`) runs with it, any other with the base model (`qwen3.8-27b`); `/v1/models` lists both, and prompt caches are kept per adapter. A path is a folder or a Hugging Face id under `~/Models`. Supported: LoRA on the attention and MLP projections, rank a multiple of 8 up to 128, rsLoRA (not DoRA, biases or saved modules). An adapter adds about 0.3 GB of reads per generated token. `SAETTA_LORA=<folder>` applies one to `saetta generate`.
+A request whose `model` is an adapter's name (`qwen3.8-pi`) runs with it, any other with the base model (`qwen3.8-27b`); `/v1/models` lists both, and prompt caches are kept per adapter. An adapter is a download name, a folder, or a Hugging Face id (`org/repo`) in the models folder. Supported: LoRA on the attention and MLP projections, rank a multiple of 8 up to 128, rsLoRA (not DoRA, biases or saved modules). An adapter adds about 0.3 GB of reads per generated token. `SAETTA_LORA=<folder>` applies one to `saetta generate`.
 
 <a id="coding-agents"></a>
 
@@ -100,7 +99,7 @@ saetta start claude -- -p "fix the failing test"   # anything after -- goes to t
 | option | effect |
 |---|---|
 | `--pack coder\|full\|27b-8bit\|27b-4bit\|<dir>` | the model (default: the first downloaded of coder, full) |
-| `--lora name=path` | a LoRA adapter on a 27B pack, thinking off, the agent pointed at it |
+| `--lora name=adapter` | a LoRA adapter on a 27B pack, thinking off, the agent pointed at it |
 | `--port N` | server port (default 8080, or `SAETTA_PORT`; a taken default moves to the next free port) |
 | `--ctx N` | context in tokens (default 204800, or `SAETTA_CTX`) |
 | `--keep` | leave the server running when the agent exits |
@@ -112,8 +111,7 @@ Without `saetta start`: run the server, then point the agent at `http://127.0.0.
 ## Run the server
 
 ```sh
-M=~/Models/mbrown-uno/Qwen3.8-Flash-Next-GSQ-RCO-Coder-MLX   # or any pack
-SAETTA_CTX=204800 saetta serve $M --port 8080                # loads in about 5 to 10 s
+SAETTA_CTX=204800 saetta serve coder --port 8080    # or any pack name or folder; loads in about 5 to 10 s
 ```
 
 It listens on 127.0.0.1, prints one `request:` line per request, and stops with Ctrl-C. One server runs per machine (`~/.saetta/run/serve.lock`). The model id is `qwen3.8-flash-next` for the Flash-Next packs and `qwen3.8-27b` for 27B.
@@ -168,15 +166,15 @@ Prompt reading 1,650 to 1,820 tokens/s (full) and 1,700 to 1,950 (Coder); answer
 
 ```sh
 saetta download <name>                  # coder | full | all | 27b-8bit | 27b-4bit | 27b-pi
-saetta start claude|pi|opencode         # an agent on saetta [--pack ...] [--lora name=path]
-saetta serve $M [--port N]              # the API server [--lora-modules name=path ...]
+saetta start claude|pi|opencode         # an agent on saetta [--pack <pack>] [--lora name=adapter]
+saetta serve <pack> [--port N]          # the API server [--lora-modules name=adapter ...]
                                         #   [--default-chat-template-kwargs JSON]
 saetta monitor | status | stop          # watch, show or stop the server
 saetta update                           # newer release over a curl install
-saetta info $M                          # check a pack and the GPU path
+saetta info <pack>                      # check a pack and the GPU path (<pack>: a name or a folder)
 saetta render request.json              # chat prompt for an OpenAI request body
-saetta tokenize $M prompt.txt           # token ids, one per line
-saetta generate $M 8 <token ids...>     # greedy, new ids and timing (@file.ids reads a file)
+saetta tokenize <pack> prompt.txt       # token ids, one per line
+saetta generate <pack> 8 <token ids...> # greedy, new ids and timing (@file.ids reads a file)
 saetta version
 ```
 

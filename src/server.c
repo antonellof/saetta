@@ -1664,10 +1664,16 @@ Err server_serve(Arena *arena, const char *dir, uint16_t port, const char *const
         const char *path = eq + 1;
         struct stat lst;
         if (stat(path, &lst) != 0) {
-            // a Hugging Face id (org/repo, as vLLM takes it): its folder under the models dir
-            char *md;
-            TRY(download_models_dir(arena, &md));
-            path = path_join(arena, md, path);
+            // a `saetta download` name (27b-pi), else a Hugging Face id (org/repo, as vLLM
+            // takes it): its folder under the models folder
+            const DownloadPack *dp = download_find(path);
+            char *dir;
+            if (dp && !download_pack_dir(arena, dp, &dir)) path = dir;
+            else {
+                char *md;
+                TRY(download_models_dir(arena, &md));
+                path = path_join(arena, md, path);
+            }
         }
         Err le = model_lora_load(arena, m, name, path);
         if (le) {

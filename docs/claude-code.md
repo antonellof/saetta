@@ -51,7 +51,7 @@ Start the server, then run Claude Code with the same settings from
 [`config/claude-code/settings.json`](../config/claude-code/settings.json):
 
 ```sh
-SAETTA_CTX=204800 saetta serve ~/Models/mbrown-uno/Qwen3.8-Flash-Next-GSQ-RCO-Coder-MLX &
+SAETTA_CTX=204800 saetta serve coder &
 claude --settings config/claude-code/settings.json --model qwen3.8-flash-next
 ```
 

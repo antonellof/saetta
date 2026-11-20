@@ -1,6 +1,6 @@
 // saetta: single-model inference engine for Qwen3.8-Flash-Next on Apple M5 Max.
 //   saetta info <model-dir>                  check the pack against its model's shapes and the GPU
-//   saetta verify [golden-dir]                    compare with golden reference output (pack: $SAETTA_PACK or ~/Models/...)
+//   saetta verify [golden-dir]                    compare with golden reference output (pack: $SAETTA_PACK or the golden's, under the models folder)
 //   saetta serve <model-dir> [--port N]           OpenAI-compatible API on 127.0.0.1 (default 8080)
 //   saetta render <request.json>                  print the chat prompt for an OpenAI request body
 //   saetta tokenize <model-dir> <file>            print the token ids of a text file
@@ -12,12 +12,9 @@
 //   saetta update                            install the latest release over this binary
 //   saetta version                           print the version
 #include <signal.h>
-#include <errno.h>
-#include <limits.h>
-#include <mach-o/dyld.h>
 #include <math.h>
 #include <stdlib.h>
-#include <unistd.h>
+#include <sys/stat.h>
 
 #include "base.h"
 #include "chat.h"
@@ -488,6 +485,17 @@ static Err mv_bench(Arena *arena, FILE *out, const char *dir) {
 
 // ---- commands ----------------------------------------------------------------------------------
 
+// A pack argument: an existing folder, else a `saetta download` name (coder, 27b-8bit, ...)
+// resolved under the models folder ($SAETTA_MODELS, default ~/Models).
+static const char *pack_arg(Arena *a, const char *arg) {
+    struct stat st;
+    if (stat(arg, &st) == 0) return arg;
+    const DownloadPack *p = download_find(arg);
+    char *dir;
+    if (p && !download_pack_dir(a, p, &dir)) return dir;
+    return arg;
+}
+
 static Err run(Arena *arena, int argc, char **argv) {
     FILE *out = stdout;
     const char *const *rest = (const char *const *)argv + 2;
@@ -544,8 +552,8 @@ static Err run(Arena *arena, int argc, char **argv) {
         }
         exit(code);
     }
-    if (argc >= 3 && eq(cmd, "info")) return info(arena, out, argv[2]);
-    if (argc == 3 && eq(cmd, "mv-bench")) return mv_bench(arena, out, argv[2]);
+    if (argc >= 3 && eq(cmd, "info")) return info(arena, out, pack_arg(arena, argv[2]));
+    if (argc == 3 && eq(cmd, "mv-bench")) return mv_bench(arena, out, pack_arg(arena, argv[2]));
     if (argc >= 2 && eq(cmd, "qgen-bench")) {
         // run-time quantization kernels against the 4-bit/32 templated ones (src/qgen.h)
         TRY(qgen_bench(arena, out));
@@ -579,7 +587,7 @@ static Err run(Arena *arena, int argc, char **argv) {
     if (argc >= 2 && eq(cmd, "verify")) {
         const char *golden = argc >= 3 ? argv[2] : "tests/golden";
         // the pack: $SAETTA_PACK, else the one the golden names (manifest "pack") under
-        // ~/Models/mlx-community
+        // the models folder's mlx-community
         const char *pack = getenv("SAETTA_PACK");
         if (!pack) {
             const char *home = getenv("HOME");
@@ -595,7 +603,9 @@ static Err run(Arena *arena, int argc, char **argv) {
                 }
                 free(mt);
             }
-            pack = path_join(arena, path_join(arena, home, "Models/mlx-community"), name);
+            char *md;
+            TRY(download_models_dir(arena, &md));
+            pack = path_join(arena, path_join(arena, md, "mlx-community"), name);
         }
         bool ok;
         TRY(verify_run(arena, out, pack, golden, &ok));
@@ -630,7 +640,7 @@ static Err run(Arena *arena, int argc, char **argv) {
                 exit(64);
             }
         }
-        Err err = server_serve(arena, argv[2], port, loras, nloras, kwargs);
+        Err err = server_serve(arena, pack_arg(arena, argv[2]), port, loras, nloras, kwargs);
         if (err && !strcmp(err, "AlreadyRunning")) exit(1);
         if (err && !strcmp(err, "AddressInUse")) {
             dbg("error: port %u is in use by another program; choose another with --port N\n", port);
@@ -653,7 +663,7 @@ static Err run(Arena *arena, int argc, char **argv) {
     }
     if (argc == 4 && eq(cmd, "tokenize")) {
         Tokenizer *tok = ARENA_NEW(arena, Tokenizer);
-        TRY(tokenizer_load(arena, argv[2], tok));
+        TRY(tokenizer_load(arena, pack_arg(arena, argv[2]), tok));
         char *text;
         size_t len;
         TRY(read_file(argv[3], 256u << 20, &text, &len));
@@ -668,7 +678,7 @@ static Err run(Arena *arena, int argc, char **argv) {
     if (argc >= 5 && eq(cmd, "generate")) {
         size_t n;
         TRY(parse_usize(argv[3], &n));
-        return generate(arena, argv[2], n, argv + 4, (size_t)argc - 4);
+        return generate(arena, pack_arg(arena, argv[2]), n, argv + 4, (size_t)argc - 4);
     }
     fprintf(out, "usage: saetta serve <model-dir> [--port N] [--lora-modules name=path ...] [--default-chat-template-kwargs JSON] | info <model-dir> | generate <model-dir> <n> <ids...> | tokenize "
                  "<model-dir> <file> | render <request.json> | verify [golden-dir] | download [coder|full|all] | start "

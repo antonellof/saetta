@@ -60,7 +60,7 @@ fi
 cat <<MSG
 
 Next:
-  saetta download coder           # 76 GB into ~/Models (or: full, 105 GB)
-  SAETTA_CTX=204800 saetta serve ~/Models/mbrown-uno/Qwen3.8-Flash-Next-GSQ-RCO-Coder-MLX
+  saetta download coder           # 76 GB into ~/Models or $SAETTA_MODELS (or: full, 27b-8bit)
+  saetta start claude             # or: saetta start pi, saetta start opencode
 Docs: https://github.com/$REPO
 MSG

@@ -11,9 +11,8 @@ config file (`~/.saetta/opencode/opencode.json`). The steps below do the same by
 
 ## 1. Start the server
 
-    # Coder variant (256 experts, 76 GB on disk); or the full pack (105 GB):
-    #   ~/Models/mlx-community/Qwen3.8-Flash-Next-4bit-mtp
-    SAETTA_CTX=204800 build/bin/saetta serve ~/Models/mbrown-uno/Qwen3.8-Flash-Next-GSQ-RCO-Coder-MLX --port 8080
+    # Coder variant (256 experts, 76 GB on disk); or the full pack (105 GB): full
+    SAETTA_CTX=204800 saetta serve coder --port 8080
 
 `SAETTA_CTX` is the context capacity in tokens (KV cache preallocated, about 35 KB per token;
 the default 32768 is too small for an agent session). Keep opencode's `limit.context` at or

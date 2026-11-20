@@ -249,11 +249,6 @@ struct Model {
     // streams, so each layer's error is measured on exact inputs.
     sx_buffer *force;
     size_t force_n;
-    // SAETTA_DSV4_PROBE=<layer>,<pos>,<file> (diagnostic): the intermediates of that layer at that
-    // position (probe_at order, 64 KiB slots) written to the file after the step.
-    sx_buffer *probe;
-    size_t probe_l, probe_p;
-    const char *probe_path;
     XStream xs;
     XSvc stops[MAX_STOPS];
     uint32_t nstops;
@@ -501,14 +496,6 @@ Err model_load(Arena *a, const Pack *pack, Gpu *g, Model **out) {
     TRY(mat(g, pack, "head.weight", &m->head));
     m->embed = pack_data(pack, pack_get(pack, S("embed.weight")));
     TRY(load_scratch(m));
-    const char *pv = getenv("SAETTA_DSV4_PROBE");
-    if (pv) {
-        char *end;
-        m->probe_l = strtoul(pv, &end, 10);
-        m->probe_p = *end == ',' ? strtoul(end + 1, &end, 10) : 0;
-        m->probe_path = *end == ',' ? end + 1 : "probe.bin";
-        TRY(newbuf(g, 16 * 65536, &m->probe));
-    }
     const char *fp = getenv("SAETTA_DSV4_FORCE");
     if (fp) {
         char *fb;
@@ -563,13 +550,6 @@ static void enc_aq(Model *m, sx_cmd *c, sx_buffer *x, uint32_t K) {
 static void enc_lin(Model *m, sx_cmd *c, const Dsv4Fp8Lin *l, sx_buffer *y) {
     dsv4_encode_linear(&m->f8, c, l, B(m->xc), B(m->xsc), B(y), 1, l->out);
 }
-// Probe slot k: bytes of b (at most 64 KiB) when (l, pos) is the probed point.
-static void probe_at(Model *m, sx_cmd *c, size_t l, uint32_t pos, uint32_t k, sx_buffer *b, uint32_t bytes) {
-    if (!m->probe || l != m->probe_l || pos != m->probe_p) return;
-    uint32_t n4 = bytes / 16;
-    DISP(c, m->p.copy4, (n4 + 255) / 256, 1, 1, 256, B(b), AT(m->probe, (size_t)k * 65536), gpu_u32_arg(&n4));
-}
-
 // One hyper-connection mixer: the block input X (with its norm) and post, comb.
 static void enc_hc_pre(Model *m, sx_cmd *c, sx_arg fn, sx_arg base, sx_arg scale, sx_arg norm) {
     MixP mp = {MIX, 1};
@@ -586,7 +566,6 @@ static void enc_attn(Model *m, DsSession *d, sx_cmd *c, size_t l, uint32_t pos) 
     const DsLayer *L = &m->L[l];
     const uint32_t ratio = L->ratio;
     enc_hc_pre(m, c, L->hca_fn, L->hca_base, L->hca_scale, L->attn_norm);
-    probe_at(m, c, l, pos, 0, m->X, H * 4);
     // q and kv projections
     enc_aq(m, c, m->X, H);
     enc_lin(m, c, &L->wq_a, m->qa);
@@ -603,9 +582,6 @@ static void enc_attn(Model *m, DsSession *d, sx_cmd *c, size_t l, uint32_t pos) 
     DISP(c, m->p.a_q, NH, 1, 1, 128, B(m->q), cs, BYTES(ap));
     ew(c, m->p.to_bf, B(m->kva), B(m->kvb), HD);
     DISP(c, m->p.a_kv, 1, 1, 1, 128, B(m->kvb), L->kv_norm, cs, B(m->kvrow), BYTES(ap));
-    probe_at(m, c, l, pos, 1, m->qr, QL * 4);
-    probe_at(m, c, l, pos, 2, m->q, NH * HD * 2);
-    probe_at(m, c, l, pos, 3, m->kvrow, HD * 2);
     // compressor, and for CSA the indexer first (R:517, R:423)
     uint32_t n = 0;
     sx_arg comp = B(m->dummy), list = B(m->dummy), cnt = AT(m->cnt, 0);
@@ -655,7 +631,6 @@ static void enc_attn(Model *m, DsSession *d, sx_cmd *c, size_t l, uint32_t pos) 
     DISP(c, m->p.a_pv, HD / 64, NH / 16, 1, 128, B(d->scores), ring, B(m->kvrow), comp, list, cnt, L->sink, cs, B(m->o),
          BYTES(ap));
     DISP(c, m->p.a_store, 1, 1, 1, 128, B(m->kvrow), ring, BYTES(ap));
-    probe_at(m, c, l, pos, 4, m->o, NH * HD * 2);
     // output projection (R:542-547)
     ew(c, m->p.from_bf, B(m->o), B(m->of), NH * HD);
     dsv4_encode_grouped(&m->f8, c, &L->wo_a, OG, B(m->of), B(m->woa), 1, OG * OL);
@@ -663,16 +638,13 @@ static void enc_attn(Model *m, DsSession *d, sx_cmd *c, size_t l, uint32_t pos) 
     enc_aq(m, c, m->woa, OG * OL);
     enc_lin(m, c, &L->wo_b, m->f);
     enc_round(m, c, m->f, H);
-    probe_at(m, c, l, pos, 5, m->f, H * 4);
     enc_hc_post(m, c);
-    probe_at(m, c, l, pos, 6, m->st, HCW * 4);
 }
 
 // MoE of layer l (R:569-649): shared expert, router (a stop on score-routed layers), routed experts.
-static void enc_ffn(Model *m, sx_cmd *c, size_t l, uint32_t pos) {
+static void enc_ffn(Model *m, sx_cmd *c, size_t l) {
     const DsLayer *L = &m->L[l];
     enc_hc_pre(m, c, L->hcf_fn, L->hcf_base, L->hcf_scale, L->ffn_norm);
-    probe_at(m, c, l, pos, 7, m->X, H * 4);
     // shared expert
     enc_aq(m, c, m->X, H);
     enc_lin(m, c, &L->sw1, m->g1);
@@ -705,13 +677,7 @@ static void enc_ffn(Model *m, sx_cmd *c, size_t l, uint32_t pos) {
         uint32_t nh = H;
         DISP(c, m->p.madd, H / 256, 1, 1, 256, B(m->yr), B(m->ys), B(m->f), gpu_u32_arg(&nh));
     }
-    probe_at(m, c, l, pos, 8, m->ys, H * 4);
-    probe_at(m, c, l, pos, 9, m->yr, H * 4);
-    probe_at(m, c, l, pos, 10, m->f, H * 4);
-    probe_at(m, c, l, pos, 11, m->rw, NLAYERS * 32);
-    probe_at(m, c, l, pos, 12, m->slots, NLAYERS * 32);
     enc_hc_post(m, c);
-    probe_at(m, c, l, pos, 13, m->st, HCW * 4);
 }
 
 // pairs (id, weight) of one row, ascending id (insertion sort of 6)
@@ -802,7 +768,7 @@ static Err step(Model *m, Session *s, uint32_t token, sx_buffer *trace, size_t t
                  gpu_u32_arg(&n4));
         }
         enc_attn(m, d, c, l, (uint32_t)pos);
-        enc_ffn(m, c, l, (uint32_t)pos);
+        enc_ffn(m, c, l);
         if (trace) {
             uint32_t n4 = HCW / 4;
             DISP(c, m->p.copy4, n4 / 256, 1, 1, 256, B(m->st), AT(trace, (l * tstride + trow) * HCW * 4), gpu_u32_arg(&n4));
@@ -828,13 +794,6 @@ static Err step(Model *m, Session *s, uint32_t token, sx_buffer *trace, size_t t
         return "GpuFailed";
     }
     TRY(xe);
-    if (m->probe && pos == m->probe_p) {
-        FILE *pf = fopen(m->probe_path, "wb");
-        if (pf) {
-            fwrite(sx_buffer_contents(m->probe), 1, 16 * 65536, pf);
-            fclose(pf);
-        }
-    }
     s->pos = pos + 1;
     return OK;
 }

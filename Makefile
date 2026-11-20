@@ -22,7 +22,7 @@ TEST_SRCS := $(wildcard src/test/*.c)
 TEST_OBJS := $(TEST_SRCS:src/test/%.c=$(OBJ)/test/%.o)
 LIB_OBJS  := $(filter-out $(OBJ)/main.o,$(OBJS))
 
-.PHONY: all test verify bench clean
+.PHONY: all test verify verify-dsv4 bench clean
 .DELETE_ON_ERROR:
 
 all: $(BIN)
@@ -54,6 +54,18 @@ verify: $(BIN)
 	$(BIN) verify $(GOLDEN)
 	@for g in $(GOLDENS_27B); do d="$(dir $(abspath $(GOLDEN)))$$g"; \
 	  if [ -d "$$d" ]; then echo "verify: $$d"; env -u SAETTA_PACK $(BIN) verify "$$d" || exit 1; fi; done
+
+# DeepSeek-V4-Flash against its goldens next to GOLDEN: the forced per-layer check on the
+# all-positions golden, then the functional check on the others (streamed experts, cache
+# SAETTA_EXPERT_CACHE_GB, default 40). Skipped when the pack is absent. Not part of verify.
+DSV4_PACK ?= $(HOME)/Models/deepseek-ai/DeepSeek-V4-Flash-0731
+GOLDENS_DSV4 := golden-dsv4-short-decode-all golden-dsv4-short-decode golden-dsv4-long
+verify-dsv4: $(BIN)
+	@if [ ! -d "$(DSV4_PACK)" ]; then echo "verify-dsv4: no DeepSeek-V4-Flash pack at $(DSV4_PACK), skipped"; exit 0; fi; \
+	for g in $(GOLDENS_DSV4); do d="$(dir $(abspath $(GOLDEN)))$$g"; \
+	  if [ -d "$$d" ]; then echo "verify: $$d"; \
+	    SAETTA_PACK="$(DSV4_PACK)" SAETTA_EXPERT_CACHE_GB=$${SAETTA_EXPERT_CACHE_GB:-40} $(BIN) verify "$$d" || exit 1; \
+	  else echo "verify-dsv4: $$d absent, skipped"; fi; done
 
 bench: $(BIN)
 	$(BIN) qgen-bench

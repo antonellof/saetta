@@ -187,9 +187,12 @@ Needs full Xcode with the Metal Toolchain (`xcodebuild -downloadComponent MetalT
 git clone https://github.com/antonellof/saetta.git && cd saetta
 make                                # ./build/bin/saetta
 make test                           # unit tests (SAETTA_PACK=<pack> for those reading real tensors)
+make verify GOLDEN=<dir>/golden     # engine against reference outputs (Flash-Next, then Qwen3.8-27B)
+make verify-dsv4 GOLDEN=<dir>/golden  # DeepSeek-V4-Flash: per-layer check on the reference's inputs,
+                                    # then greedy agreement; needs its pack (DSV4_PACK), cache 40 GB
 ```
 
-`src/` is the engine: `model.c` (Flash-Next) and `dense.c` (Qwen3.8-27B) forward passes, `model_api.c` picks one per pack, `lora.c` and `kernels/` Metal, `server.c` the API, `tokenizer.c`, `chat.c`, `toolcall.c`. `scripts/` holds the installer, `config/` the agent configurations, `docs/` the guides.
+`src/` is the engine: `model.c` (Flash-Next), `dense.c` (Qwen3.8-27B) and `dsv4.c` (DeepSeek-V4-Flash, streamed experts) forward passes, `model_api.c` picks one per pack, `lora.c` and `kernels/` Metal, `server.c` the API, `tokenizer.c`, `chat.c`, `toolcall.c`. `scripts/` holds the installer, `config/` the agent configurations, `docs/` the guides.
 
 ## License
 

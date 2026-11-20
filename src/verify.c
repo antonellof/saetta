@@ -166,6 +166,147 @@ static int64_t top2_argmax(const JValue *top2, size_t t) {
     return json_get(top2->arr.items[t], "argmax")->i;
 }
 
+// ---- DeepSeek-V4-Flash ----------------------------------------------------------------------
+//
+// The model rounds to BF16 and FP8 at nearly every op as its reference does, so the engine's
+// f32 sums against the oracle's f64 ones drift across layers (an input one BF16 step off flips
+// e4m3 codes of the next linear's input). Two gates instead of per-layer bounds on a free run:
+// - forced, on a golden that dumps every position: each layer starts from the oracle's streams
+//   of the layer before (SAETTA_DSV4_FORCE), so its error is its own; tight bounds on every
+//   layer and on the logits KL, equal greedy argmax at every position outside near ties, and
+//   the prefill path's streams bit-identical to decode's;
+// - functional, on any golden: greedy argmax agreement outside near ties; KL and the per-layer
+//   drift are printed, not gated.
+
+typedef struct {
+    const char *dir;
+    const JValue *toks, *poss, *top2;
+    const float *xs, *ls;
+    size_t ntok, npos, layers, width, vocab;
+} DsGolden;
+
+static Err verify_dsv4(Arena *a, FILE *out, const Pack *pack, const char *pack_dir, const DsGolden *G, bool *okp) {
+    // SAETTA_VERIFY_FREE_RUN=1 (diagnostic): the functional check on an all-positions golden too
+    const bool forced = G->npos == G->ntok && !getenv("SAETTA_VERIFY_FREE_RUN");
+    if (forced) setenv("SAETTA_DSV4_FORCE", path_join(a, G->dir, "x_layers.f32"), 1);
+    else unsetenv("SAETTA_DSV4_FORCE");
+    Gpu g;
+    TRY(gpu_init(a, pack, &g));
+    Model *m;
+    Session *s;
+    Err err = model_load(a, pack, &g, &m);
+    const ModelInfo *mi = err ? NULL : model_info(m);
+    if (!err && (G->layers != mi->layers || G->width != mi->width || G->vocab != mi->vocab)) err = "GoldenShapeMismatch";
+    if (!err) err = session_create_kv(m, &g, false, &s);
+    if (err) {
+        gpu_deinit(&g);
+        return err;
+    }
+    const size_t L = G->layers, W = G->width, V = G->vocab;
+    fprintf(out, "model: %s, pack %s\n", mi->name, pack_dir);
+    fprintf(out, "mode: %s\n", forced ? "forced (every layer on the reference's input streams)" : "functional (free run)");
+    float *trace = ARENA_ARRAY(a, float, L * W);
+    float *dec = forced ? ARENA_ARRAY(a, float, G->npos * L * W) : NULL; // decode streams, for prefill
+    float *worst = ARENA_ARRAY(a, float, L);
+    for (size_t li = 0; li < L; li++) worst[li] = 0;
+    double worst_kl = 0, sum_kl = 0;
+    size_t nontie = 0, agree = 0, ties = 0, tie_agree = 0;
+    char b1[64], b2[64], b3[64];
+    const char *dump_path = getenv("SAETTA_VERIFY_DUMP"); // diagnostic: decode streams, x_layers layout
+    FILE *df = dump_path ? fopen(dump_path, "wb") : NULL;
+    for (size_t t = 0; t < G->ntok && !err; t++) {
+        size_t pi = G->npos;
+        for (size_t i = 0; i < G->npos; i++)
+            if ((size_t)G->poss->arr.items[i]->i == t) pi = i;
+        s->trace = pi < G->npos ? trace : NULL;
+        s->trace_len = pi < G->npos ? L * W : 0;
+        float *logits;
+        err = model_step(m, s, (uint32_t)G->toks->arr.items[t]->i, &logits);
+        if (err) break;
+        if (pi < G->npos) {
+            for (size_t li = 0; li < L; li++)
+                worst[li] = fmaxf(worst[li], rel(trace + li * W, G->xs + (pi * L + li) * W, W));
+            double k = kl(G->ls + pi * V, logits, V);
+            worst_kl = fmax(worst_kl, k);
+            sum_kl += k;
+            if (dec) memcpy(dec + pi * L * W, trace, L * W * sizeof(float));
+            if (df) fwrite(trace, sizeof(float), L * W, df);
+        }
+        const JValue *ref = G->top2->arr.items[t];
+        size_t best = argmax_scan(logits, V), want = (size_t)json_get(ref, "argmax")->i;
+        double margin = jf(json_get(ref, "top1")) - jf(json_get(ref, "top2"));
+        if (margin < TOL_ARGMAX_MARGIN) {
+            ties++;
+            tie_agree += best == want;
+        } else {
+            nontie++;
+            agree += best == want;
+            if (best != want) {
+                fmt_fixed(b1, sizeof b1, margin, 4);
+                fprintf(out, "argmax differs at position %zu: engine %zu, reference %zu (margin %s)\n", t, best, want, b1);
+            }
+        }
+    }
+    if (df) fclose(df);
+    bool ok = !err;
+    // prefill (successive decode steps writing the trace): the same streams as decode, bit for bit
+    if (ok && forced) {
+        session_reset(s);
+        uint32_t *tokens = ARENA_ARRAY(a, uint32_t, G->ntok);
+        for (size_t t = 0; t < G->ntok; t++) tokens[t] = (uint32_t)G->toks->arr.items[t]->i;
+        sx_buffer *tb;
+        float *plog;
+        err = gpu_new_buffer(&g, L * G->ntok * W * 4, &tb);
+        if (!err) err = model_prefill(m, s, tokens, G->ntok, tb, &plog);
+        if (!err) {
+            const float *tr = gpu_floats(tb);
+            size_t ndiff = 0;
+            for (size_t i = 0; i < G->npos; i++) {
+                size_t t = (size_t)G->poss->arr.items[i]->i;
+                for (size_t li = 0; li < L; li++)
+                    ndiff += memcmp(tr + (li * G->ntok + t) * W, dec + (i * L + li) * W, W * sizeof(float)) != 0;
+            }
+            ok = ndiff == 0;
+            fprintf(out, "prefill: streams %s decode's (%zu of %zu layer rows differ)%s\n", ndiff ? "differ from" : "identical to",
+                    ndiff, G->npos * L, ndiff ? "  FAIL" : "");
+            sx_buffer_release(tb);
+        }
+        ok = ok && !err;
+    }
+    fprintf(out, "layer  max rel err (residual streams, %zu positions)%s\n", G->npos, forced ? "" : ", drift: not gated");
+    for (size_t li = 0; li < L; li++) {
+        bool bad = forced && worst[li] > TOL_DSV4_FORCE_LAYER_REL;
+        ok = ok && !bad;
+        fprintf(out, "%5zu  %s%s\n", li, e3(b1, worst[li]), bad ? "  FAIL" : "");
+    }
+    bool kbad = forced && worst_kl > TOL_DSV4_FORCE_KL;
+    fprintf(out, "logits KL(ref||engine) at the dumped positions: worst %s, mean %s%s\n", e3d(b1, worst_kl),
+            e3d(b2, G->npos ? sum_kl / (double)G->npos : 0), kbad ? "  FAIL" : "");
+    double frac = nontie ? (double)agree / (double)nontie : 1.0;
+    const bool gated = forced || nontie >= TOL_DSV4_AGREE_MIN_POSITIONS;
+    bool abad = forced ? agree != nontie : gated && frac < TOL_DSV4_ARGMAX_AGREE;
+    fmt_fixed(b1, sizeof b1, frac * 100, 2);
+    fprintf(out, "greedy argmax: %zu of %zu equal outside near ties (%s%%), near ties (margin below %g) %zu of %zu equal%s\n",
+            agree, nontie, b1, TOL_ARGMAX_MARGIN, tie_agree, ties, abad ? "  FAIL" : "");
+    ok = ok && !kbad && !abad;
+    if (forced) {
+        verify_fmt_e(b1, sizeof b1, TOL_DSV4_FORCE_LAYER_REL, true, -1);
+        verify_fmt_e(b2, sizeof b2, TOL_DSV4_FORCE_KL, false, -1);
+        fprintf(out, "verify: %s (forced; tolerances: layer %s, KL %s, argmax all outside ties)\n", ok ? "PASS" : "FAIL", b1, b2);
+    } else {
+        fmt_fixed(b3, sizeof b3, TOL_DSV4_ARGMAX_AGREE * 100, 1);
+        if (gated)
+            fprintf(out, "verify: %s (functional; argmax agreement outside near ties at least %s%%)\n", ok ? "PASS" : "FAIL", b3);
+        else
+            fprintf(out, "verify: %s (functional; %zu positions outside near ties, under %d: agreement and KL not gated)\n",
+                    ok ? "PASS" : "FAIL", nontie, TOL_DSV4_AGREE_MIN_POSITIONS);
+    }
+    gpu_deinit(&g);
+    if (err) return err;
+    *okp = ok;
+    return OK;
+}
+
 Err verify_run(Arena *a, FILE *out, const char *pack_dir, const char *golden, bool *okp) {
     JValue *man;
     TRY(read_json(a, golden, "manifest.json", &man));
@@ -187,6 +328,13 @@ Err verify_run(Arena *a, FILE *out, const char *pack_dir, const char *golden, bo
 
     Pack pack;
     TRY(pack_open(a, pack_dir, &pack));
+    const ModelInfo *pre = model_info_for(a, &pack);
+    if (pre && strcmp(pre->model_type, "deepseek_v4") == 0) {
+        DsGolden dg = {golden, toks, poss, top2, xs, ls, ntok, npos, layers, width, vocab};
+        Err e = verify_dsv4(a, out, &pack, pack_dir, &dg, okp);
+        pack_close(&pack);
+        return e;
+    }
     Gpu g;
     Err err = gpu_init(a, &pack, &g);
     if (err) {
@@ -208,14 +356,6 @@ Err verify_run(Arena *a, FILE *out, const char *pack_dir, const char *golden, bo
     const ModelInfo *mi = model_info(m);
     if (layers != mi->layers || width != mi->width || vocab != mi->vocab) FAIL_CLOSE("GoldenShapeMismatch");
     fprintf(out, "model: %s, pack %s\n", mi->name, pack_dir);
-    // DeepSeek-V4-Flash rounds to BF16 and FP8 at every op as its reference does, so the engine's
-    // f32 sums against the oracle's f64 ones drift across layers: its own bounds, and a gate on
-    // the output distribution (KL at the dumped positions).
-    const bool dsv4 = strcmp(mi->model_type, "deepseek_v4") == 0;
-    const float tol_layer = dsv4 ? TOL_DSV4_LAYER_REL : TOL_LAYER_REL;
-    const float tol_logits = dsv4 ? TOL_DSV4_LOGITS_REL : TOL_LOGITS_REL;
-    const double tol_margin = dsv4 ? TOL_DSV4_ARGMAX_MARGIN : TOL_ARGMAX_MARGIN;
-    double worst_kl = 0;
     // a golden made with a LoRA adapter (manifest "lora"): the same adapter, from the
     // manifest's path
     const JValue *lora = json_get(man, "lora");
@@ -232,10 +372,6 @@ Err verify_run(Arena *a, FILE *out, const char *pack_dir, const char *golden, bo
     FAIL_CLOSE(session_create_kv(m, &g, false, &s)); // exact checks: f32 KV cache
     float *trace = ARENA_ARRAY(a, float, layers * width);
 
-    // SAETTA_VERIFY_DUMP=<file>: the engine's decode streams at the dumped positions, written
-    // there in the layout of x_layers.f32 (diagnostic)
-    const char *dump_path = getenv("SAETTA_VERIFY_DUMP");
-    float *dump = dump_path ? ARENA_ARRAY(a, float, npos * layers * width) : NULL;
     float *worst_layer = ARENA_ARRAY(a, float, layers);
     float worst_logits = 0;
     size_t argmax_ok = 0, argmax_skip = 0, argmax_bad = 0;
@@ -252,11 +388,9 @@ Err verify_run(Arena *a, FILE *out, const char *pack_dir, const char *golden, bo
         float *logits;
         FAIL_CLOSE(model_step(m, s, (uint32_t)toks->arr.items[t]->i, &logits));
         if (has_pi) {
-            if (dump) memcpy(dump + pi * layers * width, trace, layers * width * sizeof(float));
             for (size_t li = 0; li < layers; li++)
                 worst_layer[li] = fmaxf(worst_layer[li], rel(trace + li * width, xs + (pi * layers + li) * width, width));
             worst_logits = fmaxf(worst_logits, rel(logits, ls + pi * vocab, vocab));
-            if (dsv4) worst_kl = fmax(worst_kl, kl(ls + pi * vocab, logits, vocab));
         }
         size_t best = argmax_scan(logits, vocab);
         const JValue *ref = top2->arr.items[t];
@@ -264,19 +398,12 @@ Err verify_run(Arena *a, FILE *out, const char *pack_dir, const char *golden, bo
         double margin = jf(json_get(ref, "top1")) - jf(json_get(ref, "top2"));
         if (best == want)
             argmax_ok++;
-        else if (margin < tol_margin)
+        else if (margin < TOL_ARGMAX_MARGIN)
             argmax_skip++;
         else {
             argmax_bad++;
             fmt_fixed(b1, sizeof b1, margin, 4);
             fprintf(out, "argmax differs at position %zu: engine %zu, reference %zu (margin %s)\n", t, best, want, b1);
-        }
-    }
-    if (dump) {
-        FILE *df = fopen(dump_path, "wb");
-        if (df) {
-            fwrite(dump, sizeof(float), npos * layers * width, df);
-            fclose(df);
         }
     }
     // prefill path: the whole prompt as one chunk, exact f32 first, then the accelerator path
@@ -307,11 +434,11 @@ Err verify_run(Arena *a, FILE *out, const char *pack_dir, const char *golden, bo
     fprintf(out, "prefill (one chunk of %zu): worst layer rel err %s, last-token logits %s, argmax %s\n", ntok, e3(b1, pmax),
             e3(b2, plogit), pbest == plast ? "equal" : "DIFFERENT");
     for (size_t li = 0; li < layers; li++)
-        if (pworst[li] > tol_layer) {
+        if (pworst[li] > TOL_LAYER_REL) {
             ok = false;
             fprintf(out, "  prefill layer %zu: %s  FAIL\n", li, e3(b1, pworst[li]));
         }
-    if (plogit > tol_logits || pbest != plast) ok = false;
+    if (plogit > TOL_LOGITS_REL || pbest != plast) ok = false;
 
     // accelerator prefill (half inputs): quality gate on KL of the last-token distribution
     if (fast_available) {
@@ -378,22 +505,17 @@ Err verify_run(Arena *a, FILE *out, const char *pack_dir, const char *golden, bo
         fprintf(out, "prefill, accelerators: not available, skipped\n");
     fprintf(out, "decode:\nlayer  max rel err (residual streams, %zu positions)\n", npos);
     for (size_t li = 0; li < layers; li++) {
-        bool bad = worst_layer[li] > tol_layer;
+        bool bad = worst_layer[li] > TOL_LAYER_REL;
         ok = ok && !bad;
         fprintf(out, "%5zu  %s%s\n", li, e3(b1, worst_layer[li]), bad ? "  FAIL" : "");
     }
-    bool lbad = worst_logits > tol_logits;
-    if (dsv4) {
-        bool kbad = worst_kl > TOL_DSV4_KL;
-        lbad = lbad || kbad;
-        fprintf(out, "logits KL(ref||engine), worst dumped position %s%s\n", e3d(b1, worst_kl), kbad ? "  FAIL" : "");
-    }
+    bool lbad = worst_logits > TOL_LOGITS_REL;
     ok = ok && !lbad && argmax_bad == 0;
     fprintf(out, "logits max rel err %s%s\n", e3(b1, worst_logits), lbad ? "  FAIL" : "");
     fprintf(out, "greedy argmax: %zu equal, %zu near ties skipped, %zu different\n", argmax_ok, argmax_skip, argmax_bad);
-    verify_fmt_e(b1, sizeof b1, tol_layer, true, -1);
-    verify_fmt_e(b2, sizeof b2, tol_logits, true, -1);
-    fmt_f64(b3, sizeof b3, tol_margin);
+    verify_fmt_e(b1, sizeof b1, TOL_LAYER_REL, true, -1);
+    verify_fmt_e(b2, sizeof b2, TOL_LOGITS_REL, true, -1);
+    fmt_f64(b3, sizeof b3, TOL_ARGMAX_MARGIN);
     fprintf(out, "verify: %s (tolerances: layer %s, logits %s, tie margin %s)\n", ok ? "PASS" : "FAIL", b1, b2, b3);
 #undef FAIL_CLOSE
     gpu_deinit(&g);

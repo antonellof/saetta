@@ -115,22 +115,30 @@
 // the reference's operations in its order and are checked bit for bit.
 #define TOL_DSV4_IDX_SCORE_REL 0.0078125 // f64
 #define TOL_DSV4_IDX_SCORE_FRAC 1e-3     // f64
-// DeepSeek-V4-Flash `saetta verify` (decode path, streamed experts), engine against the numpy
-// oracle (f64 except where the reference rounds). The model rounds to BF16 after nearly every op
-// and quantizes every linear's input to FP8 (3 mantissa bits), so one BF16 step of difference in
-// an input (the engine sums in f32, the oracle in f64) flips e4m3 codes and moves a layer's
-// output by up to about 1e-1 relative; the drift compounds over 43 layers. Measured 2026-11-20
-// on tests/golden-dsv4-short-decode (24 tokens, 4 dumped positions):
-// - free running: worst layer 3.55e-1 (layer 18), logits 9.3e-2, KL(ref||engine) 4.6e-2 at the
-//   worst dumped position; greedy argmax 22 of 24 equal, the other two at reference margins
-//   0.857 (position 16) and below 0.05;
-// - each layer on the oracle's inputs (SAETTA_DSV4_FORCE, all 24 positions dumped): worst layer
-//   5.8e-2, logits 2.6e-2, KL 4.3e-3, argmax 24 of 24; at the probed points every stage on
-//   identical inputs is bit-exact (MoE, q, kv) or within the kernels' own tolerances.
-// The free-running bounds below catch wiring errors (relative errors of 1 and more), not drift.
-#define TOL_DSV4_LAYER_REL 0.5f    // f32
-#define TOL_DSV4_LOGITS_REL 0.2f   // f32
-#define TOL_DSV4_ARGMAX_MARGIN 1.0 // f64
-#define TOL_DSV4_KL 0.1            // f64
+// DeepSeek-V4-Flash `saetta verify` (src/verify.c, verify_dsv4), engine against the numpy oracle
+// (f64 except where the reference rounds). The model rounds to BF16 after nearly every op and
+// quantizes every linear's input to FP8 (3 mantissa bits): an input one BF16 step off flips e4m3
+// codes and moves a layer's output by up to about 1e-1, and a free run drifts over 43 layers
+// (measured 2026-11-20 on the 24-token golden: layer 18 at 3.5e-1, KL 4.6e-2). So the gates are:
+// - forced (golden with every position dumped; each layer from the reference's input streams):
+//   max rel error of every layer's streams, worst logits KL(ref||engine), and every argmax
+//   outside near ties equal. Measured 2026-11-20 with streamed experts: 24 tokens, worst layer
+//   5.8e-2 (layer 18), KL 4.3e-3, argmax 24 of 24; the first 257 tokens of the long prompt,
+//   worst layer 1.6e-1 (layer 15; router near ties: at one position rank 6 and 7 differ by
+//   5.1e-4 and the engine's f32 sums pick the other expert, which alone moves that layer by
+//   8e-2), median per layer 2e-3 to 5e-3, KL 2.2e-3, argmax 256 of 256; prefill streams
+//   bit-identical to decode. A wiring error moves a layer by 1 or more.
+#define TOL_DSV4_FORCE_LAYER_REL 0.25f // f32
+#define TOL_DSV4_FORCE_KL 1e-2         // f64
+// - functional (any golden, free run): share of greedy argmax equal to the reference's where its
+//   top-1 minus top-2 margin is at least TOL_ARGMAX_MARGIN, gated on goldens with at least
+//   TOL_DSV4_AGREE_MIN_POSITIONS such positions (printed only on smaller ones, where one miss in
+//   23 is already 95.7%). The bound is what f32 arithmetic allows against the f64 oracle: the
+//   oracle itself with its linears and experts in f32 agrees with the f64 oracle at 95.7% (244 of
+//   255 on the first 257 tokens of the long prompt, misses at margins up to 1.71). Measured
+//   2026-11-20: engine 97.7% on the long golden (2036 of 2083), 93.0% on those 257 tokens; forced
+//   100%.
+#define TOL_DSV4_ARGMAX_AGREE 0.95 // f64
+#define TOL_DSV4_AGREE_MIN_POSITIONS 1000
 
 #endif

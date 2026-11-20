@@ -50,6 +50,15 @@ typedef struct {
     Mlp mlp;
 } Layer;
 
+// The MTP draft head (V27:67-190): x = fc([rms_e(embed(t)) | rms_h(h)]), one gated-attention
+// decoder layer with its own KV plane (slot n_attn), then norm and the shared lm_head; its
+// stream before norm is the next draft's h.
+typedef struct {
+    Linear fc;            // [H][2H], input columns [embedding | hidden]
+    Vec n_e, n_h, norm;   // pre_fc_norm_embedding, pre_fc_norm_hidden, mtp.norm
+    Layer layer;          // layer.attn->slot == n_attn
+} Mtp;
+
 #define MODEL_PIPES(X)                                                                                         \
     X(q4, "qmatvec_4_32") X(q8, "qmatvec_8_64") X(qmv4_l8, "qmv4_l8") X(qmv4_l256, "qmv4_l256")                   \
     X(qmv_multi_l8, "qmv_multi_l8") X(qmv_multi_l32, "qmv_multi_l32") X(qmv_multi_l256, "qmv_multi_l256")          \
@@ -135,7 +144,10 @@ struct Model {
     Params params;
     sx_buffer *scratch, *bscratch, *logits;
     sx_buffer *vlogits; // [KMAX][vocab], verification chunks
-    void *mtp;          // always NULL: the 27B MTP head is not loaded yet
+    Mtp *mtp;           // NULL without the head (no mtp.fc in the pack, or SAETTA_MTP=0)
+    // MTP: trunk streams before the final norm ([CH + 1][H]: row 0 the stream before the
+    // current chunk, then the chunk's rows) and the draft logits.
+    sx_buffer *mtp_hid, *mtp_logits;
     // LoRA adapters (model_lora_load) and the one the next passes apply (-1: none).
     LoraPipes lp;
     bool lp_ok;

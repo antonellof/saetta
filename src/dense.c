@@ -46,12 +46,15 @@ static_assert(NQ / NKV == 6 && HD == 256); // attn_full_6 shape (src/kernels/den
 #define NSPLIT_PRE 8
 #define AB 512
 
-static size_t n_gdn, n_attn;
+// n_kv: KV planes per session, n_attn plus one for the MTP head when model_load loaded it
+// (sessions are created after the model, which they follow).
+static size_t n_gdn, n_attn, n_kv;
 __attribute__((constructor)) static void count_layers(void) {
     size_t n = 0;
     for (size_t i = 0; i < NLAYERS; i++) n += config_layer_kinds[i] == LAYER_KIND_GDN;
     n_gdn = n;
     n_attn = NLAYERS - n;
+    n_kv = n_attn;
 }
 
 static Err params_take(Params *p, size_t n, Vec *out) {
@@ -154,6 +157,7 @@ static Err lin(Arena *a, const Pack *pack, const char *p, const char *name, Line
 static Err vec(Arena *a, const Pack *pack, Params *P, const char *p, const char *name, Vec *out);
 static char *cat(Arena *a, const char *x, const char *y) { return arena_printf(a, "%s%s", x, y); }
 static void dequant_row(const Pack *pack, const Linear *l, size_t r, float *out);
+static Err load_mtp(Arena *a, const Pack *pack, Params *P, Mtp *mt);
 
 static const char *const pipe_kernels[] = {
 #define MODEL_PIPE_KNAME(f, k) k,
@@ -266,6 +270,18 @@ Err model_load(Arena *arena, const Pack *pack, Gpu *g, Model **out) {
         TRY(lin(arena, pack, p, "mlp.up_proj", &L->mlp.up));
         TRY(lin(arena, pack, p, "mlp.down_proj", &L->mlp.down));
     }
+    // the MTP draft head, when the pack has it (SAETTA_MTP=0 leaves it off)
+    const char *mv = getenv("SAETTA_MTP");
+    if ((mv ? mv[0] != '0' : true) && pack_get(pack, S("mtp.fc.weight")) != NULL) {
+        Mtp *mt = ARENA_NEW(arena, Mtp);
+        TRY(load_mtp(arena, pack, &m->params, mt));
+        TRY(gpu_new_buffer(g, (CH + 1) * H * 4, &m->mtp_hid));
+        TRY(gpu_new_buffer(g, VOCAB * 4, &m->mtp_logits));
+        m->mtp = mt;
+        n_kv = n_attn + 1;
+        dbg("model: MTP head loaded (fc %u-bit group %u)\n", mt->fc.bits, mt->fc.group_size);
+    } else
+        n_kv = n_attn;
     // the shapes are compile-time constants here: a pack that differs is refused, not run
     FILE *quiet = fopen("/dev/null", "w");
     size_t bad = model_check_pack(arena, pack, quiet ? quiet : stderr);
@@ -617,7 +633,7 @@ static void enc_mm(Enc *e, const Linear *l, sx_arg x, sx_arg y, size_t T) {
 
 // The selected adapter's group k of layer li, or NULL.
 static const LoraGroup *lora_group(const Model *m, size_t li, int k) {
-    if (m->lora_on < 0) return NULL;
+    if (m->lora_on < 0 || li >= NLAYERS) return NULL; // li NLAYERS: the MTP layer
     const LoraGroup *G = &m->lora[m->lora_on].g[li][k];
     return G->on ? G : NULL;
 }
@@ -788,6 +804,36 @@ static void enc_layers(Enc *e, Session *s, size_t T, size_t pos0, sx_arg x, sx_a
     }
 }
 
+// MTP rows (V27:159-190): row i pairs the token embedding emb[i] ([T][H]) with the stream
+// hid[i] before it, at position p0 + i of that stream (the head's KV and RoPE position, as
+// vLLM's drafter: the stream's position, so the head's KV has no gap at 0). Leaves the
+// head's streams before mtp.norm in X ([T][H]) and, with logits, the last row's logits in
+// mtp_logits. dec: the decode scratch (T == 1), else the chunk scratch.
+static sx_arg mtp_x(Model *m, bool dec) { return dec ? sarg(m, S_X) : barg(m->bscratch, B_X); }
+
+static void enc_mtp_rows(Enc *e, Session *s, sx_arg emb, sx_arg hid, size_t T, size_t p0, bool dec, bool logits) {
+    Model *m = e->m;
+    const Mtp *mt = m->mtp;
+    sx_buffer *b = dec ? m->scratch : m->bscratch;
+    // [rms_e(emb) | rms_h(hid)] per row, in the GDN qkv scratch (CONV == 2H floats a row)
+    static_assert(CONV == 2 * H);
+    sx_arg cat2 = barg(b, dec ? S_qkv : B_qkv);
+    sx_arg x = mtp_x(m, dec), xa = barg(b, dec ? S_a : B_a), y = barg(b, dec ? S_y : B_y);
+    enc_norm(e, emb, mt->n_e, cat2, T, H, H, 2 * H, 0, false);
+    enc_norm(e, hid, mt->n_h, offa(cat2, H), T, H, H, 2 * H, 0, false);
+    if (dec)
+        enc_mv(e, &mt->fc, cat2, x);
+    else
+        enc_mm(e, &mt->fc, cat2, x, T);
+    const Layer *L = &mt->layer;
+    enc_norm(e, x, L->in_norm, xa, T, H, H, H, 0, false);
+    enc_attn_t(e, L->attn, s, T, p0, xa, y, dec, NLAYERS);
+    enc_add_norm(e, x, y, L->post_norm, xa, T);
+    enc_mlp_t(e, &L->mlp, T, xa, y, dec, NLAYERS);
+    enc_add_norm(e, x, y, mt->norm, xa, T);
+    if (logits) enc_mv(e, &m->lm_head, offa(xa, (T - 1) * H), barg(m->mtp_logits, 0));
+}
+
 // ---- host math ------------------------------------------------------------------------------
 
 // std.math.pow(f64) as the Zig engine computed it (see model.c), for the RoPE table.
@@ -857,6 +903,10 @@ Err model_step(Model *m, Session *s, uint32_t token, float **logits) {
     enc_layers(&e, s, 1, s->pos, sarg(m, S_X), sarg(m, S_a), sarg(m, S_y), trace, true);
     s->roll = SESSION_NO_ROLL; // the step's start state is encoded; it ends in the live state
     enc_mv(&e, &m->lm_head, sarg(m, S_a), barg(m->logits, 0));
+    if (m->mtp) {
+        enc_copy(&e, sarg(m, S_X), barg(m->mtp_hid, 0), H);
+        s->mtp_n = 1;
+    }
     TRY(enc_finish(&e));
     if (s->trace) memcpy(s->trace, gpu_floats(s->trace_buf), s->trace_len * sizeof(float));
     s->pos += 1;
@@ -877,10 +927,24 @@ static Err chunk_logits(Model *m, Session *s, const uint32_t *toks, size_t T, sx
     enc_norm(&e, barg(b, B_X), m->layers[0].in_norm, barg(b, B_a), T, H, H, H, 0, false);
     enc_layers(&e, s, T, s->pos, barg(b, B_X), barg(b, B_a), barg(b, B_y), trace, false);
     s->roll = SESSION_NO_ROLL;
+    if (m->mtp) enc_copy(&e, barg(b, B_X), barg(m->mtp_hid, all ? 0 : H), T * H);
     if (all)
         enc_mm(&e, &m->lm_head, barg(b, B_a), barg(m->vlogits, 0), T);
     else
         enc_mv(&e, &m->lm_head, barg(b, B_a + (T - 1) * H), barg(m->logits, 0));
+    if (m->mtp && !all) {
+        // the head's history for the prompt chunk: rows q in [pos0, pos0 + T) pair the trunk
+        // stream at q - 1 (mtp_hid row q - pos0; row 0 the previous chunk's last) with toks
+        // q - pos0 (still in stage); the first row is skipped at position 0 or when that
+        // stream is unknown. Then the chunk's last stream moves to row 0.
+        size_t skip0 = (s->pos == 0 || !s->mtp_ok) ? 1 : 0;
+        if (T > skip0)
+            enc_mtp_rows(&e, s, barg(m->stage, skip0 * H), barg(m->mtp_hid, skip0 * H), T - skip0, s->pos + skip0 - 1,
+                         false, false);
+        enc_copy(&e, barg(m->mtp_hid, T * H), barg(m->mtp_hid, 0), H);
+        s->mtp_ok = true;
+        s->mtp_n = 1;
+    }
     TRY(enc_finish(&e));
     s->pos += T;
     *logits = gpu_floats(all ? m->vlogits : m->logits);
@@ -958,6 +1022,12 @@ Err model_spec_verify(Model *m, Session *s, uint32_t x, const uint32_t *drafts, 
         j += 1;
         next = pick(ctx, lg + j * VOCAB, j < nd, j < nd ? drafts[j] : 0);
     }
+    if (m->mtp) {
+        // the chunk left its trunk streams in mtp_hid: rows 0..j pair with the accepted
+        // drafts and then next
+        memcpy(s->mtp_tok, drafts, j * sizeof(uint32_t));
+        s->mtp_n = j + 1;
+    }
     if (j + 1 < T) {
         // back to the state after token j of the chunk (its slot)
         s->roll = j;
@@ -968,9 +1038,33 @@ Err model_spec_verify(Model *m, Session *s, uint32_t x, const uint32_t *drafts, 
     return OK;
 }
 
-Err model_draft_mtp(Model *m, Session *s, uint32_t x, size_t k, uint32_t *out, size_t *nd) {
-    (void)m, (void)s, (void)x, (void)k, (void)out;
-    *nd = 0;
+// As model.c: the pending verified rows first (streams at s->pos - n .. s->pos - 1, paired with
+// mtp_tok and x), rewriting the head's KV there with the trunk's streams; then each further
+// draft feeds the head's own stream and the previous draft.
+Err model_draft_mtp(Model *m, Session *s, uint32_t x, size_t k, uint32_t *out, size_t *ndraft) {
+    *ndraft = 0;
+    if (!m->mtp || !s->mtp_ok || s->mtp_n == 0 || k == 0) return OK;
+    size_t n = s->mtp_n;
+    if (s->pos + k + 1 > s->cap || s->pos < n) return OK;
+    bool dec = n == 1;
+    float *emb = dec ? gpu_floats(m->scratch) + S_a : gpu_floats(m->bscratch) + B_a;
+    for (size_t j = 0; j < n; j++) dequant_row(m->pack, &m->embed, j + 1 < n ? s->mtp_tok[j] : x, emb + j * H);
+    Enc e = enc_begin(m);
+    enc_mtp_rows(&e, s, dec ? sarg(m, S_a) : barg(m->bscratch, B_a), barg(m->mtp_hid, 0), n, s->pos - n, dec, true);
+    TRY(enc_finish(&e));
+    sx_arg h = offa(mtp_x(m, dec), (n - 1) * H); // the head's last stream: the next row's h
+    out[0] = model_argmax(gpu_floats(m->mtp_logits), VOCAB);
+    size_t nd = 1;
+    for (; nd < k; nd++) {
+        // h may be B.X (left alone by the decode-scratch pass) or S.X (read before rewritten)
+        dequant_row(m->pack, &m->embed, out[nd - 1], gpu_floats(m->scratch) + S_a);
+        Enc e2 = enc_begin(m);
+        enc_mtp_rows(&e2, s, sarg(m, S_a), h, 1, s->pos - 1 + nd, true, true);
+        TRY(enc_finish(&e2));
+        h = sarg(m, S_X);
+        out[nd] = model_argmax(gpu_floats(m->mtp_logits), VOCAB);
+    }
+    *ndraft = nd;
     return OK;
 }
 
@@ -1000,7 +1094,7 @@ static Err new_state(Gpu *g, sx_buffer **gdn, sx_buffer **conv) {
     return OK;
 }
 
-static size_t kv_bytes(size_t cap, size_t elem) { return n_attn * 2 * cap * NKV * HD * elem; }
+static size_t kv_bytes(size_t cap, size_t elem) { return n_kv * 2 * cap * NKV * HD * elem; }
 
 Err session_create_cap(Gpu *g, bool kv_half, size_t cap, size_t max_cap, Session **out) {
     Session *s = xcalloc(1, sizeof *s);
@@ -1034,7 +1128,7 @@ Err session_grow(Session *s, Gpu *g, size_t cap) {
     TRY(gpu_new_buffer(g, kv_bytes(cap, session_kv_elem(s)), &kv));
     uint8_t *dkv = sx_buffer_contents(kv);
     const uint8_t *skv = sx_buffer_contents(s->kv);
-    for (size_t plane = 0; plane < n_attn * 2; plane++) memcpy(dkv + plane * cap * kvrow, skv + plane * old * kvrow, old * kvrow);
+    for (size_t plane = 0; plane < n_kv * 2; plane++) memcpy(dkv + plane * cap * kvrow, skv + plane * old * kvrow, old * kvrow);
     sx_buffer_release(s->kv);
     s->kv = kv;
     s->cap = cap;
@@ -1112,6 +1206,8 @@ void session_swap_conv(Session *s, Conv *cv) {
     for (int i = 0; i < PT_MAX; i++) SWAP(Point, s->pts[i], cv->pts[i]);
     SWAP(VecU32, s->ptoks, cv->ptoks);
     s->roll = SESSION_NO_ROLL;
+    s->mtp_ok = false;
+    s->mtp_n = 0;
 }
 
 bool session_roll_to(Session *s, size_t p, const uint32_t *toks) {
@@ -1119,6 +1215,8 @@ bool session_roll_to(Session *s, size_t p, const uint32_t *toks) {
     if (s->chunk_t == 0 || p <= s->chunk_pos0 || p > s->chunk_pos0 + s->chunk_t || p > s->pos) return false;
     s->roll = p - s->chunk_pos0 - 1;
     s->pos = p;
+    s->mtp_ok = false;
+    s->mtp_n = 0;
     return true;
 }
 
@@ -1139,6 +1237,8 @@ static void start_at(Session *s, const Point *pt, size_t n) {
     memcpy(gpu_floats(s->gdn_state), gpu_floats(pt->gdn), GDN_STATE_N * 4);
     memcpy(gpu_floats(s->gdn_conv), gpu_floats(pt->conv), GDN_CONV_N * 4);
     s->pos = n;
+    s->mtp_ok = false;
+    s->mtp_n = 0;
 }
 
 void session_start_at_own_point(Session *s, size_t n) {
@@ -1152,7 +1252,7 @@ Err session_start_from(Session *s, Gpu *g, const Conv *src, size_t n) {
     size_t kvrow = NKV * HD * session_kv_elem(s);
     uint8_t *dkv = sx_buffer_contents(s->kv);
     const uint8_t *skv = sx_buffer_contents(src->kv);
-    for (size_t plane = 0; plane < n_attn * 2; plane++) memcpy(dkv + plane * s->cap * kvrow, skv + plane * src->cap * kvrow, n * kvrow);
+    for (size_t plane = 0; plane < n_kv * 2; plane++) memcpy(dkv + plane * s->cap * kvrow, skv + plane * src->cap * kvrow, n * kvrow);
     size_t k = n / PT_EVERY - 1;
     start_at(s, &src->pts[k], n);
     for (size_t i = 0; i < k + 1; i++) {
@@ -1173,6 +1273,8 @@ void session_restore(Session *s) {
     memcpy(gpu_floats(s->gdn_state), gpu_floats(k->gdn), GDN_STATE_N * 4);
     memcpy(gpu_floats(s->gdn_conv), gpu_floats(k->conv), GDN_CONV_N * 4);
     s->pos = k->tokens.len;
+    s->mtp_ok = false; // the trunk stream before the checkpoint is not kept
+    s->mtp_n = 0;
 }
 
 void session_push_history(Session *s, uint32_t token) { (void)s, (void)token; }
@@ -1180,6 +1282,8 @@ void session_push_history(Session *s, uint32_t token) { (void)s, (void)token; }
 void session_reset(Session *s) {
     s->roll = SESSION_NO_ROLL;
     s->pos = 0;
+    s->mtp_ok = false;
+    s->mtp_n = 0;
     memset(gpu_floats(s->gdn_state), 0, GDN_STATE_N * 4);
     memset(gpu_floats(s->gdn_conv), 0, GDN_CONV_N * 4);
 }
@@ -1411,6 +1515,34 @@ static Err vec(Arena *a, const Pack *pack, Params *P, const char *p, const char 
     return OK;
 }
 
+// The MTP head (tensor names as HF's, under mtp.), matrices at whatever (bits, group) the pack
+// stores; the layer's attention takes the KV plane after the trunk's.
+static Err load_mtp(Arena *a, const Pack *pack, Params *P, Mtp *mt) {
+    *mt = (Mtp){0};
+    TRY(pack_linear(pack, S("mtp.fc"), &mt->fc));
+    TRY(vec(a, pack, P, "mtp.", "pre_fc_norm_embedding.weight", &mt->n_e));
+    TRY(vec(a, pack, P, "mtp.", "pre_fc_norm_hidden.weight", &mt->n_h));
+    TRY(vec(a, pack, P, "mtp.", "norm.weight", &mt->norm));
+    const char *p = "mtp.layers.0.";
+    Layer *L = &mt->layer;
+    TRY(vec(a, pack, P, p, "input_layernorm.weight", &L->in_norm));
+    TRY(vec(a, pack, P, p, "post_attention_layernorm.weight", &L->post_norm));
+    Attn *A = ARENA_NEW(a, Attn);
+    A->slot = n_attn;
+    TRY(lin(a, pack, p, "self_attn.q_proj", &A->q));
+    TRY(lin(a, pack, p, "self_attn.k_proj", &A->k));
+    TRY(lin(a, pack, p, "self_attn.v_proj", &A->v));
+    TRY(lin(a, pack, p, "self_attn.o_proj", &A->o));
+    TRY(vec(a, pack, P, p, "self_attn.q_norm.weight", &A->q_norm));
+    TRY(vec(a, pack, P, p, "self_attn.k_norm.weight", &A->k_norm));
+    L->attn = A;
+    L->gdn = NULL;
+    TRY(lin(a, pack, p, "mlp.gate_proj", &L->mlp.gate));
+    TRY(lin(a, pack, p, "mlp.up_proj", &L->mlp.up));
+    TRY(lin(a, pack, p, "mlp.down_proj", &L->mlp.down));
+    return OK;
+}
+
 // Dequantizes row r of an affine quantized matrix into out[in_features] (see model.c).
 static void dequant_row(const Pack *pack, const Linear *l, size_t r, float *out) {
     size_t bits = l->bits;
@@ -1481,6 +1613,35 @@ size_t model_check_pack(Arena *a, const Pack *pack, FILE *out) {
             } else if (lin.out_features != want[i].out || lin.in_features != want[i].in) {
                 fprintf(out, "  SHAPE %s: got %llux%llu, want %llux%llu\n", mod, (unsigned long long)lin.out_features,
                         (unsigned long long)lin.in_features, (unsigned long long)want[i].out, (unsigned long long)want[i].in);
+                bad++;
+            }
+        }
+    }
+    if (pack_get(pack, S("mtp.fc.weight")) != NULL) {
+        static const struct {
+            const char *name;
+            uint64_t out, in;
+        } mw[] = {
+            {"mtp.fc", H, 2 * H},
+            {"mtp.layers.0.self_attn.q_proj", 2 * NQ * HD, H},
+            {"mtp.layers.0.self_attn.k_proj", NKV * HD, H},
+            {"mtp.layers.0.self_attn.v_proj", NKV * HD, H},
+            {"mtp.layers.0.self_attn.o_proj", H, NQ * HD},
+            {"mtp.layers.0.mlp.gate_proj", FFN, H},
+            {"mtp.layers.0.mlp.up_proj", FFN, H},
+            {"mtp.layers.0.mlp.down_proj", H, FFN},
+        };
+        for (size_t i = 0; i < COUNT(mw); i++) {
+            Linear lin;
+            Err err = pack_linear(pack, str(mw[i].name), &lin);
+            n++;
+            if (err) {
+                fprintf(out, "  MISSING %s: %s\n", mw[i].name, err);
+                bad++;
+            } else if (lin.out_features != mw[i].out || lin.in_features != mw[i].in) {
+                fprintf(out, "  SHAPE %s: got %llux%llu, want %llux%llu\n", mw[i].name,
+                        (unsigned long long)lin.out_features, (unsigned long long)lin.in_features,
+                        (unsigned long long)mw[i].out, (unsigned long long)mw[i].in);
                 bad++;
             }
         }

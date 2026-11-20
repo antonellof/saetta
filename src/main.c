@@ -66,6 +66,7 @@ typedef struct {
     size_t done, steps;
     uint64_t t_draft, t_ver;
     size_t n_ver[8];
+    size_t mtp_drafted, mtp_accepted; // MTP drafts verified, and accepted
 } GenStats;
 
 static bool is_eos(const Model *m, uint32_t t) {
@@ -119,7 +120,11 @@ static Err decode_loop(Model *m, Session *s, float *logits, const uint32_t *toks
         TRY(model_spec_greedy(m, s, x, drafts, nd, &r));
         gs->t_ver += now_ns() - tv0;
         gs->n_ver[nd] += 1;
-        if (from_mtp) depth_record(&depth, nd, r.accepted, (float)(now_ns() - tr0) / 1e6f);
+        if (from_mtp) {
+            depth_record(&depth, nd, r.accepted, (float)(now_ns() - tr0) / 1e6f);
+            gs->mtp_drafted += nd;
+            gs->mtp_accepted += r.accepted;
+        }
         else gate_record(&gate, r.accepted + 1);
         gs->done += 1;
         for (size_t i = 0; i < r.accepted; i++) {
@@ -268,6 +273,9 @@ static Err generate_in(Arena *arena, Pack *pack, Gpu *g, const char *dir, size_t
         dbg("timing: drafts %s ms, verify %s ms, other %s ms, verify chunks by drafts %s\n", fx((double)gs.t_draft / 1e6, 1),
             fx((double)gs.t_ver / 1e6, 1), fx(tot - (double)(gs.t_draft + gs.t_ver) / 1e6, 1), nv.ptr);
         buf_free(&nv);
+        if (gs.mtp_drafted)
+            dbg("generate: MTP drafts %zu, accepted %zu (%s%%)\n", gs.mtp_drafted, gs.mtp_accepted,
+                fx(100.0 * (double)gs.mtp_accepted / (double)gs.mtp_drafted, 1));
     }
     {
         uint64_t t2 = now_ns();

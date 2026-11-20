@@ -84,7 +84,7 @@ typedef struct {
 } Conv;
 
 // Per-session state, in GPU buffers. One layout for both models (Flash-Next uses every field;
-// 27B leaves the indexer, PLE and MTP fields unset).
+// 27B leaves the indexer and PLE fields unset).
 struct Session {
     const ModelArch *arch; // the model that created it (session_* dispatch on it)
     size_t pos;
@@ -96,6 +96,7 @@ struct Session {
     sx_buffer *gdn_state; // [n_gdn][NV][DV][DK] (column-major per head)
     sx_buffer *gdn_conv;  // [n_gdn][3][CONV]
     sx_buffer *kv;        // [n_attn + 1][2][cap][NKV*HD], f16 or f32; slot n_attn is the MTP head
+                          // (27B: only when its head is loaded)
     sx_buffer *ixk;       // [n_attn][cap][IXD], raw indexer keys
     sx_buffer *ple_hist;  // [9][HCW]
     sx_buffer *rope;      // [cap][ROT/2] (cos, sin), from double precision

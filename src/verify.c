@@ -174,6 +174,9 @@ Err verify_run(Arena *a, FILE *out, const char *pack_dir, const char *golden, bo
     size_t ntok = toks->arr.len, npos = poss->arr.len;
     size_t layers = (size_t)json_get(man, "layers")->i;
     size_t width = (size_t)json_get(man, "width")->i;
+    // goldens of hyper-connection models give the width of one stream and their count
+    const JValue *hcm = json_get(man, "hc_mult");
+    if (hcm && hcm->kind == J_INTEGER) width *= (size_t)hcm->i;
     size_t vocab = (size_t)json_get(man, "vocab")->i;
     // checked against the model once it is loaded
     const float *xs, *ls;
@@ -205,6 +208,14 @@ Err verify_run(Arena *a, FILE *out, const char *pack_dir, const char *golden, bo
     const ModelInfo *mi = model_info(m);
     if (layers != mi->layers || width != mi->width || vocab != mi->vocab) FAIL_CLOSE("GoldenShapeMismatch");
     fprintf(out, "model: %s, pack %s\n", mi->name, pack_dir);
+    // DeepSeek-V4-Flash rounds to BF16 and FP8 at every op as its reference does, so the engine's
+    // f32 sums against the oracle's f64 ones drift across layers: its own bounds, and a gate on
+    // the output distribution (KL at the dumped positions).
+    const bool dsv4 = strcmp(mi->model_type, "deepseek_v4") == 0;
+    const float tol_layer = dsv4 ? TOL_DSV4_LAYER_REL : TOL_LAYER_REL;
+    const float tol_logits = dsv4 ? TOL_DSV4_LOGITS_REL : TOL_LOGITS_REL;
+    const double tol_margin = dsv4 ? TOL_DSV4_ARGMAX_MARGIN : TOL_ARGMAX_MARGIN;
+    double worst_kl = 0;
     // a golden made with a LoRA adapter (manifest "lora"): the same adapter, from the
     // manifest's path
     const JValue *lora = json_get(man, "lora");
@@ -221,6 +232,10 @@ Err verify_run(Arena *a, FILE *out, const char *pack_dir, const char *golden, bo
     FAIL_CLOSE(session_create_kv(m, &g, false, &s)); // exact checks: f32 KV cache
     float *trace = ARENA_ARRAY(a, float, layers * width);
 
+    // SAETTA_VERIFY_DUMP=<file>: the engine's decode streams at the dumped positions, written
+    // there in the layout of x_layers.f32 (diagnostic)
+    const char *dump_path = getenv("SAETTA_VERIFY_DUMP");
+    float *dump = dump_path ? ARENA_ARRAY(a, float, npos * layers * width) : NULL;
     float *worst_layer = ARENA_ARRAY(a, float, layers);
     float worst_logits = 0;
     size_t argmax_ok = 0, argmax_skip = 0, argmax_bad = 0;
@@ -237,9 +252,11 @@ Err verify_run(Arena *a, FILE *out, const char *pack_dir, const char *golden, bo
         float *logits;
         FAIL_CLOSE(model_step(m, s, (uint32_t)toks->arr.items[t]->i, &logits));
         if (has_pi) {
+            if (dump) memcpy(dump + pi * layers * width, trace, layers * width * sizeof(float));
             for (size_t li = 0; li < layers; li++)
                 worst_layer[li] = fmaxf(worst_layer[li], rel(trace + li * width, xs + (pi * layers + li) * width, width));
             worst_logits = fmaxf(worst_logits, rel(logits, ls + pi * vocab, vocab));
+            if (dsv4) worst_kl = fmax(worst_kl, kl(ls + pi * vocab, logits, vocab));
         }
         size_t best = argmax_scan(logits, vocab);
         const JValue *ref = top2->arr.items[t];
@@ -247,12 +264,19 @@ Err verify_run(Arena *a, FILE *out, const char *pack_dir, const char *golden, bo
         double margin = jf(json_get(ref, "top1")) - jf(json_get(ref, "top2"));
         if (best == want)
             argmax_ok++;
-        else if (margin < TOL_ARGMAX_MARGIN)
+        else if (margin < tol_margin)
             argmax_skip++;
         else {
             argmax_bad++;
             fmt_fixed(b1, sizeof b1, margin, 4);
             fprintf(out, "argmax differs at position %zu: engine %zu, reference %zu (margin %s)\n", t, best, want, b1);
+        }
+    }
+    if (dump) {
+        FILE *df = fopen(dump_path, "wb");
+        if (df) {
+            fwrite(dump, sizeof(float), npos * layers * width, df);
+            fclose(df);
         }
     }
     // prefill path: the whole prompt as one chunk, exact f32 first, then the accelerator path
@@ -283,11 +307,11 @@ Err verify_run(Arena *a, FILE *out, const char *pack_dir, const char *golden, bo
     fprintf(out, "prefill (one chunk of %zu): worst layer rel err %s, last-token logits %s, argmax %s\n", ntok, e3(b1, pmax),
             e3(b2, plogit), pbest == plast ? "equal" : "DIFFERENT");
     for (size_t li = 0; li < layers; li++)
-        if (pworst[li] > TOL_LAYER_REL) {
+        if (pworst[li] > tol_layer) {
             ok = false;
             fprintf(out, "  prefill layer %zu: %s  FAIL\n", li, e3(b1, pworst[li]));
         }
-    if (plogit > TOL_LOGITS_REL || pbest != plast) ok = false;
+    if (plogit > tol_logits || pbest != plast) ok = false;
 
     // accelerator prefill (half inputs): quality gate on KL of the last-token distribution
     if (fast_available) {
@@ -354,17 +378,22 @@ Err verify_run(Arena *a, FILE *out, const char *pack_dir, const char *golden, bo
         fprintf(out, "prefill, accelerators: not available, skipped\n");
     fprintf(out, "decode:\nlayer  max rel err (residual streams, %zu positions)\n", npos);
     for (size_t li = 0; li < layers; li++) {
-        bool bad = worst_layer[li] > TOL_LAYER_REL;
+        bool bad = worst_layer[li] > tol_layer;
         ok = ok && !bad;
         fprintf(out, "%5zu  %s%s\n", li, e3(b1, worst_layer[li]), bad ? "  FAIL" : "");
     }
-    bool lbad = worst_logits > TOL_LOGITS_REL;
+    bool lbad = worst_logits > tol_logits;
+    if (dsv4) {
+        bool kbad = worst_kl > TOL_DSV4_KL;
+        lbad = lbad || kbad;
+        fprintf(out, "logits KL(ref||engine), worst dumped position %s%s\n", e3d(b1, worst_kl), kbad ? "  FAIL" : "");
+    }
     ok = ok && !lbad && argmax_bad == 0;
     fprintf(out, "logits max rel err %s%s\n", e3(b1, worst_logits), lbad ? "  FAIL" : "");
     fprintf(out, "greedy argmax: %zu equal, %zu near ties skipped, %zu different\n", argmax_ok, argmax_skip, argmax_bad);
-    verify_fmt_e(b1, sizeof b1, TOL_LAYER_REL, true, -1);
-    verify_fmt_e(b2, sizeof b2, TOL_LOGITS_REL, true, -1);
-    fmt_f64(b3, sizeof b3, TOL_ARGMAX_MARGIN);
+    verify_fmt_e(b1, sizeof b1, tol_layer, true, -1);
+    verify_fmt_e(b2, sizeof b2, tol_logits, true, -1);
+    fmt_f64(b3, sizeof b3, tol_margin);
     fprintf(out, "verify: %s (tolerances: layer %s, logits %s, tie margin %s)\n", ok ? "PASS" : "FAIL", b1, b2, b3);
 #undef FAIL_CLOSE
     gpu_deinit(&g);

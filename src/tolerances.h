@@ -115,5 +115,22 @@
 // the reference's operations in its order and are checked bit for bit.
 #define TOL_DSV4_IDX_SCORE_REL 0.0078125 // f64
 #define TOL_DSV4_IDX_SCORE_FRAC 1e-3     // f64
+// DeepSeek-V4-Flash `saetta verify` (decode path, streamed experts), engine against the numpy
+// oracle (f64 except where the reference rounds). The model rounds to BF16 after nearly every op
+// and quantizes every linear's input to FP8 (3 mantissa bits), so one BF16 step of difference in
+// an input (the engine sums in f32, the oracle in f64) flips e4m3 codes and moves a layer's
+// output by up to about 1e-1 relative; the drift compounds over 43 layers. Measured 2026-11-20
+// on tests/golden-dsv4-short-decode (24 tokens, 4 dumped positions):
+// - free running: worst layer 3.55e-1 (layer 18), logits 9.3e-2, KL(ref||engine) 4.6e-2 at the
+//   worst dumped position; greedy argmax 22 of 24 equal, the other two at reference margins
+//   0.857 (position 16) and below 0.05;
+// - each layer on the oracle's inputs (SAETTA_DSV4_FORCE, all 24 positions dumped): worst layer
+//   5.8e-2, logits 2.6e-2, KL 4.3e-3, argmax 24 of 24; at the probed points every stage on
+//   identical inputs is bit-exact (MoE, q, kv) or within the kernels' own tolerances.
+// The free-running bounds below catch wiring errors (relative errors of 1 and more), not drift.
+#define TOL_DSV4_LAYER_REL 0.5f    // f32
+#define TOL_DSV4_LOGITS_REL 0.2f   // f32
+#define TOL_DSV4_ARGMAX_MARGIN 1.0 // f64
+#define TOL_DSV4_KL 0.1            // f64
 
 #endif

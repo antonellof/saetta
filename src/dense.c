@@ -804,11 +804,14 @@ static void enc_layers(Enc *e, Session *s, size_t T, size_t pos0, sx_arg x, sx_a
     }
 }
 
-// MTP rows (V27:159-190): row i pairs the token embedding emb[i] ([T][H]) with the stream
-// hid[i] before it, at position p0 + i of that stream (the head's KV and RoPE position, as
-// vLLM's drafter: the stream's position, so the head's KV has no gap at 0). Leaves the
-// head's streams before mtp.norm in X ([T][H]) and, with logits, the last row's logits in
-// mtp_logits. dec: the decode scratch (T == 1), else the chunk scratch.
+// MTP rows (V27:159-190): row i pairs the token embedding emb[i] ([T][H]) with the hidden
+// hid[i] before it, at position p0 + i of that hidden (the head's KV and RoPE position, as
+// vLLM's drafter: the hidden's position, so the head's KV has no gap at 0). As vLLM, hid is
+// the trunk's output after the final norm, or the head's own output after mtp.norm when
+// chaining (greedy acceptance at fixed depth 3 was higher on three prompts than with the
+// streams before those norms). Leaves the head's outputs after mtp.norm in a ([T][H]) and,
+// with logits, the last row's logits in mtp_logits. dec: the decode scratch (T == 1), else
+// the chunk scratch.
 static sx_arg mtp_x(Model *m, bool dec) { return dec ? sarg(m, S_X) : barg(m->bscratch, B_X); }
 
 static void enc_mtp_rows(Enc *e, Session *s, sx_arg emb, sx_arg hid, size_t T, size_t p0, bool dec, bool logits) {
@@ -904,7 +907,7 @@ Err model_step(Model *m, Session *s, uint32_t token, float **logits) {
     s->roll = SESSION_NO_ROLL; // the step's start state is encoded; it ends in the live state
     enc_mv(&e, &m->lm_head, sarg(m, S_a), barg(m->logits, 0));
     if (m->mtp) {
-        enc_copy(&e, sarg(m, S_X), barg(m->mtp_hid, 0), H);
+        enc_copy(&e, sarg(m, S_a), barg(m->mtp_hid, 0), H);
         s->mtp_n = 1;
     }
     TRY(enc_finish(&e));
@@ -927,14 +930,14 @@ static Err chunk_logits(Model *m, Session *s, const uint32_t *toks, size_t T, sx
     enc_norm(&e, barg(b, B_X), m->layers[0].in_norm, barg(b, B_a), T, H, H, H, 0, false);
     enc_layers(&e, s, T, s->pos, barg(b, B_X), barg(b, B_a), barg(b, B_y), trace, false);
     s->roll = SESSION_NO_ROLL;
-    if (m->mtp) enc_copy(&e, barg(b, B_X), barg(m->mtp_hid, all ? 0 : H), T * H);
+    if (m->mtp) enc_copy(&e, barg(b, B_a), barg(m->mtp_hid, all ? 0 : H), T * H);
     if (all)
         enc_mm(&e, &m->lm_head, barg(b, B_a), barg(m->vlogits, 0), T);
     else
         enc_mv(&e, &m->lm_head, barg(b, B_a + (T - 1) * H), barg(m->logits, 0));
     if (m->mtp && !all) {
         // the head's history for the prompt chunk: rows q in [pos0, pos0 + T) pair the trunk
-        // stream at q - 1 (mtp_hid row q - pos0; row 0 the previous chunk's last) with toks
+        // output at q - 1 (mtp_hid row q - pos0; row 0 the previous chunk's last) with toks
         // q - pos0 (still in stage); the first row is skipped at position 0 or when that
         // stream is unknown. Then the chunk's last stream moves to row 0.
         size_t skip0 = (s->pos == 0 || !s->mtp_ok) ? 1 : 0;
@@ -1023,7 +1026,7 @@ Err model_spec_verify(Model *m, Session *s, uint32_t x, const uint32_t *drafts, 
         next = pick(ctx, lg + j * VOCAB, j < nd, j < nd ? drafts[j] : 0);
     }
     if (m->mtp) {
-        // the chunk left its trunk streams in mtp_hid: rows 0..j pair with the accepted
+        // the chunk left its trunk outputs in mtp_hid: rows 0..j pair with the accepted
         // drafts and then next
         memcpy(s->mtp_tok, drafts, j * sizeof(uint32_t));
         s->mtp_n = j + 1;
@@ -1039,8 +1042,8 @@ Err model_spec_verify(Model *m, Session *s, uint32_t x, const uint32_t *drafts, 
 }
 
 // As model.c: the pending verified rows first (streams at s->pos - n .. s->pos - 1, paired with
-// mtp_tok and x), rewriting the head's KV there with the trunk's streams; then each further
-// draft feeds the head's own stream and the previous draft.
+// mtp_tok and x), rewriting the head's KV there with the trunk's outputs; then each further
+// draft feeds the head's own output and the previous draft.
 Err model_draft_mtp(Model *m, Session *s, uint32_t x, size_t k, uint32_t *out, size_t *ndraft) {
     *ndraft = 0;
     if (!m->mtp || !s->mtp_ok || s->mtp_n == 0 || k == 0) return OK;
@@ -1052,16 +1055,17 @@ Err model_draft_mtp(Model *m, Session *s, uint32_t x, size_t k, uint32_t *out, s
     Enc e = enc_begin(m);
     enc_mtp_rows(&e, s, dec ? sarg(m, S_a) : barg(m->bscratch, B_a), barg(m->mtp_hid, 0), n, s->pos - n, dec, true);
     TRY(enc_finish(&e));
-    sx_arg h = offa(mtp_x(m, dec), (n - 1) * H); // the head's last stream: the next row's h
+    // the head's last output after mtp.norm: the next row's h (B.a is left alone by the
+    // decode-scratch passes; S.a is read before it is rewritten)
+    sx_arg h = dec ? sarg(m, S_a) : barg(m->bscratch, B_a + (n - 1) * H);
     out[0] = model_argmax(gpu_floats(m->mtp_logits), VOCAB);
     size_t nd = 1;
     for (; nd < k; nd++) {
-        // h may be B.X (left alone by the decode-scratch pass) or S.X (read before rewritten)
-        dequant_row(m->pack, &m->embed, out[nd - 1], gpu_floats(m->scratch) + S_a);
+        dequant_row(m->pack, &m->embed, out[nd - 1], gpu_floats(m->scratch) + S_y);
         Enc e2 = enc_begin(m);
-        enc_mtp_rows(&e2, s, sarg(m, S_a), h, 1, s->pos - 1 + nd, true, true);
+        enc_mtp_rows(&e2, s, sarg(m, S_y), h, 1, s->pos - 1 + nd, true, true);
         TRY(enc_finish(&e2));
-        h = sarg(m, S_X);
+        h = sarg(m, S_a);
         out[nd] = model_argmax(gpu_floats(m->mtp_logits), VOCAB);
     }
     *ndraft = nd;

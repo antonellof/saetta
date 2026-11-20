@@ -52,7 +52,7 @@ typedef struct {
 
 // The MTP draft head (V27:67-190): x = fc([rms_e(embed(t)) | rms_h(h)]), one gated-attention
 // decoder layer with its own KV plane (slot n_attn), then norm and the shared lm_head; its
-// stream before norm is the next draft's h.
+// output after norm is the next draft's h (as vLLM's drafter).
 typedef struct {
     Linear fc;            // [H][2H], input columns [embedding | hidden]
     Vec n_e, n_h, norm;   // pre_fc_norm_embedding, pre_fc_norm_hidden, mtp.norm
@@ -145,7 +145,7 @@ struct Model {
     sx_buffer *scratch, *bscratch, *logits;
     sx_buffer *vlogits; // [KMAX][vocab], verification chunks
     Mtp *mtp;           // NULL without the head (no mtp.fc in the pack, or SAETTA_MTP=0)
-    // MTP: trunk streams before the final norm ([CH + 1][H]: row 0 the stream before the
+    // MTP: trunk outputs after the final norm ([CH + 1][H]: row 0 the one before the
     // current chunk, then the chunk's rows) and the draft logits.
     sx_buffer *mtp_hid, *mtp_logits;
     // LoRA adapters (model_lora_load) and the one the next passes apply (-1: none).

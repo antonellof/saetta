@@ -80,7 +80,11 @@ static void rd_skip(Rd *r, uint32_t t, uint64_t *as_int, Str *as_str) {
             else r->p += bytes;
             return;
         }
-        for (uint64_t i = 0; i < n && !r->bad; i++) rd_skip(r, et, NULL, NULL);
+        if (et != 8) { // arrays of arrays are not used by any GGUF writer: refuse (no recursion)
+            r->bad = true;
+            return;
+        }
+        for (uint64_t i = 0; i < n && !r->bad; i++) rd_str(r);
         return;
     }
     if (t >= 13 || scalar_size[t] == 0) {
@@ -144,13 +148,22 @@ static Err gguf_open(Arena *a, const char *path, Gguf *g) {
         offs[i] = rd_n(&r, 8);
     }
     if (r.bad) return "GgufBadFile";
+    if (align > 4096) return "GgufBadFile";
     uint64_t data = ALIGN_UP((uint64_t)(r.p - g->map), align);
+    if (data > g->len) return "GgufBadFile";
     for (uint64_t i = 0; i < nt; i++) {
         GTensor *t = &g->t[i];
+        t->data = NULL; // tensors of other types stay unreadable; the plan refuses them
+        if (row_bytes(t->type, 1 << 8) == 0) continue;
+        uint64_t rows = 1, total;
+        for (uint32_t d = 0; d < 4; d++)
+            if (t->ne[d] == 0 || t->ne[d] > (1ull << 32)) return "GgufBadFile";
+        if (__builtin_mul_overflow(t->ne[1], t->ne[2], &rows) || __builtin_mul_overflow(rows, t->ne[3], &rows))
+            return "GgufBadFile";
+        if (t->ne[0] % blk_len(t->type) != 0) return "GgufBadFile";
         uint64_t rb = row_bytes(t->type, t->ne[0]);
-        uint64_t rows = t->ne[1] * t->ne[2] * t->ne[3];
-        if (rb != 0 && t->ne[0] % blk_len(t->type) != 0) return "GgufBadFile";
-        if (rb != 0 && (data + offs[i] > g->len || rows * rb > g->len - data - offs[i])) return "GgufBadFile";
+        if (__builtin_mul_overflow(rows, rb, &total)) return "GgufBadFile";
+        if (offs[i] > g->len - data || total > g->len - data - offs[i]) return "GgufBadFile";
         t->data = g->map + data + offs[i];
     }
     return OK;
@@ -660,7 +673,14 @@ static Err make_plan(Arena *a, const Gguf *g, const JValue *tc, Heads *h, Plan *
         Out *o = &p->v[i];
         uint64_t have = o->src->ne[0] * o->src->ne[1] * o->src->ne[2] * o->src->ne[3];
         if (!o->quant && have != o->out * o->in) return "GgufNotQwen35";
-        if (o->quant && o->row0 + o->out > o->src->ne[1]) return "GgufNotQwen35";
+        if (!o->src->data) return "GgufUnsupportedType";
+        if (!o->quant) continue;
+        if (o->row0 + o->out > o->src->ne[1] || o->src->ne[2] != 1 || o->src->ne[3] != 1) return "GgufNotQwen35";
+        // the permuted axes must have exactly the config's head layout
+        uint64_t vd = h->nv * h->dv;
+        if ((o->perm == P_QKV_ROWS && o->out != qkv_rows) || (o->perm == P_VROWS && o->out != vd) ||
+            (o->perm == P_HEADS && o->out != h->nv) || (o->perm == P_OUT_COLS && (o->in != vd || h->dv % 32 != 0)))
+            return "GgufNotQwen35";
     }
     return OK;
 }
@@ -714,8 +734,9 @@ static Err write_config(Arena *a, const char *like_dir, const char *out_dir, con
 Err gguf_import(const char *gguf_path, const char *like_dir, const char *out_dir) {
     Arena a = {0};
     Err e = OK;
-    Gguf g;
+    Gguf g = {0};
     int fd = -1;
+    const char *part = NULL;
     e = gguf_open(&a, gguf_path, &g);
     if (e) goto done;
     char *ctext;
@@ -778,7 +799,7 @@ Err gguf_import(const char *gguf_path, const char *like_dir, const char *out_dir
         goto done;
     }
     const char *st_path = path_join(&a, out_dir, "model.safetensors");
-    const char *part = arena_printf(&a, "%s.part", st_path);
+    part = arena_printf(&a, "%s.part", st_path);
     fd = open(part, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
     if (fd < 0) {
         e = err_errno(errno);
@@ -821,16 +842,12 @@ Err gguf_import(const char *gguf_path, const char *like_dir, const char *out_dir
         e = "ImportFailed";
         goto done;
     }
-    if (fsync(fd) != 0) {
+    if (fcntl(fd, F_FULLFSYNC) != 0 && fsync(fd) != 0) {
         e = err_errno(errno);
         goto done;
     }
     close(fd);
     fd = -1;
-    if (rename(part, st_path) != 0) {
-        e = err_errno(errno);
-        goto done;
-    }
     {
         Buf ib = {0};
         buf_adds(&ib, "{\"metadata\":{\"total_size\":");
@@ -853,8 +870,11 @@ Err gguf_import(const char *gguf_path, const char *like_dir, const char *out_dir
         if (e) goto done;
     }
     e = write_config(&a, like_dir, out_dir, &p);
+    // last: model.safetensors in place marks a complete import (saetta download checks it)
+    if (!e && rename(part, st_path) != 0) e = err_errno(errno);
 done:
     if (fd >= 0) close(fd);
+    if (e && part) unlink(part);
     if (g.map) sx_unmap_file(g.map, g.len);
     arena_reset(&a);
     return e;

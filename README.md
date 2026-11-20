@@ -45,8 +45,14 @@ Needs an M5 Max with 128 GB and macOS 27.2 or later. Update with `saetta update`
 | `27b-8bit` · with adapters | [Qwen3.8-27B](https://huggingface.co/mlx-community/Qwen3.8-27B-8bit), dense, 8-bit | 29 GB |
 | `27b-4bit` | [Qwen3.8-27B](https://huggingface.co/mlx-community/Qwen3.8-27B-4bit), dense, 4-bit | 16 GB |
 | `27b-pi` | [the pi LoRA adapter](https://huggingface.co/harness-hub/Qwen3.8-27B-pi-adapted) for Qwen3.8-27B | 0.6 GB |
+| `27b-turbo` · with MTP | [TURBO Fable Cold Fusion](https://huggingface.co/DavidAU/Qwen3.8-27B-TURBO-Fable-Cold-Fusion-735-882-Heretic-Uncensored-NEO-CODER-MAX-MTP-GGUF), a Qwen3.8-27B fine-tune with shorter thinking, from its Q4_K_M GGUF | 20 GB |
+| `27b-turbo-8bit` · with MTP | the same, from its Q8_0 GGUF | 30 GB |
 
-Licenses: Flash-Next Qwen Community License 1.0, Qwen3.8-27B and the pi adapter Apache-2.0; no weights are part of this repository.
+Licenses: Flash-Next Qwen Community License 1.0, Qwen3.8-27B, the pi adapter and TURBO Apache-2.0; no weights are part of this repository.
+
+### GGUF fine-tunes of Qwen3.8-27B
+
+`saetta download 27b-turbo` fetches the GGUF, converts it into a saetta pack and deletes it. `saetta import <file.gguf> <folder>` does the same for any Qwen3.8-27B GGUF (llama.cpp `qwen35`; Q8_0, Q4_K, Q5_K, Q6_K, F16 or BF16 tensors), with the model's `config.json` and tokenizer files in the folder. A GGUF's MTP layer becomes the draft head: Qwen3.8-27B speculates with it as Flash-Next does (`SAETTA_MTP=0` turns it off).
 
 ### LoRA adapters
 
@@ -141,4 +147,4 @@ make verify GOLDEN=<dir>/golden         # Flash-Next and Qwen3.8-27B against ref
 
 ## License
 
-[MIT](LICENSE). Parts are adapted from the MIT-licensed engines sushi, qwental, Strata and ds4; each adapted file names its source, and their notices are in [LICENSE](LICENSE).
+[MIT](LICENSE). Parts are adapted from the MIT-licensed projects sushi, qwental, Strata, ds4 and llama.cpp; each adapted file names its source, and their notices are in [LICENSE](LICENSE).

@@ -509,13 +509,15 @@ static Err one(Arena *a, const DownloadPack *p, const char *token, size_t jobs) 
     char *root;
     TRY(download_pack_dir(a, p, &root));
     dbg("saetta download: %s (%s)\n  %s at %.7s\n  into %s\n", p->name, p->note, p->repo, p->rev, root);
-    TRY(fetch_repo(a, p, root, token, jobs));
-    if (!p->gguf_file) return OK;
+    // an imported pack is complete once model.safetensors exists (gguf_import renames it into
+    // place last); its config.json differs from the repo's, so the repo is not fetched again
     const char *st = path_join(a, root, "model.safetensors");
-    if (file_exists(st) && file_exists(path_join(a, root, "model.safetensors.index.json"))) {
+    if (p->gguf_file && file_exists(st)) {
         dbg("  imported pack present: %s\n", st);
         return OK;
     }
+    TRY(fetch_repo(a, p, root, token, jobs));
+    if (!p->gguf_file) return OK;
     DownloadPack g = {.name = p->name, .repo = p->gguf_repo, .rev = p->gguf_rev, .only = (const char *const[]){p->gguf_file, NULL}};
     dbg("  %s at %.7s: %s\n", g.repo, g.rev, p->gguf_file);
     TRY(fetch_repo(a, &g, root, token, jobs));

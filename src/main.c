@@ -5,7 +5,8 @@
 //   saetta render <request.json>                  print the chat prompt for an OpenAI request body
 //   saetta tokenize <model-dir> <file>            print the token ids of a text file
 //   saetta generate <model-dir> <n> <ids..>  greedy: run the prompt token ids, print n new ids
-//   saetta download [coder|full|all]         fetch a model pack from Hugging Face (pinned revision)
+//   saetta download <pack>                   fetch a model pack from Hugging Face (pinned revision)
+//   saetta import <file.gguf> <dir>          convert a Qwen3.8-27B GGUF into a pack (gguf.h)
 //   saetta start <claude|pi|opencode>        run a coding agent against saetta (starts the server)
 //   saetta monitor [--once]                  live view of the server, GPU, memory, prompt cache
 //   saetta status | stop                     the server on this machine: show it, stop it
@@ -700,7 +701,7 @@ static Err run(Arena *arena, int argc, char **argv) {
         return generate(arena, pack_arg(arena, argv[2]), n, argv + 4, (size_t)argc - 4);
     }
     fprintf(out, "usage: saetta serve <model-dir> [--port N] [--lora-modules name=path ...] [--default-chat-template-kwargs JSON] | info <model-dir> | generate <model-dir> <n> <ids...> | tokenize "
-                 "<model-dir> <file> | render <request.json> | verify [golden-dir] | download [coder|full|all] | start "
+                 "<model-dir> <file> | render <request.json> | verify [golden-dir] | download <pack> | import <file.gguf> <dir> | start "
                  "<claude|pi|opencode> | monitor | status | stop | update | version\n");
     fflush(out);
     exit(64);

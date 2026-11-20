@@ -2,7 +2,7 @@
   <img src="docs/assets/saetta-banner.png" alt="saetta" width="900">
 </p>
 
-<h3 align="center">Qwen3.8-Flash-Next, Qwen3.8-27B and DeepSeek-V4-Flash on an M5 Max.</h3>
+<h3 align="center">Qwen3.8-Flash-Next and Qwen3.8-27B at full speed on an M5 Max.</h3>
 <p align="center">An inference engine in C and hand-written Metal, tuned for coding agents.</p>
 
 <p align="center">
@@ -16,13 +16,12 @@
   <img src="https://img.shields.io/badge/Apple%20Silicon-M5%20Max%20128%20GB-111" alt="Apple M5 Max 128 GB">
 </p>
 
-saetta runs a few models on one machine, an Apple M5 Max with 128 GB, with every kernel written for it and for coding agents: long shared-prefix prompts (20K to 200K tokens), short answers, tool calls, through OpenAI- and Anthropic-compatible APIs.
+saetta runs Qwen3.8-Flash-Next and Qwen3.8-27B on one machine, an Apple M5 Max with 128 GB, with every kernel written for it and for coding agents: long shared-prefix prompts (20K to 200K tokens), short answers, tool calls, through OpenAI- and Anthropic-compatible APIs.
 
 - **Fast:** Flash-Next reads prompts at 1,650 to 1,950 tokens/s and answers at 63 to 82 tokens/s, with speculative decoding.
 - **Follow-up turns read only what is new:** a second turn on a 16K conversation answers in 0.2 s.
 - **One command to code:** `saetta start claude` (or `pi`, `opencode`).
 - **LoRA adapters** on Qwen3.8-27B, per request.
-- **Bigger than memory:** DeepSeek-V4-Flash (preview) streams its experts from the SSD.
 - **Checked** layer by layer against numpy references; one binary, no Python.
 
 ## Install
@@ -47,7 +46,7 @@ Needs an M5 Max with 128 GB and macOS 27.2 or later. Update with `saetta update`
 | `27b-4bit` | [Qwen3.8-27B](https://huggingface.co/mlx-community/Qwen3.8-27B-4bit), dense, 4-bit | 16 GB |
 | `27b-pi` | [the pi LoRA adapter](https://huggingface.co/harness-hub/Qwen3.8-27B-pi-adapted) for Qwen3.8-27B | 0.6 GB |
 
-Licenses: Flash-Next Qwen Community License 1.0, Qwen3.8-27B and the pi adapter Apache-2.0, DeepSeek-V4-Flash MIT; no weights are part of this repository.
+Licenses: Flash-Next Qwen Community License 1.0, Qwen3.8-27B and the pi adapter Apache-2.0; no weights are part of this repository.
 
 ### LoRA adapters
 
@@ -61,19 +60,6 @@ saetta serve 27b-8bit --lora-modules qwen3.8-pi=27b-pi \
 ```
 
 A request whose `model` is the adapter's name runs with it, any other with the base model. Supported: LoRA on attention and MLP projections, rank a multiple of 8 up to 128, rsLoRA. `SAETTA_LORA=<folder>` applies one to `saetta generate`.
-
-### DeepSeek-V4-Flash (preview)
-
-[DeepSeek-V4-Flash-0731](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731) runs from its official checkpoint (167 GB: FP8 dense, FP4 experts), read in place. It does not fit in 128 GB, so the dense weights stay in memory and the experts stream from the SSD into a GPU-visible cache (80 GB by default, `SAETTA_EXPERT_CACHE_GB`); on a coding prompt about 92% of the expert reads hit it.
-
-```sh
-hf download deepseek-ai/DeepSeek-V4-Flash-0731 --revision 7872f01b1d1fe23eabc4c98b48bffcef5a386062 \
-  --local-dir ~/Models/deepseek-ai/DeepSeek-V4-Flash-0731
-saetta info ~/Models/deepseek-ai/DeepSeek-V4-Flash-0731
-saetta generate ~/Models/deepseek-ai/DeepSeek-V4-Flash-0731 32 <token ids...>
-```
-
-In this release: `info`, `generate` (no speculative decoding; token ids from the pack's `tokenizer.json`, for example with Hugging Face `tokenizers`: saetta's tokenizer does not read this pack yet) and `make verify-dsv4`. **Agents (Claude Code, pi, opencode) cannot use it yet:** `saetta serve` refuses the pack until its tokenizer, chat template and DSML tool calls land; then it will be `saetta start claude --pack ~/Models/deepseek-ai/DeepSeek-V4-Flash-0731`, as for the other models. Speed is not tuned or benchmarked yet.
 
 ## Coding agents
 
@@ -119,7 +105,7 @@ Endpoints: `POST /v1/chat/completions` (streaming, `tool_calls`, `reasoning_cont
 | `SAETTA_CTX` | 32768 | context in tokens (Flash-Next about 35 KB per token, 27B 64 KB) |
 | `SAETTA_SPEC` / `SAETTA_MTP` | 1 / 1 | `0` turns speculative decoding / the MTP head off |
 | `SAETTA_KV_F32` | unset | f32 KV cache |
-| `SAETTA_EXPERT_CACHE_GB` | unset | experimental: keep this many GB of experts in memory, read the rest from the SSD (Flash-Next: slower; DeepSeek always streams, 80 GB by default) |
+| `SAETTA_EXPERT_CACHE_GB` | unset | experimental: keep this many GB of experts in memory, read the rest from the SSD (Flash-Next: slower than resident, same output) |
 
 <p align="center">
   <img src="docs/assets/monitor.png" width="900" alt="saetta monitor: model state, speed, GPU load, memory, prompt cache, speculation, sessions and recent requests">
@@ -138,7 +124,7 @@ Flash-Next on an M5 Max with 128 GB, a six-request coding-agent workload, second
 | turn 2 (reuses turn 1) | 15,948 | 0.20 | 0.90 | 0.20 | 1.01 |
 | edit (tool call, 400 tokens out) | 18,245 | 10.10 | 12.93 | 9.32 | 12.19 |
 
-Answers at 72 to 82 (full) and 63 to 70 (Coder) tokens/s, 141 tokens/s on the edit with speculation. Qwen3.8-27B and DeepSeek-V4-Flash are not benchmarked yet.
+Answers at 72 to 82 (full) and 63 to 70 (Coder) tokens/s, 141 tokens/s on the edit with speculation. Qwen3.8-27B is not benchmarked yet.
 
 ## Build from source
 
@@ -149,11 +135,10 @@ git clone https://github.com/antonellof/saetta.git && cd saetta
 make                                    # ./build/bin/saetta
 make test                               # unit tests (SAETTA_PACK=<pack> for real tensors)
 make verify GOLDEN=<dir>/golden         # Flash-Next and Qwen3.8-27B against reference outputs
-make verify-dsv4 GOLDEN=<dir>/golden    # DeepSeek-V4-Flash (needs its pack, DSV4_PACK)
 ```
 
-`src/`: `model.c` (Flash-Next), `dense.c` (27B), `dsv4.c` (DeepSeek-V4-Flash), `model_api.c` picks one per pack; `kernels/` Metal; `server.c`, `tokenizer.c`, `chat.c`, `toolcall.c`. `saetta help` lists every command.
+`src/`: `model.c` (Flash-Next), `dense.c` (27B), `model_api.c` picks one per pack; `kernels/` Metal; `server.c`, `tokenizer.c`, `chat.c`, `toolcall.c`. `saetta help` lists every command.
 
 ## License
 
-[MIT](LICENSE). Parts are adapted from the MIT-licensed engines sushi, qwental, Strata and ds4 and from DeepSeek's reference code; each adapted file names its source, and their notices are in [LICENSE](LICENSE).
+[MIT](LICENSE). Parts are adapted from the MIT-licensed engines sushi, qwental, Strata and ds4; each adapted file names its source, and their notices are in [LICENSE](LICENSE).

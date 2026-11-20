@@ -116,6 +116,15 @@ sx_pipeline *sx_pipeline_from_source(sx_device *d, const char *source, const cha
     id<MTLDevice> dev = (__bridge id<MTLDevice>)d->dev;
     MTLCompileOptions *o = [MTLCompileOptions new];
     o.languageVersion = MTLLanguageVersion4_0;
+    // Metal's default is MTLMathModeFast with the metal::fast functions (checked on macOS
+    // 27.2). SAETTA_METAL_MATH=safe|relaxed|fast picks the mode, for the precision A/B.
+    const char *mm = getenv("SAETTA_METAL_MATH");
+    if (mm && strcmp(mm, "safe") == 0) {
+        o.mathMode = MTLMathModeSafe;
+        o.mathFloatingPointFunctions = MTLMathFloatingPointFunctionsPrecise;
+    } else if (mm && strcmp(mm, "relaxed") == 0) {
+        o.mathMode = MTLMathModeRelaxed;
+    }
     NSError *e = nil;
     id<MTLLibrary> lib = [dev newLibraryWithSource:[NSString stringWithUTF8String:source] options:o error:&e];
     if (!lib) { copy_err(err, err_cap, e.localizedDescription); return NULL; }

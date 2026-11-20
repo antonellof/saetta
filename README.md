@@ -3,7 +3,7 @@
 </p>
 
 <h3 align="center">Qwen3.8-Flash-Next and Qwen3.8-27B at full speed on an M5 Max.</h3>
-<p align="center">An inference engine in C and hand-written Metal, tuned for coding agents, now with LoRA adapters.</p>
+<p align="center">An inference engine in C and hand-written Metal, tuned for coding agents, with LoRA adapters.</p>
 
 <p align="center">
   <a href="#install"><b>Install</b></a> · <a href="#models">Models</a> · <a href="#lora-adapters">LoRA adapters</a> · <a href="#run-the-server">Server</a> ·
@@ -22,8 +22,8 @@
 </p>
 
 > [!IMPORTANT]
-> **New in 0.8.0: Qwen3.8-27B with LoRA adapters, and the pi agent adapter in one command.**
-> The same `saetta` binary now also runs the dense [Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B), and applies LoRA adapters at run time with vLLM's flags (`--lora-modules`). First up: harness-hub's [**Qwen3.8-27B-pi-adapted**](https://huggingface.co/harness-hub/Qwen3.8-27B-pi-adapted), trained with RL to drive the [pi](https://pi.dev) coding agent. Its card reports SWE-bench Pro (hard 51) 39.2% to 64.7% and Terminal-Bench 2.1 39.5% to 55.8% with thinking off, at about 4.5x fewer tokens than thinking (harness-hub's numbers, not measured here).
+> **Qwen3.8-27B with LoRA adapters, and the pi agent adapter in one command.**
+> The same `saetta` binary runs the dense [Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B), and applies LoRA adapters at run time with vLLM's flags (`--lora-modules`). For example harness-hub's [**Qwen3.8-27B-pi-adapted**](https://huggingface.co/harness-hub/Qwen3.8-27B-pi-adapted), trained with RL to drive the [pi](https://pi.dev) coding agent. Its card reports SWE-bench Pro (hard 51) 39.2% to 64.7% and Terminal-Bench 2.1 39.5% to 55.8% with thinking off, at about 4.5x fewer tokens than thinking (harness-hub's numbers, not measured here).
 >
 > ```sh
 > saetta download 27b-8bit && saetta download 27b-pi

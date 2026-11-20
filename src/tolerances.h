@@ -37,4 +37,17 @@
 // The same bound as TOL_QMM_REL (about 10x headroom on the matmul path).
 #define TOL_LORA_REL 5e-5f // f32
 
+// DeepSeek-V4-Flash indexer scores (src/kernels/dsv4_cmp.metal dsv4_idx_score), GPU against
+// src/dsv4_ref_cmp.c. The q . k products run on 8x8 f32 simdgroup matrices, whose accumulation
+// order and fusion are the hardware's; the reference sums the 128 products in order. Products
+// of FP4 values with power-of-two block scales are exact and so is their sum while the terms
+// span less than 2^24, so the two agree unless the scales of one query or key differ widely;
+// then one bf16 rounding of q . k can move by one ulp (2^-8 relative), and the head sum by two
+// ulps of the largest score at most: REL is 2^-7 of the largest |score|, FRAC the share of
+// scores not equal. Measured 2026-11-20 on random keys and queries (positions 11, 4099, 199999;
+// up to 3000 keys): 0 differing scores. The compressor kernels have no tolerance: they repeat
+// the reference's operations in its order and are checked bit for bit.
+#define TOL_DSV4_IDX_SCORE_REL 0.0078125 // f64
+#define TOL_DSV4_IDX_SCORE_FRAC 1e-3     // f64
+
 #endif

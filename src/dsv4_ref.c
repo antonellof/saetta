@@ -44,8 +44,10 @@ float dsv4_e4m3_round(float v) {
     return copysignf(r, v);
 }
 
+// The one definition for every DeepSeek-V4 reference (src/dsv4_ref_*.c): NaN kept.
 float dsv4_bf16_round(float v) {
     uint32_t u = f2u(v);
+    if ((u & 0x7fffffffu) > 0x7f800000u) return v;
     u += 0x7fffu + ((u >> 16) & 1u);
     return u2f(u & 0xffff0000u);
 }

@@ -7,16 +7,7 @@
 #include <math.h>
 #include <string.h>
 
-float dsv4_bf16_round(float v) {
-    uint32_t u;
-    memcpy(&u, &v, 4);
-    if ((u & 0x7fffffffu) > 0x7f800000u) return v;
-    u += 0x7fffu + ((u >> 16) & 1u);
-    u &= 0xffff0000u;
-    float r;
-    memcpy(&r, &u, 4);
-    return r;
-}
+// dsv4_bf16_round is defined once, in src/dsv4_ref.c.
 
 float dsv4_bf16_val(uint16_t h) {
     uint32_t u = (uint32_t)h << 16;

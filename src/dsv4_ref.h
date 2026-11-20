@@ -29,7 +29,7 @@ float dsv4_e8m0(uint8_t v);       // 2^(v - 127); 0 gives 2^-127
 float dsv4_e2m1(uint8_t code);    // the low 4 bits
 float dsv4_e4m3(uint8_t code);    // NaN for 0x7f and 0xff
 float dsv4_e4m3_round(float v);   // v in [-448, 448] to the nearest e4m3 value, ties to even
-float dsv4_bf16_round(float v);   // to the nearest bf16, ties to even (finite v)
+float dsv4_bf16_round(float v);   // to the nearest bf16, ties to even (NaN kept)
 float dsv4_act_scale(float amax); // the power-of-two block scale above
 // xq = act_quant(x): n values in blocks of block (n a multiple of block). xq may equal x.
 void dsv4_act_quant(const float *x, float *xq, size_t n, size_t block);

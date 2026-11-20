@@ -10,11 +10,6 @@ static inline uint32_t f2u(float f) {
     return u;
 }
 
-static inline float u2f(uint32_t u) {
-    float f;
-    memcpy(&f, &u, 4);
-    return f;
-}
 
 float dsv4_e4m3_to_f32(uint8_t b) {
     const uint32_t e = (b >> 3) & 15u, m = b & 7u;
@@ -39,12 +34,7 @@ uint8_t dsv4_f32_to_e4m3(float v) {
     return sign | (uint8_t)((e << 3) | m);
 }
 
-float dsv4_act_scale(float amax) {
-    amax = fmaxf(amax, 1e-4f);
-    const uint32_t u = f2u(amax * (1.0f / 448.0f));
-    const int e = (int)((u >> 23) & 0xffu) - 127 + ((u & 0x7fffffu) != 0 ? 1 : 0);
-    return u2f((uint32_t)(e + 127) << 23);
-}
+// dsv4_act_scale is defined once, in src/dsv4_ref.c (the same formula).
 
 void dsv4_ref_act_quant(const float *x, size_t T, size_t K, size_t ldx, uint8_t *codes, float *scales) {
     const size_t nb = K / DSV4_FP8_BLOCK;

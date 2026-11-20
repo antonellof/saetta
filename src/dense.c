@@ -1,7 +1,7 @@
 // Qwen3.8-27B forward pass (see model.h and dense.h). Exports dense_arch (model_arch.h).
-// Formulas follow vendor/transformers/src/transformers/models/qwen3_5/modeling_qwen3_5.py
-// (M27) on an MLX pack (norm weights stored as 1 + w, mlx-lm qwen3_5.py sanitize) and are
-// checked against tools/ref27.py by `saetta verify`. The encoder helpers, the GDN and the
+// Formulas follow the Hugging Face transformers qwen3_5 model (M27, its modeling file) on an
+// MLX pack (norm weights stored as 1 + w by mlx-lm's qwen3_5 conversion) and are checked
+// against a numpy reference by `saetta verify`. The encoder helpers, the GDN and the
 // session code follow src/model.c; the hyper-connections, MoE, PLE and the QSA indexer are
 // not in this model.
 #include "dense.h"
@@ -265,6 +265,14 @@ Err model_load(Arena *arena, const Pack *pack, Gpu *g, Model **out) {
         TRY(lin(arena, pack, p, "mlp.gate_proj", &L->mlp.gate));
         TRY(lin(arena, pack, p, "mlp.up_proj", &L->mlp.up));
         TRY(lin(arena, pack, p, "mlp.down_proj", &L->mlp.down));
+    }
+    // the shapes are compile-time constants here: a pack that differs is refused, not run
+    FILE *quiet = fopen("/dev/null", "w");
+    size_t bad = model_check_pack(arena, pack, quiet ? quiet : stderr);
+    if (quiet) fclose(quiet);
+    if (bad) {
+        (void)model_check_pack(arena, pack, stderr);
+        return "PackShapeMismatch";
     }
     return OK;
 }
@@ -623,7 +631,7 @@ static void enc_lora(Enc *e, const LoraGroup *G, sx_arg x, size_t T, const sx_ar
     lora_encode_down(&m->lp, e->cmd, (sx_arg){ad->buf, G->a, NULL, 0}, x, t, (uint32_t)T, G->in, G->in, G->rt);
     LoraUp ups[3];
     for (uint32_t i = 0; i < G->n; i++)
-        ups[i] = (LoraUp){.B = {ad->buf, G->up[i].b, NULL, 0}, .y = ys[i], .out = G->up[i].out, .r0 = G->up[i].r0,
+        ups[i] = (LoraUp){.B = {ad->buf, G->up[i].b, NULL, 0}, .y = ys[G->up[i].slot], .out = G->up[i].out, .r0 = G->up[i].r0,
                           .ldy = G->up[i].out};
     lora_encode_up(&m->lp, e->cmd, t, (uint32_t)T, G->rt, ad->r, ad->scale, ups, G->n);
     e->xh_set = false; // y may be the source of the cached half copy
@@ -1263,9 +1271,9 @@ Err model_lora_load(Arena *a, Model *m, const char *name, const char *dir) {
     size_t flen;
     const uint8_t *bytes = sx_map_file(wpath, &flen);
     if (!bytes) return "MapFailed";
-    StrMap raw = {0};
-    TRY(safetensors_parse(a, bytes, flen, 0, &raw));
-    StrMap by = {0};
+    Err err = OK;
+    StrMap raw = {0}, by = {0};
+    if ((err = safetensors_parse(a, bytes, flen, 0, &raw))) goto out;
     Str k;
     void *v;
     size_t ntens = 0;
@@ -1273,7 +1281,8 @@ Err model_lora_load(Arena *a, Model *m, const char *name, const char *dir) {
         const char *p = strstr(arena_strndup(a, k.ptr, k.len), "layers.");
         if (!p) {
             dbg("lora %s: tensor %.*s is not a layer weight\n", name, (int)k.len, k.ptr);
-            return "LoraTargetUnsupported";
+            err = "LoraTargetUnsupported";
+            goto out;
         }
         strmap_put(&by, str(p), v);
         ntens++;
@@ -1294,6 +1303,7 @@ Err model_lora_load(Arena *a, Model *m, const char *name, const char *dir) {
                 // A rows of the group's present members, concatenated, then each member's B
                 const TensorInfo *ta[3] = {0}, *tb[3] = {0};
                 const Linear *bl[3] = {0};
+                uint32_t slot[3] = {0};
                 for (size_t ti = 0; ti < COUNT(lora_targets); ti++) {
                     if (lora_targets[ti].group != gk) continue;
                     char an[160], bn[160];
@@ -1301,22 +1311,28 @@ Err model_lora_load(Arena *a, Model *m, const char *name, const char *dir) {
                     snprintf(bn, sizeof bn, "layers.%zu.%s.lora_B.weight", li, lora_targets[ti].mod);
                     void **pa = strmap_get(&by, str(an)), **pb = strmap_get(&by, str(bn));
                     if (!pa && !pb) continue;
-                    if (!pa || !pb) return "LoraUnmatchedTensor";
+                    if (!pa || !pb) {
+                        err = "LoraUnmatchedTensor";
+                        goto out;
+                    }
                     const Linear *base = base_linear(L, ti);
                     if (!base) {
                         dbg("lora %s: %s has no %s\n", name, an, lora_targets[ti].mod);
-                        return "LoraTargetUnsupported";
+                        err = "LoraTargetUnsupported";
+                        goto out;
                     }
                     const TensorInfo *A = *pa, *B = *pb;
                     if (A->dtype != DTYPE_F32 || B->dtype != DTYPE_F32 || A->rank != 2 || B->rank != 2 || A->shape[0] != r ||
                         A->shape[1] != base->in_features || B->shape[0] != base->out_features || B->shape[1] != r) {
                         dbg("lora %s: %s shape or dtype does not match the base linear\n", name, an);
-                        return "LoraShapeMismatch";
+                        err = "LoraShapeMismatch";
+                        goto out;
                     }
                     int sl = (int)G.n;
                     ta[sl] = A;
                     tb[sl] = B;
                     bl[sl] = base;
+                    slot[sl] = (uint32_t)lora_targets[ti].slot;
                     G.n++;
                     nused += 2;
                 }
@@ -1333,6 +1349,7 @@ Err model_lora_load(Arena *a, Model *m, const char *name, const char *dir) {
                     G.up[i].b = at;
                     G.up[i].out = (uint32_t)bl[i]->out_features;
                     G.up[i].r0 = i * r;
+                    G.up[i].slot = slot[i];
                     if (pass) put_half(dst + at, bytes + tb[i]->offset, (size_t)G.up[i].out * r);
                     at = ALIGN_UP(at + (size_t)G.up[i].out * r * 2, 16);
                 }
@@ -1345,17 +1362,24 @@ Err model_lora_load(Arena *a, Model *m, const char *name, const char *dir) {
                 dbg("lora %s: tensor %.*s not applied\n", name, (int)k.len, k.ptr);
                 break;
             }
-            return "LoraUnmatchedTensor";
+            err = "LoraUnmatchedTensor";
+            goto out;
         }
         if (pass == 0) {
             used = at;
-            TRY(gpu_new_buffer(m->g, MAX(used, (size_t)16), &ad->buf));
+            if ((err = gpu_new_buffer(m->g, MAX(used, (size_t)16), &ad->buf))) goto out;
             dst = sx_buffer_contents(ad->buf);
         }
     }
+out:
     sx_unmap_file(bytes, flen);
     strmap_free(&by);
     strmap_free(&raw);
+    if (err) {
+        if (m->lora[m->n_lora].buf) sx_buffer_release(m->lora[m->n_lora].buf);
+        m->lora[m->n_lora] = (Adapter){0};
+        return err;
+    }
     char mb[32];
     fmt_fixed(mb, sizeof mb, (double)used / 1e6, 1);
     dbg("model: LoRA %s loaded: %zu tensors, r %u, scale %g, %s MB f16\n", ad->name, nused, r, (double)ad->scale, mb);

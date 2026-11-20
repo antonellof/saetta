@@ -1657,6 +1657,10 @@ Err server_serve(Arena *arena, const char *dir, uint16_t port, const char *const
             return "BadLoraModule";
         }
         const char *name = arena_strndup(arena, loras[i], (size_t)(eq - loras[i]));
+        if (!strcmp(name, model_info(m)->id) || model_lora_find(m, name) >= 0) {
+            dbg("saetta: LoRA name %s is taken (the base model or another adapter)\n", name);
+            return "BadLoraModule";
+        }
         const char *path = eq + 1;
         struct stat lst;
         if (stat(path, &lst) != 0) {

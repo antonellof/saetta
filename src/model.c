@@ -2714,7 +2714,7 @@ static void dequant_row(const Pack *pack, const Linear *l, size_t r, float *out)
     }
 }
 
-// ---- LoRA (27B only, docs/dense-lora.md) -------------------------------------------------------
+// ---- LoRA (Qwen3.8-27B only) -------------------------------------------------------
 
 Err model_lora_load(Arena *a, Model *m, const char *name, const char *dir) {
     (void)a, (void)m, (void)name, (void)dir;

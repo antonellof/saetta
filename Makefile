@@ -5,7 +5,7 @@ CC      := clang
 BUILD   ?= build
 GOLDEN  ?= tests/golden
 # the 27B goldens next to GOLDEN (each names its pack in manifest.json); absent ones are skipped
-GOLDENS_27B := golden-27b-4bit golden-27b-4bit-pi
+GOLDENS_27B := golden-27b-4bit golden-27b-8bit golden-27b-4bit-pi golden-27b-4bit-partial
 
 CFLAGS  := -std=c23 -O3 -ffp-contract=off -mcpu=native -mmacosx-version-min=27.2 \
            -Wall -Wextra -Wno-unused-parameter

@@ -1,7 +1,7 @@
 // Qwen3.8-27B internals (src/dense.c), compiled against src/config_27b.h. Only dense.c
 // includes this; the public API is model.h's. Pre-norm decoder with plain residuals: 64 layers,
 // three Gated DeltaNet blocks then one gated attention block, each followed by a dense SwiGLU
-// MLP (docs/model.md, "Qwen3.8-27B").
+// MLP.
 #ifndef SAETTA_DENSE_H
 #define SAETTA_DENSE_H
 
@@ -94,6 +94,7 @@ typedef struct {
     struct {
         size_t b;
         uint32_t out, r0;
+        uint32_t slot; // the member's output in the group: q 0, k 1, v 2; gate 0, up 1
     } up[3];
 } LoraGroup;
 
@@ -134,7 +135,7 @@ struct Model {
     Params params;
     sx_buffer *scratch, *bscratch, *logits;
     sx_buffer *vlogits; // [KMAX][vocab], verification chunks
-    void *mtp;          // always NULL: the 27B MTP head is not loaded yet (docs/dense-lora.md)
+    void *mtp;          // always NULL: the 27B MTP head is not loaded yet
     // LoRA adapters (model_lora_load) and the one the next passes apply (-1: none).
     LoraPipes lp;
     bool lp_ok;

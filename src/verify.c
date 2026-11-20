@@ -205,14 +205,15 @@ Err verify_run(Arena *a, FILE *out, const char *pack_dir, const char *golden, bo
     const ModelInfo *mi = model_info(m);
     if (layers != mi->layers || width != mi->width || vocab != mi->vocab) FAIL_CLOSE("GoldenShapeMismatch");
     fprintf(out, "model: %s, pack %s\n", mi->name, pack_dir);
-    // a golden made with a LoRA adapter (tools/ref27.py --lora): the same adapter, from
-    // $SAETTA_LORA or the manifest's path
+    // a golden made with a LoRA adapter (manifest "lora"): the same adapter, from the
+    // manifest's path
     const JValue *lora = json_get(man, "lora");
     if (lora && lora->kind == J_OBJECT) {
-        const char *dir = getenv("SAETTA_LORA");
-        if (!dir) dir = json_str(json_get(lora, "path"));
+        const char *dir = json_str(json_get(lora, "path"));
         if (!dir) FAIL_CLOSE("GoldenLoraPath");
+        if (dir[0] != '/') dir = path_join(a, golden, dir); // relative to the golden
         FAIL_CLOSE(model_lora_load(a, m, "golden", dir));
+        if (model_lora_count(m) != 1) FAIL_CLOSE("GoldenLoraNotLoaded");
         model_lora_select(m, 0);
         fprintf(out, "lora: %s\n", dir);
     }

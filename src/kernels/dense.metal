@@ -3,7 +3,7 @@
 
 // x[g] += y[g] (n values per group), then out[g] = rms(x[g]) * w: the residual add of one
 // block fused with the plain RMSNorm of the next (the MLX pack stores 1 + w already,
-// vendor/mlx-lm/mlx_lm/models/qwen3_5.py sanitize). Threadgroup per group (token).
+// mlx-lm's qwen3_5 conversion). Threadgroup per group (token).
 kernel void add_rmsnorm(device float *x [[buffer(0)]], device const float *y [[buffer(1)]], device const float *w [[buffer(2)]],
                         device float *out [[buffer(3)]], constant uint &n [[buffer(4)]], constant float &eps [[buffer(5)]],
                         uint g [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]],
@@ -19,7 +19,7 @@ kernel void add_rmsnorm(device float *x [[buffer(0)]], device const float *y [[b
 }
 
 // Gated RMSNorm of the GDN output with a SiLU gate (27B: Qwen3_5RMSNormGated, activation silu,
-// vendor/transformers/src/transformers/models/qwen3_5/modeling_qwen3_5.py:202-220), in place:
+// transformers qwen3_5 modeling), in place:
 // o * rsqrt(mean(o^2) + eps) * w * silu(z). Threads: dv.
 kernel void gdn_gnorm_silu(device float *o [[buffer(0)]], device const float *z [[buffer(1)]], device const float *w [[buffer(2)]],
                            constant GdnP &p [[buffer(3)]], uint g [[threadgroup_position_in_grid]], uint j [[thread_position_in_threadgroup]],

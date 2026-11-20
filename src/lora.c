@@ -135,7 +135,7 @@ static Err timed(Gpu *g, const void *ctx, run_fn run, double *best_out) {
     return OK;
 }
 
-// Qwen3.8-27B decode set (docs/dense-lora.md): R 32 everywhere.
+// Qwen3.8-27B decode set: R 32 everywhere.
 enum { BR = 32, NLAYERS = 64, NATTN = 16, HID = 5120, QOUT = 12288, KVOUT = 1024, OIN = 6144, FF = 17408 };
 
 // The adapter weights of all layers, one buffer per kind, layer l at l * (bytes per layer).

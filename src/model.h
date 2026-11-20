@@ -8,9 +8,8 @@
 // GPU in order. The host writes only what it knows before encoding: the embedding row,
 // the token's n-gram rows (PLE) and the RoPE angles in double precision. Past 2,048
 // tokens the QSA block selection runs on the host, which flushes the command buffer
-// once per attention layer. Formulas follow
-// vendor/transformers/src/transformers/models/qwen4_exp/modeling_qwen4_exp.py and are
-// checked against a numpy reference by `saetta verify`.
+// once per attention layer. Formulas follow the transformers qwen4_exp model and are checked
+// against a numpy reference by `saetta verify`.
 //
 // Public API used by main, verify and the server: Model (load, step, prefill,
 // prefill_with, verify_chunk, spec_greedy, spec_verify, draft_mtp), Session (create,

@@ -560,10 +560,6 @@ static Err run_in(Arena *a, const char *const *args, size_t n, int *code) {
         } else if (i + 1 < n && strcmp(x, "--pack") == 0) {
             i += 1;
             pack_arg = args[i];
-            if (strncmp(pack_arg, "27b", 3) == 0 || strstr(pack_arg, "27B") != NULL) {
-                model_id = "qwen3.8-27b";
-                model_label = "Qwen3.8-27B (saetta)";
-            }
         } else if (i + 1 < n && strcmp(x, "--lora") == 0) {
             i += 1;
             const char *eq = strchr(args[i], '=');
@@ -573,8 +569,6 @@ static Err run_in(Arena *a, const char *const *args, size_t n, int *code) {
                 return OK;
             }
             lora_arg = args[i];
-            model_id = arena_strndup(a, args[i], (size_t)(eq - args[i]));
-            model_label = arena_printf(a, "%s (Qwen3.8-27B LoRA, saetta)", model_id);
         } else if (i + 1 < n && strcmp(x, "--port") == 0) {
             i += 1;
             TRY(parse_u16(args[i], &port));
@@ -588,6 +582,33 @@ static Err run_in(Arena *a, const char *const *args, size_t n, int *code) {
             break;
         }
     }
+    // the model the agent asks for: the adapter's name with --lora, else the pack's base id
+    bool is27 = false;
+    if (pack_arg) {
+        const char *dir;
+        TRY(pack_for(a, pack_arg, &dir));
+        if (dir) {
+            char *cfg;
+            size_t cl;
+            if (!read_file(path_join(a, dir, "config.json"), 4u << 20, &cfg, &cl)) {
+                is27 = strstr(cfg, "\"qwen3_5_text\"") != NULL;
+                free(cfg);
+            }
+        }
+    }
+    if (lora_arg) {
+        if (!is27) {
+            dbg("saetta: --lora needs a Qwen3.8-27B pack, e.g. --pack 27b-8bit\n");
+            *code = 64;
+            return OK;
+        }
+        const char *eq = strchr(lora_arg, '=');
+        model_id = arena_strndup(a, lora_arg, (size_t)(eq - lora_arg));
+        model_label = arena_printf(a, "%s (Qwen3.8-27B LoRA, saetta)", model_id);
+    } else if (is27) {
+        model_id = "qwen3.8-27b";
+        model_label = "Qwen3.8-27B (saetta)";
+    }
     // the server: join the one running on this machine, else start one
     TRY(instance_register(agent_names[agent]));
     instance_set_keep(keep);
@@ -596,6 +617,13 @@ static Err run_in(Arena *a, const char *const *args, size_t n, int *code) {
         if (s.port != port) dbg("saetta: note: the running server is on port %u, not %u\n", s.port, port);
         port = s.port;
         if (pack_arg) dbg("saetta: note: --pack ignored, the running server keeps its model\n");
+        if (lora_arg) {
+            // the agent would ask for an adapter the running server may not have
+            dbg("saetta: a server is already running (pid %d); --lora needs a new one: stop it first (saetta stop)\n", s.pid);
+            (void)instance_unregister();
+            *code = 1;
+            return OK;
+        }
     }
     const char *base = arena_printf(a, "http://127.0.0.1:%u", port);
     Session ss = {.keep = keep};

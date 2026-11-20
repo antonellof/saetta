@@ -1,5 +1,5 @@
-// `saetta download [coder|full|all|27b-8bit|27b-4bit|27b-pi]`: fetches a model pack (or the pi
-// LoRA adapter for Qwen3.8-27B) from Hugging Face at its pinned
+// `saetta download [coder|full|all|27b-8bit|27b-4bit|27b-pi|27b-turbo|27b-turbo-8bit]`: fetches a
+// model pack (or the pi LoRA adapter for Qwen3.8-27B) from Hugging Face at its pinned
 // revision into $SAETTA_MODELS (default ~/Models) as <org>/<repo>, so other apps can share
 // the files. Lists the revision's files through the Hub's tree API, downloads several at a
 // time, resumes partial files (`<name>.part`, HTTP Range), and checks each file against the
@@ -13,17 +13,23 @@
 
 // A downloadable pack (download.Pack in the Zig engine; renamed so it does not clash with
 // the weights Pack).
+// A GGUF pack (gguf_file set): only the files in `only` come from repo (the model's own
+// config and tokenizer), then gguf_file from gguf_repo at gguf_rev, which `saetta download`
+// imports (gguf.h) into `dir` and deletes.
 typedef struct {
     const char *name;
     const char *repo;
     const char *rev;
     const char *note;
+    const char *dir; // local folder under the models folder (default: repo)
+    const char *const *only;
+    const char *gguf_repo, *gguf_rev, *gguf_file;
 } DownloadPack;
 
-#define DOWNLOAD_NPACKS 5
+#define DOWNLOAD_NPACKS 7
 // The first DOWNLOAD_NFLASH are the Flash-Next packs ("all", and saetta start's default).
 #define DOWNLOAD_NFLASH 2
-extern const DownloadPack download_packs[DOWNLOAD_NPACKS]; // coder, full, 27b-8bit, 27b-4bit, 27b-pi
+extern const DownloadPack download_packs[DOWNLOAD_NPACKS]; // coder, full, 27b-8bit, 27b-4bit, 27b-pi, 27b-turbo, 27b-turbo-8bit
 
 // The pack named `name`, or NULL.
 const DownloadPack *download_find(const char *name);

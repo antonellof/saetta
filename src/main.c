@@ -20,6 +20,7 @@
 #include "chat.h"
 #include "control.h"
 #include "download.h"
+#include "gguf.h"
 #include "gpu.h"
 #include "json.h"
 #include "launch.h"
@@ -514,6 +515,14 @@ static Err run(Arena *arena, int argc, char **argv) {
         }
         return OK;
     }
+    if (argc >= 2 && eq(cmd, "import")) {
+        Err err = gguf_import_run(rest, nrest);
+        if (err) {
+            dbg("saetta import: %s\n", err);
+            exit(1);
+        }
+        return OK;
+    }
     if (argc == 2 && eq(cmd, "update")) {
         int code;
         Err err = control_update(out, SAETTA_VERSION, &code);
@@ -586,13 +595,14 @@ static Err run(Arena *arena, int argc, char **argv) {
     }
     if (argc >= 2 && eq(cmd, "verify")) {
         const char *golden = argc >= 3 ? argv[2] : "tests/golden";
-        // the pack: $SAETTA_PACK, else the one the golden names (manifest "pack") under
-        // the models folder's mlx-community
+        // the pack: $SAETTA_PACK, else the one the golden names: manifest "pack_path" under the
+        // models folder, or "pack" under its mlx-community
         const char *pack = getenv("SAETTA_PACK");
         if (!pack) {
             const char *home = getenv("HOME");
             if (!home) return "NoHome";
             const char *name = "Qwen3.8-Flash-Next-4bit-mtp";
+            const char *pack_path = NULL; // relative to the models folder (manifest "pack_path")
             char *mt;
             size_t ml;
             if (!read_file(path_join(arena, golden, "manifest.json"), 1u << 20, &mt, &ml)) {
@@ -600,12 +610,13 @@ static Err run(Arena *arena, int argc, char **argv) {
                 if (!json_parse(arena, str_n(mt, ml), false, &man)) {
                     const char *pn = json_str(json_get(man, "pack"));
                     if (pn) name = pn;
+                    pack_path = json_str(json_get(man, "pack_path"));
                 }
                 free(mt);
             }
             char *md;
             TRY(download_models_dir(arena, &md));
-            pack = path_join(arena, path_join(arena, md, "mlx-community"), name);
+            pack = pack_path ? path_join(arena, md, pack_path) : path_join(arena, path_join(arena, md, "mlx-community"), name);
         }
         bool ok;
         TRY(verify_run(arena, out, pack, golden, &ok));

@@ -12,10 +12,20 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "gguf.h"
 #include "hash.h"
 #include "json.h"
 #include "metal/shim.h"
 #include "stats.h"
+
+// DavidAU's TURBO fine-tune of Qwen3.8-27B: config and tokenizer from the BF16 repo, weights
+// from the GGUF repo (its NEO-CODER imatrix quants with the MTP layer), both Apache-2.0.
+#define TURBO_REPO "DavidAU/Qwen3.8-27B-TURBO-Fable-Cold-Fusion-735-882-Heretic-Uncensored-NM-DAU"
+#define TURBO_REV "079b2b268c637b77f2fb4ab6a5ca1edc47d462a5"
+#define TURBO_GGUF_REPO "DavidAU/Qwen3.8-27B-TURBO-Fable-Cold-Fusion-735-882-Heretic-Uncensored-NEO-CODER-MAX-MTP-GGUF"
+#define TURBO_GGUF_REV "36116c48f4e81b4c66a9c63da13a72959999a5f6"
+static const char *const turbo_files[] = {"config.json", "tokenizer.json", "tokenizer_config.json", "chat_template.jinja",
+                                          "generation_config.json", "vocab.json", NULL};
 
 const DownloadPack download_packs[DOWNLOAD_NPACKS] = {
     {.name = "coder", .repo = "mbrown-uno/Qwen3.8-Flash-Next-GSQ-RCO-Coder-MLX", .rev = "50fa68c5e9cebf53276d8eae8af594fa8b3de9e4", .note = "256 experts, pruned for code, 76 GB"},
@@ -23,6 +33,14 @@ const DownloadPack download_packs[DOWNLOAD_NPACKS] = {
     {.name = "27b-8bit", .repo = "mlx-community/Qwen3.8-27B-8bit", .rev = "1159008f24a3f97d7afd366fcfee9a79f3bd2b94", .note = "Qwen3.8-27B dense, 8-bit, 29 GB (for LoRA adapters)"},
     {.name = "27b-4bit", .repo = "mlx-community/Qwen3.8-27B-4bit", .rev = "b935172e4bb5dcd0543774a34748fb92422e3027", .note = "Qwen3.8-27B dense, 4-bit, 16 GB"},
     {.name = "27b-pi", .repo = "harness-hub/Qwen3.8-27B-pi-adapted", .rev = "80d05c9051dfd2ae464e1daf4329cb15524caf60", .note = "LoRA adapter for the pi agent on Qwen3.8-27B, 0.6 GB"},
+    {.name = "27b-turbo", .repo = TURBO_REPO, .rev = TURBO_REV, .only = turbo_files, .gguf_repo = TURBO_GGUF_REPO, .gguf_rev = TURBO_GGUF_REV,
+     .gguf_file = "Qwen3.8-27B-TurboFCFusion-735-882-Here-Uncen-NEO-CODER-MAX-MTP-Q4_K_M.gguf",
+     .dir = "DavidAU/Qwen3.8-27B-TURBO-NEO-CODER-MAX-MTP-Q4_K_M",
+     .note = "Qwen3.8-27B TURBO Fable Cold Fusion fine-tune (DavidAU), Q4_K_M GGUF with MTP, imported, 20 GB"},
+    {.name = "27b-turbo-8bit", .repo = TURBO_REPO, .rev = TURBO_REV, .only = turbo_files, .gguf_repo = TURBO_GGUF_REPO, .gguf_rev = TURBO_GGUF_REV,
+     .gguf_file = "Qwen3.8-27B-TurboFCFusion-735-882-Here-Uncen-NEO-CODER-MAX-MTP-Q8_0.gguf",
+     .dir = "DavidAU/Qwen3.8-27B-TURBO-NEO-CODER-MAX-MTP-Q8_0",
+     .note = "the same fine-tune, Q8_0 GGUF with MTP, imported, 30 GB"},
 };
 
 // Idle timeout of a transfer (between bytes); a stalled connection fails and is retried.
@@ -49,12 +67,12 @@ Err download_models_dir(Arena *a, char **out) {
 Err download_pack_dir(Arena *a, const DownloadPack *p, char **out) {
     char *d;
     TRY(download_models_dir(a, &d));
-    *out = path_join(a, d, p->repo);
+    *out = path_join(a, d, p->dir ? p->dir : p->repo);
     return OK;
 }
 
 const char *download_usage(void) {
-    return "usage: saetta download [coder|full|all|27b-8bit|27b-4bit|27b-pi] [--jobs N]   (default coder; all = coder and "
+    return "usage: saetta download [coder|full|all|27b-8bit|27b-4bit|27b-pi|27b-turbo|27b-turbo-8bit] [--jobs N]   (default coder; all = coder and "
            "full; into $SAETTA_MODELS, default ~/Models)\n";
 }
 
@@ -165,6 +183,11 @@ static Err list_files(Arena *a, const DownloadPack *p, const char *token, Item *
         if (str_find(path->s, S(".."), 0) >= 0 || (path->s.len > 0 && path->s.ptr[0] == '/')) {
             vec_free(&items);
             return "BadListing";
+        }
+        if (p->only) {
+            bool keep = false;
+            for (const char *const *f = p->only; *f && !keep; f++) keep = str_eqz(path->s, *f);
+            if (!keep) continue;
         }
         vec_push(&items, ((Item){.path = path->s.ptr, .size = (uint64_t)size->i, .sha256 = sha, .git_oid = oid->s.ptr}));
     }
@@ -422,10 +445,8 @@ static void sort_by_size_desc(Item *v, size_t n) {
     }
 }
 
-static Err one(Arena *a, const DownloadPack *p, const char *token, size_t jobs) {
-    char *root;
-    TRY(download_pack_dir(a, p, &root));
-    dbg("saetta download: %s (%s)\n  %s at %.7s\n  into %s\n", p->name, p->note, p->repo, p->rev, root);
+// Fetches the files of p->repo at p->rev (those in p->only, if set) into root.
+static Err fetch_repo(Arena *a, const DownloadPack *p, const char *root, const char *token, size_t jobs) {
     Item *all;
     size_t n_all;
     TRY(list_files(a, p, token, &all, &n_all));
@@ -481,6 +502,28 @@ static Err one(Arena *a, const DownloadPack *p, const char *token, size_t jobs) 
         return "DownloadFailed";
     }
     dbg("  done: %s\n", root);
+    return OK;
+}
+
+static Err one(Arena *a, const DownloadPack *p, const char *token, size_t jobs) {
+    char *root;
+    TRY(download_pack_dir(a, p, &root));
+    dbg("saetta download: %s (%s)\n  %s at %.7s\n  into %s\n", p->name, p->note, p->repo, p->rev, root);
+    TRY(fetch_repo(a, p, root, token, jobs));
+    if (!p->gguf_file) return OK;
+    const char *st = path_join(a, root, "model.safetensors");
+    if (file_exists(st) && file_exists(path_join(a, root, "model.safetensors.index.json"))) {
+        dbg("  imported pack present: %s\n", st);
+        return OK;
+    }
+    DownloadPack g = {.name = p->name, .repo = p->gguf_repo, .rev = p->gguf_rev, .only = (const char *const[]){p->gguf_file, NULL}};
+    dbg("  %s at %.7s: %s\n", g.repo, g.rev, p->gguf_file);
+    TRY(fetch_repo(a, &g, root, token, jobs));
+    const char *gf = path_join(a, root, p->gguf_file);
+    dbg("  importing the GGUF into a saetta pack\n");
+    TRY(gguf_import(gf, root, root));
+    if (unlink(gf) != 0) dbg("  could not delete %s: %s\n", gf, strerror(errno));
+    else dbg("  deleted the GGUF (%s)\n", p->gguf_file);
     return OK;
 }
 

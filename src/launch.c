@@ -23,8 +23,17 @@ extern char **environ;
 
 #define MODEL_ID "qwen3.8-flash-next"
 
+// The model id the agent asks for and its display name: the server's base model, or with
+// --lora the adapter's name (the server picks the adapter by the request's model).
+static const char *model_id = MODEL_ID;
+static const char *model_label = "Qwen3.8-Flash-Next (saetta)";
+// --lora name=path, passed to serve as --lora-modules (thinking off by default, as the pi
+// adapter was trained)
+static const char *lora_arg = NULL;
+
 const char *launch_usage(void) {
-    return "usage: saetta start <claude|pi|opencode> [--pack coder|full|<dir>] [--port N] [--ctx N] [--keep] [-- <agent args>]\n";
+    return "usage: saetta start <claude|pi|opencode> [--pack coder|full|27b-8bit|27b-4bit|<dir>] [--lora name=path] [--port N] "
+           "[--ctx N] [--keep] [-- <agent args>]\n";
 }
 
 typedef enum { AGENT_CLAUDE, AGENT_PI, AGENT_OPENCODE } Agent;
@@ -201,7 +210,13 @@ static Err start_server(Arena *a, const char *dir, uint16_t port, uint32_t ctx, 
     env_put(&senv, "SAETTA_CTX", arena_printf(a, "%u", ctx));
     env_put(&senv, "SAETTA_AUTOSTOP", "1"); // stopped by the last `saetta start` session
     char *port_s = arena_printf(a, "%u", port);
-    const char *argv[] = {exe, "serve", dir, "--port", port_s, NULL};
+    const char *argv[10] = {exe, "serve", dir, "--port", port_s};
+    if (lora_arg) {
+        argv[5] = "--lora-modules";
+        argv[6] = lora_arg;
+        argv[7] = "--default-chat-template-kwargs";
+        argv[8] = "{\"enable_thinking\":false}";
+    }
     posix_spawn_file_actions_t fa;
     posix_spawn_file_actions_init(&fa);
     posix_spawn_file_actions_addopen(&fa, 0, "/dev/null", O_RDONLY, 0);
@@ -251,12 +266,12 @@ static void claude_setup(Arena *a, Env *env, Argv *argv, const char *base, uint3
     const char *vars[][2] = {
         {"ANTHROPIC_BASE_URL", base},
         {"ANTHROPIC_AUTH_TOKEN", "saetta"},
-        {"ANTHROPIC_MODEL", MODEL_ID},
-        {"ANTHROPIC_DEFAULT_OPUS_MODEL", MODEL_ID},
-        {"ANTHROPIC_DEFAULT_SONNET_MODEL", MODEL_ID},
-        {"ANTHROPIC_DEFAULT_HAIKU_MODEL", MODEL_ID},
-        {"ANTHROPIC_DEFAULT_FABLE_MODEL", MODEL_ID},
-        {"CLAUDE_CODE_SUBAGENT_MODEL", MODEL_ID},
+        {"ANTHROPIC_MODEL", model_id},
+        {"ANTHROPIC_DEFAULT_OPUS_MODEL", model_id},
+        {"ANTHROPIC_DEFAULT_SONNET_MODEL", model_id},
+        {"ANTHROPIC_DEFAULT_HAIKU_MODEL", model_id},
+        {"ANTHROPIC_DEFAULT_FABLE_MODEL", model_id},
+        {"CLAUDE_CODE_SUBAGENT_MODEL", model_id},
         {"CLAUDE_CODE_MAX_CONTEXT_TOKENS", ctx_s},
         {"CLAUDE_CODE_MAX_OUTPUT_TOKENS", "32000"},
         {"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1"},
@@ -278,7 +293,7 @@ static void claude_setup(Arena *a, Env *env, Argv *argv, const char *base, uint3
     buf_adds(&settings, "}}");
     const char *s = arena_strndup(a, settings.ptr, settings.len);
     buf_free(&settings);
-    const char *args[] = {"claude", "--model", MODEL_ID, "--settings", s};
+    const char *args[] = {"claude", "--model", model_id, "--settings", s};
     for (size_t k = 0; k < COUNT(args); k++) vec_push(argv, args[k]);
 }
 
@@ -307,8 +322,8 @@ static Err pi_setup(Arena *a, Env *env, Argv *argv, const char *base, uint32_t c
         "      },\n"
         "      \"models\": [{\n"
         "        \"id\": \"%s\",\n"
-        "        \"name\": \"Qwen3.8-Flash-Next (saetta)\",\n"
-        "        \"reasoning\": true,\n"
+        "        \"name\": \"%s\",\n"
+        "        \"reasoning\": %s,\n"
         "        \"input\": [\"text\"],\n"
         "        \"contextWindow\": %u,\n"
         "        \"maxTokens\": 32768,\n"
@@ -317,12 +332,13 @@ static Err pi_setup(Arena *a, Env *env, Argv *argv, const char *base, uint32_t c
         "    }\n"
         "  }\n"
         "}\n",
-        base, MODEL_ID, ctx);
+        base, model_id, model_label, lora_arg ? "false" : "true", ctx);
     TRY(write_in(a, dir, "models.json", models));
-    TRY(write_in(a, dir, "settings.json", "{\n  \"defaultProvider\": \"saetta\",\n  \"defaultModel\": \"" MODEL_ID "\"\n}\n"));
+    TRY(write_in(a, dir, "settings.json",
+                 arena_printf(a, "{\n  \"defaultProvider\": \"saetta\",\n  \"defaultModel\": \"%s\"\n}\n", model_id)));
     env_put(env, "PI_CODING_AGENT_DIR", dir);
     env_put(env, "PI_SKIP_VERSION_CHECK", "1");
-    const char *args[] = {"pi", "--provider", "saetta", "--model", MODEL_ID};
+    const char *args[] = {"pi", "--provider", "saetta", "--model", model_id};
     for (size_t k = 0; k < COUNT(args); k++) vec_push(argv, args[k]);
     return OK;
 }
@@ -344,7 +360,7 @@ static Err opencode_setup(Arena *a, Env *env, Argv *argv, const char *base, uint
         "      \"options\": { \"baseURL\": \"%s/v1\", \"timeout\": false },\n"
         "      \"models\": {\n"
         "        \"%s\": {\n"
-        "          \"name\": \"Qwen3.8-Flash-Next (saetta)\",\n"
+        "          \"name\": \"%s\",\n"
         "          \"limit\": { \"context\": %u, \"output\": 8192 },\n"
         "          \"options\": { \"temperature\": 0 }\n"
         "        }\n"
@@ -352,7 +368,7 @@ static Err opencode_setup(Arena *a, Env *env, Argv *argv, const char *base, uint
         "    }\n"
         "  }\n"
         "}\n",
-        MODEL_ID, MODEL_ID, base, MODEL_ID, ctx);
+        model_id, model_id, base, model_id, model_label, ctx);
     TRY(write_in(a, dir, "opencode.json", cfg));
     env_put(env, "OPENCODE_CONFIG", path_join(a, dir, "opencode.json"));
     vec_push(argv, "opencode");
@@ -544,6 +560,21 @@ static Err run_in(Arena *a, const char *const *args, size_t n, int *code) {
         } else if (i + 1 < n && strcmp(x, "--pack") == 0) {
             i += 1;
             pack_arg = args[i];
+            if (strncmp(pack_arg, "27b", 3) == 0 || strstr(pack_arg, "27B") != NULL) {
+                model_id = "qwen3.8-27b";
+                model_label = "Qwen3.8-27B (saetta)";
+            }
+        } else if (i + 1 < n && strcmp(x, "--lora") == 0) {
+            i += 1;
+            const char *eq = strchr(args[i], '=');
+            if (!eq || eq == args[i] || !eq[1]) {
+                dbg("saetta: --lora wants name=path, got %s\n", args[i]);
+                *code = 64;
+                return OK;
+            }
+            lora_arg = args[i];
+            model_id = arena_strndup(a, args[i], (size_t)(eq - args[i]));
+            model_label = arena_printf(a, "%s (Qwen3.8-27B LoRA, saetta)", model_id);
         } else if (i + 1 < n && strcmp(x, "--port") == 0) {
             i += 1;
             TRY(parse_u16(args[i], &port));

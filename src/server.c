@@ -8,6 +8,7 @@
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/sysctl.h>
 #include <time.h>
 #include <unistd.h>
@@ -15,6 +16,7 @@
 #include "anthropic.h"
 #include "chat.h"
 #include "config.h"
+#include "download.h"
 #include "gpu.h"
 #include "instance.h"
 #include "json.h"
@@ -26,7 +28,11 @@
 #include "toolcall.h"
 #include "weights.h"
 
+#if CONFIG_ARCH_27B
+#define MODEL_ID "qwen3.8-27b"
+#else
 #define MODEL_ID "qwen3.8-flash-next"
+#endif
 
 #define MAX_CONV 8
 // Capacity a conversation starts with (tokens); it grows in steps of CAP_STEP as needed.
@@ -68,6 +74,11 @@ typedef struct {
     size_t active;
     uint64_t clock;
     size_t max_conv;
+    // LoRA adapter (model_lora_find index, -1: none) whose state each conversation holds: its
+    // KV cache, restore and prefix points depend on it, so reuse stays within one adapter
+    int conv_lora[MAX_CONV];
+    // --default-chat-template-kwargs: an object whose keys fill in what a request leaves out
+    JValue *kwargs_default;
 } Engine;
 
 // Makes conversation i the active one.
@@ -112,10 +123,11 @@ static bool room_for(Engine *e, uint64_t bytes, uint64_t gpu_margin) {
 // Picks the conversation for a prompt: the one it continues; else an empty one, a new
 // one while GPU memory allows (4 GB kept free under the working-set limit), or the least
 // recently used.
-static void route(Engine *e, const uint32_t *ids, size_t nids) {
+static void route(Engine *e, const uint32_t *ids, size_t nids, int lora) {
     e->clock += 1;
     size_t best = e->active, best_n = 0;
     for (size_t i = 0; i < e->n_conv; i++) {
+        if (e->conv_lora[i] != lora) continue;
         size_t n = session_reusable_in(ck_of(e, i), ids, nids).n;
         if (n > best_n) {
             best_n = n;
@@ -138,6 +150,7 @@ static void route(Engine *e, const uint32_t *ids, size_t nids) {
                 if (!session_new_conv(e->s, e->g, CAP0, &cv)) {
                     e->held[e->n_conv] = cv;
                     e->has[e->n_conv] = true;
+                    e->conv_lora[e->n_conv] = lora;
                     e->n_conv += 1;
                     dbg("saetta: conversation %zu opened (%s GB)\n", e->n_conv,
                         fx((double)session_conv_bytes(e->s, CAP0) / (double)(1 << 30), 1));
@@ -153,6 +166,12 @@ static void route(Engine *e, const uint32_t *ids, size_t nids) {
     }
 picked:
     activate(e, best);
+    if (e->conv_lora[best] != lora) {
+        // its state was built with another adapter: start it over
+        session_invalidate_from(e->s, 0);
+        e->conv_lora[best] = lora;
+    }
+    model_lora_select(e->m, lora);
     e->used[best] = e->clock;
     e->last_s[best] = (int64_t)(wall_ns() / 1000000000ull);
     atomic_store_explicit(&e->st->convs, (uint32_t)e->n_conv, memory_order_release);
@@ -173,7 +192,7 @@ static Start plan(Engine *e, const uint32_t *ids, size_t nids) {
     size_t own = session_shared_point(e->s->ptoks.ptr, e->s->ptoks.len, e->s->pts, ids, nids);
     Start best = {own, own > 0 ? START_OWN : START_FRESH, 0, 0};
     for (size_t i = 0; i < e->n_conv; i++) {
-        if (!e->has[i]) continue;
+        if (!e->has[i] || e->conv_lora[i] != e->conv_lora[e->active]) continue;
         const Conv *cv = &e->held[i];
         size_t n = session_shared_point(cv->ptoks.ptr, cv->ptoks.len, cv->pts, ids, nids);
         if (n > best.n) {
@@ -1421,6 +1440,20 @@ static Err handle(Engine *e, Arena *a, Conn *c, Req *h, Str body, Fmt fmt, Work 
     Str named = {0};
     ToolChoiceKind choice = field(r, "tools") != NULL ? tool_choice(r, &named) : TC_AUTO;
     if (choice == TC_NONE) json_remove(r, "tools");
+    if (e->kwargs_default) {
+        // a key the request sets in chat_template_kwargs or at the top level wins
+        JValue *kw = field(r, "chat_template_kwargs");
+        for (size_t i = 0; i < e->kwargs_default->obj.len; i++) {
+            const JMember *d = &e->kwargs_default->obj.items[i];
+            const char *k = arena_strndup(a, d->key.ptr, d->key.len);
+            if ((kw && json_get(kw, k)) || field(r, k)) continue;
+            if (!kw || kw->kind != J_OBJECT) {
+                kw = json_new(a, J_OBJECT);
+                json_put(a, r, S("chat_template_kwargs"), kw);
+            }
+            json_put(a, kw, d->key, d->val);
+        }
+    }
     Str prompt;
     TRY(chat_render(a, r, &prompt));
     Str forced = S("");
@@ -1482,7 +1515,9 @@ static Err handle(Engine *e, Arena *a, Conn *c, Req *h, Str body, Fmt fmt, Work 
     // the reply fits in the context: SAETTA_CTX less the prompt and the speculation slack
     if (n + CAP_SLACK >= e->s->max_cap) return "PromptTooLong";
     size_t max_tokens = MIN(asked, e->s->max_cap - n - CAP_SLACK);
-    route(e, w->ids.ptr, n);
+    // the request's model: a LoRA adapter's name selects it, anything else the base model
+    int lora = model_name.len > 0 ? model_lora_find(e->m, arena_strndup(a, model_name.ptr, model_name.len)) : -1;
+    route(e, w->ids.ptr, n, lora);
     TRY(ensure(e, n + max_tokens + CAP_SLACK));
     Start start = plan(e, w->ids.ptr, n);
     stats_begin(e->st, fmt == FMT_ANTHROPIC, n, start.n, max_tokens);
@@ -1509,8 +1544,16 @@ static Err connection(Engine *e, int fd) {
         if (h.method == M_GET && str_eqz(path, "/health")) {
             ret = json_respond(c, &h, 200, S("{\"status\":\"ok\"}"));
         } else if (h.method == M_GET && str_eqz(path, "/v1/models")) {
-            ret = json_respond(c, &h, 200,
-                               S("{\"object\":\"list\",\"data\":[{\"id\":\"" MODEL_ID "\",\"object\":\"model\",\"owned_by\":\"saetta\"}]}"));
+            Buf mb = {0};
+            buf_adds(&mb, "{\"object\":\"list\",\"data\":[{\"id\":\"" MODEL_ID "\",\"object\":\"model\",\"owned_by\":\"saetta\"}");
+            for (size_t i = 0; i < model_lora_count(e->m); i++) {
+                buf_adds(&mb, ",{\"id\":");
+                json_write_string(&mb, str(model_lora_name(e->m, i)));
+                buf_adds(&mb, ",\"object\":\"model\",\"owned_by\":\"saetta\",\"parent\":\"" MODEL_ID "\"}");
+            }
+            buf_adds(&mb, "]}");
+            ret = json_respond(c, &h, 200, buf_str(&mb));
+            buf_free(&mb);
         } else if (h.method == M_HEAD && str_eqz(path, "/api/hello")) {
             ret = respond(c, &h, 200, S(""), NULL); // Claude Code's startup probe
         } else if (h.method == M_POST && (str_eqz(path, "/v1/chat/completions") || str_eqz(path, "/v1/messages") ||
@@ -1568,7 +1611,15 @@ static const char *basename_of(Arena *a, const char *dir) {
     return arena_strndup(a, dir + b, n - b);
 }
 
-Err server_serve(Arena *arena, const char *dir, uint16_t port) {
+Err server_serve(Arena *arena, const char *dir, uint16_t port, const char *const *loras, size_t nloras,
+                 const char *kwargs_default) {
+    JValue *kwd = NULL;
+    if (kwargs_default) {
+        if (json_parse(arena, str(kwargs_default), true, &kwd) || kwd->kind != J_OBJECT) {
+            dbg("saetta: --default-chat-template-kwargs wants a JSON object, got %s\n", kwargs_default);
+            return "BadKwargs";
+        }
+    }
     // one server per machine (src/instance.h); the lock is held until this process ends
     int lock_fd;
     TRY(instance_acquire(port, &lock_fd));
@@ -1596,6 +1647,28 @@ Err server_serve(Arena *arena, const char *dir, uint16_t port) {
     TRY(gpu_warm_except(g, pack, "ngram_embedding"));
     Model *m = ARENA_NEW(arena, Model);
     TRY(model_load(arena, pack, g, m));
+    // --lora-modules name=dir: each adapter, served under its name next to the base model
+    for (size_t i = 0; i < nloras; i++) {
+        const char *eq = strchr(loras[i], '=');
+        if (!eq || eq == loras[i] || !eq[1]) {
+            dbg("saetta: --lora-modules wants name=path, got %s\n", loras[i]);
+            return "BadLoraModule";
+        }
+        const char *name = arena_strndup(arena, loras[i], (size_t)(eq - loras[i]));
+        const char *path = eq + 1;
+        struct stat lst;
+        if (stat(path, &lst) != 0) {
+            // a Hugging Face id (org/repo, as vLLM takes it): its folder under the models dir
+            char *md;
+            TRY(download_models_dir(arena, &md));
+            path = path_join(arena, md, path);
+        }
+        Err le = model_lora_load(arena, m, name, path);
+        if (le) {
+            dbg("saetta: LoRA %s from %s: %s\n", name, path, le);
+            return le;
+        }
+    }
     Tokenizer *tok = ARENA_NEW(arena, Tokenizer);
     TRY(tokenizer_load(arena, dir, tok));
     Stats *st = ARENA_NEW(arena, Stats);
@@ -1633,6 +1706,8 @@ Err server_serve(Arena *arena, const char *dir, uint16_t port) {
     e->depth = DEPTH_INIT;
     e->n_conv = 1;
     e->active = 0;
+    for (size_t i = 0; i < MAX_CONV; i++) e->conv_lora[i] = -1;
+    e->kwargs_default = kwd;
     st->ctx = e->s->max_cap;
     TRY(stats_spawn(st));
     pthread_t th;

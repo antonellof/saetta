@@ -16,7 +16,12 @@
 // Loads the pack in dir and serves on 127.0.0.1:port until the process ends. Errors:
 // "AlreadyRunning" (another server holds the lock; message printed), load errors, socket
 // errors.
-Err server_serve(Arena *arena, const char *dir, uint16_t port);
+// loras: nloras "name=path" LoRA adapters (--lora-modules); path a folder or a Hugging Face id
+// under the models folder. A request whose model is an adapter's name runs with it.
+// kwargs_default: NULL or a JSON object of chat template kwargs (enable_thinking, ...) used when
+// a request does not set them (vLLM's --default-chat-template-kwargs).
+Err server_serve(Arena *arena, const char *dir, uint16_t port, const char *const *loras, size_t nloras,
+                 const char *kwargs_default);
 
 // ---- sampling, exposed for the unit tests --------------------------------------------------
 

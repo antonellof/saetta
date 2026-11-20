@@ -752,13 +752,32 @@ static Err run(Arena *arena, int argc, char **argv) {
     }
     if (argc >= 3 && eq(cmd, "serve")) {
         uint16_t port = 8080;
-        if (argc == 5 && eq(argv[3], "--port")) {
-            uint64_t p;
-            TRY(parse_u64(str(argv[4]), &p));
-            if (p > 65535) return "Overflow";
-            port = (uint16_t)p;
+        // --lora-modules name=path [name=path ...] (vLLM's form) or name=path,name=path
+        const char **loras = ARENA_ARRAY(arena, const char *, (size_t)argc * 8);
+        size_t nloras = 0;
+        const char *kwargs = NULL;
+        for (int i = 3; i < argc; i++) {
+            if (eq(argv[i], "--port") && i + 1 < argc) {
+                uint64_t p;
+                TRY(parse_u64(str(argv[++i]), &p));
+                if (p > 65535) return "Overflow";
+                port = (uint16_t)p;
+            } else if (eq(argv[i], "--default-chat-template-kwargs") && i + 1 < argc) {
+                kwargs = argv[++i];
+            } else if (eq(argv[i], "--lora-modules")) {
+                for (; i + 1 < argc && argv[i + 1][0] != '-'; i++) {
+                    char *list = arena_strndup(arena, argv[i + 1], strlen(argv[i + 1]));
+                    for (char *tok = strtok(list, ","); tok; tok = strtok(NULL, ",")) {
+                        if (nloras == (size_t)argc * 8) return "TooManyAdapters";
+                        loras[nloras++] = tok;
+                    }
+                }
+            } else {
+                dbg("saetta serve: unknown argument %s\n", argv[i]);
+                exit(64);
+            }
         }
-        Err err = server_serve(arena, argv[2], port);
+        Err err = server_serve(arena, argv[2], port, loras, nloras, kwargs);
         if (err && !strcmp(err, "AlreadyRunning")) exit(1);
         if (err && !strcmp(err, "AddressInUse")) {
             dbg("error: port %u is in use by another program; choose another with --port N\n", port);
@@ -798,7 +817,7 @@ static Err run(Arena *arena, int argc, char **argv) {
         TRY(parse_usize(argv[3], &n));
         return generate(arena, argv[2], n, argv + 4, (size_t)argc - 4);
     }
-    fprintf(out, "usage: saetta serve <model-dir> [--port N] | info <model-dir> | generate <model-dir> <n> <ids...> | tokenize "
+    fprintf(out, "usage: saetta serve <model-dir> [--port N] [--lora-modules name=path ...] [--default-chat-template-kwargs JSON] | info <model-dir> | generate <model-dir> <n> <ids...> | tokenize "
                  "<model-dir> <file> | render <request.json> | verify [golden-dir] | download [coder|full|all] | start "
                  "<claude|pi|opencode> | monitor | status | stop | update | version\n");
     fflush(out);

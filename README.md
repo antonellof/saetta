@@ -92,7 +92,24 @@ Qwen3.8-27B weights and the pi adapter (harness-hub/Qwen3.8-27B-pi-adapted, card
 
 ### LoRA adapters
 
-`SAETTA_LORA=<adapter folder>` applies a PEFT LoRA adapter (`adapter_config.json`, `adapter_model.safetensors`) to `saetta generate` on a 27B pack. Supported: LoRA on the attention and MLP projections, any rank that is a multiple of 8 up to 128, rsLoRA; not DoRA, biases or saved modules. Flash-Next packs take no adapters.
+PEFT LoRA adapters (`adapter_config.json`, `adapter_model.safetensors`) run on 27B packs, applied at run time; the base model stays available next to them. The flags follow vLLM's:
+
+```sh
+saetta download 27b-8bit && saetta download 27b-pi
+saetta serve ~/Models/mlx-community/Qwen3.8-27B-8bit \
+    --lora-modules qwen3.8-pi=harness-hub/Qwen3.8-27B-pi-adapted \
+    --default-chat-template-kwargs '{"enable_thinking": false}'
+```
+
+A request whose `model` is an adapter's name (`qwen3.8-pi`) runs with that adapter, any other name with the base model (`qwen3.8-27b`); `/v1/models` lists both. A path is a folder, or a Hugging Face id under `~/Models`. Prompt caches are kept per adapter. `--default-chat-template-kwargs` fills in chat template settings a request leaves out: the pi adapter was trained with thinking off.
+
+For pi in one command (thinking off, pi pointed at the adapter):
+
+```sh
+saetta start pi --pack 27b-8bit --lora qwen3.8-pi=harness-hub/Qwen3.8-27B-pi-adapted
+```
+
+`SAETTA_LORA=<adapter folder>` applies an adapter to `saetta generate`. Supported: LoRA on the attention and MLP projections, any rank that is a multiple of 8 up to 128, rsLoRA; not DoRA, biases or saved modules. Each adapter adds about 0.3 GB of reads per generated token. Flash-Next packs take no adapters.
 
 ## Run the server
 
@@ -228,10 +245,12 @@ Prompt reading 1,650 to 1,820 tokens/s (full) and 1,700 to 1,950 (Coder); answer
 saetta download coder|full|all          # fetch a pack (pinned revision, resumable, hash-checked)
 saetta download 27b-8bit|27b-4bit|27b-pi  # Qwen3.8-27B packs and the pi LoRA adapter
 saetta start claude|pi|opencode         # a coding agent on saetta (starts the server)
+  [--pack 27b-8bit] [--lora name=path]  # on Qwen3.8-27B, with a LoRA adapter
 saetta monitor                          # live view of the server, GPU, memory, prompt cache
 saetta status | stop                    # show or stop the server on this machine
 saetta update                           # install the latest release over this binary
 saetta serve $M [--port N]              # the API server
+  [--lora-modules name=path ...] [--default-chat-template-kwargs JSON]   # 27B: LoRA adapters
 saetta info $M                          # check the pack and the GPU path
 saetta render request.json              # chat prompt for an OpenAI request body
 saetta tokenize $M prompt.txt           # token ids, one per line

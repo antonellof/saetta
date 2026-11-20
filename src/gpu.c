@@ -148,10 +148,14 @@ Err gpu_warm_except(Gpu *g, const Pack *pack, const char *skip) {
         size_t skip_len = strlen(skip);
         Str key;
         void *val;
+        const bool always = gpu_pack_always_streams(pack);
         for (size_t it = 0; strmap_next(&pack->tensors, &it, &key, &val);) {
             if (skip_len > 0 && str_find(key, str_n(skip, skip_len), 0) >= 0) continue;
             // streamed experts are read from the files on demand, not touched here
             if (g->segs && streamed_tensor(key)) continue;
+            // a pack that always streams (DeepSeek-V4-Flash) does not run its draft head yet:
+            // touching it would read 10.9 GB at every start for nothing
+            if (always && str_starts(key, S("mtp."))) continue;
             const TensorInfo *t = val;
             uint64_t first = t->offset / page * page;
             uint32_t pages = (uint32_t)((t->offset + t->nbytes - first + page - 1) / page);

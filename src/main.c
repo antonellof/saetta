@@ -79,7 +79,7 @@ static bool is_eos(const Model *m, uint32_t t) {
 static Err decode_loop(Model *m, Session *s, float *logits, const uint32_t *toks, size_t ntoks, size_t n, GenStats *gs,
                        Lookup *lk) {
     const char *sv = getenv("SAETTA_SPEC");
-    bool use_spec = sv ? sv[0] != '0' : true;
+    bool use_spec = (sv ? sv[0] != '0' : true) && !model_info(m)->no_spec;
     Gate gate = GATE_INIT;
     Depth depth = DEPTH_INIT;
     for (size_t i = 0; i < ntoks; i++) lookup_push(lk, toks[i]);
@@ -355,7 +355,7 @@ static Err info(Arena *arena, FILE *out, const char *dir) {
 
     // Every quantized linear of every layer, with its expected (out, in) shape.
     if (!model_info_for(arena, &pack)) {
-        fprintf(out, "model: %s is not a Qwen3.8-Flash-Next or Qwen3.8-27B pack\n", dir);
+        fprintf(out, "model: %s is not a Qwen3.8-Flash-Next, Qwen3.8-27B or DeepSeek-V4-Flash pack\n", dir);
         pack_close(&pack);
         return "UnknownModelType";
     }

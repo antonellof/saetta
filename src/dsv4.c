@@ -986,4 +986,6 @@ const ModelArch dsv4_arch = MODEL_ARCH_TABLE({
     .hidden = H,
     .eos = dsv4_eos,
     .n_eos = 1,
+    .no_spec = true,
+    .no_serve = true,
 });

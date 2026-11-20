@@ -51,6 +51,9 @@ typedef struct {
     size_t layers, width, vocab, hidden; // width: residual stream floats per token (verify)
     const uint32_t *eos;
     size_t n_eos;
+    // what the model implements beyond a plain forward pass: speculative decoding (prompt
+    // lookup, verification chunks) and serving (tokenizer, chat template, sessions)
+    bool no_spec, no_serve;
 } ModelInfo;
 
 // Per-conversation restore point.

@@ -27,8 +27,9 @@
 - **Agent turns that do not re-read:** a prompt that extends the previous one reads only its new tokens (a follow-up turn on a 16K conversation answers in 0.2 s), and new sessions reuse the prefix they share with others.
 - **LoRA adapters** on Qwen3.8-27B, per request, next to the base model: for example the [pi agent adapter](#lora-adapters).
 - **One command to code:** `saetta start claude` (or `pi`, `opencode`) starts the server and the agent.
-- **Checked:** every layer of both models, and the LoRA path, against a numpy reference.
+- **Checked:** every layer of every model, and the LoRA path, against a numpy reference.
 - **Small:** one binary that also downloads the models; no Python, no dependencies beyond macOS.
+- **New, preview:** [DeepSeek-V4-Flash](#deepseek-v4-flash-preview) (284B, official FP4/FP8 checkpoint), with its routed experts streamed from the SSD into a GPU-side cache. It decodes and passes its checks; serving it to agents comes next.
 
 ## Install
 
@@ -58,7 +59,19 @@ Needs an Apple M5 Max with 128 GB and macOS 27.2 or later. `SAETTA_PREFIX` chang
 | `27b-4bit` | Qwen3.8-27B, dense, 4-bit | [mlx-community/Qwen3.8-27B-4bit](https://huggingface.co/mlx-community/Qwen3.8-27B-4bit) | 16 GB |
 | `27b-pi` | the pi LoRA adapter for Qwen3.8-27B (r 32) | [harness-hub/Qwen3.8-27B-pi-adapted](https://huggingface.co/harness-hub/Qwen3.8-27B-pi-adapted) | 0.6 GB |
 
-Commands take a pack by its name (`saetta serve coder`) or its folder; the model is read from the pack. Flash-Next weights are under the Qwen Community License 1.0, [Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) and the pi adapter under Apache-2.0; none are part of this repository.
+### DeepSeek-V4-Flash (preview)
+
+saetta runs [DeepSeek-V4-Flash-0731](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731) from its official checkpoint, read in place (167 GB: FP8 dense weights, FP4 routed experts). The pack does not fit in 128 GB, so the dense weights stay resident and the routed experts are read from the SSD on demand into a GPU-visible cache (80 GB by default, `SAETTA_EXPERT_CACHE_GB` to change it). Replaying the routing of a coding prompt, about 92% of the expert reads while answering hit a cache of that size.
+
+What works in this release: `saetta info`, `saetta generate <pack> <n> <token ids>` (without speculative decoding) and `make verify-dsv4`, which checks every layer against a numpy port of the checkpoint's own reference code. Not yet: the tokenizer and chat template, so `saetta serve` refuses this pack and the agents cannot use it; speculative decoding; prefix reuse; fast prompt reading. This preview is about correctness: its speed has not been tuned or benchmarked yet.
+
+```sh
+hf download deepseek-ai/DeepSeek-V4-Flash-0731 --revision 7872f01b1d1fe23eabc4c98b48bffcef5a386062 \
+  --local-dir ~/Models/deepseek-ai/DeepSeek-V4-Flash-0731
+saetta info ~/Models/deepseek-ai/DeepSeek-V4-Flash-0731
+```
+
+Commands take a pack by its name (`saetta serve coder`) or its folder; the model is read from the pack. Flash-Next weights are under the Qwen Community License 1.0, [Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) and the pi adapter under Apache-2.0; none are part of this repository. DeepSeek-V4-Flash is under the MIT license.
 
 ### LoRA adapters
 
@@ -122,7 +135,7 @@ It listens on 127.0.0.1, prints one `request:` line per request, and stops with 
 | `SAETTA_SPEC` | 1 | `0` turns speculative decoding off |
 | `SAETTA_MTP` | 1 | `0` drafts with prompt lookup only, not the MTP head (Flash-Next) |
 | `SAETTA_KV_F32` | unset | f32 instead of f16 KV cache |
-| `SAETTA_EXPERT_CACHE_GB` | unset | experimental: keep only this many GB of routed experts in memory and read the rest from the SSD on demand (Flash-Next: slower than fully resident; DeepSeek-V4-Flash always streams, and without this variable takes the largest cache that fits) |
+| `SAETTA_EXPERT_CACHE_GB` | unset | experimental: keep only this many GB of routed experts in memory and read the rest from the SSD on demand (Flash-Next: slower than fully resident; DeepSeek-V4-Flash always streams, by default with an 80 GB cache) |
 
 ```sh
 curl -s localhost:8080/v1/chat/completions -H 'content-type: application/json' -d '{

@@ -1642,6 +1642,14 @@ Err server_serve(Arena *arena, const char *dir, uint16_t port, const char *const
     uint64_t t0 = now_ns();
     Pack *pack = ARENA_NEW(arena, Pack);
     TRY(pack_open(arena, dir, pack));
+    {
+        const ModelInfo *mi = model_info_for(arena, pack);
+        if (mi && mi->no_serve) {
+            dbg("serve: %s cannot be served yet (no tokenizer and chat template for it); use saetta generate\n", mi->name);
+            close(ls);
+            return "NotServable";
+        }
+    }
     Gpu *g = ARENA_NEW(arena, Gpu);
     TRY(gpu_init(arena, pack, g));
     // first GPU touch of the mapped pack (not the n-gram table), here instead of on the first request

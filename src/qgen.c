@@ -11,6 +11,7 @@ static const char *fx(char *buf, size_t cap, double x, int prec) {
 #include <assert.h>
 #include <math.h>
 
+#include "dsv4_moe.h"
 #include "ops.h"
 
 const char qgen_src[] = {
@@ -334,6 +335,71 @@ static void gr_run(const void *ctx, sx_cmd *cmd) {
     sx_cmd_dispatch(cmd, r->p, args, r->gen ? 11 : 10, r->m->out / 64, r->ntiles, 128);
 }
 
+// DeepSeek-V4-Flash routed experts (src/kernels/dsv4_moe.metal): act_quant, gate + up and the
+// summed down projection of T rows, 6 distinct experts per row, reps per command buffer, each
+// rep on other slots of a cache larger than the system cache.
+typedef struct {
+    sx_pipeline *aq, *gu, *dn;
+    sx_buffer *W, *S, *x, *xq, *slots, *rw, *hq, *y;
+    uint32_t T, nslot, w_stride, s_stride;
+    size_t reps;
+} DsRun;
+
+static void ds_run(const void *ctx, sx_cmd *cmd) {
+    const DsRun *r = ctx;
+    const Dsv4MoeP P = {r->T, r->w_stride, r->s_stride, 0, {DSV4_W1_OFF, DSV4_W2_OFF, DSV4_W3_OFF, 0},
+                        {DSV4_S1_OFF, DSV4_S2_OFF, DSV4_S3_OFF, 0}};
+    static const uint32_t K = 4096;
+    const size_t np = (size_t)r->T * 6;
+    for (size_t i = 0; i < r->reps; i++) {
+        const sx_arg sl = {r->slots, i * np * 4, NULL, 0};
+        sx_arg a0[3] = {gpu_buf_arg(r->x), gpu_buf_arg(r->xq), gpu_u32_arg(&K)};
+        sx_cmd_dispatch(cmd, r->aq, a0, 3, 4096 / 128, r->T, 32);
+        sx_arg a1[8] = {gpu_buf_arg(r->W), gpu_buf_arg(r->S), gpu_buf_arg(r->xq), sl, gpu_buf_arg(r->rw),
+                        gpu_buf_arg(r->hq), gpu_buf_arg(r->hq), gpu_bytes_arg(&P, sizeof P)};
+        sx_cmd_dispatch(cmd, r->gu, a1, 8, 2048 / 128, np, 256);
+        sx_arg a2[6] = {gpu_buf_arg(r->W), gpu_buf_arg(r->S), gpu_buf_arg(r->hq), sl, gpu_buf_arg(r->y),
+                        gpu_bytes_arg(&P, sizeof P)};
+        sx_cmd_dispatch(cmd, r->dn, a2, 6, 4096 / 16, 1, 256);
+    }
+}
+
+static Err dsv4_bench(QgenCtx *x, FILE *out) {
+    enum { NSLOT = 40, REPS = 24 };
+    const uint32_t ws = DSV4_EXPERT_W_BYTES, ss = DSV4_EXPERT_S_BYTES;
+    DsRun r = {.nslot = NSLOT, .w_stride = ws, .s_stride = ss, .reps = REPS};
+    TRY(qgen_ctx_pipe(x, dsv4_moe_src, "dsv4_act_quant", &r.aq));
+    TRY(qgen_ctx_pipe(x, dsv4_moe_src, "dsv4_moe_gate_up", &r.gu));
+    TRY(qgen_ctx_pipe(x, dsv4_moe_src, "dsv4_moe_down", &r.dn));
+    TRY(gpu_new_buffer(&x->g, (size_t)NSLOT * ws, &r.W));
+    TRY(gpu_new_buffer(&x->g, (size_t)NSLOT * ss, &r.S));
+    qgen_prng_bytes(&x->rng, sx_buffer_contents(r.W), (size_t)NSLOT * ws);
+    uint8_t *sp = sx_buffer_contents(r.S);
+    for (size_t i = 0; i < (size_t)NSLOT * ss; i++) sp[i] = (uint8_t)(116 + qgen_prng_next(&x->rng) % 6);
+    TRY(qgen_ctx_floats(x, 8 * 4096, -2, 2, &r.x));
+    TRY(gpu_new_buffer(&x->g, 8 * 4096 * 4, &r.xq));
+    TRY(gpu_new_buffer(&x->g, (size_t)REPS * 48 * 4, &r.slots));
+    TRY(qgen_ctx_floats(x, 48, 0.1f, 0.4f, &r.rw));
+    TRY(gpu_new_buffer(&x->g, 48 * 2048 * 4, &r.hq));
+    TRY(gpu_new_buffer(&x->g, 8 * 4096 * 4, &r.y));
+    static const uint32_t Ts[2] = {1, 4};
+    for (size_t ti = 0; ti < 2; ti++) {
+        r.T = Ts[ti];
+        const size_t np = (size_t)r.T * 6;
+        uint32_t *ip = sx_buffer_contents(r.slots);
+        for (size_t i = 0; i < REPS * np; i++) ip[i] = (uint32_t)(i % NSLOT); // np <= NSLOT: distinct in a rep
+        double s;
+        TRY(timed(&x->g, &r, ds_run, &s));
+        const double by = (double)REPS * (double)np * (ws + ss);
+        fprintf(out, "dsv4 experts T=%u x6 4096x2048 fp4 act_quant+gate_up+down %7s us  %6s GB/s\n", r.T,
+                FX(s * 1e6 / REPS, 2), FX(by / s / 1e9, 1));
+        fflush(out);
+    }
+    sx_buffer *bufs[] = {r.W, r.S, r.x, r.xq, r.slots, r.rw, r.hq, r.y};
+    for (size_t i = 0; i < COUNT(bufs); i++) sx_buffer_release(bufs[i]);
+    return OK;
+}
+
 // Decode matvecs: 24 distinct copies of the matrix per command buffer (more than the system
 // cache), GB/s of weights + scales + biases. Expert matvec: 10 slots x 24 reps over 240
 // distinct experts [640][2560]. Prompt grouped expert matmul (accelerators): 2048 rows over
@@ -467,5 +533,6 @@ Err qgen_bench(Arena *a, FILE *out) {
             TRY(e);
         }
     }
+    TRY(dsv4_bench(&x, out));
     return OK;
 }

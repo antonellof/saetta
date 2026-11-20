@@ -4,9 +4,18 @@
 #include <stdlib.h>
 #include "xcache.h"
 
-// A trunk routed-expert tensor, read from the files by the expert cache when streaming.
-static bool streamed_tensor(Str name) {
-    return str_find(name, S("mlp.switch_mlp."), 0) >= 0 && str_find(name, S("mtp."), 0) != 0;
+// A trunk routed-expert tensor, read from the files by the expert cache when streaming:
+// Flash-Next's stacked mlp.switch_mlp.* tensors, or DeepSeek-V4's per-expert
+// layers.N.ffn.experts.E.* (not its shared experts, not the draft head's mtp.*).
+bool gpu_streamed_tensor(Str name) {
+    if (str_find(name, S("mtp."), 0) == 0) return false;
+    return str_find(name, S("mlp.switch_mlp."), 0) >= 0 ||
+           (str_starts(name, S("layers.")) && str_find(name, S(".ffn.experts."), 0) >= 0);
+}
+#define streamed_tensor gpu_streamed_tensor
+
+bool gpu_pack_always_streams(const Pack *pack) {
+    return pack_get(pack, S("layers.0.ffn.experts.0.w1.weight")) != NULL;
 }
 
 typedef struct {
@@ -62,7 +71,7 @@ Err gpu_init(Arena *a, const Pack *pack, Gpu *out) {
     size_t page = sx_page_size();
     size_t nf = pack->nfiles ? pack->nfiles : 1;
     sx_buffer **bufs = ARENA_ARRAY(a, sx_buffer *, nf);
-    bool stream = xc_requested_bytes() != 0;
+    bool stream = xc_requested_bytes() != 0 || gpu_pack_always_streams(pack);
     GpuSeg **segs = stream ? ARENA_ARRAY(a, GpuSeg *, nf) : NULL;
     uint32_t *nseg = stream ? ARENA_ARRAY(a, uint32_t, nf) : NULL;
     for (size_t i = 0; i < pack->nfiles; i++) {
@@ -142,7 +151,7 @@ Err gpu_warm_except(Gpu *g, const Pack *pack, const char *skip) {
         for (size_t it = 0; strmap_next(&pack->tensors, &it, &key, &val);) {
             if (skip_len > 0 && str_find(key, str_n(skip, skip_len), 0) >= 0) continue;
             // streamed experts are read from the files on demand, not touched here
-            if (xc_requested_bytes() && streamed_tensor(key)) continue;
+            if (g->segs && streamed_tensor(key)) continue;
             const TensorInfo *t = val;
             uint64_t first = t->offset / page * page;
             uint32_t pages = (uint32_t)((t->offset + t->nbytes - first + page - 1) / page);

@@ -26,7 +26,15 @@ typedef struct {
     size_t nseg_files;
 } Gpu;
 
-// Creates the device and wraps every pack file. Errors: "NoMetalDevice", "WrapFailed".
+// Whether a tensor is a trunk routed expert, which a streamed pack reads through the expert
+// cache (src/xcache.h) instead of binding it.
+bool gpu_streamed_tensor(Str name);
+// Packs whose model always streams its routed experts (DeepSeek-V4-Flash: they cannot fit).
+bool gpu_pack_always_streams(const Pack *pack);
+
+// Creates the device and wraps every pack file; with streaming (SAETTA_EXPERT_CACHE_GB set, or
+// a pack that always streams) as segments that leave out the routed experts.
+// Errors: "NoMetalDevice", "WrapFailed".
 Err gpu_init(Arena *a, const Pack *pack, Gpu *out);
 void gpu_deinit(Gpu *g);
 

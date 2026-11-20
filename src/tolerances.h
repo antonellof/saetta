@@ -37,4 +37,22 @@
 // The same bound as TOL_QMM_REL (about 10x headroom on the matmul path).
 #define TOL_LORA_REL 5e-5f // f32
 
+// DeepSeek-V4-Flash mHC, norm and router kernels (src/kernels/dsv4_hc.metal) against the
+// scalar references (src/dsv4_ref_hc.c) on random data, 2026-11-20 (src/test/dsv4_hc.c).
+// Mixes (16384-wide f32 dot, 8 slices of tree sums) against f64, relative to the largest:
+// measured 5.6e-7.
+#define TOL_DSV4_MIX_REL 5e-6f // f32
+// pre/post/comb from the GPU's own mixes, absolute (values in [0, 2]): measured 6.3e-8 (exp
+// and divide ulps only, including the 1000x-scaled and peaked Sinkhorn inputs).
+#define TOL_DSV4_SPLIT_ABS 1e-6f // f32
+// The same from the f64 mixes, on the well-conditioned configurations: measured 1.3e-7.
+#define TOL_DSV4_SPLIT_E2E_ABS 2e-6f // f32
+// BF16 outputs (block input, norms, hc_post): each within one BF16 step of the reference,
+// and at most this fraction not identical. Measured 2.4e-4 (one value in 4096, an f32 ulp of
+// pre crossing a rounding boundary); 0 with identical inputs (hc_post, rmsnorm).
+#define TOL_DSV4_BF16_FRAC 2e-3f // f32
+// Router logits (BF16 weights, f32 x) against f64, and routing weights: measured 9.8e-8 and
+// 1.4e-7 relative to the largest.
+#define TOL_DSV4_ROUTER_REL 2e-6f // f32
+
 #endif

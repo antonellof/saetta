@@ -26,9 +26,10 @@ struct XCache {
     sx_buffer *region[XC_MAX_TENSORS];
     uint8_t *base[XC_MAX_TENSORS];
     // per layer and tensor: file descriptor, offset of expert 0 and bytes per expert
-    int *fd;           // [nlayers * nt]
+    int *fd;           // [nlayers * nt], stacked layers
     uint64_t *off0;    // [nlayers * nt]
     uint64_t *per;     // [nlayers * nt]
+    const XcRange **ranges; // [nlayers], explicit layers (NULL for stacked)
     uint32_t *ne;      // [nlayers]
     int32_t *slot_of;  // [nlayers * max_ne], -1 when not cached
     uint32_t *key;     // [n_slots], layer * max_ne + expert, UINT32_MAX when empty
@@ -142,6 +143,18 @@ static bool run_jobs(XCache *c) {
 static Err open_impl(Arena *a, const Pack *p, sx_device *d, const XcLayer *layers, uint32_t nlayers, uint32_t nt,
                      uint64_t cache_bytes, uint32_t threads, XCache **out, XCache **partial);
 
+// One F_NOCACHE descriptor per pack file, opened on first use.
+static Err open_file(Arena *a, const Pack *p, XCache *c, uint16_t f) {
+    if (c->files[f] >= 0) return OK;
+    char *path = arena_printf(a, "%s/%s", p->dir, p->files[f].name);
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return "OpenFailed";
+    fcntl(fd, F_NOCACHE, 1);
+    fcntl(fd, F_RDAHEAD, 0);
+    c->files[f] = fd;
+    return OK;
+}
+
 // Releases what a failed open_impl acquired (files, slab regions, staging); no thread runs yet.
 static void open_cleanup(XCache *c) {
     if (!c) return;
@@ -174,8 +187,9 @@ static Err open_impl(Arena *a, const Pack *p, sx_device *d, const XcLayer *layer
     c->off0 = ARENA_ARRAY(a, uint64_t, nlayers * nt);
     c->per = ARENA_ARRAY(a, uint64_t, nlayers * nt);
     c->ne = ARENA_ARRAY(a, uint32_t, nlayers);
+    c->ranges = ARENA_ARRAY(a, const XcRange *, nlayers);
     c->files = ARENA_ARRAY(a, int, p->nfiles ? p->nfiles : 1);
-    if (!c->fd || !c->off0 || !c->per || !c->ne || !c->files) return "OutOfMemory";
+    if (!c->fd || !c->off0 || !c->per || !c->ne || !c->ranges || !c->files) return "OutOfMemory";
     for (size_t f = 0; f < p->nfiles; f++) c->files[f] = -1;
     c->nfiles = p->nfiles; // only now: cleanup closes files[0..nfiles), which must be -1 or open
     for (uint32_t l = 0; l < nlayers; l++) {
@@ -183,6 +197,20 @@ static Err open_impl(Arena *a, const Pack *p, sx_device *d, const XcLayer *layer
         if (ne == 0) return "BadExpertLayout";
         c->ne[l] = ne;
         if (ne > c->max_ne) c->max_ne = ne;
+        if (layers[l].ranges) {
+            c->ranges[l] = layers[l].ranges;
+            for (uint32_t e = 0; e < ne; e++)
+                for (uint32_t r = 0; r < nt; r++) {
+                    const XcRange *g = &layers[l].ranges[(size_t)e * nt + r];
+                    if (g->len == 0 || g->file >= p->nfiles || g->off + g->len > p->files[g->file].len)
+                        return "BadExpertLayout";
+                    uint64_t st = (g->len + XC_ALIGN - 1) / XC_ALIGN * XC_ALIGN;
+                    if (st > UINT32_MAX) return "BadExpertLayout";
+                    if (st > c->stride[r]) c->stride[r] = (uint32_t)st;
+                    TRY(open_file(a, p, c, g->file));
+                }
+            continue;
+        }
         for (uint32_t r = 0; r < nt; r++) {
             const TensorInfo *t = layers[l].t[r];
             if (!t || t->nbytes % ne != 0 || t->file >= p->nfiles) return "BadExpertLayout";
@@ -192,14 +220,7 @@ static Err open_impl(Arena *a, const Pack *p, sx_device *d, const XcLayer *layer
             uint64_t st = (per + XC_ALIGN - 1) / XC_ALIGN * XC_ALIGN;
             if (st > UINT32_MAX) return "BadExpertLayout";
             if (st > c->stride[r]) c->stride[r] = (uint32_t)st;
-            if (c->files[t->file] < 0) {
-                char *path = arena_printf(a, "%s/%s", p->dir, p->files[t->file].name);
-                int fd = open(path, O_RDONLY);
-                if (fd < 0) return "OpenFailed";
-                fcntl(fd, F_NOCACHE, 1);
-                fcntl(fd, F_RDAHEAD, 0);
-                c->files[t->file] = fd;
-            }
+            TRY(open_file(a, p, c, t->file));
             c->fd[l * nt + r] = c->files[t->file];
         }
     }
@@ -316,11 +337,18 @@ Err xc_map(XCache *c, uint32_t layer, const uint32_t *ids, uint32_t n, uint32_t 
         lru_unlink(c, v);
         lru_front(c, v);
         for (uint32_t r = 0; r < c->nt; r++) {
-            size_t lr = (size_t)layer * c->nt + r;
             XcJob *j = &c->jobs[c->njobs++];
-            j->fd = c->fd[lr];
-            j->off = c->off0[lr] + (uint64_t)e * c->per[lr];
-            j->len = c->per[lr];
+            if (c->ranges[layer]) {
+                const XcRange *g = &c->ranges[layer][(size_t)e * c->nt + r];
+                j->fd = c->files[g->file];
+                j->off = g->off;
+                j->len = g->len;
+            } else {
+                size_t lr = (size_t)layer * c->nt + r;
+                j->fd = c->fd[lr];
+                j->off = c->off0[lr] + (uint64_t)e * c->per[lr];
+                j->len = c->per[lr];
+            }
             j->dst = c->base[r] + (size_t)v * c->stride[r];
             bytes += j->len;
         }

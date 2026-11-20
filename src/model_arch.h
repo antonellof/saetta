@@ -55,6 +55,6 @@ struct ModelArch {
     void (*s_reset)(Session *s);
 };
 
-extern const ModelArch flash_arch, dense_arch;
+extern const ModelArch flash_arch, dense_arch, dsv4_arch;
 
 #endif

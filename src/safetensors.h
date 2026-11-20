@@ -8,10 +8,12 @@
 #include "base.h"
 
 // Order and names as the Zig enum (dtype_name gives the tag name, e.g. "bf16").
-typedef enum { DTYPE_BF16, DTYPE_F16, DTYPE_F32, DTYPE_U32, DTYPE_I64, DTYPE_U8, DTYPE_I32 } DType;
-#define DTYPE_COUNT 7
+// F8_E4M3 (e4m3fn), F8_E8M0 (power-of-two scales) and I8 (here: two FP4 e2m1 values per byte)
+// are DeepSeek-V4's formats.
+typedef enum { DTYPE_BF16, DTYPE_F16, DTYPE_F32, DTYPE_U32, DTYPE_I64, DTYPE_U8, DTYPE_I32, DTYPE_F8_E4M3, DTYPE_F8_E8M0, DTYPE_I8 } DType;
+#define DTYPE_COUNT 10
 
-// "BF16", "F16", "F32", "U32", "I64", "U8", "I32"; false for any other string.
+// "BF16", "F16", "F32", "U32", "I64", "U8", "I32", "F8_E4M3", "F8_E8M0", "I8"; false for any other string.
 bool dtype_from_string(Str s, DType *out);
 size_t dtype_size(DType d);   // bytes per element
 const char *dtype_name(DType d); // lowercase tag name: "bf16", "f16", ...

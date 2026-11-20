@@ -9,7 +9,7 @@
 #include "json.h"
 #include "model_arch.h"
 
-static const ModelArch *const archs[] = {&flash_arch, &dense_arch};
+static const ModelArch *const archs[] = {&flash_arch, &dense_arch, &dsv4_arch};
 
 // Model starts with its ModelArch pointer in both implementations.
 static const ModelArch *arch_of(const Model *m) { return *(const ModelArch *const *)m; }
@@ -40,7 +40,7 @@ static const ModelArch *arch_for(Arena *a, const Pack *pack) {
 Err model_load(Arena *a, const Pack *pack, Gpu *g, Model **out) {
     const ModelArch *A = arch_for(a, pack);
     if (!A) {
-        dbg("model: %s is not a Qwen3.8-Flash-Next or Qwen3.8-27B pack\n", pack->dir);
+        dbg("model: %s is not a Qwen3.8-Flash-Next, Qwen3.8-27B or DeepSeek-V4-Flash pack\n", pack->dir);
         return "UnknownModelType";
     }
     return A->load(a, pack, g, out);

@@ -147,3 +147,60 @@ TEST(xcache_random_maps_match_the_pack) {
     fake_free(f);
     free(f);
 }
+
+// Explicit ranges (one tensor group per expert, as DeepSeek-V4 stores them): experts at
+// scattered, out-of-order offsets, two regions of different sizes per expert.
+TEST(xcache_explicit_ranges) {
+    enum { E = 8, L = 2, R = 2 };
+    const uint64_t len[R] = {40000, 3000};
+    char dir[256], path[300];
+    snprintf(dir, sizeof dir, "%s/saetta-xcache-XXXXXX", getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
+    EXPECT(mkdtemp(dir) != NULL);
+    snprintf(path, sizeof path, "%s/x.safetensors", dir);
+    // file: for layer l, expert e, region r at offset base + ((perm(e) * R + r) * 65536) + l * E * R * 65536
+    uint64_t total = (uint64_t)L * E * R * 65536 + 4096;
+    FILE *fp = fopen(path, "wb");
+    EXPECT(fp != NULL);
+    for (uint64_t i = 0; i < total; i++) fputc(byte_at(i), fp);
+    fclose(fp);
+    XcRange rg[L][E * R];
+    XcLayer layers[L] = {0};
+    for (int l = 0; l < L; l++) {
+        for (int e = 0; e < E; e++)
+            for (int r = 0; r < R; r++) {
+                uint64_t perm = (uint64_t)((e * 5 + 3) % E); // a permutation of the experts
+                rg[l][e * R + r] = (XcRange){.off = 4096 + ((uint64_t)l * E * R + perm * R + (uint64_t)r) * 65536 + 7,
+                                             .len = len[r], .file = 0};
+            }
+        layers[l] = (XcLayer){.ne = E, .ranges = rg[l]};
+    }
+    MappedFile file = {.name = "x.safetensors", .len = (size_t)total};
+    Pack pack = {.dir = dir, .files = &file, .nfiles = 1};
+    sx_device *d = sx_device_create();
+    Arena a = {0};
+    XCache *c = NULL;
+    uint64_t slot = (len[0] + 16383) / 16384 * 16384 + (len[1] + 16383) / 16384 * 16384;
+    EXPECT_OK(xc_open(&a, &pack, d, layers, L, R, slot * (E + 2), 2, &c));
+    uint32_t ids[] = {6, 1, 6, 4}, slots[4];
+    for (int l = 0; l < L; l++) {
+        EXPECT_OK(xc_map(c, (uint32_t)l, ids, 4, slots));
+        for (int i = 0; i < 4; i++)
+            for (int r = 0; r < R; r++) {
+                const XcRange *g = &rg[l][ids[i] * R + r];
+                const uint8_t *p = (const uint8_t *)sx_buffer_contents(xc_region(c, (uint32_t)r)) + (size_t)slots[i] * xc_stride(c, (uint32_t)r);
+                for (uint64_t k = 0; k < g->len; k += 97) EXPECT(p[k] == byte_at(g->off + k));
+                EXPECT(p[g->len - 1] == byte_at(g->off + g->len - 1));
+            }
+    }
+    XcRange bad[E * R];
+    memcpy(bad, rg[0], sizeof bad);
+    bad[3].len = total; // past the end of the file
+    XcLayer bl = {.ne = E, .ranges = bad};
+    XCache *c2 = NULL;
+    EXPECT_ERR(xc_open(&a, &pack, d, &bl, 1, R, slot * (E + 2), 2, &c2), "BadExpertLayout");
+    xc_close(c);
+    arena_reset(&a);
+    sx_device_destroy(d);
+    unlink(path);
+    rmdir(dir);
+}

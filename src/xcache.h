@@ -25,9 +25,22 @@
 
 #define XC_MAX_TENSORS 9
 
+// One expert's bytes for one cache region: a range of a pack file.
 typedef struct {
-    const TensorInfo *t[XC_MAX_TENSORS]; // stacked [ne, ...] tensors of this layer's experts
-    uint32_t ne;                         // experts in this layer
+    uint64_t off, len;
+    uint16_t file;
+} XcRange;
+
+// A layer's experts, in one of two layouts:
+// - stacked (ranges NULL): t[r] is a [ne, ...] tensor and expert e is its e-th 1/ne slice
+//   (MLX packs);
+// - explicit: ranges[e * nt + r] is expert e's bytes for region r (packs with one tensor per
+//   expert, where a region can cover several adjacent tensors: DeepSeek-V4 stores an expert's
+//   three weights back to back, and its three scales back to back elsewhere).
+typedef struct {
+    const TensorInfo *t[XC_MAX_TENSORS];
+    uint32_t ne; // experts in this layer
+    const XcRange *ranges;
 } XcLayer;
 
 typedef struct {

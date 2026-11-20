@@ -3,8 +3,8 @@
 
 #include "json.h"
 
-static const char *const dtype_strs[DTYPE_COUNT] = {"BF16", "F16", "F32", "U32", "I64", "U8", "I32"};
-static const char *const dtype_names[DTYPE_COUNT] = {"bf16", "f16", "f32", "u32", "i64", "u8", "i32"};
+static const char *const dtype_strs[DTYPE_COUNT] = {"BF16", "F16", "F32", "U32", "I64", "U8", "I32", "F8_E4M3", "F8_E8M0", "I8"};
+static const char *const dtype_names[DTYPE_COUNT] = {"bf16", "f16", "f32", "u32", "i64", "u8", "i32", "f8_e4m3", "f8_e8m0", "i8"};
 
 bool dtype_from_string(Str s, DType *out) {
     for (int i = 0; i < DTYPE_COUNT; i++)
@@ -20,7 +20,7 @@ size_t dtype_size(DType d) {
     case DTYPE_BF16: case DTYPE_F16: return 2;
     case DTYPE_F32: case DTYPE_U32: case DTYPE_I32: return 4;
     case DTYPE_I64: return 8;
-    case DTYPE_U8: return 1;
+    case DTYPE_U8: case DTYPE_F8_E4M3: case DTYPE_F8_E8M0: case DTYPE_I8: return 1;
     }
     return 0;
 }

@@ -257,6 +257,67 @@ void sx_cmd_dispatch3(sx_cmd *c, sx_pipeline *p, const sx_arg *args, size_t narg
     [enc dispatchThreadgroups:MTLSizeMake(groups_x, groups_y, groups_z) threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
 }
 
+// --- events --------------------------------------------------------------------
+
+struct sx_event {
+    void *ev;  // id<MTLSharedEvent>, retained
+};
+
+sx_event *sx_event_new(sx_device *d) {
+    id<MTLDevice> dev = (__bridge id<MTLDevice>)d->dev;
+    id<MTLSharedEvent> ev = [dev newSharedEvent];
+    if (!ev) return NULL;
+    sx_event *e = calloc(1, sizeof *e);
+    if (!e) return NULL;
+    e->ev = (void *)CFBridgingRetain(ev);
+    return e;
+}
+
+void sx_event_release(sx_event *e) {
+    if (!e) return;
+    CFBridgingRelease(e->ev);
+    free(e);
+}
+
+void sx_event_set(sx_event *e, uint64_t v) { ((__bridge id<MTLSharedEvent>)e->ev).signaledValue = v; }
+
+uint64_t sx_event_value(const sx_event *e) { return ((__bridge id<MTLSharedEvent>)e->ev).signaledValue; }
+
+int sx_event_wait(const sx_event *e, uint64_t v) {
+    id<MTLSharedEvent> ev = (__bridge id<MTLSharedEvent>)e->ev;
+    const uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    while (ev.signaledValue < v) {
+        uint64_t dt = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
+        if (dt > 60000000000ull) return 1;
+        if (dt > 50000000ull) usleep(50);
+    }
+    return 0;
+}
+
+static void cmd_end_encoder(sx_cmd *c) {
+    id<MTLComputeCommandEncoder> old = CFBridgingRelease(c->enc);
+    [old endEncoding];
+    c->enc = NULL;
+}
+
+static void cmd_open_encoder(sx_cmd *c) {
+    id<MTLCommandBuffer> cb = (__bridge id<MTLCommandBuffer>)c->cb;
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial];
+    c->enc = (void *)CFBridgingRetain(enc);
+}
+
+void sx_cmd_signal(sx_cmd *c, sx_event *e, uint64_t v) {
+    cmd_end_encoder(c);
+    [(__bridge id<MTLCommandBuffer>)c->cb encodeSignalEvent:(__bridge id<MTLSharedEvent>)e->ev value:v];
+    cmd_open_encoder(c);
+}
+
+void sx_cmd_wait_event(sx_cmd *c, sx_event *e, uint64_t v) {
+    cmd_end_encoder(c);
+    [(__bridge id<MTLCommandBuffer>)c->cb encodeWaitForEvent:(__bridge id<MTLSharedEvent>)e->ev value:v];
+    cmd_open_encoder(c);
+}
+
 // --- HTTP client -------------------------------------------------------------
 
 @interface SxHttpTask : NSObject <NSURLSessionDataDelegate>

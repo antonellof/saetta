@@ -8,10 +8,22 @@
 #include "safetensors.h"
 #include "weights.h"
 
+// A wrapped piece [start, end) of a pack file (streamed experts: the file minus its routed
+// expert tensors, so binding a dense tensor does not make the experts resident).
+typedef struct {
+    uint64_t start, end;
+    sx_buffer *buf;
+} GpuSeg;
+
 typedef struct {
     sx_device *dev;
     sx_buffer **file_buffers; // one per pack file, then the files added with gpu_add_file
     size_t nfile_buffers;
+    // Streamed packs only: per pack file, its segments in file order (NULL otherwise, and
+    // then file_buffers[i] wraps the whole file).
+    GpuSeg **segs;
+    uint32_t *nseg;
+    size_t nseg_files;
 } Gpu;
 
 // Creates the device and wraps every pack file. Errors: "NoMetalDevice", "WrapFailed".
@@ -32,6 +44,9 @@ Err gpu_warm(Gpu *g);
 // touched (the n-gram table is read 16 rows per token on the host; warming its 32 GB only
 // costs RAM). pack NULL warms every file buffer, as gpu_warm.
 Err gpu_warm_except(Gpu *g, const Pack *pack, const char *skip);
+// Reads one word per page of each buffer from the GPU, so its pages are mapped for the GPU
+// before the first real use (the streamed-expert slabs: their first GPU touch is slow).
+Err gpu_touch_buffers(Gpu *g, sx_buffer *const *bufs, size_t n);
 
 // Seconds of GPU time for n dispatches of a one-thread kernel in one serial
 // command buffer: the fixed cost each dispatch adds to a token. Errors: "GpuFailed".

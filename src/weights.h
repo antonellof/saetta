@@ -19,6 +19,9 @@ typedef struct {
     TensorInfo weight, scales, biases;
     uint32_t bits, group_size;
     uint64_t out_features, in_features;
+    // Streamed routed experts (xcache.h): 1 + the cache region of weight (scales and biases
+    // follow it); 0 when the tensors are read from the pack.
+    uint8_t xr;
 } Linear;
 
 typedef struct {

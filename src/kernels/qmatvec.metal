@@ -85,8 +85,8 @@ kernel void NAME(device const uchar *w [[buffer(0)]], device const uchar *scales
                  uint2 tg [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {       \
     if (tg.x >= out) return;                                                                                 \
     const uint e = idx[tg.y];                                                                                \
-    qmatvec_row<BITS, GROUP>(w + shift[0] + e * stride.x, scales + shift[1] + e * stride.y,                  \
-                             biases + shift[2] + e * stride.y, x + (tg.y / stride.w) * stride.z, y + tg.y * out, in, tg.x, lane); \
+    qmatvec_row<BITS, GROUP>(w + shift[0] + ulong(e) * stride.x, scales + shift[1] + ulong(e) * stride.y,                  \
+                             biases + shift[2] + ulong(e) * stride.y, x + (tg.y / stride.w) * stride.z, y + tg.y * out, in, tg.x, lane); \
 }
 
 QMATVEC_EXPERT(qmatvec_expert_4_32, 4, 32)
@@ -265,8 +265,8 @@ kernel void qmv_gate_up(device const uchar *wg [[buffer(0)]], device const uchar
     if (tg.x >= d.y) return;
     const uint e = st.z ? idx[tg.y] : 0;
     device const float *xs = x + (tg.y / d.w) * d.z;
-    float g = qdot_l<32, false>(wg + shift[0] + e * st.x, sg + shift[1] + e * st.y, bg + shift[2] + e * st.y, xs, d.x, tg.x, lane, 1.0f);
-    float u = qdot_l<32, false>(wu + shift[3] + e * st.x, su + shift[4] + e * st.y, bu + shift[5] + e * st.y, xs, d.x, tg.x, lane, 1.0f);
+    float g = qdot_l<32, false>(wg + shift[0] + ulong(e) * st.x, sg + shift[1] + ulong(e) * st.y, bg + shift[2] + ulong(e) * st.y, xs, d.x, tg.x, lane, 1.0f);
+    float u = qdot_l<32, false>(wu + shift[3] + ulong(e) * st.x, su + shift[4] + ulong(e) * st.y, bu + shift[5] + ulong(e) * st.y, xs, d.x, tg.x, lane, 1.0f);
     g = simd_sum(g);
     u = simd_sum(u);
     if (lane == 0) h[tg.y * d.y + tg.x] = g / (1.0f + exp(-g)) * u;
@@ -508,8 +508,8 @@ kernel void qmv_gate_up_sh(device const uchar *wg [[buffer(0)]], device const uc
     float g, u;
     if (tg.y < d.z) {
         const uint e = idx[tg.y];
-        g = qdot_l<32, false>(wg + shift[0] + e * st.x, sg + shift[1] + e * st.y, bg + shift[2] + e * st.y, x, d.x, tg.x, lane, 1.0f);
-        u = qdot_l<32, false>(wu + shift[3] + e * st.x, su + shift[4] + e * st.y, bu + shift[5] + e * st.y, x, d.x, tg.x, lane, 1.0f);
+        g = qdot_l<32, false>(wg + shift[0] + ulong(e) * st.x, sg + shift[1] + ulong(e) * st.y, bg + shift[2] + ulong(e) * st.y, x, d.x, tg.x, lane, 1.0f);
+        u = qdot_l<32, false>(wu + shift[3] + ulong(e) * st.x, su + shift[4] + ulong(e) * st.y, bu + shift[5] + ulong(e) * st.y, x, d.x, tg.x, lane, 1.0f);
     } else {
         g = qdot_l<32, false>(xg + shift2[0], xsg + shift2[1], xbg + shift2[2], x, d.x, tg.x, lane, 1.0f);
         u = qdot_l<32, false>(xu + shift2[3], xsu + shift2[4], xbu + shift2[5], x, d.x, tg.x, lane, 1.0f);
@@ -530,7 +530,7 @@ kernel void qmv_down_sh(device const uchar *w [[buffer(0)]], device const uchar 
     if (tg.x >= d.y) return;
     if (tg.y < d.z) {
         const uint e = idx[tg.y];
-        qmatvec_row<4, 32>(w + shift[0] + e * st.x, scales + shift[1] + e * st.y, biases + shift[2] + e * st.y, x + tg.y * d.x, y + tg.y * d.y, d.x, tg.x, lane);
+        qmatvec_row<4, 32>(w + shift[0] + ulong(e) * st.x, scales + shift[1] + ulong(e) * st.y, biases + shift[2] + ulong(e) * st.y, x + tg.y * d.x, y + tg.y * d.y, d.x, tg.x, lane);
     } else {
         qmatvec_row<4, 32>(xw + shift2[0], xs + shift2[1], xb + shift2[2], x + tg.y * d.x, y + tg.y * d.y, d.x, tg.x, lane);
     }

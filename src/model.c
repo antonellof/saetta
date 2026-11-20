@@ -11,6 +11,15 @@
 
 #include "ops.h"
 #include "qgen.h"
+// The streamed-expert cache of the loaded model, for model_prof_report (one model per process).
+static XCache *xc_report;
+// Host time in the service loop: waiting for the GPU to reach a stop, and mapping (with reads).
+static double xs_wait_s, xs_map_s;
+static uint64_t xs_stops;
+// the same wait split by whether the previous stop read from the SSD (diagnostic)
+static double xs_wait_after_miss_s, xs_wait_after_hit_s;
+static uint64_t xs_after_miss, xs_after_hit, xs_prev_misses;
+static bool xs_prev_had_miss;
 
 #define H CONFIG_HIDDEN_SIZE // 2560
 #define HC CONFIG_HC_COUNT   // 4
@@ -397,6 +406,58 @@ Err model_load(Arena *arena, const Pack *pack, Gpu *g, Model **out) {
         m->gen = gn;
         dbg("model: mixed quantization, run-time (bits, group) kernels loaded\n");
     }
+    uint64_t xbytes = xc_requested_bytes();
+    if (xbytes) {
+        // streamed experts: the trunk's routed experts come from the cache (the MTP head's stay
+        // resident); the profiler's one-buffer-per-dispatch mode cannot stop mid-buffer
+        if (getenv("SAETTA_PROFILE")) return "StreamingWithProfile";
+        {
+            // the slab must fit next to what stays resident: every tensor but the streamed
+            // experts and the n-gram table (read on the host, demand paged), plus 8 GB
+            uint64_t keep = 0;
+            Str k;
+            void *v;
+            for (size_t it = 0; strmap_next(&pack->tensors, &it, &k, &v);) {
+                bool streamed = str_find(k, S("mlp.switch_mlp."), 0) >= 0 && str_find(k, S("mtp."), 0) != 0;
+                if (!streamed && str_find(k, S("ngram_embedding"), 0) < 0) keep += ((const TensorInfo *)v)->nbytes;
+            }
+            uint64_t ws = sx_device_recommended_working_set(g->dev);
+            if (xbytes + keep + 8000000000ull > ws) {
+                dbg("model: expert cache of %.1f GB does not fit: %.1f GB stay resident, working set %.1f GB\n",
+                    (double)xbytes / 1e9, (double)keep / 1e9, (double)ws / 1e9);
+                return "CacheTooLarge";
+            }
+        }
+        XcLayer *xl = ARENA_ARRAY(arena, XcLayer, NLAYERS);
+        if (!xl) return "OutOfMemory";
+        for (size_t i = 0; i < NLAYERS; i++) {
+            Moe *E = &m->layers[i].moe;
+            const Linear *ls[3] = {&E->eg, &E->eu, &E->ed};
+            for (int j = 0; j < 3; j++) {
+                xl[i].t[3 * j] = &ls[j]->weight;
+                xl[i].t[3 * j + 1] = &ls[j]->scales;
+                xl[i].t[3 * j + 2] = &ls[j]->biases;
+            }
+            xl[i].ne = E->ne;
+        }
+        TRY(xc_open(arena, pack, g->dev, xl, NLAYERS, 9, xbytes, 0, &m->xc));
+        {
+            sx_buffer *rb[9];
+            for (uint32_t r = 0; r < 9; r++) rb[r] = xc_region(m->xc, r);
+            TRY(gpu_touch_buffers(g, rb, 9));
+        }
+        m->xev = sx_event_new(g->dev);
+        if (!m->xev) return "GpuFailed";
+        for (size_t i = 0; i < NLAYERS; i++) {
+            Moe *E = &m->layers[i].moe;
+            E->eg.xr = 1;
+            E->eu.xr = 4;
+            E->ed.xr = 7;
+            E->xl1 = (uint32_t)i + 1;
+        }
+        xc_report = m->xc;
+        dbg("model: streamed experts, cache of %u slots (%.1f GB)\n", xc_slots(m->xc), (double)xc_bytes(m->xc) / 1e9);
+    }
     const char *mv = getenv("SAETTA_MTP");
     bool mtp_on = mv ? mv[0] != '0' : true;
     if (mtp_on && pack_get(pack, S("mtp.fc_embedding.weight")) != NULL) {
@@ -419,6 +480,24 @@ static inline sx_arg offa(sx_arg a, size_t floats) {
 }
 #define BYTES(x) gpu_bytes_arg(&(x), sizeof(x))
 #define TARG(t, sh) gpu_tensor_arg(m->g, &(t), (sh))
+
+
+// A routed expert tensor (k: 0 weight, 1 scales, 2 biases) and its bytes per expert: the
+// pack's stacked tensor, or for a streamed layer the cache region holding it, at the cache's
+// slot stride (the ids the kernels read are then slot numbers).
+static sx_arg xarg(Model *m, const Linear *l, int k, uint32_t *sh) {
+    if (l->xr && m->xc) {
+        *sh = 0;
+        return (sx_arg){.buffer = xc_region(m->xc, (uint32_t)(l->xr - 1 + k)), .offset = 0};
+    }
+    return gpu_tensor_arg(m->g, k == 0 ? &l->weight : k == 1 ? &l->scales : &l->biases, sh);
+}
+static uint32_t xstride(Model *m, const Linear *l, int k) {
+    if (l->xr && m->xc) return xc_stride(m->xc, (uint32_t)(l->xr - 1 + k));
+    const TensorInfo *t = k == 0 ? &l->weight : &l->scales;
+    return (uint32_t)(t->nbytes / t->shape[0]);
+}
+#define XARGS(l, sh) xarg(m, (l), 0, &(sh)[0]), xarg(m, (l), 1, &(sh)[1]), xarg(m, (l), 2, &(sh)[2])
 
 // ---- environment switches and profiling ----------------------------------------------------
 
@@ -565,6 +644,20 @@ static const char *prof_gbs(char *buf, size_t cap, uint64_t b, double t) {
 }
 
 void model_prof_report(size_t tokens) {
+    if (xc_report) {
+        XcStats st = xc_stats(xc_report);
+        double hit = st.requests ? 100.0 * (double)st.hits / (double)st.requests : 0;
+        dbg("experts: %llu requests, %.1f%% hits, %llu misses, %.2f GB read in %.1f ms (%.2f GB/s), %.2f MB/token\n",
+            (unsigned long long)st.requests, hit, (unsigned long long)st.misses, (double)st.bytes_read / 1e9,
+            st.read_seconds * 1e3, st.read_seconds > 0 ? (double)st.bytes_read / 1e9 / st.read_seconds : 0,
+            tokens ? (double)st.bytes_read / 1e6 / (double)tokens : 0);
+        dbg("experts: %llu stops, host waiting for the GPU %.1f ms, mapping %.1f ms (%.1f us per stop)\n",
+            (unsigned long long)xs_stops, xs_wait_s * 1e3, xs_map_s * 1e3,
+            xs_stops ? (xs_wait_s + xs_map_s) * 1e6 / (double)xs_stops : 0);
+        dbg("experts: wait after a stop that read %.1f us (%llu), after an all-hit stop %.1f us (%llu)\n",
+            xs_after_miss ? xs_wait_after_miss_s * 1e6 / (double)xs_after_miss : 0, (unsigned long long)xs_after_miss,
+            xs_after_hit ? xs_wait_after_hit_s * 1e6 / (double)xs_after_hit : 0, (unsigned long long)xs_after_hit);
+    }
     if (!prof.on) return;
     double total = prof.mpp_secs[0] + prof.mpp_secs[1] + prof.mpp_secs[2] + prof.other_secs;
     for (size_t i = 0; i < NPIPES; i++) total += prof.secs[i];
@@ -684,8 +777,104 @@ typedef struct {
 
 static Enc enc_begin(Model *m) { return (Enc){.m = m, .cmd = sx_cmd_begin(m->g->dev)}; }
 
+// Streamed layer: stop the command buffer once E's expert ids are written, until the host has
+// turned them into cache slots (enc_xservice).
+static void enc_xstop(Enc *e, const Moe *E, XsKind kind, uint32_t n) {
+    Model *m = e->m;
+    if (!E->xl1 || !m->xc) return;
+    if (e->nxs >= MODEL_MAX_XSVC) {
+        e->failed = true;
+        return;
+    }
+    uint64_t sig = m->xev_val + 1;
+    m->xev_val += 2;
+    sx_cmd_signal(e->cmd, m->xev, sig);
+    sx_cmd_wait_event(e->cmd, m->xev, sig + 1);
+    e->xs[e->nxs++] = (XSvc){.kind = (uint8_t)kind, .layer = E->xl1 - 1, .n = n, .sig = sig};
+}
+
+// After commit, before waiting: serve every stop of e's command buffer in order. Each stop is
+// released even when mapping fails (with slot 0, a valid slot), so the GPU never hangs; the
+// first error is returned.
+static Err enc_xservice(Enc *e) {
+    Model *m = e->m;
+    Err first = OK;
+    for (uint32_t i = 0; i < e->nxs; i++) {
+        const XSvc *s = &e->xs[i];
+        double t0 = now_s();
+        int wrc = sx_event_wait(m->xev, s->sig);
+        double t1 = now_s();
+        xs_wait_s += t1 - t0;
+        xs_stops++;
+        if (i > 0) {
+            if (xs_prev_had_miss) { xs_wait_after_miss_s += t1 - t0; xs_after_miss++; }
+            else { xs_wait_after_hit_s += t1 - t0; xs_after_hit++; }
+        }
+        if (wrc != 0) {
+            // the GPU never reached this stop: release every later one so nothing waits forever
+            sx_event_set(m->xev, e->xs[e->nxs - 1].sig + 1);
+            e->nxs = 0;
+            return "GpuTimeout";
+        }
+        Err err = OK;
+        if (s->kind == XS_DECODE || s->kind == XS_ROWS) {
+            uint32_t *ids = s->kind == XS_DECODE ? (uint32_t *)sx_buffer_contents(m->scratch) + S_topi
+                                                 : (uint32_t *)sx_buffer_contents(m->bscratch) + B_topi;
+            err = xc_map(m->xc, s->layer, ids, s->n, ids);
+            if (err) memset(ids, 0, s->n * sizeof *ids);
+        } else {
+            // the tile table of moe_group: map its distinct experts, then rewrite tiles[].x
+            uint32_t *bs = (uint32_t *)sx_buffer_contents(m->bscratch);
+            uint32_t nt = bs[B_gnt];
+            uint32_t *tiles = bs + B_gtiles;
+            uint32_t ids[NE], slot_of[NE];
+            uint32_t nid = 0;
+            bool seen[NE] = {0};
+            for (uint32_t t = 0; t < nt && !err; t++) {
+                uint32_t x = tiles[4 * t];
+                if (x >= NE) err = "BadExpertId";
+                else if (!seen[x]) {
+                    seen[x] = true;
+                    ids[nid++] = x;
+                }
+            }
+            if (!err) err = xc_map(m->xc, s->layer, ids, nid, ids);
+            if (!err) {
+                // ids now holds the slots, in the order the experts were first seen
+                for (uint32_t t = 0, j = 0; t < nt; t++) {
+                    uint32_t x = tiles[4 * t];
+                    if (seen[x]) {
+                        slot_of[x] = ids[j++];
+                        seen[x] = false;
+                    }
+                    tiles[4 * t] = slot_of[x];
+                }
+            } else
+                for (uint32_t t = 0; t < nt; t++) tiles[4 * t] = 0;
+        }
+        if (err && !first) first = err;
+        xs_map_s += now_s() - t1;
+        uint64_t mnow = xc_stats(m->xc).misses;
+        xs_prev_had_miss = mnow != xs_prev_misses;
+        xs_prev_misses = mnow;
+        sx_event_set(m->xev, s->sig + 1);
+    }
+    e->nxs = 0;
+    return first;
+}
+
 static Err enc_finish(Enc *e) {
     char err[512];
+    if (e->nxs) {
+        sx_cmd_commit(e->cmd);
+        Err xe = enc_xservice(e);
+        int rc = sx_cmd_wait(e->cmd, err, sizeof err);
+        if (rc != 0) {
+            dbg("command buffer: %s\n", err);
+            return "GpuFailed";
+        }
+        return xe;
+    }
     if (sx_cmd_finish(e->cmd, err, sizeof err) != 0) {
         dbg("command buffer: %s\n", err);
         return "GpuFailed";
@@ -844,10 +1033,8 @@ static void enc_gate_up(Enc *e, const Linear *gate, const Linear *up, sx_arg x, 
     }
     uint32_t sh[6];
     uint32_t dm[4] = {(uint32_t)gate->in_features, (uint32_t)gate->out_features, (uint32_t)H, routed ? (uint32_t)TOPK : 1};
-    uint32_t es[4] = {routed ? (uint32_t)(gate->weight.nbytes / gate->weight.shape[0]) : 0,
-                      routed ? (uint32_t)(gate->scales.nbytes / gate->scales.shape[0]) : 0, routed, 0};
-    sx_arg args[13] = {TARG(gate->weight, &sh[0]), TARG(gate->scales, &sh[1]), TARG(gate->biases, &sh[2]),
-                       TARG(up->weight, &sh[3]),   TARG(up->scales, &sh[4]),   TARG(up->biases, &sh[5]),
+    uint32_t es[4] = {routed ? xstride(m, gate, 0) : 0, routed ? xstride(m, gate, 1) : 0, routed, 0};
+    sx_arg args[13] = {XARGS(gate, &sh[0]), XARGS(up, &sh[3]),
                        x,                          h,                          idx,
                        gpu_bytes_arg(dm, 16),      gpu_bytes_arg(es, 16),      gpu_bytes_arg(sh, 24)};
     if (!is4_32(gate) || !is4_32(up)) {
@@ -869,11 +1056,9 @@ static void enc_gate_up_sh(Enc *e, const Moe *E, sx_arg x, sx_arg h) {
     }
     uint32_t sh[6], sh2[6];
     uint32_t dm[4] = {(uint32_t)E->eg.in_features, (uint32_t)E->eg.out_features, (uint32_t)TOPK, 0};
-    uint32_t es[4] = {(uint32_t)(E->eg.weight.nbytes / E->eg.weight.shape[0]),
-                      (uint32_t)(E->eg.scales.nbytes / E->eg.scales.shape[0]), 0, 0};
+    uint32_t es[4] = {xstride(m, &E->eg, 0), xstride(m, &E->eg, 1), 0, 0};
     sx_arg args[20] = {
-        TARG(E->eg.weight, &sh[0]),  TARG(E->eg.scales, &sh[1]),  TARG(E->eg.biases, &sh[2]),  TARG(E->eu.weight, &sh[3]),
-        TARG(E->eu.scales, &sh[4]),  TARG(E->eu.biases, &sh[5]),  x,                           h,
+        XARGS(&E->eg, &sh[0]), XARGS(&E->eu, &sh[3]), x, h,
         sarg(m, S_topi),             gpu_bytes_arg(dm, 16),       gpu_bytes_arg(es, 16),       gpu_bytes_arg(sh, 24),
         TARG(E->sg.weight, &sh2[0]), TARG(E->sg.scales, &sh2[1]), TARG(E->sg.biases, &sh2[2]), TARG(E->su.weight, &sh2[3]),
         TARG(E->su.scales, &sh2[4]), TARG(E->su.biases, &sh2[5]), gpu_bytes_arg(sh2, 24),
@@ -896,10 +1081,9 @@ static void enc_down_sh(Enc *e, const Moe *E, sx_arg x, sx_arg y) {
     }
     uint32_t sh[3], sh2[3];
     uint32_t dm[4] = {(uint32_t)E->ed.in_features, (uint32_t)E->ed.out_features, (uint32_t)TOPK, 0};
-    uint32_t es[2] = {(uint32_t)(E->ed.weight.nbytes / E->ed.weight.shape[0]),
-                      (uint32_t)(E->ed.scales.nbytes / E->ed.scales.shape[0])};
+    uint32_t es[2] = {xstride(m, &E->ed, 0), xstride(m, &E->ed, 1)};
     sx_arg args[14] = {
-        TARG(E->ed.weight, &sh[0]), TARG(E->ed.scales, &sh[1]),  TARG(E->ed.biases, &sh[2]),  x,
+        XARGS(&E->ed, &sh[0]), x,
         y,                          gpu_bytes_arg(dm, 16),       gpu_bytes_arg(sh, 12),       sarg(m, S_topi),
         gpu_bytes_arg(es, 8),       TARG(E->sd.weight, &sh2[0]), TARG(E->sd.scales, &sh2[1]), TARG(E->sd.biases, &sh2[2]),
         gpu_bytes_arg(sh2, 12),
@@ -923,9 +1107,8 @@ static void enc_mv_expert_idx(Enc *e, const Linear *l, sx_arg x, uint32_t x_stri
     uint32_t out = (uint32_t)l->out_features;
     uint32_t sh[3];
     if (prof.on) prof.pend = prof_expert_bytes(l, TOPK * T);
-    uint32_t stride[4] = {(uint32_t)(l->weight.nbytes / l->weight.shape[0]),
-                          (uint32_t)(l->scales.nbytes / l->scales.shape[0]), x_stride, div};
-    sx_arg args[11] = {TARG(l->weight, &sh[0]), TARG(l->scales, &sh[1]), TARG(l->biases, &sh[2]), x, y, BYTES(in),
+    uint32_t stride[4] = {xstride(m, l, 0), xstride(m, l, 1), x_stride, div};
+    sx_arg args[11] = {XARGS(l, sh), x, y, BYTES(in),
                        BYTES(out), gpu_bytes_arg(sh, 12), idx, gpu_bytes_arg(stride, 16)};
     if (!is4_32(l)) {
         uint32_t q[2] = {l->bits, l->group_size};
@@ -1050,10 +1233,9 @@ static void enc_mm_grouped(Enc *e, const Linear *l, sx_arg x, sx_arg y, size_t T
     if (m->fast_prefill) {
         enc_to_half(e, x, T * TOPK * (size_t)l->in_features);
         uint32_t dims[3] = {(uint32_t)l->in_features, (uint32_t)l->out_features, (uint32_t)(T * TOPK)};
-        uint32_t stride[2] = {(uint32_t)(l->weight.nbytes / l->weight.shape[0]),
-                              (uint32_t)(l->scales.nbytes / l->scales.shape[0])};
+        uint32_t stride[2] = {xstride(m, l, 0), xstride(m, l, 1)};
         uint32_t sh[3];
-        sx_arg args[11] = {TARG(l->weight, &sh[0]), TARG(l->scales, &sh[1]), TARG(l->biases, &sh[2]), barg(b, B_xh), y,
+        sx_arg args[11] = {XARGS(l, sh), barg(b, B_xh), y,
                            gpu_bytes_arg(dims, 12), gpu_bytes_arg(sh, 12), barg(b, B_gtiles), barg(b, B_gnt),
                            gpu_bytes_arg(stride, 8)};
         if (!is4_32(l)) {
@@ -1066,9 +1248,9 @@ static void enc_mm_grouped(Enc *e, const Linear *l, sx_arg x, sx_arg y, size_t T
         return;
     }
     uint32_t dims[3] = {(uint32_t)l->in_features, (uint32_t)l->out_features, 0};
-    uint32_t stride[2] = {(uint32_t)(l->weight.nbytes / l->weight.shape[0]), (uint32_t)(l->scales.nbytes / l->scales.shape[0])};
+    uint32_t stride[2] = {xstride(m, l, 0), xstride(m, l, 1)};
     uint32_t sh[3];
-    sx_arg args[11] = {TARG(l->weight, &sh[0]), TARG(l->scales, &sh[1]), TARG(l->biases, &sh[2]), x, y,
+    sx_arg args[11] = {XARGS(l, sh), x, y,
                        gpu_bytes_arg(dims, 12), gpu_bytes_arg(sh, 12), barg(b, B_gtiles), barg(b, B_gnt),
                        gpu_bytes_arg(stride, 8)};
     if (!is4_32(l)) {
@@ -1353,6 +1535,7 @@ static void enc_moe_t(Enc *e, const Moe *E, size_t T) {
     sx_arg a[] = {barg(b, B_rl), barg(b, B_topi), barg(b, B_topw), gpu_bytes_arg(tp, 8)};
     D(e, m->p.moe_topk, a, T, 1, E->ne);
     if (T <= SMALL) {
+        enc_xstop(e, E, XS_ROWS, (uint32_t)(T * TOPK));
         // routed experts per (token, slot) with the decode kernels: each slot reads its expert
         enc_gate_up(e, &E->eg, &E->eu, barg(b, B_a), barg(b, B_eh), true, barg(b, B_topi), T * TOPK);
         enc_mv_expert_ti(e, &E->ed, barg(b, B_eh), FF, 1, barg(b, B_ed), T);
@@ -1375,6 +1558,7 @@ static void enc_moe_t(Enc *e, const Moe *E, size_t T) {
     uint32_t gp[4] = {(uint32_t)(T * TOPK), (uint32_t)TOPK, E->ne, m->fast_prefill ? 64u : 32u};
     sx_arg g1[] = {barg(b, B_topi), barg(b, B_gtok), barg(b, B_ginv), barg(b, B_gtiles), barg(b, B_gnt), gpu_bytes_arg(gp, 16)};
     D(e, m->p.moe_group, g1, 1, 1, 1024);
+    enc_xstop(e, E, XS_TILES, 0);
     uint32_t rp[2] = {(uint32_t)H, (uint32_t)(T * TOPK)};
     if (m->fast_prefill) {
         // straight to the half input of the accelerator matmul (the cache says B.xg is in B.xh)
@@ -1611,6 +1795,7 @@ static void enc_moe(Enc *e, const Moe *E) {
     uint32_t tp[2] = {E->ne, (uint32_t)TOPK};
     sx_arg a[] = {sarg(m, S_rl), sarg(m, S_topi), sarg(m, S_topw), gpu_bytes_arg(tp, 8)};
     D(e, m->p.moe_topk, a, 1, 1, E->ne);
+    enc_xstop(e, E, XS_DECODE, (uint32_t)TOPK);
     if (fold_shared(E)) {
         // the shared expert as slot TOPK of the routed launches (6 dispatches instead of 8)
         enc_gate_up_sh(e, E, sarg(m, S_a), sarg(m, S_eh));
@@ -2104,6 +2289,8 @@ Err model_verify_chunk(Model *m, Session *s, const uint32_t *toks, size_t n, flo
 // model_verify_chunk) while the GPU runs e, then waits for e.
 static Err commit_preparing_verify(Model *m, Session *s, Enc *e, size_t T) {
     sx_cmd_commit(e->cmd);
+    // streamed layers: serve this command buffer's stops before encoding the next one
+    Err xe = e->nxs ? enc_xservice(e) : OK;
     drop_pending(m);
     if (T <= KMAX && s->pos + T <= s->cap && prep_verify()) {
         bool spec0 = s->spec;
@@ -2119,7 +2306,7 @@ static Err commit_preparing_verify(Model *m, Session *s, Enc *e, size_t T) {
         dbg("command buffer: %s\n", err);
         return "GpuFailed";
     }
-    return OK;
+    return xe;
 }
 
 static uint32_t greedy_pick(void *ctx, const float *row, bool has_draft, uint32_t draft) {

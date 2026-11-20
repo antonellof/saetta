@@ -101,7 +101,7 @@ kernel void qmmh_g_4_32(device const uchar *w [[buffer(0)]], device const uchar 
     if (tg.y >= ntiles[0]) return;
     threadgroup half Wt[MTN * MKC];
     const uint4 t = tiles[tg.y];
-    qmmh_tile<4, 32, 64>(w + shift[0] + t.x * stride.x, scales + shift[1] + t.x * stride.y, biases + shift[2] + t.x * stride.y,
+    qmmh_tile<4, 32, 64>(w + shift[0] + ulong(t.x) * stride.x, scales + shift[1] + ulong(t.x) * stride.y, biases + shift[2] + ulong(t.x) * stride.y,
                      X, Y, dims.x, dims.y, dims.z, t.y, t.z, tg.x * MTN, tid, Wt);
 }
 

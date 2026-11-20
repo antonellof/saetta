@@ -76,7 +76,7 @@ kernel void qmatvec_expert_gen(device const uchar *w [[buffer(0)]], device const
                                uint2 tg [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
     if (tg.x >= out) return;
     const uint e = idx[tg.y];
-    qg_row(q.x, q.y, w + shift[0] + e * stride.x, scales + shift[1] + e * stride.y, biases + shift[2] + e * stride.y,
+    qg_row(q.x, q.y, w + shift[0] + ulong(e) * stride.x, scales + shift[1] + ulong(e) * stride.y, biases + shift[2] + ulong(e) * stride.y,
            x + (tg.y / stride.w) * stride.z, y + tg.y * out, in, tg.x, lane);
 }
 
@@ -90,7 +90,7 @@ kernel void qmv_down_sh_gen(device const uchar *w [[buffer(0)]], device const uc
     if (tg.x >= d.y) return;
     if (tg.y < d.z) {
         const uint e = idx[tg.y];
-        qg_row(q.x, q.y, w + shift[0] + e * st.x, scales + shift[1] + e * st.y, biases + shift[2] + e * st.y, x + tg.y * d.x, y + tg.y * d.y, d.x, tg.x, lane);
+        qg_row(q.x, q.y, w + shift[0] + ulong(e) * st.x, scales + shift[1] + ulong(e) * st.y, biases + shift[2] + ulong(e) * st.y, x + tg.y * d.x, y + tg.y * d.y, d.x, tg.x, lane);
     } else {
         qg_row(q.z, q.w, xw + shift2[0], xs + shift2[1], xb + shift2[2], x + tg.y * d.x, y + tg.y * d.y, d.x, tg.x, lane);
     }
@@ -173,8 +173,8 @@ kernel void qmv_gate_up_gen(device const uchar *wg [[buffer(0)]], device const u
     if (tg.x >= d.y) return;
     const uint e = st.z ? idx[tg.y] : 0;
     device const float *xs = x + (tg.y / d.w) * d.z;
-    float g = qg_dot_rt(q.x, wg + shift[0] + e * st.x, sg + shift[1] + e * st.y, bg + shift[2] + e * st.y, xs, d.x, q.y, tg.x, lane, 32);
-    float u = qg_dot_rt(q.x, wu + shift[3] + e * st.x, su + shift[4] + e * st.y, bu + shift[5] + e * st.y, xs, d.x, q.y, tg.x, lane, 32);
+    float g = qg_dot_rt(q.x, wg + shift[0] + ulong(e) * st.x, sg + shift[1] + ulong(e) * st.y, bg + shift[2] + ulong(e) * st.y, xs, d.x, q.y, tg.x, lane, 32);
+    float u = qg_dot_rt(q.x, wu + shift[3] + ulong(e) * st.x, su + shift[4] + ulong(e) * st.y, bu + shift[5] + ulong(e) * st.y, xs, d.x, q.y, tg.x, lane, 32);
     g = simd_sum(g);
     u = simd_sum(u);
     if (lane == 0) h[tg.y * d.y + tg.x] = g / (1.0f + exp(-g)) * u;
@@ -194,8 +194,8 @@ kernel void qmv_gate_up_sh_gen(device const uchar *wg [[buffer(0)]], device cons
     float g, u;
     if (tg.y < d.z) {
         const uint e = idx[tg.y];
-        g = qg_dot_rt(q.x, wg + shift[0] + e * st.x, sg + shift[1] + e * st.y, bg + shift[2] + e * st.y, x, d.x, q.y, tg.x, lane, 32);
-        u = qg_dot_rt(q.x, wu + shift[3] + e * st.x, su + shift[4] + e * st.y, bu + shift[5] + e * st.y, x, d.x, q.y, tg.x, lane, 32);
+        g = qg_dot_rt(q.x, wg + shift[0] + ulong(e) * st.x, sg + shift[1] + ulong(e) * st.y, bg + shift[2] + ulong(e) * st.y, x, d.x, q.y, tg.x, lane, 32);
+        u = qg_dot_rt(q.x, wu + shift[3] + ulong(e) * st.x, su + shift[4] + ulong(e) * st.y, bu + shift[5] + ulong(e) * st.y, x, d.x, q.y, tg.x, lane, 32);
     } else {
         g = qg_dot_rt(q.z, xg + shift2[0], xsg + shift2[1], xbg + shift2[2], x, d.x, q.w, tg.x, lane, 32);
         u = qg_dot_rt(q.z, xu + shift2[3], xsu + shift2[4], xbu + shift2[5], x, d.x, q.w, tg.x, lane, 32);
@@ -424,6 +424,6 @@ kernel void qmm_grouped_gen(device const uchar *w [[buffer(0)]], device const uc
     threadgroup float ws[32][33];
     threadgroup float ys[32][33];
     const uint4 t = tiles[tg.y];
-    qg_qmm_tile(q.x, q.y, w + shift[0] + t.x * stride.x, scales + shift[1] + t.x * stride.y, biases + shift[2] + t.x * stride.y,
+    qg_qmm_tile(q.x, q.y, w + shift[0] + ulong(t.x) * stride.x, scales + shift[1] + ulong(t.x) * stride.y, biases + shift[2] + ulong(t.x) * stride.y,
                 X + t.y * dims.x, Y + t.y * dims.y, dims.x, dims.y, t.z - t.y, uint2(tg.x, 0), sgid, tid, xs, ws, ys);
 }

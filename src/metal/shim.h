@@ -94,6 +94,24 @@ void sx_cmd_commit(sx_cmd *c);
 int sx_cmd_wait(sx_cmd *c, char *err, size_t err_cap);
 void sx_cmd_discard(sx_cmd *c);
 
+// --- events (MTLSharedEvent) --------------------------------------------------
+// A counter shared by the GPU and the CPU, for a command buffer that stops mid-way until the
+// host has done something (streamed experts: the host maps the router's choice to cache slots
+// and loads the missing ones). Values only grow.
+typedef struct sx_event sx_event;
+sx_event *sx_event_new(sx_device *d);
+void sx_event_release(sx_event *e);
+// CPU side: set the value (signal), read it, and wait until it reaches at least v (spins,
+// then blocks after 50 ms as sx_cmd_finish does). wait returns 0, or 1 on a 60 s timeout.
+void sx_event_set(sx_event *e, uint64_t v);
+uint64_t sx_event_value(const sx_event *e);
+int sx_event_wait(const sx_event *e, uint64_t v);
+// GPU side, in command-buffer order: signal sets the value once every dispatch encoded before
+// it has completed; wait holds every dispatch encoded after it until the value reaches v.
+// Both end the current compute encoder and open a new serial one.
+void sx_cmd_signal(sx_cmd *c, sx_event *e, uint64_t v);
+void sx_cmd_wait_event(sx_cmd *c, sx_event *e, uint64_t v);
+
 // --- HTTP client -------------------------------------------------------------
 // One HTTP(S) request through NSURLSession (redirects followed; no caching, no cookies,
 // no compression: Accept-Encoding identity is sent unless a header overrides it).

@@ -6,6 +6,7 @@
 #include "config_flash.h"
 #include "model.h"
 #include "model_arch.h"
+#include "xcache.h"
 
 // Width of the hyper-connection streams: hc_count x hidden_size (10240).
 #define HCW (CONFIG_HC_COUNT * CONFIG_HIDDEN_SIZE)
@@ -53,6 +54,7 @@ typedef struct {
     // Coder trunk, 512 in its MTP head; buffers are sized for num_experts (the most)
     uint32_t ne;
     Linear router, shared_gate, sg, su, sd, eg, eu, ed;
+    uint32_t xl1; // streamed: 1 + this layer's index in the expert cache; 0 when resident
 } Moe;
 
 typedef struct {
@@ -135,11 +137,24 @@ typedef struct {
 } Gen;
 
 
+// A point where the command buffer stops until the host has mapped one layer's expert ids to
+// cache slots (streamed packs): the GPU signals sig once the ids are written, the host remaps
+// them in place, loads the missing experts and sets sig + 1.
+typedef enum { XS_DECODE, XS_ROWS, XS_TILES } XsKind;
+typedef struct {
+    uint8_t kind;
+    uint32_t layer, n; // cache layer; ids to map (XS_DECODE, XS_ROWS)
+    uint64_t sig;
+} XSvc;
+#define MODEL_MAX_XSVC 160
+
 // Encoder for one token: dispatches go into one serial command buffer.
 typedef struct {
     Model *m;
     sx_cmd *cmd;
     bool failed;
+    XSvc xs[MODEL_MAX_XSVC]; // stops encoded in cmd, in order
+    uint32_t nxs;
     // B.xh holds the half copy of this (buffer, offset, count); any dispatch other than an
     // accelerator matmul clears it, since it may have rewritten the source.
     bool xh_set;
@@ -186,6 +201,11 @@ struct Model {
     // (draft_mtp), committed by verify_chunk once the drafts are known; any other call drops it.
     bool has_pend;
     PendVerify pend;
+    // Streamed experts (SAETTA_EXPERT_CACHE_GB): the cache, the event the command buffers stop
+    // on, and its last value handed out. NULL when every expert is resident.
+    XCache *xc;
+    sx_event *xev;
+    uint64_t xev_val;
 };
 
 static_assert(MODEL_NG_HEADS == SESSION_NG_HEADS);

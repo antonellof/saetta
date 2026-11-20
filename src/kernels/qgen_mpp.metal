@@ -85,7 +85,7 @@ kernel void qmmh_g_gen(device const uchar *w [[buffer(0)]], device const uchar *
     if (tg.y >= ntiles[0]) return;
     threadgroup half Wt[QG_TN * QG_KC];
     const uint4 t = tiles[tg.y];
-    qg_qmmh_tile<64>(q.x, q.y, w + shift[0] + t.x * stride.x, scales + shift[1] + t.x * stride.y, biases + shift[2] + t.x * stride.y,
+    qg_qmmh_tile<64>(q.x, q.y, w + shift[0] + ulong(t.x) * stride.x, scales + shift[1] + ulong(t.x) * stride.y, biases + shift[2] + ulong(t.x) * stride.y,
                      X, Y, dims.x, dims.y, dims.z, t.y, t.z, tg.x * QG_TN, tid, Wt);
 }
 

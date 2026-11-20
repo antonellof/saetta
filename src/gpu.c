@@ -1,29 +1,112 @@
 // GPU context (see gpu.h).
 #include "gpu.h"
 
+#include <stdlib.h>
+#include "xcache.h"
+
+// A trunk routed-expert tensor, read from the files by the expert cache when streaming.
+static bool streamed_tensor(Str name) {
+    return str_find(name, S("mlp.switch_mlp."), 0) >= 0 && str_find(name, S("mtp."), 0) != 0;
+}
+
+typedef struct {
+    uint64_t a, b;
+} Hole;
+
+static int hole_cmp(const void *x, const void *y) {
+    const Hole *p = x, *q = y;
+    return (p->a > q->a) - (p->a < q->a);
+}
+
+// Wraps file i as the segments between its streamed tensors (each hole shrunk to whole pages).
+static Err wrap_segments(Arena *a, sx_device *dev, const Pack *pack, size_t i, GpuSeg **out, uint32_t *nout) {
+    const MappedFile *f = &pack->files[i];
+    size_t page = sx_page_size();
+    size_t nh = 0;
+    Str key;
+    void *val;
+    for (size_t it = 0; strmap_next(&pack->tensors, &it, &key, &val);) {
+        const TensorInfo *t = val;
+        if (t->file == i && streamed_tensor(key)) nh++;
+    }
+    Hole *h = ARENA_ARRAY(a, Hole, nh ? nh : 1);
+    size_t k = 0;
+    for (size_t it = 0; strmap_next(&pack->tensors, &it, &key, &val);) {
+        const TensorInfo *t = val;
+        if (t->file != i || !streamed_tensor(key)) continue;
+        uint64_t s = ALIGN_UP(t->offset, page), e = (t->offset + t->nbytes) / page * page;
+        if (e > s) h[k++] = (Hole){s, e};
+    }
+    nh = k;
+    qsort(h, nh, sizeof *h, hole_cmp);
+    GpuSeg *seg = ARENA_ARRAY(a, GpuSeg, nh + 1);
+    uint32_t ns = 0;
+    uint64_t cur = 0, flen = ALIGN_UP(f->len, page);
+    for (size_t j = 0; j <= nh; j++) {
+        uint64_t end = j < nh ? h[j].a : flen;
+        if (end > cur) {
+            sx_buffer *b = sx_buffer_wrap(dev, f->bytes + cur, (size_t)(end - cur));
+            if (!b) return "WrapFailed";
+            seg[ns++] = (GpuSeg){cur, end, b};
+        }
+        if (j < nh && h[j].b > cur) cur = h[j].b;
+    }
+    *out = seg;
+    *nout = ns;
+    return OK;
+}
+
 Err gpu_init(Arena *a, const Pack *pack, Gpu *out) {
     sx_device *dev = sx_device_create();
     if (!dev) return "NoMetalDevice";
     size_t page = sx_page_size();
-    sx_buffer **bufs = ARENA_ARRAY(a, sx_buffer *, pack->nfiles ? pack->nfiles : 1);
+    size_t nf = pack->nfiles ? pack->nfiles : 1;
+    sx_buffer **bufs = ARENA_ARRAY(a, sx_buffer *, nf);
+    bool stream = xc_requested_bytes() != 0;
+    GpuSeg **segs = stream ? ARENA_ARRAY(a, GpuSeg *, nf) : NULL;
+    uint32_t *nseg = stream ? ARENA_ARRAY(a, uint32_t, nf) : NULL;
     for (size_t i = 0; i < pack->nfiles; i++) {
         const MappedFile *f = &pack->files[i];
+        if (stream) {
+            TRY(wrap_segments(a, dev, pack, i, &segs[i], &nseg[i]));
+            bufs[i] = nseg[i] ? segs[i][0].buf : NULL;
+            continue;
+        }
         bufs[i] = sx_buffer_wrap(dev, f->bytes, ALIGN_UP(f->len, page));
         if (!bufs[i]) return "WrapFailed";
     }
-    *out = (Gpu){dev, bufs, pack->nfiles};
+    *out = (Gpu){.dev = dev, .file_buffers = bufs, .nfile_buffers = pack->nfiles, .segs = segs, .nseg = nseg,
+                 .nseg_files = stream ? pack->nfiles : 0};
     return OK;
 }
 
+// The buffer holding byte off of file `file` and the offset into it.
+static sx_arg file_arg(const Gpu *g, size_t file, uint64_t off) {
+    if (file < g->nseg_files) {
+        const GpuSeg *s = g->segs[file];
+        uint32_t lo = 0, hi = g->nseg[file];
+        while (hi - lo > 1) {
+            uint32_t mid = (lo + hi) / 2;
+            if (s[mid].start <= off) lo = mid;
+            else hi = mid;
+        }
+        return (sx_arg){s[lo].buf, off - s[lo].start, NULL, 0};
+    }
+    return (sx_arg){g->file_buffers[file], off, NULL, 0};
+}
+
 void gpu_deinit(Gpu *g) {
-    for (size_t i = 0; i < g->nfile_buffers; i++) sx_buffer_release(g->file_buffers[i]);
+    for (size_t i = 0; i < g->nfile_buffers; i++)
+        if (i >= g->nseg_files) sx_buffer_release(g->file_buffers[i]);
+    for (size_t i = 0; i < g->nseg_files; i++)
+        for (uint32_t j = 0; j < g->nseg[i]; j++) sx_buffer_release(g->segs[i][j].buf);
     sx_device_destroy(g->dev);
 }
 
 sx_arg gpu_tensor_arg(const Gpu *g, const TensorInfo *t, uint32_t *shift) {
     uint64_t base = t->offset & ~(uint64_t)15;
     *shift = (uint32_t)(t->offset - base);
-    return (sx_arg){g->file_buffers[t->file], base, NULL, 0};
+    return file_arg(g, t->file, base);
 }
 
 Err gpu_warm(Gpu *g) { return gpu_warm_except(g, NULL, ""); }
@@ -58,20 +141,25 @@ Err gpu_warm_except(Gpu *g, const Pack *pack, const char *skip) {
         void *val;
         for (size_t it = 0; strmap_next(&pack->tensors, &it, &key, &val);) {
             if (skip_len > 0 && str_find(key, str_n(skip, skip_len), 0) >= 0) continue;
+            // streamed experts are read from the files on demand, not touched here
+            if (xc_requested_bytes() && streamed_tensor(key)) continue;
             const TensorInfo *t = val;
             uint64_t first = t->offset / page * page;
             uint32_t pages = (uint32_t)((t->offset + t->nbytes - first + page - 1) / page);
             uint32_t p[2] = {pages, (uint32_t)(page / 4)};
-            sx_arg args[3] = {{g->file_buffers[t->file], first, NULL, 0}, gpu_buf_arg(sink), gpu_bytes_arg(p, 8)};
+            sx_arg args[3] = {file_arg(g, t->file, first), gpu_buf_arg(sink), gpu_bytes_arg(p, 8)};
             sx_cmd_dispatch(cmd, pl, args, 3, (pages + 255) / 256, 1, 256);
         }
     } else {
         for (size_t i = 0; i < g->nfile_buffers; i++) {
-            sx_buffer *b = g->file_buffers[i];
-            uint32_t pages = (uint32_t)(sx_buffer_length(b) / page);
-            uint32_t p[2] = {pages, (uint32_t)(page / 4)};
-            sx_arg args[3] = {gpu_buf_arg(b), gpu_buf_arg(sink), gpu_bytes_arg(p, 8)};
-            sx_cmd_dispatch(cmd, pl, args, 3, (pages + 255) / 256, 1, 256);
+            uint32_t nb = i < g->nseg_files ? g->nseg[i] : 1;
+            for (uint32_t j = 0; j < nb; j++) {
+                sx_buffer *b = i < g->nseg_files ? g->segs[i][j].buf : g->file_buffers[i];
+                uint32_t pages = (uint32_t)(sx_buffer_length(b) / page);
+                uint32_t p[2] = {pages, (uint32_t)(page / 4)};
+                sx_arg args[3] = {gpu_buf_arg(b), gpu_buf_arg(sink), gpu_bytes_arg(p, 8)};
+                sx_cmd_dispatch(cmd, pl, args, 3, (pages + 255) / 256, 1, 256);
+            }
         }
     }
     char err[512];
@@ -80,6 +168,34 @@ Err gpu_warm_except(Gpu *g, const Pack *pack, const char *skip) {
     sx_pipeline_release(pl);
     if (rc != 0) {
         dbg("warm: %s\n", err);
+        return "GpuFailed";
+    }
+    return OK;
+}
+
+Err gpu_touch_buffers(Gpu *g, sx_buffer *const *bufs, size_t n) {
+    sx_pipeline *pl;
+    TRY(gpu_pipeline(g, touch_src, "touch", &pl));
+    sx_buffer *sink;
+    Err e = gpu_new_buffer(g, 16, &sink);
+    if (e) {
+        sx_pipeline_release(pl);
+        return e;
+    }
+    size_t page = sx_page_size();
+    sx_cmd *cmd = sx_cmd_begin(g->dev);
+    for (size_t i = 0; i < n; i++) {
+        uint32_t pages = (uint32_t)(sx_buffer_length(bufs[i]) / page);
+        uint32_t p[2] = {pages, (uint32_t)(page / 4)};
+        sx_arg args[3] = {gpu_buf_arg(bufs[i]), gpu_buf_arg(sink), gpu_bytes_arg(p, 8)};
+        sx_cmd_dispatch(cmd, pl, args, 3, (pages + 255) / 256, 1, 256);
+    }
+    char err[512];
+    int rc = sx_cmd_finish(cmd, err, sizeof err);
+    sx_buffer_release(sink);
+    sx_pipeline_release(pl);
+    if (rc != 0) {
+        dbg("touch: %s\n", err);
         return "GpuFailed";
     }
     return OK;

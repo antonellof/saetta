@@ -98,8 +98,8 @@ kernel void NAME(device const uchar *w [[buffer(0)]], device const uchar *scales
     threadgroup float ws[32][33];                                                                            \
     threadgroup float ys[32][33];                                                                            \
     const uint4 t = tiles[tg.y];                                                                             \
-    qmm_tile<BITS, GROUP>(w + shift[0] + t.x * stride.x, scales + shift[1] + t.x * stride.y,                 \
-                          biases + shift[2] + t.x * stride.y, X + t.y * dims.x, Y + t.y * dims.y,            \
+    qmm_tile<BITS, GROUP>(w + shift[0] + ulong(t.x) * stride.x, scales + shift[1] + ulong(t.x) * stride.y,                 \
+                          biases + shift[2] + ulong(t.x) * stride.y, X + t.y * dims.x, Y + t.y * dims.y,            \
                           dims.x, dims.y, t.z - t.y, uint2(tg.x, 0), sgid, tid, xs, ws, ys);                 \
 }
 

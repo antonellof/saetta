@@ -23,6 +23,11 @@
 Err server_serve(Arena *arena, const char *dir, uint16_t port, const char *const *loras, size_t nloras,
                  const char *kwargs_default);
 
+// The error object a failed request is answered with (also the data of a stream's error
+// event): 4xx is the client's (invalid_request_error; Anthropic request_too_large for 413),
+// 5xx the server's (OpenAI server_error, Anthropic api_error).
+void server_error_json(Buf *o, bool anthropic, int status, Str msg);
+
 // ---- sampling, exposed for the unit tests --------------------------------------------------
 
 typedef struct {

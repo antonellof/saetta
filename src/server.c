@@ -424,14 +424,11 @@ typedef enum { FMT_OPENAI, FMT_ANTHROPIC } Fmt;
 // A request body larger than this is refused (413).
 #define BODY_LIMIT ((uint64_t)64 << 20)
 
-// The error object of either API for an HTTP status: 400 and other 4xx are the client's
-// (invalid_request_error; Anthropic request_too_large for 413), 500 the server's
-// (OpenAI server_error, Anthropic api_error).
-static void error_json(Buf *o, Fmt fmt, int status, Str msg) {
-    const char *type = status >= 500 ? (fmt == FMT_ANTHROPIC ? "api_error" : "server_error")
-                       : status == 413 && fmt == FMT_ANTHROPIC ? "request_too_large"
-                                                              : "invalid_request_error";
-    if (fmt == FMT_ANTHROPIC) {
+void server_error_json(Buf *o, bool anthropic, int status, Str msg) {
+    const char *type = status >= 500 ? (anthropic ? "api_error" : "server_error")
+                       : status == 413 && anthropic ? "request_too_large"
+                                                    : "invalid_request_error";
+    if (anthropic) {
         buf_printf(o, "{\"type\":\"error\",\"error\":{\"type\":\"%s\",\"message\":", type);
         chat_json_string(o, msg);
         buf_adds(o, "}}");
@@ -441,6 +438,7 @@ static void error_json(Buf *o, Fmt fmt, int status, Str msg) {
         buf_printf(o, ",\"type\":\"%s\"}}", type);
     }
 }
+static void error_json(Buf *o, Fmt fmt, int status, Str msg) { server_error_json(o, fmt == FMT_ANTHROPIC, status, msg); }
 
 static Err respond_error(Conn *c, Req *h, int status, Fmt fmt, Err err) {
     Buf msg = {0};
@@ -514,6 +512,18 @@ static Err out_end(Out *o) {
     TRY(out_flush(o));
     TRY(conn_writes(o->c, "0\r\n\r\n"));
     return conn_flush(o->c);
+}
+
+// An error after the stream has started (the 200 and its headers are out): an error event
+// in the request's format (OpenAI: a data line with the error object, then [DONE];
+// Anthropic: event: error), then the end of the chunked body.
+static Err out_error(Out *o, int status, Err err) {
+    Buf msg = {0};
+    error_json(&msg, o->fmt, status, str(err));
+    if (o->fmt == FMT_OPENAI) buf_printf(&o->ev, "data: %.*s\n\ndata: [DONE]\n\n", (int)msg.len, msg.ptr);
+    else buf_printf(&o->ev, "event: error\ndata: %.*s\n\n", (int)msg.len, msg.ptr);
+    buf_free(&msg);
+    return out_end(o);
 }
 
 static Err out_event(Out *o, const char *name, Str data) {
@@ -635,6 +645,9 @@ typedef struct {
     Splitter split;
     Out out;
     bool streaming;
+    // the status a failure is answered with: 400 while the request is checked, 500 once it
+    // runs (memory, the GPU: the server's fault, not the request's)
+    int status;
 } Work;
 
 // Prefill hook: a prefix point every PT_EVERY tokens, the monitor's progress, a stream's
@@ -1060,6 +1073,7 @@ static Err handle(Engine *e, Arena *a, Conn *c, Req *h, Str body, Fmt fmt, Work 
     size_t max_tokens = MIN(asked, e->s->max_cap - n - CAP_SLACK);
     // the request's model: a LoRA adapter's name selects it, anything else the base model
     int lora = model_name.len > 0 ? model_lora_find(e->m, arena_strndup(a, model_name.ptr, model_name.len)) : -1;
+    w->status = 500;
     route(e, w->ids.ptr, n, lora);
     reply_id = lora >= 0 ? model_lora_name(e->m, (size_t)lora) : base_id;
     TRY(ensure(e, n + max_tokens + CAP_SLACK));
@@ -1136,25 +1150,19 @@ static Err connection(Engine *e, int fd) {
             }
             Str bs = str_n(arena_dup(&a, body.ptr ? body.ptr : "", body.len + 1), body.len);
             buf_free(&body);
-            Work w = {0};
+            Work w = {.status = 400};
             Err err = str_ends(path, S("/count_tokens")) ? count_tokens(e, &a, c, &h, bs) : handle(e, &a, c, &h, bs, fmt, &w);
+            if (err) {
+                dbg("request failed: %s\n", err);
+                // a client that is gone gets nothing; a started stream ends with an error event
+                if (!strcmp(err, "WriteFailed")) ret = err;
+                else if (w.streaming) (void)out_error(&w.out, w.status, err);
+                else (void)respond_error(c, &h, w.status, fmt, err);
+            }
             vec_free(&w.ids);
             lookup_free(&w.lk);
             buf_free(&w.split.text);
             buf_free(&w.out.ev);
-            if (err) {
-                dbg("request failed: %s\n", err);
-                if (!strcmp(err, "WriteFailed")) ret = err;
-                else {
-                    Buf msg = {0};
-                    buf_adds(&msg, fmt == FMT_ANTHROPIC ? "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":"
-                                                        : "{\"error\":{\"message\":");
-                    chat_json_string(&msg, str(err));
-                    buf_adds(&msg, fmt == FMT_ANTHROPIC ? "}}" : ",\"type\":\"invalid_request_error\"}}");
-                    (void)json_respond(c, &h, 400, buf_str(&msg));
-                    buf_free(&msg);
-                }
-            }
         } else {
             ret = json_respond(c, &h, 404, S("{\"error\":{\"message\":\"not found\"}}"));
         }

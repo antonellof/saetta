@@ -88,3 +88,20 @@ TEST(server_top_k_with_group_skipping_matches_the_plain_loop) {
         for (size_t i = 0; i < nb; i++) EXPECT_EQ(a[i], b[i]);
     }
 }
+
+TEST(server_error_json_by_status_and_format) {
+    Buf b = {0};
+    server_error_json(&b, false, 400, S("NoMessages"));
+    EXPECT_STR(buf_str(&b), S("{\"error\":{\"message\":\"NoMessages\",\"type\":\"invalid_request_error\"}}"));
+    b.len = 0;
+    server_error_json(&b, false, 500, S("AllocFailed"));
+    EXPECT_STR(buf_str(&b), S("{\"error\":{\"message\":\"AllocFailed\",\"type\":\"server_error\"}}"));
+    b.len = 0;
+    server_error_json(&b, true, 500, S("AllocFailed"));
+    EXPECT_STR(buf_str(&b), S("{\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"AllocFailed\"}}"));
+    b.len = 0;
+    server_error_json(&b, true, 413, S("BodyTooLarge"));
+    EXPECT_STR(buf_str(&b),
+               S("{\"type\":\"error\",\"error\":{\"type\":\"request_too_large\",\"message\":\"BodyTooLarge\"}}"));
+    buf_free(&b);
+}

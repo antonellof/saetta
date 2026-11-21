@@ -130,7 +130,7 @@ Flash-Next on an M5 Max with 128 GB, a six-request coding-agent workload, second
 | turn 2 (reuses turn 1) | 15,948 | 0.20 | 0.90 | 0.20 | 1.01 |
 | edit (tool call, 400 tokens out) | 18,245 | 10.10 | 12.93 | 9.32 | 12.19 |
 
-Answers at 72 to 82 (full) and 63 to 70 (Coder) tokens/s, 141 tokens/s on the edit with speculation. Qwen3.8-27B is not benchmarked yet.
+Answers at 72 to 82 (full) and 63 to 70 (Coder) tokens/s, 141 tokens/s on the edit with speculation. Qwen3.8-27B: prompts at 926 tokens/s (4K) to 761 (64K); answers at 31 ms/token on the 4-bit pack, 19 ms/token on `27b-turbo` with its MTP head.
 
 ## Build from source
 

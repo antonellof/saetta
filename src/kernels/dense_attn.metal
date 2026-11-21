@@ -6,8 +6,10 @@
 // kernels/qsa_pf.metal, MIT, Copyright (c) 2026 Ong Hoe Yuan; b1be701): S = Q K^T per tile
 // on one simdgroup, K and V rows read straight into the right-operand cooperative tensors
 // (half4 per lane, the M5 lane layout), the row max exchanged through threadgroup memory once
-// per key step (row sums kept per lane, exchanged once at the end), P stored as half, then each simdgroup does tot = tot * f + P V for its
-// dims. Changed for the 27B: a threadgroup serves QB query tokens of one kv head, so its
+// per key step (row sums kept per lane, exchanged once at the end), P stored as half, then each simdgroup does
+// tot = tot * f + (P V)^T = tot * f + V^T P^T for its dims: V is the left operand, read by the
+// matmul from device memory, and P the right one from threadgroup memory (P as the left
+// operand with per-lane V loads was 7% slower per layer). Changed for the 27B: a threadgroup serves QB query tokens of one kv head, so its
 // 6 * QB query rows (token-major: row = token * 6 + head) share every K / V tile instead of
 // one token's heads; dense causal mask; queries permuted to [kv head][token][6][256] half by
 // attn_fl_q6h so a row block is one strided tensor.
@@ -39,18 +41,23 @@ kernel void attn_fl_q6h(device const float4 *q [[buffer(0)]], device half4 *qh [
 // Threadgroup (kv head g, block of QB tokens), NSG simdgroups, key steps of BK keys.
 // S phase: the NSG simdgroups are KG key groups x NSG / KG row groups; simdgroup sg takes the
 // KS = BK / KG keys of group sg % KG against the MS rows of group sg / KG.
-// O phase: simdgroup sg takes dims [sg * DS, sg * DS + DS) of all R rows.
+// O phase: simdgroup sg takes dims [sg * DS, sg * DS + DS) of all R rows, as the transposed tile
+// O^T (DS x R): a lane holds dims r0 + 8 j and runs of four rows, so the rescale factors and the
+// row sums of its rows are read from threadgroup memory.
 // A destination lane holds rows r0 + 8 j (j < rows / 8) of its tile, r0 below, and runs of four
 // consecutive columns: the M5 layout, probed for 48 x 16 and 48 x 32 tiles; lanes xor 1 and
 // xor 8 hold the other columns of a row.
 // Scores are kept in the log2 domain (the scale folds log2 e), so exp2 replaces exp; steps that
 // every row of the block sees in full skip the causal mask and the key bound checks.
-template <int QB, int NSG, int BK, int KG>
+// P rows (one per query row) have a stride of PS >= BK halfs: padding them past BK spreads the
+// rows of a P^T tile over the threadgroup memory banks (PS 264 against 256: 2.5% per layer).
+template <int QB, int NSG, int BK, int KG, int PS>
 inline void attn_fl(device const half *q, device const half *K, device const half *V, device const float *qg,
                     device float *out, constant AttnFlP &a, uint2 tg, ushort sg, ushort lane, threadgroup half *p,
-                    threadgroup float *pm, threadgroup float *ps) {
+                    threadgroup float *pm, threadgroup float *ps, threadgroup float *fs) {
     constexpr int R = FA_G * QB, RG = NSG / KG, MS = R / RG, KS = BK / KG, DS = FA_HD / NSG, J = R / 8, JS = MS / 8;
-    static_assert(R % 16 == 0 && NSG % KG == 0 && MS % 16 == 0 && DS % 16 == 0 && KS % 16 == 0 && BK % 32 == 0);
+    static_assert(R % 16 == 0 && NSG % KG == 0 && MS % 16 == 0 && DS % 16 == 0 && KS % 16 == 0 && BK % 32 == 0 && PS >= BK &&
+                  PS % 4 == 0);
     using T2 = dextents<int32_t, 2>;
     const uint g = tg.x;
     const uint nblk = (a.T + QB - 1) / QB;
@@ -64,17 +71,23 @@ inline void attn_fl(device const half *q, device const half *K, device const hal
     constexpr float SC = 0.0625f * M_LOG2E_F; // 1 / sqrt(256), in log2 units
 
     constexpr auto dS = matmul2d_descriptor(MS, KS, 32, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
-    constexpr auto dO = matmul2d_descriptor(R, DS, 32, false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
+    // O^T += V^T P^T: V^T (DS x keys) from the cache rows, transposed; P^T (keys x R) from P, transposed
+    constexpr auto dO = matmul2d_descriptor(DS, R, 32, true, true, false, matmul2d_descriptor::mode::multiply_accumulate);
+    // the last 32 keys of the chunk, when fewer: K from the tensors, so V rows past nk (any value) are not read
+    constexpr auto dOt = matmul2d_descriptor(DS, R, static_cast<int>(dynamic_extent), true, true, false,
+                                             matmul2d_descriptor::mode::multiply_accumulate);
     matmul2d<dS, execution_simdgroup> opS;
     matmul2d<dO, execution_simdgroup> opO;
+    matmul2d<dOt, execution_simdgroup> opOt;
     tensor<device half, T2, tensor_inline> tQ((device half *)q + ((ulong)g * a.tq + t0) * FA_G * FA_HD, T2(FA_HD, R));
-    tensor<threadgroup half, T2, tensor_inline> tP(p, T2(BK, R));
+    tensor<threadgroup half, T2, tensor_inline> tP(p, T2(BK, R), array<int32_t, 2>{1, PS});
+    tensor<device half, T2, tensor_inline> tV((device half *)Vg, T2(DS, (int)nk), array<int32_t, 2>{1, (int)rs});
     auto rk = opS.template get_right_input_cooperative_tensor<half, half, float>();
-    auto rv = opO.template get_right_input_cooperative_tensor<half, half, float>();
     auto tA0 = tQ.template slice<32, MS>(0, row0);
     auto tP0 = tP.template slice<32, R>(0, 0);
-    auto tot = opO.template get_destination_cooperative_tensor<__tensor_ops_detail::__remove_addrspace_t<decltype(tP0)>,
-                                                               __tensor_ops_detail::__remove_addrspace_t<decltype(rv)>, float>();
+    auto tV0 = tV.template slice<DS, 32>(0, 0);
+    auto tot = opO.template get_destination_cooperative_tensor<__tensor_ops_detail::__remove_addrspace_t<decltype(tV0)>,
+                                                               __tensor_ops_detail::__remove_addrspace_t<decltype(tP0)>, float>();
 #pragma clang loop unroll(full)
     for (uint16_t i = 0; i < tot.get_capacity(); ++i) tot[i] = 0.0f;
     const uint r0 = ((lane >> 1) & 3) + 4 * (lane >> 4);
@@ -146,6 +159,7 @@ inline void attn_fl(device const half *q, device const half *K, device const hal
             for (int k = 0; k < KG; ++k) n = max(n, pm[k * R + 8 * j + r0]);
             f[j] = n == -INFINITY ? 1.0f : exp2(m[j] - n);
             m[j] = n;
+            if (sg == 0 && wr) fs[8 * j + r0] = f[j]; // for the O^T rescale; published by the barrier after P
         }
         // P = exp2(s - m) as half, four consecutive keys per store
 #pragma clang loop unroll(full)
@@ -162,24 +176,26 @@ inline void attn_fl(device const half *q, device const half *K, device const hal
                 x[js] += ev;
                 e[u] = half(ev);
             }
-            if (s.is_valid_element(i)) *(threadgroup half4 *)(p + (row0 + ix[1]) * BK + kg * KS + ix[0]) = e;
+            if (s.is_valid_element(i)) *(threadgroup half4 *)(p + (row0 + ix[1]) * PS + kg * KS + ix[0]) = e;
         }
         // the row sums stay per lane (one exchange at the end); the barrier publishes P
 #pragma clang loop unroll(full)
         for (int j = 0; j < JS; ++j) l[j] = l[j] * f[row0 / 8 + j] + x[j];
         threadgroup_barrier(mem_flags::mem_threadgroup);
 #pragma clang loop unroll(full)
-        for (uint16_t i = 0; i < tot.get_capacity(); ++i) tot[i] *= f[tot.get_multidimensional_index(i)[1] / 8];
+        for (uint16_t i = 0; i < tot.get_capacity(); ++i) tot[i] *= fs[tot.get_multidimensional_index(i)[0]];
         for (int cc = 0; cc < BK && c0 + cc < (int)nk; cc += 32) {
-#pragma clang loop unroll(full)
-            for (uint16_t i = 0; i < rv.get_capacity(); i += 4) {
-                const auto ix = rv.get_multidimensional_index(i);
-                const int id = c0 + cc + ix[1];
-                const half4 w = full || id < (int)nk ? *(device const half4 *)(Vg + (ulong)id * rs + ix[0]) : half4(0.0h);
-                rv[i] = w.x; rv[i + 1] = w.y; rv[i + 2] = w.z; rv[i + 3] = w.w;
+            if (full || c0 + cc + 32 <= (int)nk) {
+                auto tVh = tV.template slice<DS, 32>(0, c0 + cc);
+                auto tPh = tP.template slice<32, R>(cc, 0);
+                opO.run(tVh, tPh, tot);
+            } else {
+                const int kl = (int)nk - (c0 + cc);
+                tensor<device half, T2, tensor_inline> tVt((device half *)Vg + (ulong)(c0 + cc) * rs, T2(DS, kl),
+                                                          array<int32_t, 2>{1, (int)rs});
+                tensor<threadgroup half, T2, tensor_inline> tPt(p + cc, T2(kl, R), array<int32_t, 2>{1, PS});
+                opOt.run(tVt, tPt, tot);
             }
-            auto tPh = tP.template slice<32, R>(cc, 0);
-            opO.run(tPh, rv, tot);
         }
     }
     // row sums: lanes, then key groups
@@ -191,20 +207,16 @@ inline void attn_fl(device const half *q, device const half *K, device const hal
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 #pragma clang loop unroll(full)
-    for (int j = 0; j < J; ++j) {
-        float z = 0.0f;
-#pragma clang loop unroll(full)
-        for (int k = 0; k < KG; ++k) z += ps[k * R + 8 * j + r0];
-        l[j] = z;
-    }
-#pragma clang loop unroll(full)
     for (uint16_t i = 0; i < tot.get_capacity(); ++i)
         if (tot.is_valid_element(i)) {
             const auto ix = tot.get_multidimensional_index(i);
-            const uint row = ix[1], t = t0 + row / FA_G;
+            const uint row = ix[0], t = t0 + row / FA_G;
             if (t >= a.T) continue;
-            const uint hh = g * FA_G + row % FA_G, d = d0 + ix[0];
-            const float o = tot[i] / l[row / 8];
+            const uint hh = g * FA_G + row % FA_G, d = d0 + ix[1];
+            float z = 0.0f;
+#pragma clang loop unroll(full)
+            for (int k = 0; k < KG; ++k) z += ps[k * R + row];
+            const float o = tot[i] / z;
             const float gate = qg[((ulong)t * FA_NQ + hh) * 2 * FA_HD + d];
             out[((ulong)t * FA_NQ + hh) * FA_HD + d] = o / (1.0f + exp(-gate));
         }
@@ -214,15 +226,15 @@ inline void attn_fl(device const half *q, device const half *K, device const hal
 // half of the q projection [T][24][query 256 | gate 256] (f32, bound at the first gate); out
 // [T][24][256] f32.
 // Grid (4, ceil(T / QB)), 32 * NSG threads.
-#define ATTN_FL(NAME, QB, NSG, BK, KG)                                                                                    \
+#define ATTN_FL(NAME, QB, NSG, BK, KG, PS)                                                                                  \
     kernel void NAME(device const half *q [[buffer(0)]], device const half *K [[buffer(1)]], device const half *V [[buffer(2)]], \
                      device const float *qg [[buffer(3)]], device float *out [[buffer(4)]], constant AttnFlP &a [[buffer(5)]],  \
                      uint2 tg [[threadgroup_position_in_grid]], ushort sg [[simdgroup_index_in_threadgroup]],                    \
                      ushort lane [[thread_index_in_simdgroup]]) {                                                                \
-        threadgroup half p[FA_G * QB * BK];                                                                                     \
-        threadgroup float pm[KG * FA_G * QB], ps[KG * FA_G * QB];                                                               \
-        attn_fl<QB, NSG, BK, KG>(q, K, V, qg, out, a, tg, sg, lane, p, pm, ps);                                                 \
+        threadgroup half p[FA_G * QB * PS];                                                                                     \
+        threadgroup float pm[KG * FA_G * QB], ps[KG * FA_G * QB], fs[FA_G * QB];                                                \
+        attn_fl<QB, NSG, BK, KG, PS>(q, K, V, qg, out, a, tg, sg, lane, p, pm, ps, fs);                                         \
     }
 // 8 tokens (48 rows), 8 simdgroups, 256-key steps of 32 keys per simdgroup: S tiles of 48 x 32
-// (48 x 16 at 128-key steps: 16% slower); P takes 24 KB of the 32 KB of threadgroup memory
-ATTN_FL(attn_fl_6_q8, 8, 8, 256, 8)
+// (48 x 16 at 128-key steps: 16% slower); P takes 24.8 KB of the 32 KB of threadgroup memory
+ATTN_FL(attn_fl_6_q8, 8, 8, 256, 8, 264)

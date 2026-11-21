@@ -101,7 +101,8 @@ static bool has_config(Arena *a, const char *dir) {
     return stat(path_join(a, dir, "config.json"), &st) == 0;
 }
 
-// The pack folder: --pack (name or path), else the first downloaded of coder, full.
+// The pack folder: --pack (name or path), else the first downloaded pack that fits this Mac's
+// memory, in download table order (coder, full, then the 27B packs).
 // *out NULL (after a message) when there is none.
 static Err pack_for(Arena *a, const char *arg, const char **out) {
     *out = NULL;
@@ -168,15 +169,33 @@ static bool healthy_within(const char *base, double timeout_s) {
     return status == 200;
 }
 
-// The context a running server serves: max_model_len from GET /v1/models, 0 when unknown.
-static uint32_t server_context(const char *base) {
+// The context a running server serves: "ctx" in its metrics file (~/.saetta/run/metrics.json,
+// written after the memory cap, readable while the server is busy), else max_model_len from
+// GET /v1/models; 0 when unknown.
+static uint32_t server_context(Arena *a, const char *base) {
+    const char *home = getenv("HOME");
+    char *path = path_join(a, path_join(a, path_join(a, home ? home : "", ".saetta"), "run"), "metrics.json");
+    char *text;
+    size_t len;
+    if (!read_file(path, 1 << 20, &text, &len)) {
+        // only the running server's file (a stopped one leaves its last)
+        Server srv;
+        uint64_t v = 0, pid = 0;
+        const char *k = strstr(text, "\"ctx\":"), *kp = strstr(text, "\"pid\":");
+        if (k)
+            for (const char *c = k + 6; *c >= '0' && *c <= '9'; c++) v = v * 10 + (uint64_t)(*c - '0');
+        if (kp)
+            for (const char *c = kp + 6; *c >= '0' && *c <= '9'; c++) pid = pid * 10 + (uint64_t)(*c - '0');
+        free(text);
+        if (v > 0 && v <= UINT32_MAX && instance_running(&srv) && pid == (uint64_t)srv.pid) return (uint32_t)v;
+    }
     char url[256];
     if ((size_t)snprintf(url, sizeof url, "%s/v1/models", base) >= sizeof url) return 0;
     Sink s = {0};
     int status = 0;
     char err[256];
     // the sink keeps the first 256 bytes, which hold the base model's entry
-    (void)sx_http("GET", url, NULL, 0, NULL, 0, 30.0, sink_fixed, &s, &status, err, sizeof err);
+    (void)sx_http("GET", url, NULL, 0, NULL, 0, 10.0, sink_fixed, &s, &status, err, sizeof err);
     if (status != 200 && !s.overflow) return 0;
     const char *k = "\"max_model_len\":";
     size_t kl = strlen(k);
@@ -517,7 +536,8 @@ static Err session(Arena *a, Session *ss, Agent agent, const char *pack_arg, uin
     }
 
     // the context the server actually serves (it can be smaller than asked: this Mac's memory)
-    uint32_t served = server_context(base);
+    uint32_t served = server_context(a, base);
+    if (!served) dbg("saetta: warning: could not read the server's context; the agent is told %u tokens\n", ctx);
     if (served && served < ctx) {
         dbg("saetta: the server's context is %u tokens (this Mac's memory); the agent is told so\n", served);
         ctx = served;

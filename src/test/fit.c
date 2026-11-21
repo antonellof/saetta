@@ -12,7 +12,7 @@ TEST(fit_rules_by_mac_memory) {
     unsetenv("SAETTA_IGNORE_MEMORY");
     static const struct {
         const char *gb, *pick;
-    } cases[] = {{"16", NULL}, {"24", NULL}, {"32", "27b-turbo"}, {"64", "27b-turbo"}, {"96", "coder"}, {"128", "coder"}};
+    } cases[] = {{"16", NULL}, {"24", NULL}, {"32", "27b-4bit"}, {"36", "27b-turbo"}, {"64", "27b-turbo"}, {"96", "coder"}, {"128", "coder"}};
     for (size_t i = 0; i < COUNT(cases); i++) {
         setenv("SAETTA_RAM_GB", cases[i].gb, 1);
         const char *p = fit_default_pack();

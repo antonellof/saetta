@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "model.h"
 #include "xcache.h"
 
 // A trunk routed-expert tensor, read from the files by the expert cache when streaming:
@@ -68,6 +69,8 @@ static Err wrap_segments(Arena *a, sx_device *dev, const Pack *pack, size_t i, G
 }
 
 Err gpu_init(Arena *a, const Pack *pack, Gpu *out) {
+    // before anything touches the pack: one that does not fit this Mac is refused here (fit.h)
+    TRY(model_fit_check(a, pack));
     sx_device *dev = sx_device_create();
     if (!dev) return "NoMetalDevice";
     size_t page = sx_page_size();

@@ -25,8 +25,8 @@ void fit_suggest(uint64_t ram);
 // FIT_RESERVE_GB exceed this Mac's memory; SAETTA_IGNORE_MEMORY=1 loads it anyway.
 Err fit_check_pack(const Pack *pack);
 
-// The download name to suggest on this Mac: "coder" with 96 GB or more, else "27b-turbo"
-// (32 GB or more), else NULL.
+// The download name to suggest on this Mac: "coder" with 96 GB or more, "27b-turbo" with 36
+// (its 18.6 GB leave a 32 GB Mac too little context), "27b-4bit" with 32, else NULL.
 const char *fit_default_pack(void);
 
 #endif

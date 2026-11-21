@@ -719,7 +719,7 @@ static Err run(Arena *arena, int argc, char **argv) {
                 "  monitor | status | stop      live view, state, stop the running server\n"
                 "\n"
                 "Models:\n"
-                "  download [name] [--jobs N]   fetch a pack into ~/Models (SAETTA_MODELS); default coder, an unknown name lists them\n"
+                "  download [name] [--jobs N]   fetch a pack into ~/Models (SAETTA_MODELS); default: what fits this Mac\n"
                 "  import <file.gguf> <dir> [--like dir]   a Qwen3.8-27B GGUF into a pack\n"
                 "  info <pack>                  what the pack holds\n"
                 "\n"

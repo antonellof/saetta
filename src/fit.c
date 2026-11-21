@@ -64,6 +64,7 @@ Err fit_check_pack(const Pack *pack) {
 const char *fit_default_pack(void) {
     const uint64_t gb = fit_ram_bytes() >> 30;
     if (gb >= 96) return "coder";
-    if (gb >= 32) return "27b-turbo";
+    if (gb >= 36) return "27b-turbo";
+    if (gb >= 32) return "27b-4bit";
     return NULL;
 }

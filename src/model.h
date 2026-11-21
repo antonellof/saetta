@@ -256,6 +256,10 @@ void model_prof_report(size_t tokens);
 // SESSION_CTX_DEFAULT), rounded down to a multiple of SESSION_CTX_ALIGN (src/ctxlimits.h).
 // Errors: "InvalidCharacter" / "Overflow" (not a number), "ContextTooSmall" (below
 // SESSION_CTX_MIN), "ContextTooLarge" (above max, the model's max_position_embeddings).
+// NotEnoughMemory (after a message) when the pack does not fit this Mac's memory (fit.h); OK for
+// packs that stream their experts and for an empty pack. gpu_init calls it before touching the pack.
+Err model_fit_check(Arena *a, const Pack *pack);
+
 Err session_ctx_parse(const char *text, size_t max, size_t *out);
 
 // Context capacity from $SAETTA_CTX (session_ctx_parse); KV f16 unless SAETTA_KV_F32.

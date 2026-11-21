@@ -1354,8 +1354,13 @@ Err server_serve(Arena *arena, const char *dir, uint16_t port, const char *const
         if (ram && !(ig && strcmp(ig, "0") != 0)) {
             const uint64_t budget = ram > used + (uint64_t)FIT_KV_RESERVE_GB * gib ? ram - used - (uint64_t)FIT_KV_RESERVE_GB * gib : 0;
             const size_t c0 = MIN(CAP0, max_cap), have = session_conv_bytes(e->s, c0);
+            // growing a conversation allocates the new buffers before it frees the old ones
+            // (session_grow), so the last step holds about twice the final size
             size_t fit = max_cap;
-            while (fit > c0 && session_conv_bytes(e->s, fit) - have > budget) fit -= SESSION_CTX_ALIGN;
+            while (fit > c0 && 2 * session_conv_bytes(e->s, fit) - have > budget) fit -= SESSION_CTX_ALIGN;
+            if (2 * have > budget + have)
+                dbg("saetta: warning: this Mac's memory (%llu GB) is short even for a %zu-token context; expect swapping\n",
+                    (unsigned long long)(ram / gib), c0);
             if (fit < max_cap) {
                 dbg("saetta: context limited to %zu tokens by this Mac's memory (%llu GB; SAETTA_CTX asked %zu)\n", fit,
                     (unsigned long long)(ram / gib), max_cap);

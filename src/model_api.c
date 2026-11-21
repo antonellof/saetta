@@ -45,9 +45,17 @@ Err model_load(Arena *a, const Pack *pack, Gpu *g, Model **out) {
         dbg("model: %s is not a Qwen3.8-Flash-Next, Qwen3.8-27B or DeepSeek-V4-Flash pack\n", pack->dir);
         return "UnknownModelType";
     }
-    // packs that stream their experts from the SSD (DeepSeek-V4-Flash) are larger than memory by design
-    if (strstr(A->info.model_type, "deepseek") == NULL && getenv("SAETTA_EXPERT_CACHE_GB") == NULL) TRY(fit_check_pack(pack));
     return A->load(a, pack, g, out);
+}
+
+Err model_fit_check(Arena *a, const Pack *pack) {
+    const ModelArch *A = pack->nfiles ? arch_for(a, pack) : NULL;
+    if (!A) return OK;
+    // packs that stream their experts from the SSD are larger than memory by design: DeepSeek-V4-Flash,
+    // and Flash-Next with an expert cache (SAETTA_EXPERT_CACHE_GB above 0, as xcache.c reads it)
+    const char *xc = getenv("SAETTA_EXPERT_CACHE_GB");
+    if (strstr(A->info.model_type, "deepseek") != NULL || (xc && atof(xc) > 0)) return OK;
+    return fit_check_pack(pack);
 }
 
 Err session_ctx_parse(const char *text, size_t max, size_t *out) {

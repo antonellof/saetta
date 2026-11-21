@@ -28,7 +28,8 @@ typedef struct {
 } DownloadPack;
 
 #define DOWNLOAD_NPACKS 7
-// The first DOWNLOAD_NFLASH are the Flash-Next packs ("all", and saetta start's default).
+// The first DOWNLOAD_NFLASH are the Flash-Next packs ("all"); saetta start's default is the
+// first downloaded pack that fits this Mac (launch.c pack_for).
 #define DOWNLOAD_NFLASH 2
 extern const DownloadPack download_packs[DOWNLOAD_NPACKS]; // coder, full, 27b-8bit, 27b-4bit, 27b-pi, 27b-turbo, 27b-turbo-8bit
 

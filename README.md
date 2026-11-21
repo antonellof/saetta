@@ -33,7 +33,7 @@ saetta download          # the model that fits this Mac, into ~/Models, resumabl
 saetta start claude      # or: saetta start pi, saetta start opencode
 ```
 
-`saetta download` picks by memory: `coder` (Flash-Next, 76 GB) with 96 GB or more, else `27b-turbo` (Qwen3.8-27B, 20 GB, converted from its GGUF: about 40 GB free disk while it runs). Any pack can be named instead (table below); one that cannot run on this Mac is refused, and the context shrinks to what memory holds.
+`saetta download` picks by memory: `coder` (Flash-Next, 76 GB) with 96 GB or more, `27b-turbo` (Qwen3.8-27B fine-tune, 20 GB, converted from its GGUF: about 40 GB free disk while it runs) with 36 GB, `27b-4bit` (16 GB) with 32 GB. Any pack can be named instead (table below); one that cannot run on this Mac is refused, and the context shrinks to what memory holds.
 
 Needs an Apple Silicon Mac (M1 or later) with 32 GB of memory or more, and macOS 27.2 or later. Update with `saetta update`. `SAETTA_PREFIX` changes the install folder, `SAETTA_VERSION=0.11.0` pins a release, `HF_TOKEN` raises Hugging Face's limits.
 
@@ -48,10 +48,10 @@ Needs an Apple Silicon Mac (M1 or later) with 32 GB of memory or more, and macOS
 | `27b-8bit` · with adapters | [Qwen3.8-27B](https://huggingface.co/mlx-community/Qwen3.8-27B-8bit), dense, 8-bit | 29 GB | 48 GB |
 | `27b-4bit` | [Qwen3.8-27B](https://huggingface.co/mlx-community/Qwen3.8-27B-4bit), dense, 4-bit | 16 GB | 32 GB |
 | `27b-pi` | [the pi LoRA adapter](https://huggingface.co/harness-hub/Qwen3.8-27B-pi-adapted) for Qwen3.8-27B | 0.6 GB | |
-| **`27b-turbo`** · with MTP | [TURBO Fable Cold Fusion](https://huggingface.co/DavidAU/Qwen3.8-27B-TURBO-Fable-Cold-Fusion-735-882-Heretic-Uncensored-NEO-CODER-MAX-MTP-GGUF), a Qwen3.8-27B fine-tune with shorter thinking, from its Q4_K_M GGUF | 20 GB | 32 GB |
+| **`27b-turbo`** · with MTP | [TURBO Fable Cold Fusion](https://huggingface.co/DavidAU/Qwen3.8-27B-TURBO-Fable-Cold-Fusion-735-882-Heretic-Uncensored-NEO-CODER-MAX-MTP-GGUF), a Qwen3.8-27B fine-tune with shorter thinking, from its Q4_K_M GGUF | 20 GB | 36 GB |
 | `27b-turbo-8bit` · with MTP | the same, from its Q8_0 GGUF | 30 GB | 48 GB |
 
-On 32 GB the context is smaller: about 80K tokens with `27b-4bit`, 32K with `27b-turbo`. `SAETTA_IGNORE_MEMORY=1` skips the memory checks.
+With less memory the context is smaller: about 37K tokens with `27b-4bit` on 32 GB. `SAETTA_IGNORE_MEMORY=1` skips the memory checks.
 
 Licenses: Flash-Next Qwen Community License 1.0, Qwen3.8-27B, the pi adapter and TURBO Apache-2.0; no weights are part of this repository.
 

@@ -23,6 +23,7 @@
 #include "metal/shim.h"
 #include "model.h"
 #include "spec.h"
+#include "split.h"
 #include "stats.h"
 #include "tokenizer.h"
 #include "toolcall.h"
@@ -416,102 +417,6 @@ uint32_t server_sample_pick(void *ctx, const float *row, bool has_draft, uint32_
     return draw(c->rng, c->cand, p, n, tot);
 }
 
-// ---- splitting the answer ---------------------------------------------------------------------
-
-// Incremental split of the generated text into reasoning and answer, emitting only
-// bytes that cannot change: valid UTF-8, no trailing whitespace, no partial tag.
-typedef struct {
-    Buf text;
-    bool thinking;
-    size_t sent_reasoning, sent_content;
-} Splitter;
-
-static Str sp_text(const Splitter *sp) { return buf_str(&sp->text); }
-
-static Str sp_reasoning(const Splitter *sp) {
-    if (!sp->thinking) return S("");
-    Str t = sp_text(sp);
-    ptrdiff_t end = str_find(t, S("</think>"), 0);
-    return str_trim(str_sub(t, 0, end < 0 ? t.len : (size_t)end));
-}
-
-static Str sp_answer(const Splitter *sp) {
-    Str t = sp_text(sp);
-    if (!sp->thinking) return t;
-    ptrdiff_t e = str_find(t, S("</think>"), 0);
-    if (e < 0) return S("");
-    return str_sub(t, (size_t)e + 8, t.len);
-}
-
-static bool ascii_ws(char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == 0x0B || c == 0x0C; }
-static bool trim_ws(char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; }
-
-static size_t lead_ws(Str s) {
-    size_t i = 0;
-    while (i < s.len && trim_ws(s.ptr[i])) i++;
-    return i;
-}
-static size_t trim_end_len(Str s) {
-    size_t n = s.len;
-    while (n > 0 && trim_ws(s.ptr[n - 1])) n--;
-    return n;
-}
-
-// Stable prefix length of s: drop a partial UTF-8 char, trailing whitespace, and a suffix
-// that could start tag.
-static size_t sp_stable(Str s, Str tag) {
-    size_t n = s.len;
-    size_t k = MIN(tag.len - 1, n);
-    for (; k > 0; k--)
-        if (memcmp(s.ptr + n - k, tag.ptr, k) == 0) {
-            n -= k;
-            break;
-        }
-    size_t cut = n, back = 0;
-    while (cut > 0 && back < 4 && ((unsigned char)s.ptr[cut - 1] & 0xC0) == 0x80) {
-        back += 1;
-        cut -= 1;
-    }
-    if (cut > 0 && (unsigned char)s.ptr[cut - 1] >= 0xC0) {
-        unsigned char b = (unsigned char)s.ptr[cut - 1];
-        size_t len = b < 0xE0 ? 2 : b < 0xF0 ? 3 : b < 0xF8 ? 4 : 1;
-        if (back + 1 < len) n = cut - 1;
-    }
-    while (n > 0 && ascii_ws(s.ptr[n - 1])) n -= 1;
-    return n;
-}
-
-typedef struct {
-    Str reasoning, content;
-} Poll;
-
-// New reasoning and content bytes that can be sent now.
-static Poll sp_poll(Splitter *sp, bool final) {
-    Str t = sp_text(sp);
-    Poll r = {S(""), S("")};
-    if (sp->thinking) {
-        ptrdiff_t closed = str_find(t, S("</think>"), 0);
-        Str raw = str_sub(t, 0, closed < 0 ? t.len : (size_t)closed);
-        Str body = str_sub(raw, lead_ws(raw), raw.len);
-        size_t n = (closed >= 0 || final) ? trim_end_len(body) : sp_stable(body, S("</think>"));
-        if (n > sp->sent_reasoning) {
-            r.reasoning = str_sub(body, sp->sent_reasoning, n);
-            sp->sent_reasoning = n;
-        }
-        if (closed < 0) return r;
-    }
-    Str ans = sp_answer(sp);
-    Str body = str_sub(ans, lead_ws(ans), ans.len);
-    ptrdiff_t tool = toolcall_start(body);
-    size_t upto = tool >= 0 ? (size_t)tool : body.len;
-    size_t n = (tool >= 0 || final) ? trim_end_len(str_sub(body, 0, upto)) : sp_stable(body, S("<tool_call>"));
-    if (n > sp->sent_content) {
-        r.content = str_sub(body, sp->sent_content, n);
-        sp->sent_content = n;
-    }
-    return r;
-}
-
 // ---- requests ---------------------------------------------------------------------------------
 
 typedef enum { FMT_OPENAI, FMT_ANTHROPIC } Fmt;
@@ -802,6 +707,8 @@ static Err generate_reply(Engine *e, Arena *a, Conn *c, Req *h, Work *w, JValue 
 
     Splitter *spl = &w->split;
     spl->thinking = thinking;
+    spl->stops = stops;
+    spl->n_stops = n_stops;
     buf_addstr(&spl->text, forced); // the forced opening is part of the answer
     uint32_t cand[256];
     size_t n_gen = 0;
@@ -837,23 +744,13 @@ static Err generate_reply(Engine *e, Arena *a, Conn *c, Req *h, Work *w, JValue 
             break;
         }
         tokenizer_decode_append(e->tok, t, &spl->text);
-        bool stopped = false;
-        for (size_t i = 0; i < n_stops; i++) {
-            Str st = stops[i];
-            Str ans = sp_answer(spl);
-            ptrdiff_t cut = st.len > 0 ? str_find(ans, st, 0) : -1;
-            if (cut >= 0) {
-                spl->text.len -= ans.len - (size_t)cut;
-                spl->text.ptr[spl->text.len] = 0;
-                finish = "stop";
-                by_stop = &stops[i];
-                stopped = true;
-                break;
-            }
+        by_stop = split_cut_stop(spl);
+        if (by_stop) {
+            finish = "stop";
+            break;
         }
-        if (stopped) break;
         if (out) {
-            Poll d = sp_poll(spl, false);
+            SplitPoll d = split_poll(spl, false);
             TRY(out_text(out, BLOCK_THINKING, d.reasoning));
             TRY(out_text(out, BLOCK_TEXT, d.content));
             TRY(out_keep_alive(out, 5000));
@@ -918,7 +815,7 @@ static Err generate_reply(Engine *e, Arena *a, Conn *c, Req *h, Work *w, JValue 
     }
     int64_t pre_ms = (int64_t)(t1 - t0) / 1000000;
     int64_t dec_ms = (int64_t)(t2 - t1) / 1000000;
-    Parsed parsed = toolcall_parse(a, str_trim(sp_answer(spl)), tools);
+    Parsed parsed = toolcall_parse(a, str_trim(split_answer(spl)), tools);
     if (parsed.n_calls > 0) finish = "tool_calls";
     dbg("request: %zu prompt tokens (%zu reused) in %lld ms, %zu generated in %lld ms (%s tok/s, %zu passes), finish %s%s, "
         "conversation %zu/%zu\n",
@@ -966,7 +863,7 @@ static Err generate_reply(Engine *e, Arena *a, Conn *c, Req *h, Work *w, JValue 
         n, n_gen, n + n_gen, reused);
 
     if (out) {
-        Poll d = sp_poll(spl, true);
+        SplitPoll d = split_poll(spl, true);
         TRY(out_text(out, BLOCK_THINKING, d.reasoning));
         TRY(out_text(out, BLOCK_TEXT, d.content));
         if (parsed.n_calls > 0) TRY(out_chunk(out, str(arena_printf(a, "{\"tool_calls\":%s}", calls_json)), NULL));
@@ -984,7 +881,7 @@ static Err generate_reply(Engine *e, Arena *a, Conn *c, Req *h, Work *w, JValue 
                id, (long long)created, reply_id);
     if (parsed.content.len == 0 && parsed.n_calls > 0) buf_adds(&res, "null");
     else chat_json_string(&res, parsed.content);
-    Str rc = sp_reasoning(spl);
+    Str rc = split_reasoning(spl);
     if (rc.len > 0) {
         buf_adds(&res, ",\"reasoning_content\":");
         chat_json_string(&res, rc);
@@ -1006,7 +903,7 @@ static Err anthropic_end(Arena *a, Conn *c, Req *h, Out *o, Splitter *sp, Parsed
     const char *seq = arena_strdup(a, seqb.ptr);
     buf_free(&seqb);
     if (o) {
-        Poll d = sp_poll(sp, true);
+        SplitPoll d = split_poll(sp, true);
         TRY(out_text(o, BLOCK_THINKING, d.reasoning));
         TRY(out_text(o, BLOCK_TEXT, d.content));
         TRY(out_close(o));
@@ -1044,7 +941,7 @@ static Err anthropic_end(Arena *a, Conn *c, Req *h, Out *o, Splitter *sp, Parsed
     chat_json_string(&res, name);
     buf_adds(&res, ",\"content\":[");
     bool first = true;
-    Str rc = sp_reasoning(sp);
+    Str rc = split_reasoning(sp);
     if (rc.len > 0) {
         buf_adds(&res, "{\"type\":\"thinking\",\"thinking\":");
         chat_json_string(&res, rc);

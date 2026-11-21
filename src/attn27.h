@@ -16,7 +16,7 @@
 // dense_attn.metal, NUL terminated.
 extern const char attn27_src[];
 
-#define ATTN27_BK 128 // attn_fl_6_q8's key step
+#define ATTN27_BK 256 // attn_fl_6_q8's key step
 #define ATTN27_BK_MAX 256 // largest key step attn27_ref mirrors
 
 // Kernel parameters (AttnFlP in the kernel).

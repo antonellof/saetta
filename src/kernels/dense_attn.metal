@@ -218,5 +218,6 @@ inline void attn_fl(device const half *q, device const half *K, device const hal
         threadgroup float pm[KG * FA_G * QB], ps[KG * FA_G * QB];                                                               \
         attn_fl<QB, NSG, BK, KG>(q, K, V, qg, out, a, tg, sg, lane, p, pm, ps);                                                 \
     }
-// 8 tokens (48 rows), 8 simdgroups, 128-key steps of 16 keys per simdgroup
-ATTN_FL(attn_fl_6_q8, 8, 8, 128, 8)
+// 8 tokens (48 rows), 8 simdgroups, 256-key steps of 32 keys per simdgroup: S tiles of 48 x 32
+// (48 x 16 at 128-key steps: 16% slower); P takes 24 KB of the 32 KB of threadgroup memory
+ATTN_FL(attn_fl_6_q8, 8, 8, 256, 8)

@@ -461,7 +461,7 @@ static Err parse_request(Arena *a, Str body, Fmt fmt, JValue **r, Str *model) {
 }
 
 // POST /v1/messages/count_tokens: the rendered prompt's length, without running the model.
-static Err count_tokens(Engine *e, Arena *a, Conn *c, Req *h, Str body) {
+static Err count_tokens(Engine *e, Arena *a, Conn *c, Req *h, Str body, int *status) {
     JValue *r;
     Str model, prompt;
     TRY(parse_request(a, body, FMT_ANTHROPIC, &r, &model));
@@ -470,7 +470,10 @@ static Err count_tokens(Engine *e, Arena *a, Conn *c, Req *h, Str body) {
     Err err = tokenizer_encode(e->tok, prompt, &ids);
     size_t n = ids.len;
     vec_free(&ids);
-    if (err) return err;
+    if (err) {
+        *status = 500; // not caused by the request, as in handle()
+        return err;
+    }
     return json_respond(c, h, 200, str(arena_printf(a, "{\"input_tokens\":%zu}", n)));
 }
 
@@ -1141,7 +1144,8 @@ static Err connection(Engine *e, int fd) {
         int status = http_error_status(he);
         if (status) {
             Req none = {.method = M_GET};
-            (void)respond_error(c, &none, status, FMT_OPENAI, he);
+            // drained like a refused body (1 MB, 1 s at most), so the client sees the answer
+            if (!respond_error(c, &none, status, FMT_OPENAI, he)) http_drain(c, 1u << 20, 1000);
         }
         ret = status ? he : OK;
         goto done;
@@ -1197,7 +1201,7 @@ static Err connection(Engine *e, int fd) {
             Str bs = str_n(arena_dup(&a, body.ptr ? body.ptr : "", body.len + 1), body.len);
             buf_free(&body);
             Work w = {.status = 400};
-            Err err = str_ends(path, S("/count_tokens")) ? count_tokens(e, &a, c, &h, bs) : handle(e, &a, c, &h, bs, fmt, &w);
+            Err err = str_ends(path, S("/count_tokens")) ? count_tokens(e, &a, c, &h, bs, &w.status) : handle(e, &a, c, &h, bs, fmt, &w);
             if (err) {
                 dbg("request failed: %s\n", err);
                 // a client that is gone gets nothing; a started stream ends with an error event

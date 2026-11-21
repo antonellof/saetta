@@ -650,11 +650,17 @@ typedef struct {
     int status;
 } Work;
 
+// A request whose client has disconnected stops: checked after each prefill chunk and every
+// GONE_EVERY decode steps from this loop (one non-blocking recv peek, never inside the
+// model's per-token path), so a non-streamed request does not run on to max_tokens.
+#define GONE_EVERY 16
+
 // Prefill hook: a prefix point every PT_EVERY tokens, the monitor's progress, a stream's
-// keep-alive.
+// keep-alive, the client's disconnect.
 typedef struct {
     Engine *e;
     Out *out;
+    Conn *c;
     const uint32_t *ids;
     bool points;
 } Hook;
@@ -668,6 +674,7 @@ static Err hook_chunk_done(void *ctx, size_t pos) {
     }
     atomic_store_explicit(&h->e->st->prompt_done, (uint32_t)pos, memory_order_release);
     if (h->out) TRY(out_keep_alive(h->out, 0));
+    if (conn_peer_gone(h->c)) return "ClientGone";
     return OK;
 }
 
@@ -705,7 +712,7 @@ static Err generate_reply(Engine *e, Arena *a, Conn *c, Req *h, Work *w, JValue 
     const char *pv = getenv("SAETTA_POINTS");
     bool points_on = pv ? pv[0] != '0' : true;
     if (n - 1 > reused) {
-        Hook hk = {e, out, ids, points_on};
+        Hook hk = {e, out, c, ids, points_on};
         PrefillHook ph = {&hk, hook_aligned, hook_chunk_done};
         float *lg;
         TRY(model_prefill_with(e->m, e->s, ids + reused, n - 1 - reused, NULL, &ph, &lg));
@@ -769,6 +776,7 @@ static Err generate_reply(Engine *e, Arena *a, Conn *c, Req *h, Work *w, JValue 
             TRY(out_keep_alive(out, 5000));
         }
         if (n_gen >= max_tokens) break;
+        if (n_gen % GONE_EVERY == 0 && conn_peer_gone(c)) return "ClientGone";
         lookup_push(lk, t);
         if (qi < qn) {
             next = queue[qi];
@@ -1155,7 +1163,7 @@ static Err connection(Engine *e, int fd) {
             if (err) {
                 dbg("request failed: %s\n", err);
                 // a client that is gone gets nothing; a started stream ends with an error event
-                if (!strcmp(err, "WriteFailed")) ret = err;
+                if (!strcmp(err, "WriteFailed") || !strcmp(err, "ClientGone")) ret = err;
                 else if (w.streaming) (void)out_error(&w.out, w.status, err);
                 else (void)respond_error(c, &h, w.status, fmt, err);
             }

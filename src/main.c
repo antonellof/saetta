@@ -707,10 +707,30 @@ static Err run(Arena *arena, int argc, char **argv) {
         TRY(parse_usize(argv[3], &n));
         return generate(arena, pack_arg(arena, argv[2]), n, argv + 4, (size_t)argc - 4);
     }
-    fprintf(out, "usage: saetta serve <model-dir> [--port N] [--lora-modules name=path ...] [--default-chat-template-kwargs JSON] | info <model-dir> | generate <model-dir> <n> <ids...> | tokenize "
-                 "<model-dir> <file> | render <request.json> | verify [golden-dir] | download <pack> | import <file.gguf> <dir> | start "
-                 "<claude|pi|opencode> | monitor | status | stop | update | version\n");
-    fflush(out);
+    // `saetta help` (or -h, --help) prints this on stdout and succeeds; anything else unknown
+    // prints it on stderr and exits 64 (EX_USAGE)
+    const bool asked = argc == 2 && (eq(cmd, "help") || eq(cmd, "-h") || eq(cmd, "--help"));
+    FILE *uo = asked ? stdout : stderr;
+    fprintf(uo, "usage: saetta <command> [arguments]\n"
+                "\n"
+                "Agents and server (<pack> is a download name, such as coder or 27b-turbo, or a folder):\n"
+                "  start <claude|pi|opencode> [--pack P] [--lora name=adapter] [--port N] [--ctx N] [--keep] [-- agent args]\n"
+                "  serve <pack> [--port N] [--lora-modules name=path ...] [--default-chat-template-kwargs JSON]\n"
+                "  monitor | status | stop      live view, state, stop the running server\n"
+                "\n"
+                "Models:\n"
+                "  download [name] [--jobs N]   fetch a pack into ~/Models (SAETTA_MODELS); default coder, an unknown name lists them\n"
+                "  import <file.gguf> <dir> [--like dir]   a Qwen3.8-27B GGUF into a pack\n"
+                "  info <pack>                  what the pack holds\n"
+                "\n"
+                "Tools:\n"
+                "  generate <pack> <n> <token ids...>   n greedy tokens after the ids (SAETTA_LORA=adapter)\n"
+                "  tokenize <pack> <file>       token ids of a text file\n"
+                "  render <request.json>        the prompt a chat request renders to\n"
+                "  verify [golden-dir]          the engine against reference outputs (development)\n"
+                "  update | version | help\n");
+    fflush(uo);
+    if (asked) return OK;
     exit(64);
 }
 

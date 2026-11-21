@@ -6,6 +6,9 @@ BUILD   ?= build
 GOLDEN  ?= tests/golden
 # the 27B goldens next to GOLDEN (each names its pack in manifest.json); absent ones are skipped
 GOLDENS_27B := golden-27b-4bit golden-27b-8bit golden-27b-4bit-pi golden-27b-4bit-partial golden-27b-turbo
+# the Coder variant's golden (its manifest names the pack without a folder); skipped when absent
+MODELS ?= $(or $(SAETTA_MODELS),$(HOME)/Models)
+CODER_PACK ?= $(MODELS)/mbrown-uno/Qwen3.8-Flash-Next-GSQ-RCO-Coder-MLX
 
 CFLAGS  := -std=c23 -O3 -ffp-contract=off -mcpu=native -mmacosx-version-min=27.2 \
            -Wall -Wextra -Wno-unused-parameter
@@ -49,9 +52,13 @@ $(OBJ)/metal/shim.o: src/metal/shim.m
 test: $(BUILD)/bin/saetta-test
 	$(BUILD)/bin/saetta-test $(T)
 
-# Flash-Next against GOLDEN, then Qwen3.8-27B against the goldens beside it that exist
+# Flash-Next against GOLDEN, the Coder variant against golden-coder, then Qwen3.8-27B against
+# the goldens beside it that exist
 verify: $(BIN)
 	$(BIN) verify $(GOLDEN)
+	@d="$(dir $(abspath $(GOLDEN)))golden-coder"; \
+	  if [ -d "$$d" ] && [ -d "$(CODER_PACK)" ]; then echo "verify: $$d"; SAETTA_PACK="$(CODER_PACK)" $(BIN) verify "$$d" || exit 1; \
+	  elif [ -d "$$d" ]; then echo "verify: no Coder pack at $(CODER_PACK), golden-coder skipped"; fi
 	@for g in $(GOLDENS_27B); do d="$(dir $(abspath $(GOLDEN)))$$g"; \
 	  if [ -d "$$d" ]; then echo "verify: $$d"; env -u SAETTA_PACK $(BIN) verify "$$d" || exit 1; fi; done
 

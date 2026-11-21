@@ -147,7 +147,7 @@ Needs full Xcode with the Metal Toolchain (`xcodebuild -downloadComponent MetalT
 git clone https://github.com/antonellof/saetta.git && cd saetta
 make                                    # ./build/bin/saetta
 make test                               # unit tests (SAETTA_PACK=<pack> for real tensors)
-make verify GOLDEN=<dir>/golden         # Flash-Next and Qwen3.8-27B against reference outputs
+make verify GOLDEN=<dir>/golden         # development: against reference outputs (not in this repository)
 ```
 
 `src/`: `model.c` (Flash-Next), `dense.c` (27B), `model_api.c` picks one per pack; `kernels/` Metal; `server.c`, `tokenizer.c`, `chat.c`, `toolcall.c`. `saetta help` lists every command.

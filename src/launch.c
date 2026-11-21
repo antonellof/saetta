@@ -88,12 +88,18 @@ static void sleep_ms(long ms) {
     nanosleep(&ts, NULL);
 }
 
+const char *launch_install_command(const char *agent) {
+    if (strcmp(agent, "claude") == 0) return "curl -fsSL https://claude.ai/install.sh | bash";
+    if (strcmp(agent, "pi") == 0) return "curl -fsSL https://pi.dev/install.sh | sh";
+    if (strcmp(agent, "opencode") == 0) return "curl -fsSL https://opencode.ai/install | bash";
+    return NULL;
+}
+
 static const char *install_hint(Agent agent) {
-    switch (agent) {
-    case AGENT_CLAUDE: return "Install Claude Code: curl -fsSL https://claude.ai/install.sh | bash";
-    case AGENT_PI: return "Install pi: curl -fsSL https://pi.dev/install.sh | sh";
-    default: return "Install opencode: curl -fsSL https://opencode.ai/install | bash";
-    }
+    static char b[160];
+    static const char *const label[] = {"Claude Code", "pi", "opencode"};
+    snprintf(b, sizeof b, "Install %s: %s", label[agent], launch_install_command(agent_names[agent]));
+    return b;
 }
 
 static bool has_config(Arena *a, const char *dir) {

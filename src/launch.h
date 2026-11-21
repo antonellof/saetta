@@ -22,4 +22,7 @@ const char *launch_usage(void);
 // "NoHome", file errors.
 Err launch_run(const char *const *args, size_t n, int *code);
 
+// The official install command of an agent ("claude", "pi", "opencode"), NULL for others.
+const char *launch_install_command(const char *agent);
+
 #endif

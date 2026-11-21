@@ -21,7 +21,7 @@ saetta runs Qwen3.8 coding models on any Apple Silicon Mac with 32 GB of memory 
 - **Fast:** on an M5 Max, Flash-Next reads prompts at 1,600 to 1,950 tokens/s and answers at 66 to 85 tokens/s, with speculative decoding.
 - **On par with [Strata](https://github.com/Niko1221/Strata)**, the established engine for Flash-Next on Apple Silicon: the Coder pack finishes the six-request agent workload 1 s ahead, the full pack 2 s behind, and both answer faster ([Performance](#performance)).
 - **Follow-up turns read only what is new:** a second turn on a 16K conversation answers in 0.2 s.
-- **One command to code:** `saetta start claude` (or `pi`, `opencode`).
+- **One command to code:** `saetta` picks the model and the agent for you; `saetta start claude` (or `pi`, `opencode`) when you know.
 - **LoRA adapters** on Qwen3.8-27B, per request.
 - **Checked** layer by layer against numpy references; one binary, no Python.
 
@@ -29,6 +29,12 @@ saetta runs Qwen3.8 coding models on any Apple Silicon Mac with 32 GB of memory 
 
 ```sh
 curl -fsSL https://github.com/antonellof/saetta/releases/latest/download/install.sh | sh   # into ~/.local/bin
+saetta                   # guided: pick a model and a coding agent, then it downloads, installs and starts
+```
+
+`saetta` (or `saetta auto`) shows this Mac's chip, memory and free disk, lists the models best first (the ones that do not fit are greyed out), downloads the one you pick, finds Claude Code, pi and opencode, offers the official installer for a missing one, and starts it. The same by hand:
+
+```sh
 saetta download          # the model that fits this Mac, into ~/Models, resumable, hash-checked
 saetta start claude      # or: saetta start pi, saetta start opencode
 ```

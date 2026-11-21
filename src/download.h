@@ -25,6 +25,7 @@ typedef struct {
     const char *const *only;
     const char *gguf_repo, *gguf_rev, *gguf_file;
     unsigned min_ram_gb; // the smallest Mac memory it runs on (fit.h: weights + FIT_RESERVE_GB), 0 for adapters
+    unsigned disk_gb;    // free disk the download needs at its peak (a GGUF import holds the GGUF and the pack)
 } DownloadPack;
 
 #define DOWNLOAD_NPACKS 7

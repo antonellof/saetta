@@ -25,6 +25,9 @@
 #include "gpu.h"
 #include "json.h"
 #include "launch.h"
+#include "wizard.h"
+
+#include <unistd.h>
 #include "metal/shim.h"
 #include "model.h"
 #include "monitor.h"
@@ -517,6 +520,17 @@ static Err run(Arena *arena, int argc, char **argv) {
         fflush(out);
         return OK;
     }
+    // `saetta` alone in a terminal, or `saetta auto`: the guided start (src/wizard.h)
+    if ((argc == 1 && isatty(0) && isatty(1)) || (argc == 2 && eq(cmd, "auto"))) {
+        int code = 1;
+        Err err = wizard_run(&code);
+        if (err) {
+            dbg("saetta auto: %s (run it in a terminal)\n", err);
+            exit(64);
+        }
+        fflush(stdout);
+        exit(code);
+    }
     if (argc >= 2 && eq(cmd, "download")) {
         Err err = download_run(rest, nrest);
         if (err) {
@@ -712,6 +726,8 @@ static Err run(Arena *arena, int argc, char **argv) {
     const bool asked = argc == 2 && (eq(cmd, "help") || eq(cmd, "-h") || eq(cmd, "--help"));
     FILE *uo = asked ? stdout : stderr;
     fprintf(uo, "usage: saetta <command> [arguments]\n"
+                "\n"
+                "  (no command)                 in a terminal: pick a model and a coding agent, then start (also: saetta auto)\n"
                 "\n"
                 "Agents and server (<pack> is a download name, such as coder or 27b-turbo, or a folder):\n"
                 "  start <claude|pi|opencode> [--pack P] [--lora name=adapter] [--port N] [--ctx N] [--keep] [-- agent args]\n"

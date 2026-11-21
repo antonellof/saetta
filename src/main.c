@@ -1,4 +1,4 @@
-// saetta: single-model inference engine for Qwen3.8-Flash-Next on Apple M5 Max.
+// saetta: inference engine for Qwen3.8 coding models on Apple Silicon Macs.
 //   saetta info <model-dir>                  check the pack against its model's shapes and the GPU
 //   saetta verify [golden-dir]                    compare with golden reference output (pack: $SAETTA_PACK or the golden's, under the models folder)
 //   saetta serve <model-dir> [--port N]           OpenAI-compatible API on 127.0.0.1 (default 8080)

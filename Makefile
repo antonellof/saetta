@@ -10,9 +10,12 @@ GOLDENS_27B := golden-27b-4bit golden-27b-8bit golden-27b-4bit-pi golden-27b-4bi
 MODELS ?= $(or $(SAETTA_MODELS),$(HOME)/Models)
 CODER_PACK ?= $(MODELS)/mbrown-uno/Qwen3.8-Flash-Next-GSQ-RCO-Coder-MLX
 
-CFLAGS  := -std=c23 -O3 -ffp-contract=off -mcpu=native -mmacosx-version-min=27.2 \
+# MCPU: the oldest CPU the binary runs on (every Apple Silicon Mac); -mcpu=native would let
+# the compiler use the build machine's newer instructions
+MCPU    ?= apple-m1
+CFLAGS  := -std=c23 -O3 -ffp-contract=off -mcpu=$(MCPU) -mmacosx-version-min=27.2 \
            -Wall -Wextra -Wno-unused-parameter
-OBJCFLAGS := -fobjc-arc -O2 -mcpu=native -mmacosx-version-min=27.2 -Wall -Wextra -Wno-unused-parameter
+OBJCFLAGS := -fobjc-arc -O2 -mcpu=$(MCPU) -mmacosx-version-min=27.2 -Wall -Wextra -Wno-unused-parameter
 DEPFLAGS = -MMD -MP
 LDFLAGS := -mmacosx-version-min=27.2
 LDLIBS  := -framework Metal -framework Foundation -framework Accelerate -lpthread

@@ -17,6 +17,7 @@
 #include "chat.h"
 #include "download.h"
 #include "gpu.h"
+#include "fit.h"
 #include "http.h"
 #include "instance.h"
 #include "json.h"
@@ -1159,7 +1160,8 @@ static Err connection(Engine *e, int fd) {
             ret = json_respond(c, &h, 200, S("{\"status\":\"ok\"}"));
         } else if (h.method == M_GET && str_eqz(path, "/v1/models")) {
             Buf mb = {0};
-            buf_printf(&mb, "{\"object\":\"list\",\"data\":[{\"id\":\"%s\",\"object\":\"model\",\"owned_by\":\"saetta\"}", base_id);
+            buf_printf(&mb, "{\"object\":\"list\",\"data\":[{\"id\":\"%s\",\"object\":\"model\",\"owned_by\":\"saetta\",\"max_model_len\":%zu}",
+                       base_id, e->s->max_cap);
             for (size_t i = 0; i < model_lora_count(e->m); i++) {
                 buf_adds(&mb, ",{\"id\":");
                 json_write_string(&mb, str(model_lora_name(e->m, i)));
@@ -1345,6 +1347,21 @@ Err server_serve(Arena *arena, const char *dir, uint16_t port, const char *const
         if (ctx && strtoull(ctx, NULL, 10) != max_cap)
             dbg("saetta: SAETTA_CTX=%s rounded down to %zu (a multiple of %d)\n", ctx, max_cap, SESSION_CTX_ALIGN);
         TRY(session_create_cap(m, g, getenv("SAETTA_KV_F32") == NULL, MIN(CAP0, max_cap), max_cap, &e->s));
+        // the context that fits this Mac's memory (fit.h): RAM less FIT_KV_RESERVE_GB less what
+        // the GPU holds now (weights, scratch, the first conversation)
+        const uint64_t gib = 1ull << 30, ram = fit_ram_bytes(), used = sx_device_allocated_size(g->dev);
+        const char *ig = getenv("SAETTA_IGNORE_MEMORY");
+        if (ram && !(ig && strcmp(ig, "0") != 0)) {
+            const uint64_t budget = ram > used + (uint64_t)FIT_KV_RESERVE_GB * gib ? ram - used - (uint64_t)FIT_KV_RESERVE_GB * gib : 0;
+            const size_t c0 = MIN(CAP0, max_cap), have = session_conv_bytes(e->s, c0);
+            size_t fit = max_cap;
+            while (fit > c0 && session_conv_bytes(e->s, fit) - have > budget) fit -= SESSION_CTX_ALIGN;
+            if (fit < max_cap) {
+                dbg("saetta: context limited to %zu tokens by this Mac's memory (%llu GB; SAETTA_CTX asked %zu)\n", fit,
+                    (unsigned long long)(ram / gib), max_cap);
+                e->s->max_cap = fit;
+            }
+        }
     }
     e->tok = tok;
     qgen_prng_init(&e->rng, (uint64_t)(int64_t)wall_ns());

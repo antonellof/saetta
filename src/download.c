@@ -1,5 +1,6 @@
 // `saetta download` (see download.h).
 #include "download.h"
+#include "fit.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -28,16 +29,16 @@ static const char *const turbo_files[] = {"config.json", "tokenizer.json", "toke
                                           "generation_config.json", "vocab.json", NULL};
 
 const DownloadPack download_packs[DOWNLOAD_NPACKS] = {
-    {.name = "coder", .repo = "mbrown-uno/Qwen3.8-Flash-Next-GSQ-RCO-Coder-MLX", .rev = "50fa68c5e9cebf53276d8eae8af594fa8b3de9e4", .note = "256 experts, pruned for code, 76 GB"},
-    {.name = "full", .repo = "mlx-community/Qwen3.8-Flash-Next-4bit-mtp", .rev = "825df623302aeebc434f44ca9122827b04f9a0f1", .note = "512 experts, the original model, 105 GB"},
-    {.name = "27b-8bit", .repo = "mlx-community/Qwen3.8-27B-8bit", .rev = "1159008f24a3f97d7afd366fcfee9a79f3bd2b94", .note = "Qwen3.8-27B dense, 8-bit, 29 GB (for LoRA adapters)"},
-    {.name = "27b-4bit", .repo = "mlx-community/Qwen3.8-27B-4bit", .rev = "b935172e4bb5dcd0543774a34748fb92422e3027", .note = "Qwen3.8-27B dense, 4-bit, 16 GB"},
+    {.name = "coder", .min_ram_gb = 96, .repo = "mbrown-uno/Qwen3.8-Flash-Next-GSQ-RCO-Coder-MLX", .rev = "50fa68c5e9cebf53276d8eae8af594fa8b3de9e4", .note = "256 experts, pruned for code, 76 GB"},
+    {.name = "full", .min_ram_gb = 128, .repo = "mlx-community/Qwen3.8-Flash-Next-4bit-mtp", .rev = "825df623302aeebc434f44ca9122827b04f9a0f1", .note = "512 experts, the original model, 105 GB"},
+    {.name = "27b-8bit", .min_ram_gb = 48, .repo = "mlx-community/Qwen3.8-27B-8bit", .rev = "1159008f24a3f97d7afd366fcfee9a79f3bd2b94", .note = "Qwen3.8-27B dense, 8-bit, 29 GB (for LoRA adapters)"},
+    {.name = "27b-4bit", .min_ram_gb = 32, .repo = "mlx-community/Qwen3.8-27B-4bit", .rev = "b935172e4bb5dcd0543774a34748fb92422e3027", .note = "Qwen3.8-27B dense, 4-bit, 16 GB"},
     {.name = "27b-pi", .repo = "harness-hub/Qwen3.8-27B-pi-adapted", .rev = "80d05c9051dfd2ae464e1daf4329cb15524caf60", .note = "LoRA adapter for the pi agent on Qwen3.8-27B, 0.6 GB"},
-    {.name = "27b-turbo", .repo = TURBO_REPO, .rev = TURBO_REV, .only = turbo_files, .gguf_repo = TURBO_GGUF_REPO, .gguf_rev = TURBO_GGUF_REV,
+    {.name = "27b-turbo", .min_ram_gb = 32, .repo = TURBO_REPO, .rev = TURBO_REV, .only = turbo_files, .gguf_repo = TURBO_GGUF_REPO, .gguf_rev = TURBO_GGUF_REV,
      .gguf_file = "Qwen3.8-27B-TurboFCFusion-735-882-Here-Uncen-NEO-CODER-MAX-MTP-Q4_K_M.gguf",
      .dir = "DavidAU/Qwen3.8-27B-TURBO-NEO-CODER-MAX-MTP-Q4_K_M",
      .note = "Qwen3.8-27B TURBO Fable Cold Fusion fine-tune (DavidAU), Q4_K_M GGUF with MTP, imported, 20 GB"},
-    {.name = "27b-turbo-8bit", .repo = TURBO_REPO, .rev = TURBO_REV, .only = turbo_files, .gguf_repo = TURBO_GGUF_REPO, .gguf_rev = TURBO_GGUF_REV,
+    {.name = "27b-turbo-8bit", .min_ram_gb = 48, .repo = TURBO_REPO, .rev = TURBO_REV, .only = turbo_files, .gguf_repo = TURBO_GGUF_REPO, .gguf_rev = TURBO_GGUF_REV,
      .gguf_file = "Qwen3.8-27B-TurboFCFusion-735-882-Here-Uncen-NEO-CODER-MAX-MTP-Q8_0.gguf",
      .dir = "DavidAU/Qwen3.8-27B-TURBO-NEO-CODER-MAX-MTP-Q8_0",
      .note = "the same fine-tune, Q8_0 GGUF with MTP, imported, 30 GB"},
@@ -72,7 +73,7 @@ Err download_pack_dir(Arena *a, const DownloadPack *p, char **out) {
 }
 
 const char *download_usage(void) {
-    return "usage: saetta download [coder|full|all|27b-8bit|27b-4bit|27b-pi|27b-turbo|27b-turbo-8bit] [--jobs N]   (default coder; all = coder and "
+    return "usage: saetta download [coder|full|all|27b-8bit|27b-4bit|27b-pi|27b-turbo|27b-turbo-8bit] [--jobs N]   (default: coder with 96 GB of memory or more, else 27b-turbo; all = coder and "
            "full; into $SAETTA_MODELS, default ~/Models)\n";
 }
 
@@ -530,7 +531,8 @@ static Err one(Arena *a, const DownloadPack *p, const char *token, size_t jobs) 
 }
 
 static Err run_in(Arena *a, const char *const *args, size_t n) {
-    const char *which = "coder";
+    // no name: the pack this Mac's memory suits (fit.h)
+    const char *which = NULL;
     size_t jobs = 4;
     for (size_t i = 0; i < n; i++) {
         if (strcmp(args[i], "--jobs") == 0 && i + 1 < n) {
@@ -539,6 +541,12 @@ static Err run_in(Arena *a, const char *const *args, size_t n) {
             TRY(parse_u64(str(args[i]), &j));
             jobs = (size_t)CLAMP(j, 1, 16);
         } else which = args[i];
+    }
+    if (!which) which = fit_default_pack();
+    if (!which) {
+        dbg("saetta download: this Mac has %llu GB of memory.\n", (unsigned long long)(fit_ram_bytes() >> 30));
+        fit_suggest(fit_ram_bytes());
+        return "NotEnoughMemory";
     }
     const char *token = hf_token(a);
     if (strcmp(which, "all") == 0) {
@@ -549,6 +557,15 @@ static Err run_in(Arena *a, const char *const *args, size_t n) {
     if (!p) {
         dbg("saetta download: unknown pack '%s'\n%s", which, download_usage());
         return "UnknownPack";
+    }
+    // a pack that cannot run here is not downloaded (SAETTA_IGNORE_MEMORY=1 fetches it anyway)
+    const uint64_t ram = fit_ram_bytes();
+    const char *ig = getenv("SAETTA_IGNORE_MEMORY");
+    if (ram && p->min_ram_gb && ((uint64_t)p->min_ram_gb << 30) > ram && !(ig && strcmp(ig, "0") != 0)) {
+        dbg("saetta download: %s needs a Mac with %u GB of memory or more; this one has %llu GB.\n", p->name, p->min_ram_gb,
+            (unsigned long long)(ram >> 30));
+        fit_suggest(ram);
+        return "NotEnoughMemory";
     }
     return one(a, p, token, jobs);
 }

@@ -2,6 +2,8 @@
 #include "gpu.h"
 
 #include <stdlib.h>
+#include <string.h>
+
 #include "xcache.h"
 
 // A trunk routed-expert tensor, read from the files by the expert cache when streaming:
@@ -241,6 +243,13 @@ Err gpu_dispatch_cost(Gpu *g, size_t n, size_t serial_threads, double *secs) {
 }
 
 Err gpu_pipeline(Gpu *g, const char *source, const char *name, sx_pipeline **out) {
+    // SAETTA_NO_ACCEL=1: no tensor-op (neural accelerator) kernels, as when they do not compile;
+    // every model then takes its simdgroup paths (checks the path older GPUs may take)
+    if (strstr(source, "<metal_tensor>") != NULL && getenv("SAETTA_NO_ACCEL") != NULL &&
+        strcmp(getenv("SAETTA_NO_ACCEL"), "0") != 0) {
+        *out = NULL;
+        return "AccelDisabled";
+    }
     char err[2048];
     err[0] = 0;
     *out = sx_pipeline_from_source(g->dev, source, name, err, sizeof err);

@@ -5,7 +5,9 @@
 #include "model.h"
 
 #include <stdlib.h>
+#include <string.h>
 
+#include "fit.h"
 #include "json.h"
 #include "model_arch.h"
 
@@ -43,6 +45,8 @@ Err model_load(Arena *a, const Pack *pack, Gpu *g, Model **out) {
         dbg("model: %s is not a Qwen3.8-Flash-Next, Qwen3.8-27B or DeepSeek-V4-Flash pack\n", pack->dir);
         return "UnknownModelType";
     }
+    // packs that stream their experts from the SSD (DeepSeek-V4-Flash) are larger than memory by design
+    if (strstr(A->info.model_type, "deepseek") == NULL && getenv("SAETTA_EXPERT_CACHE_GB") == NULL) TRY(fit_check_pack(pack));
     return A->load(a, pack, g, out);
 }
 

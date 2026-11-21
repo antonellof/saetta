@@ -16,6 +16,7 @@
 #include <unistd.h>
 
 #include "ctxlimits.h"
+#include "fit.h"
 #include "download.h"
 #include "instance.h"
 #include "metal/shim.h"
@@ -33,7 +34,7 @@ static const char *model_label = "Qwen3.8-Flash-Next (saetta)";
 static const char *lora_arg = NULL;
 
 const char *launch_usage(void) {
-    return "usage: saetta start <claude|pi|opencode> [--pack coder|full|27b-8bit|27b-4bit|<dir>] [--lora name=path] [--port N] "
+    return "usage: saetta start <claude|pi|opencode> [--pack coder|full|27b-turbo|27b-8bit|27b-4bit|<dir>] [--lora name=path] [--port N] "
            "[--ctx N] [--keep] [-- <agent args>]\n";
 }
 
@@ -112,18 +113,29 @@ static Err pack_for(Arena *a, const char *arg, const char **out) {
             *out = dir;
             return OK;
         }
-        dbg("saetta: no model at %s; download it with: saetta download %s\n", dir, pk ? arg : "coder");
+        dbg("saetta: no model at %s; download it with: saetta download %s\n", dir, pk ? arg : (fit_default_pack() ? fit_default_pack() : "27b-4bit"));
         return OK;
     }
-    for (size_t i = 0; i < DOWNLOAD_NFLASH; i++) {
+    // the first downloaded pack that fits this Mac, in table order: coder, full, then the 27B packs
+    const uint64_t ram = fit_ram_bytes();
+    bool any = false;
+    for (size_t i = 0; i < DOWNLOAD_NPACKS; i++) {
+        const DownloadPack *p = &download_packs[i];
+        if (p->min_ram_gb == 0) continue; // adapters
         char *dir;
-        TRY(download_pack_dir(a, &download_packs[i], &dir));
-        if (has_config(a, dir)) {
-            *out = dir;
-            return OK;
-        }
+        TRY(download_pack_dir(a, p, &dir));
+        if (!has_config(a, dir)) continue;
+        any = true;
+        if (ram && ((uint64_t)p->min_ram_gb << 30) > ram) continue;
+        *out = dir;
+        return OK;
     }
-    dbg("saetta: no model downloaded yet. Run: saetta download coder\n");
+    const char *rec = fit_default_pack();
+    if (any) dbg("saetta: no downloaded model fits this Mac's memory (%llu GB).\n", (unsigned long long)(ram >> 30));
+    if (rec)
+        dbg("saetta: %s Run: saetta download %s\n", any ? "" : "no model downloaded yet.", rec);
+    else
+        fit_suggest(ram);
     return OK;
 }
 
@@ -135,12 +147,14 @@ typedef struct {
 
 static int sink_fixed(void *ctx, int status, const void *p, size_t n) {
     Sink *s = ctx;
-    if (s->n + n > sizeof s->b) {
+    // keeps what fits; the rest stops the transfer
+    size_t room = sizeof s->b - s->n, k = n < room ? n : room;
+    memcpy(s->b + s->n, p, k);
+    s->n += k;
+    if (k < n) {
         s->overflow = true;
         return 1;
     }
-    memcpy(s->b + s->n, p, n);
-    s->n += n;
     return 0;
 }
 
@@ -152,6 +166,27 @@ static bool healthy_within(const char *base, double timeout_s) {
     char err[256];
     if (sx_http("GET", url, NULL, 0, NULL, 0, timeout_s, sink_fixed, &s, &status, err, sizeof err) != 0) return false;
     return status == 200;
+}
+
+// The context a running server serves: max_model_len from GET /v1/models, 0 when unknown.
+static uint32_t server_context(const char *base) {
+    char url[256];
+    if ((size_t)snprintf(url, sizeof url, "%s/v1/models", base) >= sizeof url) return 0;
+    Sink s = {0};
+    int status = 0;
+    char err[256];
+    // the sink keeps the first 256 bytes, which hold the base model's entry
+    (void)sx_http("GET", url, NULL, 0, NULL, 0, 30.0, sink_fixed, &s, &status, err, sizeof err);
+    if (status != 200 && !s.overflow) return 0;
+    const char *k = "\"max_model_len\":";
+    size_t kl = strlen(k);
+    for (size_t i = 0; i + kl < s.n; i++)
+        if (memcmp(s.b + i, k, kl) == 0) {
+            uint64_t v = 0;
+            for (size_t j = i + kl; j < s.n && s.b[j] >= '0' && s.b[j] <= '9'; j++) v = v * 10 + (uint64_t)(s.b[j] - '0');
+            return v > UINT32_MAX ? 0 : (uint32_t)v;
+        }
+    return 0;
 }
 
 // A running server: no timeout, a busy server answers after its current request.
@@ -479,6 +514,13 @@ static Err session(Arena *a, Session *ss, Agent agent, const char *pack_arg, uin
         }
         if (tty) dbg("\n");
         dbg("saetta: ready at %s (%.1f s)\n", base, (double)(now_ns() - t0) / 1e9);
+    }
+
+    // the context the server actually serves (it can be smaller than asked: this Mac's memory)
+    uint32_t served = server_context(base);
+    if (served && served < ctx) {
+        dbg("saetta: the server's context is %u tokens (this Mac's memory); the agent is told so\n", served);
+        ctx = served;
     }
 
     // the agent

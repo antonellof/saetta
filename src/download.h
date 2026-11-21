@@ -24,6 +24,7 @@ typedef struct {
     const char *dir; // local folder under the models folder (default: repo)
     const char *const *only;
     const char *gguf_repo, *gguf_rev, *gguf_file;
+    unsigned min_ram_gb; // the smallest Mac memory it runs on (fit.h: weights + FIT_RESERVE_GB), 0 for adapters
 } DownloadPack;
 
 #define DOWNLOAD_NPACKS 7

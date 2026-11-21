@@ -39,7 +39,7 @@ saetta download 27b-turbo                # 20 GB pack, converted from its GGUF (
 saetta start claude --pack 27b-turbo
 ```
 
-Needs an M5 Max with 128 GB and macOS 27.2 or later. Update with `saetta update`. `SAETTA_PREFIX` changes the install folder, `SAETTA_VERSION=0.10.0` pins a release, `HF_TOKEN` raises Hugging Face's limits.
+Needs an M5 Max with 128 GB and macOS 27.2 or later. Update with `saetta update`. `SAETTA_PREFIX` changes the install folder, `SAETTA_VERSION=0.11.0` pins a release, `HF_TOKEN` raises Hugging Face's limits.
 
 ## Models
 

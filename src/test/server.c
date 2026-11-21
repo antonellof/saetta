@@ -105,3 +105,37 @@ TEST(server_error_json_by_status_and_format) {
                S("{\"type\":\"error\",\"error\":{\"type\":\"request_too_large\",\"message\":\"BodyTooLarge\"}}"));
     buf_free(&b);
 }
+
+static Err numbers(const char *body, ReqNumbers *rn) {
+    Arena a = {0};
+    JValue *r;
+    Err e = json_parse(&a, str(body), false, &r);
+    if (!e) e = server_request_numbers(r, rn);
+    arena_reset(&a);
+    return e;
+}
+
+// max_tokens and seed are checked before their integer conversion (negative, huge, NaN or
+// fractional values are 400s, not undefined casts).
+TEST(server_request_numbers_are_validated) {
+    ReqNumbers rn;
+    EXPECT_OK(numbers("{}", &rn));
+    EXPECT_EQ(rn.max_tokens, 4096);
+    EXPECT(!rn.has_seed);
+    EXPECT_OK(numbers("{\"max_tokens\":100,\"seed\":-1,\"temperature\":0,\"top_k\":0}", &rn));
+    EXPECT_EQ(rn.max_tokens, 100);
+    EXPECT(rn.has_seed && rn.seed == UINT64_MAX);
+    EXPECT(rn.sp.temperature == 0.0f);
+    EXPECT_EQ(rn.sp.top_k, 256);
+    EXPECT_OK(numbers("{\"max_completion_tokens\":7,\"max_tokens\":9,\"seed\":1e3}", &rn));
+    EXPECT_EQ(rn.max_tokens, 7);
+    EXPECT_EQ(rn.seed, 1000);
+    EXPECT_ERR(numbers("{\"max_tokens\":-5}", &rn), "BadMaxTokens");
+    EXPECT_ERR(numbers("{\"max_tokens\":0}", &rn), "BadMaxTokens");
+    EXPECT_ERR(numbers("{\"max_tokens\":1.5}", &rn), "BadMaxTokens");
+    EXPECT_ERR(numbers("{\"max_tokens\":1e300}", &rn), "BadMaxTokens");
+    EXPECT_ERR(numbers("{\"seed\":1e19}", &rn), "BadSeed");
+    EXPECT_ERR(numbers("{\"seed\":0.5}", &rn), "BadSeed");
+    EXPECT_ERR(numbers("{\"temperature\":-1}", &rn), "BadTemperature");
+    EXPECT_ERR(numbers("{\"top_p\":2}", &rn), "BadTopP");
+}

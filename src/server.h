@@ -11,6 +11,7 @@
 #define SAETTA_SERVER_H
 
 #include "base.h"
+#include "json.h"
 #include "qgen.h"
 
 // Loads the pack in dir and serves on 127.0.0.1:port until the process ends. Errors:
@@ -34,6 +35,18 @@ typedef struct {
     float temperature, top_p;
     size_t top_k;
 } Sampling;
+
+// The numbers of an OpenAI-shaped request: max_completion_tokens or max_tokens (default 4096;
+// an integer from 1 to SESSION_CTX_MAX), temperature (1; 0 to 1e6), top_p (0.95; 0 to 1),
+// top_k (20; below 1 means 256, the most kept), seed (any integer an i64 holds). Errors:
+// "BadMaxTokens", "BadTemperature", "BadTopP", "BadTopK", "BadSeed".
+typedef struct {
+    size_t max_tokens;
+    Sampling sp;
+    bool has_seed;
+    uint64_t seed;
+} ReqNumbers;
+Err server_request_numbers(const JValue *r, ReqNumbers *out);
 
 // The k largest of logits[0..n) into cand[0..k), largest first (ties: earlier index first);
 // returns how many (min(k, n)).

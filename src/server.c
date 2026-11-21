@@ -994,6 +994,39 @@ static Err anthropic_end(Arena *a, Conn *c, Req *h, Out *o, Splitter *sp, Parsed
     return err;
 }
 
+Err server_request_numbers(const JValue *r, ReqNumbers *out) {
+    // every number is checked before its conversion: a cast of a negative, huge or NaN
+    // double to an integer is undefined
+    double v;
+    out->max_tokens = 4096;
+    if (num(field(r, "max_completion_tokens"), &v) || num(field(r, "max_tokens"), &v)) {
+        if (!(v >= 1 && v <= (double)SESSION_CTX_MAX) || v != floor(v)) return "BadMaxTokens";
+        out->max_tokens = (size_t)v;
+    }
+    out->sp.temperature = 1.0f;
+    if (num(field(r, "temperature"), &v)) {
+        if (!(v >= 0 && v <= 1e6)) return "BadTemperature";
+        out->sp.temperature = (float)v;
+    }
+    out->sp.top_p = 0.95f;
+    if (num(field(r, "top_p"), &v)) {
+        if (!(v >= 0 && v <= 1)) return "BadTopP";
+        out->sp.top_p = (float)v;
+    }
+    // top_k below 1 (0 conventionally means no limit) samples from the 256 kept candidates
+    double tk = num(field(r, "top_k"), &v) ? v : 20;
+    if (isnan(tk)) return "BadTopK";
+    out->sp.top_k = tk < 1 ? 256 : (size_t)fmin(256, tk);
+    out->has_seed = num(field(r, "seed"), &v);
+    out->seed = 0;
+    if (out->has_seed) {
+        // any integer an i64 holds (a negative one wraps to its u64 bits)
+        if (!(v >= -0x1p63 && v < 0x1p63) || v != floor(v)) return "BadSeed";
+        out->seed = (uint64_t)(int64_t)v;
+    }
+    return OK;
+}
+
 static Err handle(Engine *e, Arena *a, Conn *c, Req *h, Str body, Fmt fmt, Work *w) {
     JValue *r;
     Str model_name;
@@ -1043,15 +1076,11 @@ static Err handle(Engine *e, Arena *a, Conn *c, Req *h, Str body, Fmt fmt, Work 
     }
     TRY(tokenizer_encode(e->tok, prompt, &w->ids));
     bool thinking = forced.len == 0 && str_ends(prompt, S("<think>\n")) && !str_ends(prompt, S("</think>\n\n"));
-    double v;
-    size_t asked = num(field(r, "max_completion_tokens"), &v) ? (size_t)v : num(field(r, "max_tokens"), &v) ? (size_t)v : 4096;
-    Sampling sp;
-    sp.temperature = num(field(r, "temperature"), &v) ? (float)v : 1.0f;
-    sp.top_p = num(field(r, "top_p"), &v) ? (float)v : 0.95f;
-    // top_k below 1 (0 conventionally means no limit) samples from the 256 kept candidates
-    double tk = num(field(r, "top_k"), &v) ? v : 20;
-    sp.top_k = tk < 1 ? 256 : (size_t)fmin(256, tk);
-    if (num(field(r, "seed"), &v)) qgen_prng_init(&e->rng, (uint64_t)v);
+    ReqNumbers rn;
+    TRY(server_request_numbers(r, &rn));
+    size_t asked = rn.max_tokens;
+    Sampling sp = rn.sp;
+    if (rn.has_seed) qgen_prng_init(&e->rng, rn.seed);
     Str *stops = NULL;
     size_t n_stops = 0;
     JValue *stv = field(r, "stop");

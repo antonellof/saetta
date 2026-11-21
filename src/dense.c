@@ -320,12 +320,19 @@ static inline sx_arg offa(sx_arg a, size_t floats) {
 
 // ---- profiling (SAETTA_PROFILE=1: every dispatch in its own command buffer) -----------------
 
+// the pipelines outside m->p, named in the report (the rest of them stay "other")
+enum { PROF_NX = 10 };
+static const char *const prof_x_names[PROF_NX] = {"qmmh_4_32", "to_half", "dq_f16_4_32", "mmh_dense", "dq_bf16_f16",
+                                                  "attn_fl_q6h", "attn_fl_6_q8", "dq_f16_gen", "qmmh_gen", "qmm_gen"};
+
 static struct {
     bool on;
     double secs[NPIPES];
     uint64_t count[NPIPES];
     double other_secs;
     uint64_t other_count;
+    double x_secs[PROF_NX]; // pipelines outside m->p: the accelerator and run-time kernels
+    uint64_t x_count[PROF_NX];
 } prof;
 
 void model_prof_init(void) { prof.on = getenv("SAETTA_PROFILE") != NULL; }
@@ -333,6 +340,8 @@ void model_prof_init(void) { prof.on = getenv("SAETTA_PROFILE") != NULL; }
 void model_prof_reset(void) {
     memset(prof.secs, 0, sizeof prof.secs);
     memset(prof.count, 0, sizeof prof.count);
+    memset(prof.x_secs, 0, sizeof prof.x_secs);
+    memset(prof.x_count, 0, sizeof prof.x_count);
     prof.other_secs = 0;
     prof.other_count = 0;
 }
@@ -345,6 +354,17 @@ static void prof_add(Model *m, sx_pipeline *p, double s) {
             prof.count[i] += 1;
             return;
         }
+    const Mpp *mp = m->mpp;
+    const sx_pipeline *xs[PROF_NX] = {mp ? mp->dense : NULL, mp ? mp->to_half : NULL, mp ? mp->dq : NULL,
+                                      mp ? mp->mmh : NULL,   mp ? mp->dq_bf16 : NULL, mp ? mp->attn_q6h : NULL,
+                                      mp ? mp->attn_fl : NULL, m->gen ? m->gen->dq : NULL,
+                                      m->gen ? m->gen->qmmh : NULL, m->gen ? m->gen->qmm : NULL};
+    for (size_t i = 0; i < PROF_NX; i++)
+        if (xs[i] && xs[i] == p) {
+            prof.x_secs[i] += s;
+            prof.x_count[i] += 1;
+            return;
+        }
     prof.other_secs += s;
     prof.other_count += 1;
 }
@@ -353,18 +373,23 @@ void model_prof_report(size_t tokens) {
     if (!prof.on) return;
     double total = prof.other_secs;
     for (size_t i = 0; i < NPIPES; i++) total += prof.secs[i];
+    for (size_t i = 0; i < PROF_NX; i++) total += prof.x_secs[i];
     char a[64];
     fmt_fixed(a, sizeof a, total * 1e3 / (double)tokens, 2);
     dbg("profile: GPU time per token by kernel (%zu tokens), total %s ms/token\n", tokens, a);
     for (size_t i = 0; i < NPIPES; i++)
         if (prof.count[i] > 0) {
             fmt_fixed(a, sizeof a, prof.secs[i] * 1e3 / (double)tokens, 3);
-            dbg("  %14s %8s ms/token  %5llu dispatches/token\n", pipe_names[i], a,
-                (unsigned long long)(prof.count[i] / tokens));
+            dbg("  %14s %8s ms/token  %8llu dispatches\n", pipe_names[i], a, (unsigned long long)prof.count[i]);
+        }
+    for (size_t i = 0; i < PROF_NX; i++)
+        if (prof.x_count[i] > 0) {
+            fmt_fixed(a, sizeof a, prof.x_secs[i] * 1e3 / (double)tokens, 3);
+            dbg("  %14s %8s ms/token  %8llu dispatches\n", prof_x_names[i], a, (unsigned long long)prof.x_count[i]);
         }
     if (prof.other_count > 0) {
         fmt_fixed(a, sizeof a, prof.other_secs * 1e3 / (double)tokens, 3);
-        dbg("  other (matmuls) %7s ms/token  %5llu dispatches/token\n", a, (unsigned long long)(prof.other_count / tokens));
+        dbg("  other (matvecs) %7s ms/token  %8llu dispatches\n", a, (unsigned long long)prof.other_count);
     }
 }
 

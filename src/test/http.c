@@ -164,3 +164,57 @@ TEST(http_peer_gone) {
     close(p.c->fd);
     free(p.c);
 }
+
+static bool send_all(int fd, Str s) {
+    size_t off = 0;
+    while (off < s.len) {
+        ssize_t n = write(fd, s.ptr + off, s.len - off);
+        if (n <= 0) return false;
+        off += (size_t)n;
+    }
+    return true;
+}
+
+// The body arrives after the head was read, and a body larger than the read buffer: the
+// target and the Expect value parsed from the head survive the body reads, which refill
+// the read buffer from its start.
+TEST(http_head_survives_the_body_read) {
+    for (int big = 0; big < 2; big++) {
+        size_t blen = big ? 3 * HTTP_RBUF + 17 : 40;
+        Buf req = {0};
+        buf_printf(&req, "POST /v1/messages/count_tokens HTTP/1.1\r\nExpect: 100-continue\r\nContent-Length: %zu\r\n\r\n", blen);
+        Pair p;
+        EXPECT(pair_open(&p, buf_str(&req), false));
+        buf_free(&req);
+        Req h;
+        Err e = http_receive_head(p.c, &h);
+        EXPECT_OK(e);
+        Buf body = {0}, b = {0};
+        for (size_t i = 0; i < blen; i++) buf_addc(&body, (char)('a' + i % 26));
+        // a writer thread is not needed for the small body; the big one is written in
+        // pieces between reads, as the socket buffer is smaller than the body
+        Err be = OK;
+        if (!big) {
+            EXPECT(send_all(p.peer, buf_str(&body)));
+            be = http_read_body(p.c, &h, 1 << 26, &b);
+        } else {
+            Req hh = h;
+            size_t sent = 0;
+            hh.content_length = 0;
+            while (sent < blen && !be) {
+                size_t k = MIN((size_t)8192, blen - sent);
+                EXPECT(send_all(p.peer, str_sub(buf_str(&body), sent, sent + k)));
+                hh.content_length = k;
+                be = http_read_body(p.c, &hh, 1 << 26, &b);
+                sent += k;
+            }
+        }
+        EXPECT_OK(be);
+        EXPECT_STR(buf_str(&b), buf_str(&body));
+        EXPECT_STR(h.target, S("/v1/messages/count_tokens"));
+        EXPECT_STR(h.expect, S("100-continue"));
+        buf_free(&body);
+        buf_free(&b);
+        pair_close(&p);
+    }
+}

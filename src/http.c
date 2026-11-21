@@ -290,9 +290,9 @@ Err http_receive_head(Conn *c, Req *h) {
         if (a >= 0 && (b < 0 || a + 2 <= b)) end = (size_t)a + 4;
         else if (b >= 0) end = (size_t)b + 2;
         if (end > 0) {
-            Str head = {buf.ptr, end};
+            memcpy(c->head, buf.ptr, end);
             c->rpos += end;
-            return http_parse_head(head, h);
+            return http_parse_head((Str){c->head, end}, h);
         }
         if (buf.len >= HTTP_RBUF) return "HttpHeadersOversize";
         int r = conn_fill(c);

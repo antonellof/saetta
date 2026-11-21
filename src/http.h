@@ -17,6 +17,9 @@ typedef struct {
     int fd;
     char rbuf[HTTP_RBUF];
     size_t rpos, rend;
+    // the request head, copied out of rbuf (which the body reads refill): Req's strings
+    // point here and stay valid for the whole request
+    char head[HTTP_RBUF];
     char wbuf[HTTP_WBUF];
     size_t wlen;
     bool wfail;
@@ -46,7 +49,8 @@ void conn_init(Conn *c, int fd); // no deadline
 // "HttpHeadersInvalid", "UnknownHttpMethod", "HttpHeaderContinuationsUnsupported",
 // "InvalidContentLength", "HttpTransferEncodingUnsupported", "MissingFinalNewline".
 Err http_parse_head(Str bytes, Req *h);
-// Reads and parses one request head (at most HTTP_RBUF bytes). Errors: parse errors,
+// Reads and parses one request head (at most HTTP_RBUF bytes) into c->head, so h's strings
+// survive the body reads. Errors: parse errors,
 // "HttpHeadersOversize", "HttpConnectionClosing" (closed before any byte),
 // "HttpRequestTruncated", "ReadFailed", "RequestTimeout".
 Err http_receive_head(Conn *c, Req *h);

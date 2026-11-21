@@ -89,11 +89,20 @@ SplitPoll split_poll(Splitter *sp, bool final) {
         if (closed < 0) return r;
     }
     Str ans = split_answer(sp);
-    Str body = str_sub(ans, lead_ws(ans), ans.len);
+    size_t lead = lead_ws(ans);
+    Str body = str_sub(ans, lead, ans.len);
     ptrdiff_t tool = toolcall_start(body);
     size_t upto = tool >= 0 ? (size_t)tool : body.len;
-    size_t n = (tool >= 0 || final) ? trim_end_len(str_sub(body, 0, upto))
-                                    : split_stable(body, S("<tool_call>"), sp->stops, sp->n_stops);
+    size_t n;
+    if (tool >= 0 || final) n = trim_end_len(str_sub(body, 0, upto));
+    else {
+        // a possible stop string start is held back in the raw answer, where split_cut_stop
+        // looks for it (a stop string may begin with the whitespace body leaves out)
+        size_t hold = 0;
+        for (size_t i = 0; i < sp->n_stops; i++) hold = MAX(hold, prefix_tail(ans, sp->stops[i]));
+        size_t keep = ans.len - hold > lead ? ans.len - hold - lead : 0;
+        n = split_stable(str_sub(body, 0, keep), S("<tool_call>"), NULL, 0);
+    }
     if (n > sp->sent_content) {
         r.content = str_sub(body, sp->sent_content, n);
         sp->sent_content = n;

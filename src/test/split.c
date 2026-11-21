@@ -149,3 +149,30 @@ TEST(split_stable_prefix) {
     EXPECT_EQ(split_stable(S("x \xe2\x9c"), S("</think>"), NULL, 0), 1);
     EXPECT_EQ(split_stable(S("x \xe2\x9c\x93"), S("</think>"), NULL, 0), 5);
 }
+
+// Stop strings that begin with whitespace (which the streamed content leaves out at its
+// start): across every chunk boundary the stream sends exactly the non-streamed answer.
+TEST(split_whitespace_leading_stop_strings) {
+    const Str stops[2] = {S("\nObservation"), S("  END")};
+    static const char *const texts[] = {"\nObservation: x", "Hi.\nObservation: x", "\n\nHi  ENDING", "  END", "a\nObs b"};
+    static const char *const want[] = {"", "Hi.", "\n\nHi", "", "a\nObs b"};
+    for (size_t t = 0; t < COUNT(texts); t++) {
+        Str text = str(texts[t]);
+        for (size_t i = 1; i <= text.len; i++) {
+            Splitter sp = {.stops = stops, .n_stops = 2};
+            Sent s = {0};
+            for (size_t k = 0; k < text.len; k += i) {
+                buf_addstr(&sp.text, str_sub(text, k, MIN(k + i, text.len)));
+                if (split_cut_stop(&sp)) break;
+                feed(&sp, &s, S(""));
+            }
+            finish(&sp, &s);
+            // the non-streamed answer: the cut text, trimmed
+            Str whole = str_trim(buf_str(&sp.text));
+            EXPECT_STR(buf_str(&s.content), whole);
+            Str w = str_trim(str(want[t]));
+            EXPECT_STR(buf_str(&s.content), w);
+            sent_free(&s, &sp);
+        }
+    }
+}

@@ -138,7 +138,7 @@ Flash-Next on an M5 Max with 128 GB, a six-request coding-agent workload, second
 | edit (tool call, 400 tokens out) | 18,243 | 10.09 / 12.91 | 9.37 / 12.25 | 10.14 / 13.19 |
 | sum of totals | | 79.6 | 76.5 | 77.5 |
 
-Answers at 78 to 85 (full) and 66 to 75 (Coder) tokens/s, 142 tokens/s on the edit with speculation (Strata 130). Answer lengths differ between engines (cold 4K: 130 tokens against Strata's 102), which accounts for most of the gap on the short requests. Qwen3.8-27B: prompts at 926 tokens/s (4K) to 761 (64K); answers at 31 ms/token on the 4-bit pack, 19 ms/token on `27b-turbo` with its MTP head (short prompts; 25 ms/token at 16K).
+Answers at 78 to 85 (full) and 66 to 75 (Coder) tokens/s, 142 tokens/s on the edit with speculation (Strata 130). Answer lengths differ between engines (cold 4K: 130 tokens against Strata's 102), which accounts for most of the gap on the short requests. Qwen3.8-27B: prompts at 940 tokens/s (4K) to 787 (64K); answers at 31 ms/token on the 4-bit pack, 19 ms/token on `27b-turbo` with its MTP head (short prompts; 25 ms/token at 16K).
 
 ## Build from source
 

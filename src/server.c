@@ -650,9 +650,11 @@ typedef struct {
     int status;
 } Work;
 
-// A request whose client has disconnected stops: checked after each prefill chunk and every
-// GONE_EVERY decode steps from this loop (one non-blocking recv peek, never inside the
-// model's per-token path), so a non-streamed request does not run on to max_tokens.
+// A non-streamed request whose client has disconnected stops: checked after each prefill
+// chunk and every GONE_EVERY decode steps from this loop (one non-blocking recv peek, never
+// inside the model's per-token path), so it does not run on to max_tokens. A stream finds a
+// gone client by its failing writes (keep-alives during prefill), and is not peeked: a
+// client that half-closes after its request must still get the whole stream.
 #define GONE_EVERY 16
 
 // Prefill hook: a prefix point every PT_EVERY tokens, the monitor's progress, a stream's
@@ -674,7 +676,7 @@ static Err hook_chunk_done(void *ctx, size_t pos) {
     }
     atomic_store_explicit(&h->e->st->prompt_done, (uint32_t)pos, memory_order_release);
     if (h->out) TRY(out_keep_alive(h->out, 0));
-    if (conn_peer_gone(h->c)) return "ClientGone";
+    if (!h->out && conn_peer_gone(h->c)) return "ClientGone";
     return OK;
 }
 
@@ -776,7 +778,7 @@ static Err generate_reply(Engine *e, Arena *a, Conn *c, Req *h, Work *w, JValue 
             TRY(out_keep_alive(out, 5000));
         }
         if (n_gen >= max_tokens) break;
-        if (n_gen % GONE_EVERY == 0 && conn_peer_gone(c)) return "ClientGone";
+        if (!out && n_gen % GONE_EVERY == 0 && conn_peer_gone(c)) return "ClientGone";
         lookup_push(lk, t);
         if (qi < qn) {
             next = queue[qi];

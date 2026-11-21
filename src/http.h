@@ -67,8 +67,10 @@ int http_error_status(Err e);
 Err conn_write(Conn *c, const void *p, size_t n);
 Err conn_writes(Conn *c, const char *s);
 Err conn_flush(Conn *c);
-// True when the peer has closed the connection or it failed: one non-blocking recv peek
-// (a client that half-closes its side after the request also reads as gone).
+// True when the peer has closed the connection or it failed: one non-blocking recv peek.
+// Limitation: a client that half-closes (shutdown(SHUT_WR)) after sending its request reads
+// exactly like one that left (recv returns 0 either way), so it also counts as gone; the
+// server peeks only for non-streamed requests.
 bool conn_peer_gone(Conn *c);
 
 // 100 Continue for a request that expects it. Errors: "HttpExpectationFailed" (another

@@ -176,6 +176,12 @@ static const char *const pipe_names[] = {
 #define NPIPES COUNT(pipe_names)
 static_assert(sizeof(Pipes) == NPIPES * sizeof(sx_pipeline *));
 
+// An env switch is on when set to anything but "" or "0".
+static bool env_on(const char *k) {
+    const char *v = getenv(k);
+    return v && v[0] && strcmp(v, "0") != 0;
+}
+
 Err model_load(Arena *arena, const Pack *pack, Gpu *g, Model **out) {
     Pipes pipes;
     sx_pipeline **pp = (sx_pipeline **)&pipes;
@@ -188,7 +194,7 @@ Err model_load(Arena *arena, const Pack *pack, Gpu *g, Model **out) {
             if (gpu_pipeline(g, mpp_src, "dq_f16_4_32", &mp.dq)) mp.dq = NULL;
             if (gpu_pipeline(g, mpp_src, "dq_bf16_f16", &mp.dq_bf16)) mp.dq_bf16 = NULL;
             mp.attn_qb = 8;
-            if (getenv("SAETTA_ATTN27_SIMD") == NULL &&
+            if (!env_on("SAETTA_ATTN27_SIMD") &&
                 (gpu_pipeline(g, attn27_src, "attn_fl_q6h", &mp.attn_q6h) || gpu_pipeline(g, attn27_src, "attn_fl_6_q8", &mp.attn_fl))) {
                 dbg("model: accelerator prompt attention unavailable, attn_full_6h serves every chunk\n");
                 mp.attn_q6h = mp.attn_fl = NULL;

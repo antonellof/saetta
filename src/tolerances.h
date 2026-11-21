@@ -151,5 +151,8 @@
 // against the exact f64 softmax 3.6e-3 (half q at the largest logits), where verify's prefill
 // KL gate applies.
 #define TOL_ATTN27_REL 1e-3 // f64
+// The same kernel against the exact f64 softmax (no mirrored roundings): measured 3.6e-3,
+// bounded so a wrong assumption shared by kernel and mirror still fails the test.
+#define TOL_ATTN27_EXACT_REL 1e-2
 
 #endif

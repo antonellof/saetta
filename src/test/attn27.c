@@ -99,6 +99,7 @@ TEST(attn27_flash) {
             worst = fmax(worst, cw);
             worst_exact = fmax(worst_exact, cx);
             EXPECT(cw <= TOL_ATTN27_REL);
+            EXPECT(cx <= TOL_ATTN27_EXACT_REL);
         }
         free(ref);
         free(ex);

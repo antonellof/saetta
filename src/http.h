@@ -73,6 +73,11 @@ Err conn_flush(Conn *c);
 // server peeks only for non-streamed requests.
 bool conn_peer_gone(Conn *c);
 
+// After an error response to a request whose body was not read: ends the write side and
+// reads and drops up to max_bytes of what the client still sends, for at most ms, so the
+// close does not reset the connection before the client reads the response.
+void http_drain(Conn *c, size_t max_bytes, uint32_t ms);
+
 // 100 Continue for a request that expects it. Errors: "HttpExpectationFailed" (another
 // expectation), write errors.
 Err http_write_expect_continue(Conn *c, Req *h);

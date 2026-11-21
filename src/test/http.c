@@ -218,3 +218,30 @@ TEST(http_head_survives_the_body_read) {
         pair_close(&p);
     }
 }
+
+// A refused body: the response is written, the write side ended and the client's unread
+// bytes drained, so the client reads the whole response and then end of stream.
+TEST(http_drain_after_refusal) {
+    Pair p;
+    EXPECT(pair_open(&p, S("POST / HTTP/1.1\r\nContent-Length: 100000000\r\n\r\nxxxxxxxxxxxxxxxx"), false));
+    Req h;
+    EXPECT_OK(http_receive_head(p.c, &h));
+    Buf b = {0};
+    EXPECT_ERR(http_read_body(p.c, &h, 1 << 20, &b), "BodyTooLarge");
+    EXPECT_OK(http_respond(p.c, &h, 413, S("{}"), "application/json"));
+    double t0 = now_s();
+    http_drain(p.c, 1 << 20, 300);
+    EXPECT(now_s() - t0 < 2.0);
+    char r[512];
+    size_t got = 0;
+    for (;;) {
+        ssize_t n = read(p.peer, r + got, sizeof r - 1 - got);
+        if (n <= 0) break;
+        got += (size_t)n;
+    }
+    r[got] = 0;
+    EXPECT(str_starts(str(r), S("HTTP/1.1 413 Content Too Large\r\n")));
+    EXPECT(strstr(r, "\r\n\r\n{}") != NULL);
+    buf_free(&b);
+    pair_close(&p);
+}

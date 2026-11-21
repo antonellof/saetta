@@ -413,6 +413,19 @@ int http_error_status(Err e) {
     return 400;
 }
 
+void http_drain(Conn *c, size_t max_bytes, uint32_t ms) {
+    shutdown(c->fd, SHUT_WR);
+    c->deadline_ns = now_ns() + (uint64_t)ms * 1000000ull;
+    c->timed_out = false;
+    size_t got = 0;
+    while (got < max_bytes) {
+        c->rpos = c->rend = 0;
+        if (conn_fill(c) <= 0) break;
+        got += c->rend;
+    }
+    c->rpos = c->rend = 0;
+}
+
 // ---- responses ---------------------------------------------------------------------------------
 
 Err http_write_expect_continue(Conn *c, Req *h) {

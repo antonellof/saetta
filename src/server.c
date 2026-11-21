@@ -1181,7 +1181,10 @@ static Err connection(Engine *e, int fd) {
                 dbg("request: %s\n", be);
                 int status = http_error_status(be);
                 h.has_expect = false;
-                if (status) (void)respond_error(c, &h, status, fmt, be);
+                if (status) {
+                    // the rest of a refused body is drained (1 MB, 1 s at most) so the client sees the answer
+                    if (!respond_error(c, &h, status, fmt, be)) http_drain(c, 1u << 20, 1000);
+                }
                 buf_free(&body);
                 arena_reset(&a);
                 ret = be;

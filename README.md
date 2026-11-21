@@ -19,6 +19,7 @@
 saetta runs Qwen3.8-Flash-Next and Qwen3.8-27B on one machine, an Apple M5 Max with 128 GB, with every kernel written for it and for coding agents: long shared-prefix prompts (20K to 200K tokens), short answers, tool calls, through OpenAI- and Anthropic-compatible APIs.
 
 - **Fast:** Flash-Next reads prompts at 1,600 to 1,950 tokens/s and answers at 66 to 85 tokens/s, with speculative decoding.
+- **On par with [Strata](https://github.com/Niko1221/Strata)**, the established engine for Flash-Next on Apple Silicon: the Coder pack finishes the six-request agent workload 1 s ahead, the full pack 2 s behind, and both answer faster ([Performance](#performance)).
 - **Follow-up turns read only what is new:** a second turn on a 16K conversation answers in 0.2 s.
 - **One command to code:** `saetta start claude` (or `pi`, `opencode`).
 - **LoRA adapters** on Qwen3.8-27B, per request.
@@ -125,6 +126,10 @@ Endpoints: `POST /v1/chat/completions` (streaming, `tool_calls`, `reasoning_cont
 </p>
 
 ## Performance
+
+<p align="center">
+  <img src="docs/assets/bench-strata.svg" width="760" alt="Six-request coding workload: saetta full 79.6 s, saetta Coder 76.5 s, Strata 77.5 s total; answer speed on the edit request 142, 139 and 130 tokens/s">
+</p>
 
 Flash-Next on an M5 Max with 128 GB, a six-request coding-agent workload, seconds (first token / total):
 

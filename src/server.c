@@ -1349,7 +1349,9 @@ Err server_serve(Arena *arena, const char *dir, uint16_t port, const char *const
         TRY(session_create_cap(m, g, getenv("SAETTA_KV_F32") == NULL, MIN(CAP0, max_cap), max_cap, &e->s));
         // the context that fits this Mac's memory (fit.h): RAM less FIT_KV_RESERVE_GB less what
         // the GPU holds now (weights, scratch, the first conversation)
-        const uint64_t gib = 1ull << 30, ram = fit_ram_bytes(), used = sx_device_allocated_size(g->dev);
+        // (less the n-gram table: clean file pages the CPU reads by row, fit_pack_paged_bytes)
+        const uint64_t gib = 1ull << 30, ram = fit_ram_bytes(), alloc = sx_device_allocated_size(g->dev),
+                       paged = fit_pack_paged_bytes(pack), used = alloc > paged ? alloc - paged : alloc;
         const char *ig = getenv("SAETTA_IGNORE_MEMORY");
         if (ram && !(ig && strcmp(ig, "0") != 0)) {
             const uint64_t budget = ram > used + (uint64_t)FIT_KV_RESERVE_GB * gib ? ram - used - (uint64_t)FIT_KV_RESERVE_GB * gib : 0;
@@ -1358,7 +1360,7 @@ Err server_serve(Arena *arena, const char *dir, uint16_t port, const char *const
             // (session_grow), so the last step holds about twice the final size
             size_t fit = max_cap;
             while (fit > c0 && 2 * session_conv_bytes(e->s, fit) - have > budget) fit -= SESSION_CTX_ALIGN;
-            if (2 * have > budget + have)
+            if (budget == 0)
                 dbg("saetta: warning: this Mac's memory (%llu GB) is short even for a %zu-token context; expect swapping\n",
                     (unsigned long long)(ram / gib), c0);
             if (fit < max_cap) {

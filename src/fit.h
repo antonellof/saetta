@@ -21,6 +21,11 @@ uint64_t fit_pack_bytes(const Pack *pack);
 // Prints the download packs that fit a Mac with `ram` bytes.
 void fit_suggest(uint64_t ram);
 
+// Bytes of tensors the CPU reads a row at a time from the mapped files (Flash-Next's n-gram
+// table, 29.8 GiB in the full pack): clean file pages macOS can reclaim, so the context budget
+// does not count them although Metal's allocated size does.
+uint64_t fit_pack_paged_bytes(const Pack *pack);
+
 // "NotEnoughMemory" (after a message naming the memory it needs) when the pack's weights plus
 // FIT_RESERVE_GB exceed this Mac's memory; SAETTA_IGNORE_MEMORY=1 loads it anyway.
 Err fit_check_pack(const Pack *pack);

@@ -553,6 +553,7 @@ static Err run_in(Arena *a, const char *const *args, size_t n) {
     const char *ig = getenv("SAETTA_IGNORE_MEMORY");
     const bool ignore = ig && strcmp(ig, "0") != 0;
     if (strcmp(which, "all") == 0) {
+        size_t got = 0;
         for (size_t i = 0; i < DOWNLOAD_NFLASH; i++) {
             const DownloadPack *p = &download_packs[i];
             if (ram && !ignore && ((uint64_t)p->min_ram_gb << 30) > ram) {
@@ -561,8 +562,9 @@ static Err run_in(Arena *a, const char *const *args, size_t n) {
                 continue;
             }
             TRY(one(a, p, token, jobs));
+            got++;
         }
-        return OK;
+        return got ? OK : "NotEnoughMemory";
     }
     const DownloadPack *p = download_find(which);
     if (!p) {

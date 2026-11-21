@@ -10,6 +10,7 @@
 #include "fit.h"
 #include "json.h"
 #include "model_arch.h"
+#include "xcache.h"
 
 static const ModelArch *const archs[] = {&flash_arch, &dense_arch, &dsv4_arch};
 
@@ -53,8 +54,7 @@ Err model_fit_check(Arena *a, const Pack *pack) {
     if (!A) return OK;
     // packs that stream their experts from the SSD are larger than memory by design: DeepSeek-V4-Flash,
     // and Flash-Next with an expert cache (SAETTA_EXPERT_CACHE_GB above 0, as xcache.c reads it)
-    const char *xc = getenv("SAETTA_EXPERT_CACHE_GB");
-    if (strstr(A->info.model_type, "deepseek") != NULL || (xc && atof(xc) > 0)) return OK;
+    if (strstr(A->info.model_type, "deepseek") != NULL || xc_requested_bytes() > 0) return OK;
     return fit_check_pack(pack);
 }
 

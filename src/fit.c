@@ -23,6 +23,15 @@ uint64_t fit_pack_bytes(const Pack *pack) {
     return n;
 }
 
+uint64_t fit_pack_paged_bytes(const Pack *pack) {
+    uint64_t n = 0;
+    Str key;
+    void *val;
+    for (size_t it = 0; strmap_next(&pack->tensors, &it, &key, &val);)
+        if (str_find(key, S("ngram_embedding"), 0) >= 0) n += ((const TensorInfo *)val)->nbytes;
+    return n;
+}
+
 static bool ignore_memory(void) {
     const char *v = getenv("SAETTA_IGNORE_MEMORY");
     return v != NULL && strcmp(v, "0") != 0;

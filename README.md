@@ -32,7 +32,7 @@ saetta download coder    # 76 GB into ~/Models, resumable, hash-checked
 saetta start claude      # or: saetta start pi, saetta start opencode
 ```
 
-Needs an M5 Max with 128 GB and macOS 27.2 or later. Update with `saetta update`. `SAETTA_PREFIX` changes the install folder, `SAETTA_VERSION=0.9.0` pins a release, `HF_TOKEN` raises Hugging Face's limits.
+Needs an M5 Max with 128 GB and macOS 27.2 or later. Update with `saetta update`. `SAETTA_PREFIX` changes the install folder, `SAETTA_VERSION=0.10.0` pins a release, `HF_TOKEN` raises Hugging Face's limits.
 
 ## Models
 

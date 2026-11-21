@@ -17,6 +17,7 @@
 #include "chat.h"
 #include "download.h"
 #include "gpu.h"
+#include "http.h"
 #include "instance.h"
 #include "json.h"
 #include "metal/shim.h"
@@ -269,393 +270,9 @@ static void publish_convs(Engine *e) {
 // Room for one more prefix point (2 GB kept free under the GPU working-set limit).
 static bool point_room(Engine *e) { return room_for(e, 128ull << 20, 2ull << 30); }
 
-// ---- the connection guard --------------------------------------------------------------------
-
-// Drops a connection whose socket read or write has been blocked too long. The server serves
-// one connection at a time, so a client that connects and sends nothing, or stops reading its
-// stream, would otherwise hold up every other request forever. Each socket call counts seq
-// up on entry and on exit (odd: inside a call); the guard thread samples it, and when it stays
-// odd and unchanged past the limit it shuts the socket down, so the blocked call returns
-// end of stream or a write error and the connection ends normally.
-#define READ_LIMIT_MS 30000u  // head and body of a request: a client sends them at once
-#define WRITE_LIMIT_MS 60000u // a streamed answer the client does not read
-#define TICK_MS 500u
-
-static struct {
-    _Atomic uint64_t seq;
-    _Atomic uint32_t limit_ms;
-    _Atomic int32_t fd;
-    _Atomic bool busy;
-} guard = {0, READ_LIMIT_MS, -1, false};
-
-static void guard_enter(uint32_t limit_ms) {
-    atomic_store_explicit(&guard.limit_ms, limit_ms, memory_order_release);
-    atomic_fetch_add_explicit(&guard.seq, 1, memory_order_acq_rel);
+static Err json_respond(Conn *c, Req *h, int status, Str body) {
+    return http_respond(c, h, status, body, "application/json");
 }
-static void guard_leave(void) { atomic_fetch_add_explicit(&guard.seq, 1, memory_order_acq_rel); }
-
-static void guard_attach(int fd) { atomic_store(&guard.fd, fd); }
-
-// Before the socket closes: the guard is not shutting down this descriptor, and never
-// will (the number may be reused by the next accept).
-static void guard_detach(void) {
-    atomic_store(&guard.fd, -1);
-    while (atomic_load(&guard.busy)) __builtin_arm_yield();
-}
-
-static void *guard_loop(void *arg) {
-    (void)arg;
-    uint64_t last = 0;
-    uint32_t stalled_ms = 0;
-    for (;;) {
-        struct timespec ts = {0, (long)TICK_MS * 1000000L};
-        nanosleep(&ts, NULL);
-        uint64_t s = atomic_load_explicit(&guard.seq, memory_order_acquire);
-        stalled_ms = ((s & 1) == 1 && s == last) ? stalled_ms + TICK_MS : 0;
-        last = s;
-        uint32_t limit = atomic_load_explicit(&guard.limit_ms, memory_order_acquire);
-        if (stalled_ms < limit) continue;
-        stalled_ms = 0;
-        // busy before fd: detach either sees busy and waits, or has cleared fd first
-        atomic_store(&guard.busy, true);
-        int fd = atomic_load(&guard.fd);
-        if (fd >= 0 && atomic_load_explicit(&guard.seq, memory_order_acquire) == s) {
-            shutdown(fd, SHUT_RDWR);
-            dbg("connection: no %s for %u s, dropped\n", limit == READ_LIMIT_MS ? "request" : "reader", limit / 1000);
-        }
-        atomic_store(&guard.busy, false);
-    }
-    return NULL;
-}
-
-// ---- HTTP/1.1 (the parts of std.http.Server the engine used) ----------------------------------
-
-typedef enum { M_GET, M_HEAD, M_POST, M_PUT, M_DELETE, M_CONNECT, M_OPTIONS, M_TRACE, M_PATCH, M_QUERY } Method;
-static const char *const method_names[] = {"GET", "HEAD", "POST", "PUT", "DELETE", "CONNECT", "OPTIONS", "TRACE", "PATCH", "QUERY"};
-
-#define RBUF (1 << 16)
-#define WBUF (1 << 16)
-
-typedef struct {
-    int fd;
-    char rbuf[RBUF];
-    size_t rpos, rend;
-    char wbuf[WBUF];
-    size_t wlen;
-    bool wfail;
-} Conn;
-
-typedef struct {
-    Method method;
-    Str target;
-    bool has_expect;
-    Str expect;
-    bool has_length;
-    uint64_t content_length;
-    bool chunked;
-} Req;
-
-// Reads more bytes into rbuf (compacting it first when full). 1: read, 0: end of stream,
-// -1: read error.
-static int conn_fill(Conn *c) {
-    if (c->rend == RBUF) {
-        memmove(c->rbuf, c->rbuf + c->rpos, c->rend - c->rpos);
-        c->rend -= c->rpos;
-        c->rpos = 0;
-        if (c->rend == RBUF) return -1;
-    }
-    for (;;) {
-        guard_enter(READ_LIMIT_MS);
-        ssize_t n = recv(c->fd, c->rbuf + c->rend, RBUF - c->rend, 0);
-        guard_leave();
-        if (n < 0 && errno == EINTR) continue;
-        if (n < 0) return -1;
-        if (n == 0) return 0;
-        c->rend += (size_t)n;
-        return 1;
-    }
-}
-
-static Err conn_flush(Conn *c) {
-    if (c->wfail) return "WriteFailed";
-    size_t off = 0;
-    while (off < c->wlen) {
-        guard_enter(WRITE_LIMIT_MS);
-        ssize_t n = send(c->fd, c->wbuf + off, c->wlen - off, 0);
-        guard_leave();
-        if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) {
-            c->wfail = true;
-            c->wlen = 0;
-            return "WriteFailed";
-        }
-        off += (size_t)n;
-    }
-    c->wlen = 0;
-    return OK;
-}
-
-static Err conn_write(Conn *c, const void *p, size_t n) {
-    const char *s = p;
-    while (n > 0) {
-        if (c->wlen == WBUF) TRY(conn_flush(c));
-        size_t k = MIN(n, WBUF - c->wlen);
-        memcpy(c->wbuf + c->wlen, s, k);
-        c->wlen += k;
-        s += k;
-        n -= k;
-    }
-    return c->wfail ? "WriteFailed" : OK;
-}
-static Err conn_writes(Conn *c, const char *s) { return conn_write(c, s, strlen(s)); }
-
-static bool ieq(Str a, const char *b) {
-    size_t n = strlen(b);
-    if (a.len != n) return false;
-    for (size_t i = 0; i < n; i++) {
-        char x = a.ptr[i], y = b[i];
-        if (x >= 'A' && x <= 'Z') x = (char)(x + 32);
-        if (y >= 'A' && y <= 'Z') y = (char)(y + 32);
-        if (x != y) return false;
-    }
-    return true;
-}
-
-static Str trim_set(Str s, const char *set) {
-    size_t b = 0, e = s.len;
-    while (b < e && strchr(set, s.ptr[b])) b++;
-    while (e > b && strchr(set, s.ptr[e - 1])) e--;
-    return (Str){s.ptr + b, e - b};
-}
-
-static bool content_encoding_known(Str s) {
-    static const char *const names[] = {"zstd", "gzip", "x-gzip", "deflate", "compress", "x-compress", "identity"};
-    for (size_t i = 0; i < COUNT(names); i++)
-        if (str_eqz(s, names[i])) return true;
-    return false;
-}
-
-// std.http.Server.Request.Head.parse.
-static Err parse_head(Str bytes, Req *h) {
-    memset(h, 0, sizeof *h);
-    size_t pos = 0;
-    ptrdiff_t eol = str_find(bytes, S("\r\n"), 0);
-    Str first = eol < 0 ? bytes : str_sub(bytes, 0, (size_t)eol);
-    pos = eol < 0 ? bytes.len + 2 : (size_t)eol + 2;
-    if (first.len < 10) return "HttpHeadersInvalid";
-    ptrdiff_t method_end = str_find_char(first, ' ', 0);
-    if (method_end < 0) return "HttpHeadersInvalid";
-    Str mname = str_sub(first, 0, (size_t)method_end);
-    bool found = false;
-    for (size_t i = 0; i < COUNT(method_names); i++)
-        if (str_eqz(mname, method_names[i])) {
-            h->method = (Method)i;
-            found = true;
-        }
-    if (!found) return "UnknownHttpMethod";
-    ptrdiff_t version_start = -1;
-    for (size_t i = first.len; i > 0; i--)
-        if (first.ptr[i - 1] == ' ') {
-            version_start = (ptrdiff_t)i - 1;
-            break;
-        }
-    if (version_start == method_end) return "HttpHeadersInvalid";
-    Str version = str_sub(first, (size_t)version_start + 1, first.len);
-    if (version.len != 8) return "HttpHeadersInvalid";
-    if (!str_eqz(version, "HTTP/1.0") && !str_eqz(version, "HTTP/1.1")) return "HttpHeadersInvalid";
-    h->target = str_sub(first, (size_t)method_end + 1, (size_t)version_start);
-    bool has_compression = false;
-    while (pos <= bytes.len) {
-        ptrdiff_t e = str_find(bytes, S("\r\n"), pos);
-        Str line = e < 0 ? str_sub(bytes, pos, bytes.len) : str_sub(bytes, pos, (size_t)e);
-        pos = e < 0 ? bytes.len + 1 : (size_t)e + 2;
-        if (line.len == 0) return OK;
-        if (line.ptr[0] == ' ' || line.ptr[0] == '\t') return "HttpHeaderContinuationsUnsupported";
-        ptrdiff_t colon = str_find_char(line, ':', 0);
-        Str name = colon < 0 ? line : str_sub(line, 0, (size_t)colon);
-        Str value = colon < 0 ? S("") : trim_set(str_sub(line, (size_t)colon + 1, line.len), " \t");
-        if (name.len == 0) return "HttpHeadersInvalid";
-        if (ieq(name, "expect")) {
-            h->has_expect = true;
-            h->expect = value;
-        } else if (ieq(name, "content-length")) {
-            if (h->has_length) return "HttpHeadersInvalid";
-            if (parse_u64(value, &h->content_length)) return "InvalidContentLength";
-            h->has_length = true;
-        } else if (ieq(name, "content-encoding")) {
-            if (has_compression) return "HttpHeadersInvalid";
-            Str t = trim_set(value, " ");
-            if (!content_encoding_known(t)) return "HttpTransferEncodingUnsupported";
-            has_compression = !str_eqz(t, "identity");
-        } else if (ieq(name, "transfer-encoding")) {
-            // Transfer-Encoding: second, first (read from the end)
-            Str seg[3];
-            size_t nseg = 0, end = value.len;
-            for (size_t i = value.len + 1; i > 0 && nseg < 3; i--) {
-                if (i - 1 == 0 || value.ptr[i - 2] == ',') {
-                    seg[nseg++] = str_sub(value, i - 1, end);
-                    end = i >= 2 ? i - 2 : 0;
-                }
-            }
-            size_t si = 0;
-            Str first = trim_set(seg[si], " ");
-            bool has_next = true;
-            if (str_eqz(first, "chunked") || str_eqz(first, "none")) {
-                if (h->chunked) return "HttpHeadersInvalid";
-                h->chunked = str_eqz(first, "chunked");
-                si++;
-                has_next = si < nseg;
-            }
-            if (has_next) {
-                Str t = trim_set(seg[si], " ");
-                if (!content_encoding_known(t)) return "HttpTransferEncodingUnsupported";
-                if (has_compression) return "HttpHeadersInvalid";
-                has_compression = !str_eqz(t, "identity");
-                si++;
-            }
-            if (si < nseg) return "HttpTransferEncodingUnsupported";
-        }
-    }
-    return "MissingFinalNewline";
-}
-
-// Reads one request head (std.http.Server.receiveHead): up to RBUF bytes, ending at an
-// empty line. Any failure ends the connection without a response.
-static Err receive_head(Conn *c, Req *h) {
-    for (;;) {
-        Str buf = {c->rbuf + c->rpos, c->rend - c->rpos};
-        ptrdiff_t a = str_find(buf, S("\r\n\r\n"), 0), b = str_find(buf, S("\n\n"), 0);
-        size_t end = 0;
-        if (a >= 0 && (b < 0 || a + 2 <= b)) end = (size_t)a + 4;
-        else if (b >= 0) end = (size_t)b + 2;
-        if (end > 0) {
-            Str head = {buf.ptr, end};
-            c->rpos += end;
-            return parse_head(head, h);
-        }
-        if (buf.len >= RBUF) return "HttpHeadersOversize";
-        int r = conn_fill(c);
-        if (r == 0) return buf.len == 0 ? "HttpConnectionClosing" : "HttpRequestTruncated";
-        if (r < 0) return "ReadFailed";
-    }
-}
-
-// One byte of the body stream; false at end of stream or on a read error.
-static bool conn_byte(Conn *c, char *out) {
-    if (c->rpos == c->rend) {
-        c->rpos = c->rend = 0;
-        if (conn_fill(c) <= 0) return false;
-    }
-    *out = c->rbuf[c->rpos++];
-    return true;
-}
-
-static bool conn_take(Conn *c, Buf *out, uint64_t n) {
-    while (n > 0) {
-        if (c->rpos == c->rend) {
-            c->rpos = c->rend = 0;
-            if (conn_fill(c) <= 0) return false;
-        }
-        size_t k = (size_t)MIN((uint64_t)(c->rend - c->rpos), n);
-        buf_add(out, c->rbuf + c->rpos, k);
-        c->rpos += k;
-        n -= k;
-    }
-    return true;
-}
-
-// The request body (content-length or chunked; none without either), at most limit bytes.
-static bool read_body(Conn *c, const Req *h, uint64_t limit, Buf *out) {
-    if (h->method == M_HEAD) return true;
-    if (h->chunked) {
-        for (;;) {
-            // chunk head: hex size, optional extension, CRLF (or LF)
-            uint64_t len = 0;
-            char ch;
-            int state = 0; // 0 size, 1 extension, 2 after CR
-            for (;;) {
-                if (!conn_byte(c, &ch)) return false;
-                if (state == 0) {
-                    int d;
-                    if (ch >= '0' && ch <= '9') d = ch - '0';
-                    else if (ch >= 'A' && ch <= 'Z') d = ch - 'A' + 10;
-                    else if (ch >= 'a' && ch <= 'z') d = ch - 'a' + 10;
-                    else if (ch == '\r') {
-                        state = 2;
-                        continue;
-                    } else if (ch == '\n') break;
-                    else {
-                        state = 1;
-                        continue;
-                    }
-                    uint64_t nl = len * 16 + (uint64_t)d;
-                    if (nl <= len && len != 0) return false;
-                    len = nl;
-                } else if (state == 1) {
-                    if (ch == '\r') state = 2;
-                    else if (ch == '\n') break;
-                } else {
-                    if (ch != '\n') return false;
-                    break;
-                }
-            }
-            if (len == 0) {
-                // trailers until an empty line
-                size_t line = 0;
-                for (;;) {
-                    if (!conn_byte(c, &ch)) return false;
-                    if (ch == '\n') {
-                        if (line == 0) return true;
-                        line = 0;
-                    } else if (ch != '\r') line++;
-                }
-            }
-            if (len > limit || out->len > limit - len) return false; // no wrap on a huge chunk size
-            if (!conn_take(c, out, len)) return false;
-            char r1, r2;
-            if (!conn_byte(c, &r1) || !conn_byte(c, &r2) || r1 != '\r' || r2 != '\n') return false;
-        }
-    }
-    if (!h->has_length) return true;
-    if (h->content_length > limit) return false;
-    return conn_take(c, out, h->content_length);
-}
-
-static Err write_expect_continue(Conn *c, Req *h) {
-    if (!h->has_expect) return OK;
-    if (!str_eqz(h->expect, "100-continue")) return "HttpExpectationFailed";
-    TRY(conn_writes(c, "HTTP/1.1 100 Continue\r\n\r\n"));
-    h->has_expect = false;
-    return OK;
-}
-
-static const char *phrase(int status) {
-    switch (status) {
-    case 200: return "OK";
-    case 400: return "Bad Request";
-    case 404: return "Not Found";
-    default: return "";
-    }
-}
-
-// Request.respond with keep_alive false: the whole response, then a flush.
-static Err respond(Conn *c, Req *h, int status, Str body, const char *content_type) {
-    TRY(write_expect_continue(c, h));
-    char head[256];
-    int n = snprintf(head, sizeof head, "HTTP/1.1 %d %s\r\nconnection: close\r\ncontent-length: %zu\r\n", status,
-                     phrase(status), body.len);
-    TRY(conn_write(c, head, (size_t)n));
-    if (content_type) {
-        TRY(conn_writes(c, "content-type: "));
-        TRY(conn_writes(c, content_type));
-        TRY(conn_writes(c, "\r\n"));
-    }
-    TRY(conn_writes(c, "\r\n"));
-    if (h->method != M_HEAD && body.len > 0) TRY(conn_write(c, body.ptr, body.len));
-    return conn_flush(c);
-}
-
-static Err json_respond(Conn *c, Req *h, int status, Str body) { return respond(c, h, status, body, "application/json"); }
 
 // ---- request fields ----------------------------------------------------------------------------
 
@@ -899,6 +516,35 @@ static Poll sp_poll(Splitter *sp, bool final) {
 
 typedef enum { FMT_OPENAI, FMT_ANTHROPIC } Fmt;
 
+// A request body larger than this is refused (413).
+#define BODY_LIMIT ((uint64_t)64 << 20)
+
+// The error object of either API for an HTTP status: 400 and other 4xx are the client's
+// (invalid_request_error; Anthropic request_too_large for 413), 500 the server's
+// (OpenAI server_error, Anthropic api_error).
+static void error_json(Buf *o, Fmt fmt, int status, Str msg) {
+    const char *type = status >= 500 ? (fmt == FMT_ANTHROPIC ? "api_error" : "server_error")
+                       : status == 413 && fmt == FMT_ANTHROPIC ? "request_too_large"
+                                                              : "invalid_request_error";
+    if (fmt == FMT_ANTHROPIC) {
+        buf_printf(o, "{\"type\":\"error\",\"error\":{\"type\":\"%s\",\"message\":", type);
+        chat_json_string(o, msg);
+        buf_adds(o, "}}");
+    } else {
+        buf_adds(o, "{\"error\":{\"message\":");
+        chat_json_string(o, msg);
+        buf_printf(o, ",\"type\":\"%s\"}}", type);
+    }
+}
+
+static Err respond_error(Conn *c, Req *h, int status, Fmt fmt, Err err) {
+    Buf msg = {0};
+    error_json(&msg, fmt, status, str(err));
+    Err e = json_respond(c, h, status, buf_str(&msg));
+    buf_free(&msg);
+    return e;
+}
+
 // Request body -> (OpenAI-shaped request, the model name to echo).
 static Err parse_request(Arena *a, Str body, Fmt fmt, JValue **r, Str *model) {
     JValue *raw;
@@ -1120,7 +766,7 @@ static Err generate_reply(Engine *e, Arena *a, Conn *c, Req *h, Work *w, JValue 
     (void)r;
     Out *out = NULL;
     if (stream) {
-        TRY(write_expect_continue(c, h));
+        TRY(http_write_expect_continue(c, h));
         TRY(conn_writes(c, "HTTP/1.1 200 OK\r\nconnection: close\r\ntransfer-encoding: chunked\r\ncontent-type: "
                            "text/event-stream\r\ncache-control: no-cache\r\n\r\n"));
         w->out = (Out){.a = a, .fmt = fmt, .c = c, .id = id, .created = created, .model = model_name, .last = now_ns()};
@@ -1530,13 +1176,22 @@ static Err handle(Engine *e, Arena *a, Conn *c, Req *h, Str body, Fmt fmt, Work 
 
 static Err connection(Engine *e, int fd) {
     Conn *c = xmalloc(sizeof(Conn));
-    c->fd = fd;
-    c->rpos = c->rend = c->wlen = 0;
-    c->wfail = false;
-    guard_attach(fd);
+    conn_init(c, fd);
+    c->deadline_ns = now_ns() + (uint64_t)HTTP_REQUEST_DEADLINE_MS * 1000000ull;
+    http_guard_attach(fd);
     Err ret = OK;
     Req h;
-    if (receive_head(c, &h)) goto done;
+    Err he = http_receive_head(c, &h);
+    if (he) {
+        // a malformed head is answered (431 / 400 / 408), a client that left is not
+        int status = http_error_status(he);
+        if (status) {
+            Req none = {.method = M_GET};
+            (void)respond_error(c, &none, status, FMT_OPENAI, he);
+        }
+        ret = status ? he : OK;
+        goto done;
+    }
     {
         Arena a = {0};
         Str target = h.target;
@@ -1556,18 +1211,30 @@ static Err connection(Engine *e, int fd) {
             ret = json_respond(c, &h, 200, buf_str(&mb));
             buf_free(&mb);
         } else if (h.method == M_HEAD && str_eqz(path, "/api/hello")) {
-            ret = respond(c, &h, 200, S(""), NULL); // Claude Code's startup probe
+            ret = http_respond(c, &h, 200, S(""), NULL); // Claude Code's startup probe
         } else if (h.method == M_POST && (str_eqz(path, "/v1/chat/completions") || str_eqz(path, "/v1/messages") ||
                                           str_eqz(path, "/v1/messages/count_tokens"))) {
             Fmt fmt = str_starts(path, S("/v1/messages")) ? FMT_ANTHROPIC : FMT_OPENAI;
             Buf body = {0};
-            // a client that waits for 100 Continue gets it before its body is read
-            Err ex = h.has_expect && str_eqz(h.expect, "100-continue") ? write_expect_continue(c, &h) : OK;
-            if (!ex) ex = conn_flush(c);
-            if (ex || !read_body(c, &h, 64u << 20, &body)) {
+            // a client that waits for 100 Continue gets it before its body is read (not when
+            // the body is refused anyway, or for an expectation other than 100-continue)
+            Err be = OK;
+            if (h.has_expect && !str_eqz(h.expect, "100-continue")) be = "HttpExpectationFailed";
+            else if (h.has_length && h.content_length > BODY_LIMIT) be = "BodyTooLarge";
+            else if (h.has_expect) {
+                be = http_write_expect_continue(c, &h);
+                if (!be) be = conn_flush(c);
+            }
+            if (!be) be = http_read_body(c, &h, BODY_LIMIT, &body);
+            c->deadline_ns = 0; // the request is in; generation and the answer have no deadline
+            if (be) {
+                dbg("request: %s\n", be);
+                int status = http_error_status(be);
+                h.has_expect = false;
+                if (status) (void)respond_error(c, &h, status, fmt, be);
                 buf_free(&body);
                 arena_reset(&a);
-                ret = "BodyTooLarge";
+                ret = be;
                 goto done;
             }
             Str bs = str_n(arena_dup(&a, body.ptr ? body.ptr : "", body.len + 1), body.len);
@@ -1599,7 +1266,7 @@ static Err connection(Engine *e, int fd) {
     // one request per connection (connection: close): agent sessions sharing the server
     // take turns, and an idle keep-alive connection of one never holds up the others
 done:
-    guard_detach();
+    http_guard_detach();
     free(c);
     return ret;
 }
@@ -1734,9 +1401,7 @@ Err server_serve(Arena *arena, const char *dir, uint16_t port, const char *const
     e->kwargs_default = kwd;
     st->ctx = e->s->max_cap;
     TRY(stats_spawn(st));
-    pthread_t th;
-    if (pthread_create(&th, NULL, guard_loop, NULL) != 0) return "SystemResources";
-    pthread_detach(th);
+    TRY(http_guard_spawn());
     if (listen(ls, 128) != 0) {
         Err err = err_errno(errno);
         close(ls);

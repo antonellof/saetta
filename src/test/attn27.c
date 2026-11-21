@@ -2,11 +2,15 @@
 // scalar reference in src/attn27.c, on random data (no pack needed).
 #include <math.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "../attn27.h"
 #include "../qgen.h"
 #include "../test.h"
 #include "../tolerances.h"
+
+#define STR2(x) #x
+#define STRINGIFY(x) STR2(x)
 
 #define NQ ATTN27_NQ
 #define NKV ATTN27_NKV
@@ -40,12 +44,17 @@ TEST(attn27_flash) {
         size_t qb, nsg, bk;
     } vs[] = {{"attn_fl_6_q8", 8, 8, ATTN27_BK}};
     enum { NV = COUNT(vs) };
+    // the reference mirrors the kernel's key step: ATTN27_BK must be the one in its instantiation
+    EXPECT(strstr(attn27_src, "ATTN_FL(attn_fl_6_q8, 8, 8, " STRINGIFY(ATTN27_BK) ",") != NULL);
     sx_pipeline *q6h, *fl[NV];
     EXPECT_OK(qgen_ctx_pipe(&x, attn27_src, "attn_fl_q6h", &q6h));
     for (size_t v = 0; v < NV; v++) EXPECT_OK(qgen_ctx_pipe(&x, attn27_src, vs[v].name, &fl[v]));
     // chunk at 0 (the golden prompt's 24 tokens), odd sizes, a cached prefix, long rows, peaked rows
     static const Case cases[] = {{0, 24, 1.0f},     {0, 37, 4.0f},    {5, 9, 2.0f},       {100, 300, 4.0f},
-                                 {3000, 517, 4.0f}, {127, 129, 12.0f}, {9000, 200, 24.0f}, {0, 1024, 8.0f}};
+                                 {3000, 517, 4.0f}, {127, 129, 12.0f}, {9000, 200, 24.0f}, {0, 1024, 8.0f},
+                                 // a block whose first row sees one key short of a full step: 255 keys
+                                 // (pos0 254, t0 0) and 511 (pos0 502, t0 8)
+                                 {254, 40, 4.0f},   {502, 100, 8.0f}};
     double worst = 0, worst_exact = 0;
     for (size_t ci = 0; ci < COUNT(cases); ci++) {
         const Case c = cases[ci];

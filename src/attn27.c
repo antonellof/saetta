@@ -28,6 +28,7 @@ static const char old_src[] = {
 
 void attn27_ref(const float *q, const float *qg, const _Float16 *K, const _Float16 *V, size_t pos0, size_t t,
                 size_t bk, bool mirror, float *out) {
+    if (bk == 0 || bk > ATTN27_BK_MAX) die("attn27_ref: key step %zu\n", bk);
     const size_t n = pos0 + t + 1;
     double s[ATTN27_BK_MAX], o[HD];
     for (size_t h = 0; h < NQ; h++) {

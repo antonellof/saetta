@@ -582,6 +582,14 @@ static Err run_in(Arena *a, const char *const *args, size_t n, int *code) {
             break;
         }
     }
+    // the server's rule (session_ctx_parse in src/model.h, whose Session type clashes with
+    // this file's): a multiple of 128, at least 1024
+    ctx -= ctx % 128;
+    if (ctx < 1024) {
+        dbg("saetta: --ctx / SAETTA_CTX wants at least 1024 tokens\n");
+        *code = 64;
+        return OK;
+    }
     // the model the agent asks for: the adapter's name with --lora, else the pack's base id
     bool is27 = false;
     if (pack_arg) {

@@ -908,13 +908,8 @@ Err session_create_cap(Gpu *g, bool kv_half, size_t cap, size_t max_cap, Session
 }
 
 Err session_create_kv(Gpu *g, bool kv_half, Session **out) {
-    size_t cap = 32768;
-    const char *v = getenv("SAETTA_CTX");
-    if (v) {
-        uint64_t c;
-        TRY(parse_u64(str(v), &c));
-        cap = (size_t)c;
-    }
+    size_t cap;
+    TRY(session_ctx_parse(getenv("SAETTA_CTX"), &cap));
     return session_create_cap(g, kv_half, cap, cap, out);
 }
 Err session_create(Gpu *g, Session **out) { return session_create_kv(g, false, out); }

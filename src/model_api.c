@@ -46,6 +46,20 @@ Err model_load(Arena *a, const Pack *pack, Gpu *g, Model **out) {
     return A->load(a, pack, g, out);
 }
 
+Err session_ctx_parse(const char *text, size_t *out) {
+    if (!text) {
+        *out = SESSION_CTX_DEFAULT;
+        return OK;
+    }
+    uint64_t x;
+    TRY(parse_u64(str(text), &x));
+    if (x > SESSION_CTX_MAX) return "ContextTooLarge";
+    x -= x % SESSION_CTX_ALIGN;
+    if (x < SESSION_CTX_MIN) return "ContextTooSmall";
+    *out = (size_t)x;
+    return OK;
+}
+
 const ModelInfo *model_info(const Model *m) { return &arch_of(m)->info; }
 const ModelInfo *model_info_for(Arena *a, const Pack *pack) {
     const ModelArch *A = arch_for(a, pack);

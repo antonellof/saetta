@@ -250,8 +250,17 @@ void model_prof_report(size_t tokens);
 
 // ---- Session -----------------------------------------------------------------------------
 
-// Context capacity from $SAETTA_CTX (tokens, default 32768); KV f16 unless SAETTA_KV_F32.
-// Errors: "AllocFailed", "InvalidCharacter" / "Overflow" (bad SAETTA_CTX).
+// A context capacity (tokens) from the text of $SAETTA_CTX or --ctx (NULL: the default,
+// 32768), rounded down to a multiple of SESSION_CTX_ALIGN: session_grow wants a multiple of
+// the indexer block (4) and DeepSeek-V4-Flash's compressed rows come every 128 tokens.
+// Errors: "InvalidCharacter" / "Overflow" (not a number), "ContextTooSmall" (below
+// SESSION_CTX_MIN), "ContextTooLarge" (above SESSION_CTX_MAX).
+enum { SESSION_CTX_DEFAULT = 32768, SESSION_CTX_ALIGN = 128, SESSION_CTX_MIN = 1024 };
+#define SESSION_CTX_MAX ((size_t)1 << 30)
+Err session_ctx_parse(const char *text, size_t *out);
+
+// Context capacity from $SAETTA_CTX (session_ctx_parse); KV f16 unless SAETTA_KV_F32.
+// Errors: "AllocFailed", session_ctx_parse's (bad SAETTA_CTX).
 Err session_create(const Model *m, Gpu *g, Session **out);
 Err session_create_kv(const Model *m, Gpu *g, bool kv_half, Session **out);
 // A session whose conversation buffers hold cap tokens, growable (session_grow) up to

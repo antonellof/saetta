@@ -144,15 +144,15 @@ static void route(Engine *e, const uint32_t *ids, size_t nids, int lora) {
                 goto picked;
             }
         if (e->n_conv < e->max_conv) {
-            if (room_for(e, session_conv_bytes(e->s, CAP0), 4ull << 30)) {
+            if (room_for(e, session_conv_bytes(e->s, MIN(CAP0, e->s->max_cap)), 4ull << 30)) {
                 Conv cv;
-                if (!session_new_conv(e->s, e->g, CAP0, &cv)) {
+                if (!session_new_conv(e->s, e->g, MIN(CAP0, e->s->max_cap), &cv)) {
                     e->held[e->n_conv] = cv;
                     e->has[e->n_conv] = true;
                     e->conv_lora[e->n_conv] = lora;
                     e->n_conv += 1;
                     dbg("saetta: conversation %zu opened (%s GB)\n", e->n_conv,
-                        fx((double)session_conv_bytes(e->s, CAP0) / (double)(1 << 30), 1));
+                        fx((double)session_conv_bytes(e->s, MIN(CAP0, e->s->max_cap)) / (double)(1 << 30), 1));
                     best = e->n_conv - 1;
                     goto picked;
                 }
@@ -1710,13 +1710,17 @@ Err server_serve(Arena *arena, const char *dir, uint16_t port, const char *const
     e->m = m;
     {
         // conversations start small and grow (ensure); SAETTA_CTX is the maximum
-        size_t max_cap = 32768;
+        // SAETTA_CTX rounded down to a multiple of SESSION_CTX_ALIGN, at least SESSION_CTX_MIN
+        size_t max_cap;
         const char *ctx = getenv("SAETTA_CTX");
-        if (ctx) {
-            uint64_t x;
-            TRY(parse_u64(str(ctx), &x));
-            max_cap = (size_t)x;
+        Err ce = session_ctx_parse(ctx, &max_cap);
+        if (ce) {
+            dbg("saetta: SAETTA_CTX=%s: %s (a number of tokens from %d to %zu)\n", ctx, ce, SESSION_CTX_MIN,
+                (size_t)SESSION_CTX_MAX);
+            return ce;
         }
+        if (ctx && strtoull(ctx, NULL, 10) != max_cap)
+            dbg("saetta: SAETTA_CTX=%s rounded down to %zu (a multiple of %d)\n", ctx, max_cap, SESSION_CTX_ALIGN);
         TRY(session_create_cap(m, g, getenv("SAETTA_KV_F32") == NULL, MIN(CAP0, max_cap), max_cap, &e->s));
     }
     e->tok = tok;

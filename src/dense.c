@@ -1132,13 +1132,8 @@ size_t session_kv_elem(const Session *s) { return s->kv_half ? 2 : 4; }
 Err session_create(Gpu *g, Session **out) { return session_create_kv(g, getenv("SAETTA_KV_F32") == NULL, out); }
 
 Err session_create_kv(Gpu *g, bool kv_half, Session **out) {
-    size_t cap = 32768;
-    const char *v = getenv("SAETTA_CTX");
-    if (v) {
-        uint64_t c;
-        TRY(parse_u64(str(v), &c));
-        cap = (size_t)c;
-    }
+    size_t cap;
+    TRY(session_ctx_parse(getenv("SAETTA_CTX"), &cap));
     return session_create_cap(g, kv_half, cap, cap, out);
 }
 

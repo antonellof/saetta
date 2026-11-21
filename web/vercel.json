@@ -1,6 +1,21 @@
 {
   "cleanUrls": true,
   "headers": [
-    { "source": "/assets/(.*)", "headers": [{ "key": "Cache-Control", "value": "public, max-age=604800" }] }
+    {
+      "source": "/assets/(.*)",
+      "headers": [
+        {
+          "key": "Cache-Control",
+          "value": "public, max-age=604800"
+        }
+      ]
+    }
+  ],
+  "redirects": [
+    {
+      "source": "/install.sh",
+      "destination": "https://github.com/antonellof/saetta/releases/latest/download/install.sh",
+      "permanent": false
+    }
   ]
 }

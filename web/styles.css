@@ -67,7 +67,15 @@ code, pre { font-family: var(--mono); }
 .icon-btn:hover { color: var(--fg); background: var(--card-2); }
 
 /* hero */
-.hero { padding: clamp(64px, 10vw, 112px) 0 56px; }
+.hero { position: relative; overflow: hidden; padding: clamp(64px, 10vw, 112px) 0 56px; isolation: isolate; }
+.hero > .wrap { position: relative; z-index: 1; }
+.hero-bg { position: absolute; inset: 0; width: 100%; height: 100%; z-index: -2; display: block; }
+.hero::after {
+  /* blend the background into the page below */
+  content: ""; position: absolute; inset: 0; z-index: -1; pointer-events: none;
+  background: linear-gradient(180deg, transparent 60%, var(--bg) 96%);
+}
+
 .pill {
   display: inline-flex; align-items: center; gap: 8px;
   font-size: 13px; color: var(--muted); text-decoration: none;
@@ -154,6 +162,16 @@ h2 { font-size: clamp(28px, 3.6vw, 38px); line-height: 1.12; letter-spacing: -0.
 .cell .k { font-size: 14px; font-weight: 500; margin-bottom: 6px; }
 .cell .v { font-size: 13px; color: var(--muted); line-height: 1.5; }
 
+/* monitor */
+.sub code { font-size: 0.9em; color: var(--fg); }
+.shot { margin: 0; border: 1px solid var(--border); border-radius: 10px; overflow: hidden; background: #1e1d2b; }
+.shot img { display: block; width: 100%; height: auto; aspect-ratio: 1400 / 520; object-fit: cover; object-position: top; } /* the shot's empty lower part is cut */
+.shot figcaption { padding: 10px 14px; font-size: 12px; color: var(--muted); border-top: 1px solid var(--border); background: var(--card); }
+.cells-3 { grid-template-columns: repeat(3, 1fr); }
+.cells-3 .cell { border-bottom: 0; border-right: 1px solid var(--border); }
+.cells-3 .cell:last-child { border-right: 0; }
+.cell .k code { font-size: 13px; }
+
 /* capabilities */
 .caps { display: grid; grid-template-columns: repeat(3, 1fr); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
 .cap-card { padding: 18px; border-right: 1px solid var(--border); border-bottom: 1px solid var(--border); }
@@ -224,6 +242,9 @@ td.num { font-family: var(--mono); font-size: 13px; white-space: nowrap; }
   .cap-card:last-child { border-bottom: 0 !important; }
   .agents { grid-template-columns: 1fr; }
   .links .hide-sm { display: none; }
+  .cells-3 { grid-template-columns: 1fr; }
+  .cells-3 .cell { border-right: 0 !important; border-bottom: 1px solid var(--border) !important; }
+  .cells-3 .cell:last-child { border-bottom: 0 !important; }
 }
 @media (max-width: 520px) {
   .replay-foot { grid-template-columns: 1fr; }

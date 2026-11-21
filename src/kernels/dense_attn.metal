@@ -5,8 +5,8 @@
 // Structure after qsa_flash_tr (src/kernels/qmm_mpp.metal, adapted from qwental
 // kernels/qsa_pf.metal, MIT, Copyright (c) 2026 Ong Hoe Yuan; b1be701): S = Q K^T per tile
 // on one simdgroup, K and V rows read straight into the right-operand cooperative tensors
-// (half4 per lane, the M5 lane layout), row max and row sum exchanged once each through
-// threadgroup memory, P stored as half, then each simdgroup does tot = tot * f + P V for its
+// (half4 per lane, the M5 lane layout), the row max exchanged through threadgroup memory once
+// per key step (row sums kept per lane, exchanged once at the end), P stored as half, then each simdgroup does tot = tot * f + P V for its
 // dims. Changed for the 27B: a threadgroup serves QB query tokens of one kv head, so its
 // 6 * QB query rows (token-major: row = token * 6 + head) share every K / V tile instead of
 // one token's heads; dense causal mask; queries permuted to [kv head][token][6][256] half by
@@ -79,7 +79,7 @@ inline void attn_fl(device const half *q, device const half *K, device const hal
     for (uint16_t i = 0; i < tot.get_capacity(); ++i) tot[i] = 0.0f;
     const uint r0 = ((lane >> 1) & 3) + 4 * (lane >> 4);
     const bool wr = (lane & 9) == 0;
-    float m[J], l[J];
+    float m[J], l[J]; // l: this lane's part of the row sum of rows row0 + r0 + 8 j (j < JS) until the end
     int lim[J]; // last visible key of row r0 + 8 j (-1: past the chunk)
 #pragma clang loop unroll(full)
     for (int j = 0; j < J; ++j) {
@@ -164,20 +164,10 @@ inline void attn_fl(device const half *q, device const half *K, device const hal
             }
             if (s.is_valid_element(i)) *(threadgroup half4 *)(p + (row0 + ix[1]) * BK + kg * KS + ix[0]) = e;
         }
+        // the row sums stay per lane (one exchange at the end); the barrier publishes P
 #pragma clang loop unroll(full)
-        for (int j = 0; j < JS; ++j) {
-            float v = x[j] + simd_shuffle_xor(x[j], 1);
-            v += simd_shuffle_xor(v, 8);
-            if (wr) ps[kg * R + row0 + 8 * j + r0] = v;
-        }
+        for (int j = 0; j < JS; ++j) l[j] = l[j] * f[row0 / 8 + j] + x[j];
         threadgroup_barrier(mem_flags::mem_threadgroup);
-#pragma clang loop unroll(full)
-        for (int j = 0; j < J; ++j) {
-            float z = 0.0f;
-#pragma clang loop unroll(full)
-            for (int k = 0; k < KG; ++k) z += ps[k * R + 8 * j + r0];
-            l[j] = l[j] * f[j] + z;
-        }
 #pragma clang loop unroll(full)
         for (uint16_t i = 0; i < tot.get_capacity(); ++i) tot[i] *= f[tot.get_multidimensional_index(i)[1] / 8];
         for (int cc = 0; cc < BK && c0 + cc < (int)nk; cc += 32) {
@@ -191,6 +181,21 @@ inline void attn_fl(device const half *q, device const half *K, device const hal
             auto tPh = tP.template slice<32, R>(cc, 0);
             opO.run(tPh, rv, tot);
         }
+    }
+    // row sums: lanes, then key groups
+#pragma clang loop unroll(full)
+    for (int j = 0; j < JS; ++j) {
+        float v = l[j] + simd_shuffle_xor(l[j], 1);
+        v += simd_shuffle_xor(v, 8);
+        if (wr) ps[kg * R + row0 + 8 * j + r0] = v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+#pragma clang loop unroll(full)
+    for (int j = 0; j < J; ++j) {
+        float z = 0.0f;
+#pragma clang loop unroll(full)
+        for (int k = 0; k < KG; ++k) z += ps[k * R + 8 * j + r0];
+        l[j] = z;
     }
 #pragma clang loop unroll(full)
     for (uint16_t i = 0; i < tot.get_capacity(); ++i)

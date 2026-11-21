@@ -28,7 +28,7 @@ saetta runs Qwen3.8 coding models on any Apple Silicon Mac with 32 GB of memory 
 ## Install
 
 ```sh
-curl -fsSL https://github.com/antonellof/saetta/releases/latest/download/install.sh | sh   # into ~/.local/bin
+curl -fsSL https://saetta.dev/install.sh | sh        # into ~/.local/bin
 saetta                   # guided: pick a model and a coding agent, then it downloads, installs and starts
 ```
 

@@ -1,7 +1,7 @@
 #!/bin/sh
 # saetta installer. Downloads the release binary for Apple Silicon, checks its SHA-256
 # and installs it into $SAETTA_PREFIX/bin (default ~/.local).
-#   curl -fsSL https://github.com/antonellof/saetta/releases/latest/download/install.sh | sh
+#   curl -fsSL https://saetta.dev/install.sh | sh
 # SAETTA_VERSION=0.8.1 pins a release (default: the latest). With saetta already installed by
 # Homebrew it stops (brew upgrade saetta keeps one copy); SAETTA_FORCE=1 installs anyway.
 set -eu

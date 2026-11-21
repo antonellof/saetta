@@ -22,7 +22,11 @@ if [ "$major" -lt 27 ] || { [ "$major" -eq 27 ] && [ "$minor" -lt 2 ]; }; then
   die "needs macOS 27.2 or later (this is $os)."
 fi
 mem=$(( $(sysctl -n hw.memsize) / 1073741824 ))
-[ "$mem" -ge 128 ] || say "warning: built for 128 GB of memory, this Mac has $mem GB; the model may not fit."
+if [ "$mem" -lt 32 ]; then
+  say "warning: this Mac has $mem GB of memory; the smallest model (Qwen3.8-27B 4-bit) needs 32 GB."
+elif [ "$mem" -lt 96 ]; then
+  say "this Mac has $mem GB of memory: Qwen3.8-27B fits (saetta download picks 27b-turbo); Flash-Next needs 96 GB."
+fi
 
 # one copy: a Homebrew install is upgraded by Homebrew
 if [ -z "${SAETTA_FORCE:-}" ] && command -v brew >/dev/null 2>&1 && brew list --formula saetta >/dev/null 2>&1; then

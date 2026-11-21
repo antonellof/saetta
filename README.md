@@ -2,8 +2,8 @@
   <img src="docs/assets/saetta-banner.png" alt="saetta" width="900">
 </p>
 
-<h3 align="center">Qwen3.8-Flash-Next and Qwen3.8-27B at full speed on an M5 Max.</h3>
-<p align="center">An inference engine in C and hand-written Metal, tuned for coding agents.</p>
+<h3 align="center">Local coding models for Apple Silicon Macs.</h3>
+<p align="center">Qwen3.8-27B from 32 GB of memory, Qwen3.8-Flash-Next from 96 GB. An inference engine in C and hand-written Metal, tuned for coding agents.</p>
 
 <p align="center">
   <a href="#install"><b>Install</b></a> · <a href="#models">Models</a> · <a href="#coding-agents">Coding agents</a> ·
@@ -13,12 +13,12 @@
 <p align="center">
   <a href="https://github.com/antonellof/saetta/releases/latest"><img src="https://img.shields.io/github/v/release/antonellof/saetta?label=download&color=8a3ffc" alt="Download saetta"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-f28c28" alt="MIT license"></a>
-  <img src="https://img.shields.io/badge/Apple%20Silicon-M5%20Max%20128%20GB-111" alt="Apple M5 Max 128 GB">
+  <img src="https://img.shields.io/badge/Apple%20Silicon-M1%20to%20M5%2C%2032%20GB%2B-111" alt="Apple Silicon M1 to M5, 32 GB or more">
 </p>
 
-saetta runs Qwen3.8-Flash-Next and Qwen3.8-27B on one machine, an Apple M5 Max with 128 GB, with every kernel written for it and for coding agents: long shared-prefix prompts (20K to 200K tokens), short answers, tool calls, through OpenAI- and Anthropic-compatible APIs.
+saetta runs Qwen3.8 coding models on any Apple Silicon Mac with 32 GB of memory or more, with every kernel written for coding agents: long shared-prefix prompts (20K to 200K tokens), short answers, tool calls, through OpenAI- and Anthropic-compatible APIs. It picks the model that fits your Mac. It is tuned and measured on an M5 Max with 128 GB, whose neural accelerators read prompts fastest; M1 to M4 run the same kernels on their GPU cores (not yet tested on those chips: reports welcome).
 
-- **Fast:** Flash-Next reads prompts at 1,600 to 1,950 tokens/s and answers at 66 to 85 tokens/s, with speculative decoding.
+- **Fast:** on an M5 Max, Flash-Next reads prompts at 1,600 to 1,950 tokens/s and answers at 66 to 85 tokens/s, with speculative decoding.
 - **On par with [Strata](https://github.com/Niko1221/Strata)**, the established engine for Flash-Next on Apple Silicon: the Coder pack finishes the six-request agent workload 1 s ahead, the full pack 2 s behind, and both answer faster ([Performance](#performance)).
 - **Follow-up turns read only what is new:** a second turn on a 16K conversation answers in 0.2 s.
 - **One command to code:** `saetta start claude` (or `pi`, `opencode`).
@@ -29,32 +29,29 @@ saetta runs Qwen3.8-Flash-Next and Qwen3.8-27B on one machine, an Apple M5 Max w
 
 ```sh
 curl -fsSL https://github.com/antonellof/saetta/releases/latest/download/install.sh | sh   # into ~/.local/bin
-saetta download coder    # 76 GB into ~/Models, resumable, hash-checked
+saetta download          # the model that fits this Mac, into ~/Models, resumable, hash-checked
 saetta start claude      # or: saetta start pi, saetta start opencode
 ```
 
-Or the smaller Qwen3.8-27B TURBO fine-tune, with its MTP head:
+`saetta download` picks by memory: `coder` (Flash-Next, 76 GB) with 96 GB or more, else `27b-turbo` (Qwen3.8-27B, 20 GB, converted from its GGUF: about 40 GB free disk while it runs). Any pack can be named instead (table below); one that cannot run on this Mac is refused, and the context shrinks to what memory holds.
 
-```sh
-saetta download 27b-turbo                # 20 GB pack, converted from its GGUF (needs about 40 GB free while it runs)
-saetta start claude --pack 27b-turbo
-```
-
-Needs an M5 Max with 128 GB and macOS 27.2 or later. Update with `saetta update`. `SAETTA_PREFIX` changes the install folder, `SAETTA_VERSION=0.11.0` pins a release, `HF_TOKEN` raises Hugging Face's limits.
+Needs an Apple Silicon Mac (M1 or later) with 32 GB of memory or more, and macOS 27.2 or later. Update with `saetta update`. `SAETTA_PREFIX` changes the install folder, `SAETTA_VERSION=0.11.0` pins a release, `HF_TOKEN` raises Hugging Face's limits.
 
 ## Models
 
 `saetta download <name>` fetches a pack at a pinned revision into `~/Models` (or `SAETTA_MODELS`). Commands take a pack by name (`saetta serve coder`) or folder.
 
-| name | model | on disk |
-|---|---|---|
-| **`coder`** · for agents | [Flash-Next](https://huggingface.co/mbrown-uno/Qwen3.8-Flash-Next-GSQ-RCO-Coder-MLX), 256 experts pruned for code, mixed 4/5/6/8-bit | 76 GB |
-| `full` | [Flash-Next](https://huggingface.co/mlx-community/Qwen3.8-Flash-Next-4bit-mtp), all 512 experts, 4-bit | 105 GB |
-| `27b-8bit` · with adapters | [Qwen3.8-27B](https://huggingface.co/mlx-community/Qwen3.8-27B-8bit), dense, 8-bit | 29 GB |
-| `27b-4bit` | [Qwen3.8-27B](https://huggingface.co/mlx-community/Qwen3.8-27B-4bit), dense, 4-bit | 16 GB |
-| `27b-pi` | [the pi LoRA adapter](https://huggingface.co/harness-hub/Qwen3.8-27B-pi-adapted) for Qwen3.8-27B | 0.6 GB |
-| `27b-turbo` · with MTP | [TURBO Fable Cold Fusion](https://huggingface.co/DavidAU/Qwen3.8-27B-TURBO-Fable-Cold-Fusion-735-882-Heretic-Uncensored-NEO-CODER-MAX-MTP-GGUF), a Qwen3.8-27B fine-tune with shorter thinking, from its Q4_K_M GGUF | 20 GB |
-| `27b-turbo-8bit` · with MTP | the same, from its Q8_0 GGUF | 30 GB |
+| name | model | on disk | Mac memory |
+|---|---|---|---|
+| **`coder`** · for agents | [Flash-Next](https://huggingface.co/mbrown-uno/Qwen3.8-Flash-Next-GSQ-RCO-Coder-MLX), 256 experts pruned for code, mixed 4/5/6/8-bit | 76 GB | 96 GB |
+| `full` | [Flash-Next](https://huggingface.co/mlx-community/Qwen3.8-Flash-Next-4bit-mtp), all 512 experts, 4-bit | 105 GB | 128 GB |
+| `27b-8bit` · with adapters | [Qwen3.8-27B](https://huggingface.co/mlx-community/Qwen3.8-27B-8bit), dense, 8-bit | 29 GB | 48 GB |
+| `27b-4bit` | [Qwen3.8-27B](https://huggingface.co/mlx-community/Qwen3.8-27B-4bit), dense, 4-bit | 16 GB | 32 GB |
+| `27b-pi` | [the pi LoRA adapter](https://huggingface.co/harness-hub/Qwen3.8-27B-pi-adapted) for Qwen3.8-27B | 0.6 GB | |
+| **`27b-turbo`** · with MTP | [TURBO Fable Cold Fusion](https://huggingface.co/DavidAU/Qwen3.8-27B-TURBO-Fable-Cold-Fusion-735-882-Heretic-Uncensored-NEO-CODER-MAX-MTP-GGUF), a Qwen3.8-27B fine-tune with shorter thinking, from its Q4_K_M GGUF | 20 GB | 32 GB |
+| `27b-turbo-8bit` · with MTP | the same, from its Q8_0 GGUF | 30 GB | 48 GB |
+
+On 32 GB the context is smaller: about 80K tokens with `27b-4bit`, 32K with `27b-turbo`. `SAETTA_IGNORE_MEMORY=1` skips the memory checks.
 
 Licenses: Flash-Next Qwen Community License 1.0, Qwen3.8-27B, the pi adapter and TURBO Apache-2.0; no weights are part of this repository.
 
@@ -93,7 +90,7 @@ saetta start claude -- -p "fix the failing test"   # anything after -- goes to t
 
 | option | effect |
 |---|---|
-| `--pack <name or dir>` | the model (default: the first downloaded of coder, full) |
+| `--pack <name or dir>` | the model (default: the first downloaded pack that fits this Mac: coder, full, then the 27B packs) |
 | `--lora name=adapter` | a LoRA adapter on a 27B pack |
 | `--port N`, `--ctx N` | server port (8080) and context (204800 tokens) |
 | `--keep` | leave the server running when the agent exits |
@@ -119,6 +116,8 @@ Endpoints: `POST /v1/chat/completions` (streaming, `tool_calls`, `reasoning_cont
 | `SAETTA_CTX` | 32768 | context in tokens, 1024 to 262144, rounded down to a multiple of 128 (Flash-Next about 35 KB per token, 27B 64 KB) |
 | `SAETTA_SPEC` / `SAETTA_MTP` | 1 / 1 | `0` turns speculative decoding / the MTP head off |
 | `SAETTA_KV_F32` | unset | f32 KV cache |
+| `SAETTA_IGNORE_MEMORY` | unset | `1` loads or downloads a pack this Mac's memory is too small for, and keeps the asked context |
+| `SAETTA_NO_ACCEL` | unset | `1` runs without the tensor-op (neural accelerator) kernels, for a Mac where they misbehave (slower prompt reading, same output) |
 | `SAETTA_EXPERT_CACHE_GB` | unset | experimental: keep this many GB of experts in memory, read the rest from the SSD (Flash-Next: slower than resident, same output) |
 
 <p align="center">

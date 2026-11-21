@@ -61,10 +61,11 @@ done
 if [ -n "$first" ] && [ "$first" != "$PREFIX/bin/saetta" ]; then
   say "warning: \`saetta\` runs $first, which comes first in your PATH."
 fi
-cat <<MSG
+cat <<'MSG'
 
 Next:
-  saetta download coder           # 76 GB into ~/Models or $SAETTA_MODELS (or: full, 27b-8bit)
-  saetta start claude             # or: saetta start pi, saetta start opencode
-Docs: https://github.com/$REPO
+  saetta                          # pick a model that fits this Mac and a coding agent, then it starts
+  saetta download                 # or by hand: the model that fits, into ~/Models (SAETTA_MODELS)
+  saetta start claude             #   then: saetta start claude, pi or opencode
+Docs: https://saetta.dev
 MSG

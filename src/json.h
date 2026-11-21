@@ -36,8 +36,10 @@ struct JValue {
 // J_NUMBER_STRING (std.json .parse_numbers = false); true gives J_INTEGER when the literal
 // is an integer that fits i64, else J_FLOAT (std.json's default; an integer that overflows
 // i64 or a float that overflows f64 stays J_NUMBER_STRING). Errors: "SyntaxError",
-// "UnexpectedEndOfInput", "DuplicateField" (no depth limit, as std.json); callers
+// "UnexpectedEndOfInput", "DuplicateField", "NestingTooDeep" (more than JSON_MAX_DEPTH
+// nested arrays and objects; std.json has no limit, but the writers recurse); callers
 // only test for failure. Strings, keys and number literals are copied into the arena.
+enum { JSON_MAX_DEPTH = 128 };
 Err json_parse(Arena *a, Str text, bool parse_numbers, JValue **out);
 
 // Lookup and accessors (NULL / defaults when absent or of another kind).

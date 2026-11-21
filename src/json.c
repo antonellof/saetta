@@ -303,7 +303,8 @@ static Err obj_put_checked(Arena *a, Frame *f, JValue *v) {
     return OK;
 }
 
-// The frame stack grows as needed (std.json has no depth limit; memory is O(depth)).
+// The frame stack grows as needed up to JSON_MAX_DEPTH open containers; deeper input is
+// "NestingTooDeep", so the recursive writers (json_write, chat_to_json) stay bounded.
 typedef struct {
     Frame *f;
     size_t cap, hi; // hi: frames ever used, whose maps need freeing
@@ -327,6 +328,7 @@ static Err parse_doc(Parser *ps, bool parse_numbers, Stack *st, JValue **out) {
                 ps->i++;
                 v = cont;
             } else {
+                if (depth == JSON_MAX_DEPTH) return "NestingTooDeep";
                 if (depth == st->cap) {
                     size_t nc = st->cap * 2;
                     st->f = xrealloc(st->f, nc * sizeof(Frame));

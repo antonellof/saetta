@@ -101,15 +101,11 @@ TEST(json_errors) {
     for (int k = 0; k < 100; k++) buf_printf(&b, "\"k%d\":%d,", k, k);
     buf_adds(&b, "\"k42\":0}");
     EXPECT_ERR(json_parse(&a, buf_str(&b), true, &v), "DuplicateField");
-    // No nesting limit: 2000 levels parse (std.json has none).
+    // Nesting is limited (json_depth_limit): 2000 levels fail.
     b.len = 0;
     for (int k = 0; k < 2000; k++) buf_addc(&b, '[');
     for (int k = 0; k < 2000; k++) buf_addc(&b, ']');
-    EXPECT_OK(json_parse(&a, buf_str(&b), true, &v));
-    b.len = 0;
-    for (int k = 0; k < 1000; k++) buf_addc(&b, '[');
-    for (int k = 0; k < 1000; k++) buf_addc(&b, ']');
-    EXPECT_OK(json_parse(&a, buf_str(&b), true, &v));
+    EXPECT_ERR(json_parse(&a, buf_str(&b), true, &v), "NestingTooDeep");
     // A NUL inside the input is a syntax error, an escaped one is kept.
     EXPECT(json_parse(&a, str_n("[1]\0", 4), true, &v) != OK);
     EXPECT_OK(json_parse(&a, S("\"a\\u0000b\""), true, &v));
@@ -139,16 +135,34 @@ TEST(json_duplicate_reported_at_value) {
     arena_reset(&a);
 }
 
-// No nesting limit, as std.json: 5000 nested arrays and objects parse.
-TEST(json_deep_nesting) {
+static Str nested(Buf *b, int n) {
+    b->len = 0;
+    for (int i = 0; i < n; i++) buf_adds(b, i % 2 ? "[" : "{\"k\":");
+    buf_adds(b, "1");
+    for (int i = n - 1; i >= 0; i--) buf_adds(b, i % 2 ? "]" : "}");
+    return buf_str(b);
+}
+
+// JSON_MAX_DEPTH nested arrays and objects parse; one more is "NestingTooDeep", and a
+// 100000 deep document fails without exhausting memory or the stack.
+TEST(json_depth_limit) {
     Arena a = {0};
     Buf b = {0};
-    for (int i = 0; i < 5000; i++) buf_adds(&b, i % 2 ? "[" : "{\"k\":");
-    buf_adds(&b, "1");
-    for (int i = 4999; i >= 0; i--) buf_adds(&b, i % 2 ? "]" : "}");
     JValue *v;
-    EXPECT_OK(json_parse(&a, buf_str(&b), true, &v));
+    EXPECT_OK(json_parse(&a, nested(&b, JSON_MAX_DEPTH), true, &v));
     EXPECT(v->kind == J_OBJECT);
+    Buf w = {0};
+    json_write(&w, v);
+    EXPECT_STR(buf_str(&w), buf_str(&b));
+    buf_free(&w);
+    EXPECT_ERR(json_parse(&a, nested(&b, JSON_MAX_DEPTH + 1), true, &v), "NestingTooDeep");
+    EXPECT_ERR(json_parse(&a, nested(&b, 100000), false, &v), "NestingTooDeep");
+    // empty containers at the bottom do not open a level
+    b.len = 0;
+    for (int i = 0; i < JSON_MAX_DEPTH; i++) buf_adds(&b, "[");
+    buf_adds(&b, "[]");
+    for (int i = 0; i < JSON_MAX_DEPTH; i++) buf_adds(&b, "]");
+    EXPECT_OK(json_parse(&a, buf_str(&b), true, &v));
     buf_free(&b);
     arena_reset(&a);
 }

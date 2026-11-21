@@ -21,8 +21,9 @@ Err chat_render(Arena *a, const JValue *req, Str *out);
 void chat_to_json(Buf *o, const JValue *v);
 
 // A quoted JSON string: \" \\ \n \r \t \b \f escaped, other controls as \u00xx
-// (lowercase hex), everything else (DEL, non-ASCII) raw. Used for every JSON string the
-// server writes.
+// (lowercase hex), everything else (DEL, non-ASCII) raw, except ill-formed UTF-8 (a reply
+// cut inside a character, stray bytes): each maximal ill-formed subpart becomes U+FFFD, so
+// the output is always valid UTF-8. Used for every JSON string the server writes.
 void chat_json_string(Buf *o, Str s);
 
 #endif

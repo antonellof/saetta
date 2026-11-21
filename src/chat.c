@@ -324,6 +324,35 @@ void chat_to_json(Buf *o, const JValue *v) {
     }
 }
 
+// Length of the well-formed UTF-8 sequence at p[0..n) (Unicode Table 3-7), p[0] >= 0x80;
+// 0 when ill-formed, with *bad the length of its maximal subpart (replaced by one U+FFFD).
+static size_t utf8_seq(const uint8_t *p, size_t n, size_t *bad) {
+    uint8_t b = p[0], lo = 0x80, hi = 0xBF;
+    size_t need;
+    if (b >= 0xC2 && b <= 0xDF) need = 1;
+    else if (b >= 0xE0 && b <= 0xEF) {
+        need = 2;
+        if (b == 0xE0) lo = 0xA0;
+        if (b == 0xED) hi = 0x9F;
+    } else if (b >= 0xF0 && b <= 0xF4) {
+        need = 3;
+        if (b == 0xF0) lo = 0x90;
+        if (b == 0xF4) hi = 0x8F;
+    } else {
+        *bad = 1;
+        return 0;
+    }
+    for (size_t i = 1; i <= need; i++) {
+        if (i >= n || p[i] < lo || p[i] > hi) {
+            *bad = i;
+            return 0;
+        }
+        lo = 0x80;
+        hi = 0xBF;
+    }
+    return need + 1;
+}
+
 void chat_json_string(Buf *o, Str s) {
     buf_reserve(o, s.len + 2);
     buf_addc(o, '"');
@@ -331,6 +360,18 @@ void chat_json_string(Buf *o, Str s) {
     for (size_t i = 0; i < s.len; i++) {
         uint8_t ch = (uint8_t)s.ptr[i];
         const char *esc = NULL;
+        if (ch >= 0x80) {
+            size_t bad = 0, n = utf8_seq((const uint8_t *)s.ptr + i, s.len - i, &bad);
+            if (n > 0) {
+                i += n - 1;
+                continue;
+            }
+            buf_add(o, s.ptr + run, i - run);
+            buf_adds(o, "\xef\xbf\xbd"); // U+FFFD
+            i += bad - 1;
+            run = i + 1;
+            continue;
+        }
         switch (ch) {
         case '"': esc = "\\\""; break;
         case '\\': esc = "\\\\"; break;

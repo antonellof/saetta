@@ -1076,7 +1076,11 @@ static Err handle(Engine *e, Arena *a, Conn *c, Req *h, Str body, Fmt fmt, Work 
         else forced = S("<tool_call>\n");
         prompt = str(arena_printf(a, "%.*s%.*s", (int)prompt.len, prompt.ptr, (int)forced.len, forced.ptr));
     }
+    // the only tokenizer error (TokenNotInVocab: byte-level BPE covers every byte) is the
+    // tokenizer's, not the request's
+    w->status = 500;
     TRY(tokenizer_encode(e->tok, prompt, &w->ids));
+    w->status = 400;
     bool thinking = forced.len == 0 && str_ends(prompt, S("<think>\n")) && !str_ends(prompt, S("</think>\n\n"));
     ReqNumbers rn;
     TRY(server_request_numbers(r, &rn));

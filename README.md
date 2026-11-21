@@ -1,9 +1,9 @@
 <p align="center">
-  <img src="docs/assets/saetta-banner.png" alt="saetta" width="900">
+  <img src="docs/assets/saetta-banner.png" alt="Saetta" width="900">
 </p>
 
-<h3 align="center">Local coding models for Apple Silicon Macs.</h3>
-<p align="center">Qwen3.8-27B from 32 GB of memory, Qwen3.8-Flash-Next from 96 GB. An inference engine in C and hand-written Metal, tuned for coding agents.</p>
+<h3 align="center">Local coding models at lightning speed.</h3>
+<p align="center">Qwen3.8 for Claude Code, pi and opencode on Apple Silicon Macs: Qwen3.8-27B from 32 GB of memory, Qwen3.8-Flash-Next from 96 GB. An inference engine in C and hand-written Metal, built for coding agents. <a href="https://saetta.dev">saetta.dev</a></p>
 
 <p align="center">
   <a href="#install"><b>Install</b></a> · <a href="#models">Models</a> · <a href="#coding-agents">Coding agents</a> ·
@@ -11,15 +11,15 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/antonellof/saetta/releases/latest"><img src="https://img.shields.io/github/v/release/antonellof/saetta?label=download&color=8a3ffc" alt="Download saetta"></a>
+  <a href="https://saetta.dev"><img src="https://img.shields.io/badge/web-saetta.dev-58a6ff" alt="saetta.dev"></a>
+  <a href="https://github.com/antonellof/saetta/releases/latest"><img src="https://img.shields.io/github/v/release/antonellof/saetta?label=download&color=8a3ffc" alt="Download Saetta"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-f28c28" alt="MIT license"></a>
   <img src="https://img.shields.io/badge/Apple%20Silicon-M1%20to%20M5%2C%2032%20GB%2B-111" alt="Apple Silicon M1 to M5, 32 GB or more">
 </p>
 
-saetta runs Qwen3.8 coding models on any Apple Silicon Mac with 32 GB of memory or more, with every kernel written for coding agents: long shared-prefix prompts (20K to 200K tokens), short answers, tool calls, through OpenAI- and Anthropic-compatible APIs. It picks the model that fits your Mac. It is tuned and measured on an M5 Max with 128 GB, whose neural accelerators read prompts fastest; M1 to M4 run the same kernels on their GPU cores (not yet tested on those chips: reports welcome).
+Saetta runs Qwen3.8 coding models on any Apple Silicon Mac with 32 GB of memory or more, with every kernel written for coding agents: long shared-prefix prompts (20K to 200K tokens), short answers, tool calls, through OpenAI- and Anthropic-compatible APIs. It picks the model that fits your Mac. It is tuned and measured on an M5 Max with 128 GB, whose neural accelerators read prompts fastest; M1 to M4 run the same kernels on their GPU cores (not yet tested on those chips: reports welcome).
 
 - **Fast:** on an M5 Max, Flash-Next reads prompts at 1,600 to 1,950 tokens/s and answers at 66 to 85 tokens/s, with speculative decoding.
-- **On par with [Strata](https://github.com/Niko1221/Strata)**, the established engine for Flash-Next on Apple Silicon: the Coder pack finishes the six-request agent workload 1 s ahead, the full pack 2 s behind, and both answer faster ([Performance](#performance)).
 - **Follow-up turns read only what is new:** a second turn on a 16K conversation answers in 0.2 s.
 - **One command to code:** `saetta` picks the model and the agent for you; `saetta start claude` (or `pi`, `opencode`) when you know.
 - **LoRA adapters** on Qwen3.8-27B, per request.
@@ -63,7 +63,7 @@ Licenses: Flash-Next Qwen Community License 1.0, Qwen3.8-27B, the pi adapter and
 
 ### GGUF fine-tunes of Qwen3.8-27B
 
-`saetta download 27b-turbo` fetches the GGUF, converts it into a saetta pack and deletes it. `saetta import <file.gguf> <folder>` does the same for any Qwen3.8-27B GGUF (llama.cpp `qwen35`; Q8_0, Q4_K, Q5_K, Q6_K, F16 or BF16 tensors), with the model's `config.json` and tokenizer files in the folder. A GGUF's MTP layer becomes the draft head: Qwen3.8-27B speculates with it as Flash-Next does (`SAETTA_MTP=0` turns it off).
+`saetta download 27b-turbo` fetches the GGUF, converts it into a Saetta pack and deletes it. `saetta import <file.gguf> <folder>` does the same for any Qwen3.8-27B GGUF (llama.cpp `qwen35`; Q8_0, Q4_K, Q5_K, Q6_K, F16 or BF16 tensors), with the model's `config.json` and tokenizer files in the folder. A GGUF's MTP layer becomes the draft head: Qwen3.8-27B speculates with it as Flash-Next does (`SAETTA_MTP=0` turns it off).
 
 ### LoRA adapters
 
@@ -88,7 +88,7 @@ saetta start claude -- -p "fix the failing test"   # anything after -- goes to t
 ```
 
 <p align="center">
-  <img src="docs/assets/demo.gif" width="900" alt="saetta start claude: Claude Code on saetta writes a snake game in Python, checks it, and the game runs">
+  <img src="docs/assets/demo.gif" width="900" alt="saetta start claude: Claude Code on Saetta writes a snake game in Python, checks it, and the game runs">
   <br><sub><code>saetta start claude</code>: Claude Code on the local model writes a snake game and checks it. Real time, no cloud.</sub>
 </p>
 
@@ -102,7 +102,7 @@ saetta start claude -- -p "fix the failing test"   # anything after -- goes to t
 | `--keep` | leave the server running when the agent exits |
 
 <p align="center">
-  <img src="docs/assets/demo-pi.gif" width="900" alt="saetta start pi: pi on saetta writes a Mandelbrot renderer, which then draws the set in color">
+  <img src="docs/assets/demo-pi.gif" width="900" alt="saetta start pi: pi on Saetta writes a Mandelbrot renderer, which then draws the set in color">
   <br><sub><code>saetta start pi</code>: pi writes a Mandelbrot renderer, then it runs.</sub>
 </p>
 
@@ -132,23 +132,19 @@ Endpoints: `POST /v1/chat/completions` (streaming, `tool_calls`, `reasoning_cont
 
 ## Performance
 
-<p align="center">
-  <img src="docs/assets/bench-strata.svg" width="760" alt="Six-request coding workload: saetta full 79.6 s, saetta Coder 76.5 s, Strata 77.5 s total; answer speed on the edit request 142, 139 and 130 tokens/s">
-</p>
+Flash-Next on an M5 Max with 128 GB, a six-request coding-agent workload through the HTTP API, seconds (first token / total):
 
-Flash-Next on an M5 Max with 128 GB, a six-request coding-agent workload, seconds (first token / total):
+| request | prompt tokens | full | Coder |
+|---|---:|---:|---:|
+| cold 4K | 3,335 | 2.06 / 3.66 | 2.01 / 3.90 |
+| cold 16K | 15,873 | 8.78 / 10.61 | 8.24 / 10.86 |
+| cold 64K | 69,923 | 40.23 / 42.16 | 37.31 / 39.87 |
+| turn 1 | 15,867 | 8.68 / 9.39 | 8.07 / 8.81 |
+| turn 2 (reuses turn 1) | 15,951 | 0.20 / 0.87 | 0.20 / 0.79 |
+| edit (tool call, 400 tokens out) | 18,243 | 10.09 / 12.91 | 9.37 / 12.25 |
+| sum of totals | | 79.6 | 76.5 |
 
-| request | prompt tokens | full | Coder | Strata (UD-Q4_K_XL) |
-|---|---:|---:|---:|---:|
-| cold 4K | 3,335 | 2.06 / 3.66 | 2.01 / 3.90 | 1.90 / 3.24 |
-| cold 16K | 15,873 | 8.78 / 10.61 | 8.24 / 10.86 | 8.82 / 10.34 |
-| cold 64K | 69,923 | 40.23 / 42.16 | 37.31 / 39.87 | 39.57 / 41.53 |
-| turn 1 | 15,867 | 8.68 / 9.39 | 8.07 / 8.81 | 8.96 / 9.61 |
-| turn 2 (reuses turn 1) | 15,951 | 0.20 / 0.87 | 0.20 / 0.79 | 0.19 / 0.56 |
-| edit (tool call, 400 tokens out) | 18,243 | 10.09 / 12.91 | 9.37 / 12.25 | 10.14 / 13.19 |
-| sum of totals | | 79.6 | 76.5 | 77.5 |
-
-Answers at 78 to 85 (full) and 66 to 75 (Coder) tokens/s, 142 tokens/s on the edit with speculation (Strata 130). Answer lengths differ between engines (cold 4K: 130 tokens against Strata's 102), which accounts for most of the gap on the short requests. Qwen3.8-27B: prompts at 940 tokens/s (4K) to 787 (64K); answers at 31 ms/token on the 4-bit pack, 19 ms/token on `27b-turbo` with its MTP head (short prompts; 25 ms/token at 16K).
+Prompts at 1,620 to 1,930 tokens/s; answers at 78 to 85 (full) and 66 to 75 (Coder) tokens/s, 142 and 139 tokens/s on the edit with speculation. Qwen3.8-27B: prompts at 940 tokens/s (4K) to 787 (64K); answers at 31 ms/token on the 4-bit pack, 19 ms/token on `27b-turbo` with its MTP head (short prompts; 25 ms/token at 16K).
 
 ## Build from source
 

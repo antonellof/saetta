@@ -535,6 +535,6 @@ Err qgen_bench(Arena *a, FILE *out) {
         }
     }
     TRY(dsv4_bench(&x, out));
-    TRY(attn27_bench(a, out)); // Qwen3.8-27B prompt attention (src/attn27.h)
+    TRY(attn27_bench(a, out, NULL, 0)); // Qwen3.8-27B prompt attention (src/attn27.h)
     return OK;
 }

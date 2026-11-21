@@ -581,7 +581,7 @@ static Err run(Arena *arena, int argc, char **argv) {
     }
     if (argc >= 2 && eq(cmd, "attn-bench")) {
         // Qwen3.8-27B prompt attention, old against new kernel, one layer (src/attn27.h)
-        TRY(attn27_bench(arena, out));
+        TRY(attn27_bench(arena, out, (const char *const *)argv + 2, (size_t)argc - 2));
         fflush(out);
         return OK;
     }

@@ -34,11 +34,15 @@ TEST(attn27_flash) {
     static Arena ar;
     QgenCtx x;
     EXPECT_OK(qgen_ctx_init(&ar, &x));
-    sx_pipeline *q6h, *fl[2];
+    // kernel, query tokens per threadgroup, simdgroups, key step
+    static const struct {
+        const char *name;
+        size_t qb, nsg, bk;
+    } vs[] = {{"attn_fl_6_q8", 8, 8, ATTN27_BK}};
+    enum { NV = COUNT(vs) };
+    sx_pipeline *q6h, *fl[NV];
     EXPECT_OK(qgen_ctx_pipe(&x, attn27_src, "attn_fl_q6h", &q6h));
-    EXPECT_OK(qgen_ctx_pipe(&x, attn27_src, "attn_fl_6_q8", &fl[0]));
-    EXPECT_OK(qgen_ctx_pipe(&x, attn27_src, "attn_fl_6_q16", &fl[1]));
-    static const size_t qbs[2] = {8, 16};
+    for (size_t v = 0; v < NV; v++) EXPECT_OK(qgen_ctx_pipe(&x, attn27_src, vs[v].name, &fl[v]));
     // chunk at 0 (the golden prompt's 24 tokens), odd sizes, a cached prefix, long rows, peaked rows
     static const Case cases[] = {{0, 24, 1.0f},     {0, 37, 4.0f},    {5, 9, 2.0f},       {100, 300, 4.0f},
                                  {3000, 517, 4.0f}, {127, 129, 12.0f}, {9000, 200, 24.0f}, {0, 1024, 8.0f}};
@@ -69,12 +73,14 @@ TEST(attn27_flash) {
         toks[nt++] = c.T - 1;
         if (c.T > 1) toks[nt++] = c.T - 2;
         float *ref = malloc(nt * NQ * HD * 4), *ex = malloc(nt * NQ * HD * 4);
-        for (size_t i = 0; i < nt; i++) {
-            attn27_ref(q, qg, K, V, c.pos0, toks[i], true, ref + i * NQ * HD);
-            attn27_ref(q, qg, K, V, c.pos0, toks[i], false, ex + i * NQ * HD);
-        }
-        for (int v = 0; v < 2; v++) {
-            const Attn27P p = {(uint32_t)c.pos0, (uint32_t)c.T, attn27_tq(c.T, qbs[v])};
+        size_t bk_ref = 0;
+        for (size_t i = 0; i < nt; i++) attn27_ref(q, qg, K, V, c.pos0, toks[i], 128, false, ex + i * NQ * HD);
+        for (size_t v = 0; v < NV; v++) {
+            if (vs[v].bk != bk_ref) {
+                bk_ref = vs[v].bk;
+                for (size_t i = 0; i < nt; i++) attn27_ref(q, qg, K, V, c.pos0, toks[i], bk_ref, true, ref + i * NQ * HD);
+            }
+            const Attn27P p = {(uint32_t)c.pos0, (uint32_t)c.T, attn27_tq(c.T, vs[v].qb)};
             float *o = sx_buffer_contents(ob);
             for (size_t i = 0; i < c.T * NQ * HD; i++) o[i] = NAN;
             const size_t n4 = (size_t)NKV * p.tq * (NQ / NKV) * HD / 4;
@@ -82,10 +88,10 @@ TEST(attn27_flash) {
             EXPECT_OK(qgen_ctx_run(&x, q6h, a, COUNT(a), (n4 + 255) / 256, 1, 256));
             sx_arg b[] = {gpu_buf_arg(qhb), {kvb, 0, NULL, 0}, {kvb, cap * NKV * HD * 2, NULL, 0},
                           {qgb, HD * 4, NULL, 0}, gpu_buf_arg(ob), gpu_bytes_arg(&p, sizeof p)};
-            EXPECT_OK(qgen_ctx_run(&x, fl[v], b, COUNT(b), NKV, p.tq / qbs[v], qbs[v] * 32));
+            EXPECT_OK(qgen_ctx_run(&x, fl[v], b, COUNT(b), NKV, p.tq / vs[v].qb, vs[v].nsg * 32));
             bool finite = true;
             for (size_t i = 0; i < c.T * NQ * HD; i++) finite &= isfinite(o[i]);
-            if (!finite) dbg("attn27_flash: case %zu q%zu: non-finite output\n", ci, qbs[v]);
+            if (!finite) dbg("attn27_flash: case %zu %s: non-finite output\n", ci, vs[v].name);
             EXPECT(finite);
             double cw = 0, cx = 0;
             for (size_t i = 0; i < nt; i++)
@@ -94,8 +100,8 @@ TEST(attn27_flash) {
                     cw = fmax(cw, row_rel(gv, ref + (i * NQ + h) * HD));
                     cx = fmax(cx, row_rel(gv, ex + (i * NQ + h) * HD));
                 }
-            dbg("attn27_flash: pos0 %5zu T %4zu qa %4.1f q%-2zu: rel to the mirrored reference %.3g, to the exact %.3g\n",
-                c.pos0, c.T, (double)c.qa, qbs[v], cw, cx);
+            dbg("attn27_flash: pos0 %5zu T %4zu qa %4.1f %-18s: rel to the mirrored reference %.3g, to the exact %.3g\n",
+                c.pos0, c.T, (double)c.qa, vs[v].name, cw, cx);
             worst = fmax(worst, cw);
             worst_exact = fmax(worst_exact, cx);
             EXPECT(cw <= TOL_ATTN27_REL);

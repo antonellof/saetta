@@ -2,6 +2,7 @@
 #include "attn27.h"
 
 #include <math.h>
+#include <string.h>
 
 #include "qgen.h"
 
@@ -24,12 +25,11 @@ static const char old_src[] = {
 #define NKV ATTN27_NKV
 #define HD ATTN27_HD
 #define G (NQ / NKV)
-#define BK 128 // the kernel's key step (FA_BK)
 
 void attn27_ref(const float *q, const float *qg, const _Float16 *K, const _Float16 *V, size_t pos0, size_t t,
-                bool mirror, float *out) {
+                size_t bk, bool mirror, float *out) {
     const size_t n = pos0 + t + 1;
-    double s[BK], o[HD];
+    double s[ATTN27_BK_MAX], o[HD];
     for (size_t h = 0; h < NQ; h++) {
         const size_t g = h / G;
         double qv[HD];
@@ -39,9 +39,9 @@ void attn27_ref(const float *q, const float *qg, const _Float16 *K, const _Float
         }
         double m = -INFINITY, l = 0;
         for (size_t d = 0; d < HD; d++) o[d] = 0;
-        // 128-key steps from key 0, as the kernel: the max is the running one after each step
-        for (size_t c0 = 0; c0 < n; c0 += BK) {
-            const size_t cn = MIN((size_t)BK, n - c0);
+        // bk-key steps from key 0, as the kernel: the max is the running one after each step
+        for (size_t c0 = 0; c0 < n; c0 += bk) {
+            const size_t cn = MIN(bk, n - c0);
             double mx = m;
             for (size_t i = 0; i < cn; i++) {
                 const _Float16 *k = K + (c0 + i) * NKV * HD + g * HD;
@@ -80,7 +80,7 @@ typedef struct {
 typedef struct {
     sx_pipeline *full, *merge, *q6h, *fl;
     sx_buffer *q, *qg, *kv, *part, *qh, *att;
-    size_t pos0, T, cap, qb;
+    size_t pos0, T, cap, qb, nsg;
     int which; // 0 old, 1 new
 } Run;
 
@@ -110,7 +110,7 @@ static void run_new(const Run *r, sx_cmd *c) {
     sx_cmd_dispatch(c, r->q6h, a, COUNT(a), (n4 + 255) / 256, 1, 256);
     sx_arg b[] = {gpu_buf_arg(r->qh), {r->kv, 0, NULL, 0}, {r->kv, r->cap * NKV * HD * 2, NULL, 0}, {r->qg, HD * 4, NULL, 0},
                   gpu_buf_arg(r->att), gpu_bytes_arg(&p, sizeof p)};
-    sx_cmd_dispatch(c, r->fl, b, COUNT(b), NKV, p.tq / r->qb, r->qb == 8 ? 256 : 512);
+    sx_cmd_dispatch(c, r->fl, b, COUNT(b), NKV, p.tq / r->qb, r->nsg * 32);
 }
 
 // Best GPU seconds of reps command buffers of one call each, after one warm-up call.
@@ -132,24 +132,40 @@ static Err time_run(Gpu *g, const Run *r, int reps, double *best) {
     return OK;
 }
 
-Err attn27_bench(Arena *a, FILE *out) {
+// The accelerator variants attn-bench knows: kernel, query tokens per threadgroup, simdgroups.
+static const struct {
+    const char *name;
+    size_t qb, nsg;
+} variants[] = {{"attn_fl_6_q8", 8, 8}};
+
+static bool wanted(const char *name, const char *const *only, size_t nonly) {
+    if (!nonly) return true;
+    for (size_t i = 0; i < nonly; i++)
+        if (!strcmp(only[i], name)) return true;
+    return false;
+}
+
+Err attn27_bench(Arena *a, FILE *out, const char *const *only, size_t nonly) {
     QgenCtx x;
     TRY(qgen_ctx_init(a, &x));
     enum { T = 4096 };
     static const size_t ctxs[4] = {4096, 16384, 32768, 65536};
     const size_t cap = 65536;
     Run r = {.T = T, .cap = cap};
-    TRY(qgen_ctx_pipe(&x, old_src, "attn_full_6h", &r.full));
-    TRY(qgen_ctx_pipe(&x, old_src, "attn_merge", &r.merge));
+    const bool old = wanted("old", only, nonly);
+    if (old) {
+        TRY(qgen_ctx_pipe(&x, old_src, "attn_full_6h", &r.full));
+        TRY(qgen_ctx_pipe(&x, old_src, "attn_merge", &r.merge));
+    }
     TRY(qgen_ctx_pipe(&x, attn27_src, "attn_fl_q6h", &r.q6h));
-    sx_pipeline *fl8, *fl16;
-    TRY(qgen_ctx_pipe(&x, attn27_src, "attn_fl_6_q8", &fl8));
-    TRY(qgen_ctx_pipe(&x, attn27_src, "attn_fl_6_q16", &fl16));
+    sx_pipeline *fls[COUNT(variants)] = {0};
+    for (size_t v = 0; v < COUNT(variants); v++)
+        if (wanted(variants[v].name, only, nonly)) TRY(qgen_ctx_pipe(&x, attn27_src, variants[v].name, &fls[v]));
     TRY(qgen_ctx_floats(&x, (size_t)T * NQ * HD, -2, 2, &r.q));
     TRY(qgen_ctx_floats(&x, (size_t)T * NQ * 2 * HD, -2, 2, &r.qg));
     TRY(qgen_ctx_halfs(&x, 2 * cap * NKV * HD, &r.kv));
     TRY(gpu_new_buffer(&x.g, (size_t)AB * NQ * NSPLIT_PRE * (HD + 2) * 4, &r.part));
-    TRY(gpu_new_buffer(&x.g, (size_t)NKV * (T + 16) * G * HD * 2, &r.qh));
+    TRY(gpu_new_buffer(&x.g, (size_t)NKV * (T + 32) * G * HD * 2, &r.qh));
     TRY(gpu_new_buffer(&x.g, (size_t)T * NQ * HD * 4, &r.att));
     fprintf(out, "attn-bench: Qwen3.8-27B prompt attention, one layer, chunk of %d tokens, f16 KV, best GPU time\n", T);
     fflush(out);
@@ -157,15 +173,18 @@ Err attn27_bench(Arena *a, FILE *out) {
         r.pos0 = ctxs[ci] - T;
         double fl = 0; // causal flops: QK and PV, 2 each per head, dim and visible key
         for (size_t t = 0; t < T; t++) fl += 4.0 * NQ * HD * (double)(r.pos0 + t + 1);
-        for (int k = 0; k < 3; k++) {
+        for (size_t k = 0; k <= COUNT(variants); k++) {
+            if (k == 0 ? !old : !fls[k - 1]) continue;
             r.which = k > 0;
-            r.fl = k == 1 ? fl8 : fl16;
-            r.qb = k == 1 ? 8 : 16;
+            if (k > 0) {
+                r.fl = fls[k - 1];
+                r.qb = variants[k - 1].qb;
+                r.nsg = variants[k - 1].nsg;
+            }
             double s;
             TRY(time_run(&x.g, &r, ctxs[ci] > 16384 && k == 0 ? 2 : 5, &s));
-            static const char *names[3] = {"attn_full_6h+merge", "attn_fl_6_q8", "attn_fl_6_q16"};
             fprintf(out, "ctx %6zu pos0 %6zu %-20s %9.2f ms/layer %7.3f ms/token (16 layers) %6.2f TFLOP/s\n", ctxs[ci],
-                    r.pos0, names[k], s * 1e3, s * 1e3 * 16 / T, fl / s / 1e12);
+                    r.pos0, k == 0 ? "attn_full_6h+merge" : variants[k - 1].name, s * 1e3, s * 1e3 * 16 / T, fl / s / 1e12);
             fflush(out);
         }
     }

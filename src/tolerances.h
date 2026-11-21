@@ -141,9 +141,9 @@
 #define TOL_DSV4_ARGMAX_AGREE 0.95 // f64
 #define TOL_DSV4_AGREE_MIN_POSITIONS 1000
 
-// Qwen3.8-27B prompt attention on the accelerators (src/kernels/dense_attn.metal attn_fl_6_q8
-// and _q16), GPU against attn27_ref with the kernel's roundings mirrored (half q, each
-// probability rounded to half after the running max of its 128-key step; f64 otherwise), on
+// Qwen3.8-27B prompt attention on the accelerators (src/kernels/dense_attn.metal attn_fl_6_q8),
+// GPU against attn27_ref with the kernel's roundings mirrored (half q, each probability
+// rounded to half after the running max of its key step; f64 otherwise), on
 // random data (src/test/attn27.c). Per (token, head) row: the largest difference relative to
 // the largest |value| of the row. A probability's f32 exp can round to the other half (2^-11
 // relative), so this is a few half steps of P, not f32 order. Measured 2026-11-20: at most

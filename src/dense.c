@@ -1171,7 +1171,11 @@ static Err new_state(Gpu *g, sx_buffer **gdn, sx_buffer **conv) {
     return OK;
 }
 
-static size_t kv_bytes(size_t cap, size_t elem) { return n_kv * 2 * cap * NKV * HD * elem; }
+// The planes of every attention slot, plus a tail of KV_TAIL rows of one plane: the prompt
+// attention kernel's last partial key group (32 keys, src/kernels/dense_attn.metal) may read
+// past the last valid row of the buffer's final V plane; the tail keeps that inside the buffer.
+#define KV_TAIL 32
+static size_t kv_bytes(size_t cap, size_t elem) { return (n_kv * 2 * cap + KV_TAIL) * NKV * HD * elem; }
 
 Err session_create_cap(Gpu *g, bool kv_half, size_t cap, size_t max_cap, Session **out) {
     Session *s = xcalloc(1, sizeof *s);

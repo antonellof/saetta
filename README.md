@@ -18,7 +18,7 @@
 
 saetta runs Qwen3.8-Flash-Next and Qwen3.8-27B on one machine, an Apple M5 Max with 128 GB, with every kernel written for it and for coding agents: long shared-prefix prompts (20K to 200K tokens), short answers, tool calls, through OpenAI- and Anthropic-compatible APIs.
 
-- **Fast:** Flash-Next reads prompts at 1,650 to 1,950 tokens/s and answers at 63 to 82 tokens/s, with speculative decoding.
+- **Fast:** Flash-Next reads prompts at 1,600 to 1,950 tokens/s and answers at 66 to 85 tokens/s, with speculative decoding.
 - **Follow-up turns read only what is new:** a second turn on a 16K conversation answers in 0.2 s.
 - **One command to code:** `saetta start claude` (or `pi`, `opencode`).
 - **LoRA adapters** on Qwen3.8-27B, per request.
@@ -126,18 +126,19 @@ Endpoints: `POST /v1/chat/completions` (streaming, `tool_calls`, `reasoning_cont
 
 ## Performance
 
-Flash-Next on an M5 Max with 128 GB, a six-request coding-agent workload, seconds:
+Flash-Next on an M5 Max with 128 GB, a six-request coding-agent workload, seconds (first token / total):
 
-| request | prompt tokens | full: first token | full: total | Coder: first token | Coder: total |
-|---|---:|---:|---:|---:|---:|
-| cold 4K | 3,334 | 2.02 | 3.54 | 1.96 | 3.94 |
-| cold 16K | 15,868 | 8.72 | 10.36 | 8.13 | 10.09 |
-| cold 64K | 69,925 | 39.81 | 41.89 | 36.84 | 39.29 |
-| turn 1 | 15,864 | 8.63 | 9.46 | 8.01 | 8.82 |
-| turn 2 (reuses turn 1) | 15,948 | 0.20 | 0.90 | 0.20 | 1.01 |
-| edit (tool call, 400 tokens out) | 18,245 | 10.10 | 12.93 | 9.32 | 12.19 |
+| request | prompt tokens | full | Coder | Strata (UD-Q4_K_XL) |
+|---|---:|---:|---:|---:|
+| cold 4K | 3,335 | 2.06 / 3.66 | 2.01 / 3.90 | 1.90 / 3.24 |
+| cold 16K | 15,873 | 8.78 / 10.61 | 8.24 / 10.86 | 8.82 / 10.34 |
+| cold 64K | 69,923 | 40.23 / 42.16 | 37.31 / 39.87 | 39.57 / 41.53 |
+| turn 1 | 15,867 | 8.68 / 9.39 | 8.07 / 8.81 | 8.96 / 9.61 |
+| turn 2 (reuses turn 1) | 15,951 | 0.20 / 0.87 | 0.20 / 0.79 | 0.19 / 0.56 |
+| edit (tool call, 400 tokens out) | 18,243 | 10.09 / 12.91 | 9.37 / 12.25 | 10.14 / 13.19 |
+| sum of totals | | 79.6 | 76.5 | 77.5 |
 
-Answers at 72 to 82 (full) and 63 to 70 (Coder) tokens/s, 141 tokens/s on the edit with speculation. Qwen3.8-27B: prompts at 926 tokens/s (4K) to 761 (64K); answers at 31 ms/token on the 4-bit pack, 19 ms/token on `27b-turbo` with its MTP head.
+Answers at 78 to 85 (full) and 66 to 75 (Coder) tokens/s, 142 tokens/s on the edit with speculation (Strata 130). Answer lengths differ between engines (cold 4K: 130 tokens against Strata's 102), which accounts for most of the gap on the short requests. Qwen3.8-27B: prompts at 926 tokens/s (4K) to 761 (64K); answers at 31 ms/token on the 4-bit pack, 19 ms/token on `27b-turbo` with its MTP head (short prompts; 25 ms/token at 16K).
 
 ## Build from source
 

@@ -15,6 +15,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "ctxlimits.h"
 #include "download.h"
 #include "instance.h"
 #include "metal/shim.h"
@@ -582,11 +583,10 @@ static Err run_in(Arena *a, const char *const *args, size_t n, int *code) {
             break;
         }
     }
-    // the server's rule (session_ctx_parse in src/model.h, whose Session type clashes with
-    // this file's): a multiple of 128, at least 1024
-    ctx -= ctx % 128;
-    if (ctx < 1024) {
-        dbg("saetta: --ctx / SAETTA_CTX wants at least 1024 tokens\n");
+    // the server's rule (session_ctx_parse in src/model.h, limits in src/ctxlimits.h)
+    ctx -= ctx % SESSION_CTX_ALIGN;
+    if (ctx < SESSION_CTX_MIN || ctx > SESSION_CTX_QWEN_MAX) {
+        dbg("saetta: --ctx / SAETTA_CTX wants %d to %zu tokens\n", SESSION_CTX_MIN, SESSION_CTX_QWEN_MAX);
         *code = 64;
         return OK;
     }

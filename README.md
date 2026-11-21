@@ -115,7 +115,7 @@ Endpoints: `POST /v1/chat/completions` (streaming, `tool_calls`, `reasoning_cont
 
 | variable | default | effect |
 |---|---|---|
-| `SAETTA_CTX` | 32768 | context in tokens, at least 1024, rounded down to a multiple of 128 (Flash-Next about 35 KB per token, 27B 64 KB) |
+| `SAETTA_CTX` | 32768 | context in tokens, 1024 to 262144, rounded down to a multiple of 128 (Flash-Next about 35 KB per token, 27B 64 KB) |
 | `SAETTA_SPEC` / `SAETTA_MTP` | 1 / 1 | `0` turns speculative decoding / the MTP head off |
 | `SAETTA_KV_F32` | unset | f32 KV cache |
 | `SAETTA_EXPERT_CACHE_GB` | unset | experimental: keep this many GB of experts in memory, read the rest from the SSD (Flash-Next: slower than resident, same output) |

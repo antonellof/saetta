@@ -909,7 +909,7 @@ Err session_create_cap(Gpu *g, bool kv_half, size_t cap, size_t max_cap, Session
 
 Err session_create_kv(Gpu *g, bool kv_half, Session **out) {
     size_t cap;
-    TRY(session_ctx_parse(getenv("SAETTA_CTX"), &cap));
+    TRY(session_ctx_parse(getenv("SAETTA_CTX"), CONFIG_MAX_POSITION_EMBEDDINGS, &cap));
     return session_create_cap(g, kv_half, cap, cap, out);
 }
 Err session_create(Gpu *g, Session **out) { return session_create_kv(g, false, out); }
@@ -981,6 +981,7 @@ const ModelArch dsv4_arch = MODEL_ARCH_TABLE({
     .hidden = H,
     .eos = dsv4_eos,
     .n_eos = 1,
+    .max_positions = CONFIG_MAX_POSITION_EMBEDDINGS,
     .no_spec = true,
     .no_serve = true,
 });

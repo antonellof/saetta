@@ -19,6 +19,7 @@
 #define SAETTA_MODEL_H
 
 #include "base.h"
+#include "ctxlimits.h"
 #include "gpu.h"
 #include "metal/shim.h"
 #include "safetensors.h"
@@ -51,6 +52,7 @@ typedef struct {
     size_t layers, width, vocab, hidden; // width: residual stream floats per token (verify)
     const uint32_t *eos;
     size_t n_eos;
+    size_t max_positions; // config.json max_position_embeddings: the largest context
     // what the model implements beyond a plain forward pass: speculative decoding (prompt
     // lookup, verification chunks) and serving (tokenizer, chat template, sessions)
     bool no_spec, no_serve;
@@ -251,13 +253,10 @@ void model_prof_report(size_t tokens);
 // ---- Session -----------------------------------------------------------------------------
 
 // A context capacity (tokens) from the text of $SAETTA_CTX or --ctx (NULL: the default,
-// 32768), rounded down to a multiple of SESSION_CTX_ALIGN: session_grow wants a multiple of
-// the indexer block (4) and DeepSeek-V4-Flash's compressed rows come every 128 tokens.
+// SESSION_CTX_DEFAULT), rounded down to a multiple of SESSION_CTX_ALIGN (src/ctxlimits.h).
 // Errors: "InvalidCharacter" / "Overflow" (not a number), "ContextTooSmall" (below
-// SESSION_CTX_MIN), "ContextTooLarge" (above SESSION_CTX_MAX).
-enum { SESSION_CTX_DEFAULT = 32768, SESSION_CTX_ALIGN = 128, SESSION_CTX_MIN = 1024 };
-#define SESSION_CTX_MAX ((size_t)1 << 30)
-Err session_ctx_parse(const char *text, size_t *out);
+// SESSION_CTX_MIN), "ContextTooLarge" (above max, the model's max_position_embeddings).
+Err session_ctx_parse(const char *text, size_t max, size_t *out);
 
 // Context capacity from $SAETTA_CTX (session_ctx_parse); KV f16 unless SAETTA_KV_F32.
 // Errors: "AllocFailed", session_ctx_parse's (bad SAETTA_CTX).

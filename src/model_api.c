@@ -46,14 +46,14 @@ Err model_load(Arena *a, const Pack *pack, Gpu *g, Model **out) {
     return A->load(a, pack, g, out);
 }
 
-Err session_ctx_parse(const char *text, size_t *out) {
+Err session_ctx_parse(const char *text, size_t max, size_t *out) {
     if (!text) {
         *out = SESSION_CTX_DEFAULT;
         return OK;
     }
     uint64_t x;
     TRY(parse_u64(str(text), &x));
-    if (x > SESSION_CTX_MAX) return "ContextTooLarge";
+    if (x > max) return "ContextTooLarge";
     x -= x % SESSION_CTX_ALIGN;
     if (x < SESSION_CTX_MIN) return "ContextTooSmall";
     *out = (size_t)x;

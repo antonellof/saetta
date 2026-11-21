@@ -2350,9 +2350,11 @@ size_t session_kv_elem(const Session *s) { return s->kv_half ? 2 : 4; }
 
 Err session_create(Gpu *g, Session **out) { return session_create_kv(g, getenv("SAETTA_KV_F32") == NULL, out); }
 
+static_assert(CONFIG_MAX_POSITION_EMBEDDINGS == SESSION_CTX_QWEN_MAX, "saetta start --ctx limit (src/ctxlimits.h)");
+
 Err session_create_kv(Gpu *g, bool kv_half, Session **out) {
     size_t cap;
-    TRY(session_ctx_parse(getenv("SAETTA_CTX"), &cap));
+    TRY(session_ctx_parse(getenv("SAETTA_CTX"), CONFIG_MAX_POSITION_EMBEDDINGS, &cap));
     return session_create_cap(g, kv_half, cap, cap, out);
 }
 
@@ -2967,4 +2969,5 @@ const ModelArch flash_arch = MODEL_ARCH_TABLE({
     .hidden = CONFIG_HIDDEN_SIZE,
     .eos = config_eos_token_ids,
     .n_eos = CONFIG_N_EOS_TOKEN_IDS,
+    .max_positions = CONFIG_MAX_POSITION_EMBEDDINGS,
 });

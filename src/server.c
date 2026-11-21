@@ -1324,10 +1324,11 @@ Err server_serve(Arena *arena, const char *dir, uint16_t port, const char *const
         // SAETTA_CTX rounded down to a multiple of SESSION_CTX_ALIGN, at least SESSION_CTX_MIN
         size_t max_cap;
         const char *ctx = getenv("SAETTA_CTX");
-        Err ce = session_ctx_parse(ctx, &max_cap);
+        size_t max_pos = model_info(m)->max_positions;
+        Err ce = session_ctx_parse(ctx, max_pos, &max_cap);
         if (ce) {
-            dbg("saetta: SAETTA_CTX=%s: %s (a number of tokens from %d to %zu)\n", ctx, ce, SESSION_CTX_MIN,
-                (size_t)SESSION_CTX_MAX);
+            dbg("saetta: SAETTA_CTX=%s: %s (a number of tokens from %d to %zu, the model's maximum)\n", ctx, ce,
+                SESSION_CTX_MIN, max_pos);
             return ce;
         }
         if (ctx && strtoull(ctx, NULL, 10) != max_cap)

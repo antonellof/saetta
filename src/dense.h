@@ -65,7 +65,7 @@ typedef struct {
     X(mv_bf16, "mv_bf16") X(rmsnorm, "rmsnorm") X(add_rmsnorm, "add_rmsnorm") X(gdn_conv, "gdn_conv")               \
     X(gdn_conv_norm, "gdn_conv_norm") X(gdn_qknorm, "gdn_qknorm") X(gdn_step, "gdn_step")                          \
     X(gdn_gnorm, "gdn_gnorm_silu") X(rope, "rope") X(copy_f32, "copy_f32") X(copy_rows, "copy_rows")               \
-    X(copy_rows_h, "copy_rows_h") X(swiglu, "swiglu") X(attn_full, "attn_full_6") X(attn_full_h, "attn_full_6h")   \
+    X(copy_rows_h, "copy_rows_h") X(swiglu, "swiglu") X(swiglu_h, "swiglu_h") X(attn_full, "attn_full_6") X(attn_full_h, "attn_full_6h")   \
     X(attn_merge, "attn_merge") X(mm4, "qmm_4_32") X(mm8, "qmm_8_64")
 
 typedef struct {

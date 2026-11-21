@@ -591,6 +591,17 @@ static void enc_out_writes_range(Enc *e, sx_arg y, size_t n) {
         e->xh_set = false;
 }
 
+// Whether enc_mm over T rows takes its input from the half copy in B.xh (the accelerator
+// paths), so a producer can write that copy directly and skip to_half.
+static bool mm_reads_xh(const Model *m, const Linear *l, size_t T) {
+    if (l->bits == 16 || T <= SMALL || !m->fast_prefill) return false;
+    const Mpp *mp = m->mpp;
+    bool gen = !is4_32(l);
+    sx_pipeline *dq = gen ? m->gen->dq : mp->dq;
+    if (mp->mmh && dq && (size_t)l->in_features * l->out_features <= (size_t)FFN * H) return true;
+    return gen ? m->gen->qmmh != NULL : mp->dense != NULL;
+}
+
 // Y[T][out] = X[T][in] W^T
 static void enc_mm(Enc *e, const Linear *l, sx_arg x, sx_arg y, size_t T) {
     Model *m = e->m;
@@ -830,6 +841,18 @@ static void enc_mlp_t(Enc *e, const Mlp *M, size_t T, sx_arg xa, sx_arg y, bool 
     }
     enc_lora(e, lora_group(m, li, LORA_GU), xa, T, (const sx_arg[]){barg(b, o_g), barg(b, o_u)}, dec);
     uint32_t n = (uint32_t)(T * FFN);
+    if (!dec && !lora_group(m, li, LORA_DOWN) && mm_reads_xh(m, &M->down, T)) {
+        // prompt chunk: silu(g) * u straight into the half input of the down matmul (no f32 hh,
+        // no to_half pass); enc_to_half then finds hh's half copy in place
+        sx_arg c[] = {barg(b, o_g), barg(b, o_u), barg(m->bscratch, B_xh), BYTES(n)};
+        D1(e, m->p.swiglu_h, c, T * FFN);
+        e->xh_set = true;
+        e->xh_buf = b;
+        e->xh_off = (size_t)o_hh * 4;
+        e->xh_n = T * FFN;
+        enc_mm(e, &M->down, barg(b, o_hh), y, T);
+        return;
+    }
     sx_arg c[] = {barg(b, o_g), barg(b, o_u), barg(b, o_hh), BYTES(n)};
     D1(e, m->p.swiglu, c, T * FFN);
     if (T == 1)

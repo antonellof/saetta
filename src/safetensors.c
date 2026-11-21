@@ -62,10 +62,16 @@ Err safetensors_parse(Arena *a, const uint8_t *bytes, size_t len, uint16_t file_
         uint64_t begin, end;
         if (!as_u64(offs->arr.items[0], &begin)) return "BadTensor";
         if (!as_u64(offs->arr.items[1], &end)) return "BadTensor";
-        info.offset = data_start + begin;
+        if (end < begin) return "BadTensor";
+        // every product and sum checked: a crafted header must not wrap into a small size
+        uint64_t numel = 1, bytes, stop;
+        for (uint8_t i = 0; i < info.rank; i++)
+            if (__builtin_mul_overflow(numel, info.shape[i], &numel)) return "SizeMismatch";
+        if (__builtin_mul_overflow(numel, (uint64_t)dtype_size(dtype), &bytes)) return "SizeMismatch";
+        if (__builtin_add_overflow(data_start, begin, &info.offset)) return "TooShort";
         info.nbytes = end - begin;
-        if (tensor_numel(&info) * dtype_size(dtype) != info.nbytes) return "SizeMismatch";
-        if (info.offset + info.nbytes > len) return "TooShort";
+        if (bytes != info.nbytes) return "SizeMismatch";
+        if (__builtin_add_overflow(info.offset, info.nbytes, &stop) || stop > len) return "TooShort";
         TensorInfo *t = arena_dup(a, &info, sizeof info);
         char *name = arena_strndup(a, e->key.ptr, e->key.len);
         strmap_put(out, str_n(name, e->key.len), t);

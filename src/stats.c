@@ -83,31 +83,30 @@ static const char *state_name(uint8_t s) {
     }
 }
 
-static Err write_snapshot(Stats *st, const char *dir) {
-    Buf o = {0};
+void stats_json(Stats *st, Buf *o) {
     int64_t now = stats_now_ns();
     uint8_t state = atomic_load_explicit(&st->state, ACQ);
     uint32_t gen = atomic_load_explicit(&st->gen, ACQ);
     int64_t ds = atomic_load_explicit(&st->decode_start_ns, ACQ);
     double dec_s = state == STATE_GENERATING && ds > 0 ? (double)(now - ds) / 1e9 : 0;
     double rate = dec_s > 0.05 ? (double)gen / dec_s : 0;
-    buf_printf(&o, "{\"pid\":%d,\"port\":%u,\"model\":\"%s\",\"pack\":\"%s\",\"ctx\":%zu,\"started\":%lld,\"now\":%lld",
+    buf_printf(o, "{\"pid\":%d,\"port\":%u,\"model\":\"%s\",\"pack\":\"%s\",\"ctx\":%zu,\"started\":%lld,\"now\":%lld",
                (int)getpid(), st->port, st->model, st->pack, st->ctx, (long long)st->started_s, (long long)unix_s());
     if (st->dev)
-        buf_printf(&o, ",\"gpu_allocated\":%llu,\"gpu_working_set\":%llu",
+        buf_printf(o, ",\"gpu_allocated\":%llu,\"gpu_working_set\":%llu",
                    (unsigned long long)sx_device_allocated_size(st->dev),
                    (unsigned long long)sx_device_recommended_working_set(st->dev));
     char el[64], ts[64];
     fmt_fixed(el, sizeof el, (double)(now - atomic_load_explicit(&st->req_start_ns, ACQ)) / 1e9, 2);
     fmt_fixed(ts, sizeof ts, rate, 1);
-    buf_printf(&o,
+    buf_printf(o,
                ",\"state\":\"%s\",\"api\":\"%s\",\"prompt_total\":%u,\"prompt_done\":%u,\"reused\":%u,\"gen\":%u,"
                "\"passes\":%u,\"max_tokens\":%u,\"elapsed_s\":%s,\"tok_s\":%s",
                state_name(state), atomic_load_explicit(&st->anthropic, ACQ) ? "anthropic" : "openai",
                atomic_load_explicit(&st->prompt_total, ACQ), atomic_load_explicit(&st->prompt_done, ACQ),
                atomic_load_explicit(&st->reused, ACQ), gen, atomic_load_explicit(&st->passes, ACQ),
                atomic_load_explicit(&st->max_tokens, ACQ), el, ts);
-    buf_printf(&o,
+    buf_printf(o,
                ",\"requests\":%llu,\"prompt_tokens\":%llu,\"reused_tokens\":%llu,\"output_tokens\":%llu,"
                "\"output_passes\":%llu,\"ck\":[%u,%u],\"convs\":%u,\"recent\":[",
                (unsigned long long)atomic_load_explicit(&st->requests, ACQ),
@@ -120,24 +119,29 @@ static Err write_snapshot(Stats *st, const char *dir) {
     lock(st);
     for (size_t i = 0; i < st->ring_n; i++) {
         const Done *d = &st->ring[i];
-        if (i > 0) buf_addc(&o, ',');
-        buf_printf(&o,
+        if (i > 0) buf_addc(o, ',');
+        buf_printf(o,
                    "{\"end\":%lld,\"api\":\"%s\",\"prompt\":%u,\"reused\":%u,\"output\":%u,\"passes\":%u,"
                    "\"prefill_ms\":%u,\"decode_ms\":%u,\"finish\":\"%.*s\"}",
                    (long long)d->end_s, d->anthropic ? "anthropic" : "openai", d->prompt, d->reused, d->output,
                    d->passes, d->prefill_ms, d->decode_ms, (int)strnlen(d->finish, sizeof d->finish), d->finish);
     }
     unlock(st);
-    buf_adds(&o, "],\"conversations\":[");
+    buf_adds(o, "],\"conversations\":[");
     lock(st);
     for (size_t i = 0; i < st->conv_n; i++) {
         const ConvInfo *cv = &st->conv[i];
-        if (i > 0) buf_addc(&o, ',');
-        buf_printf(&o, "{\"tokens\":%u,\"cap\":%u,\"last\":%lld,\"active\":%s}", cv->tokens, cv->cap,
+        if (i > 0) buf_addc(o, ',');
+        buf_printf(o, "{\"tokens\":%u,\"cap\":%u,\"last\":%lld,\"active\":%s}", cv->tokens, cv->cap,
                    (long long)cv->last_s, cv->active ? "true" : "false");
     }
     unlock(st);
-    buf_adds(&o, "]}\n");
+    buf_adds(o, "]}\n");
+}
+
+static Err write_snapshot(Stats *st, const char *dir) {
+    Buf o = {0};
+    stats_json(st, &o);
     char tmp[1024], dst[1024];
     snprintf(tmp, sizeof tmp, "%s/metrics.json.tmp", dir);
     snprintf(dst, sizeof dst, "%s/metrics.json", dir);

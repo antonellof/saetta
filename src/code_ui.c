@@ -10,6 +10,7 @@
 // core/compaction/compaction.ts (the context estimate the footer shows).
 #include "code_tui.h"
 #include "code_oai.h"
+#include "code_monitor.h"
 #include "download.h"
 
 #include <ctype.h>
@@ -3636,6 +3637,13 @@ static void draw(bool force) {
     Screen *s = &U->scr;
     int w = s->cols, h = s->rows;
     View *v = &g_view;
+    if (code_monitor_is_open()) { // /monitor: the whole screen
+        Lines mf = {0};
+        code_monitor_render(w, h, &mf);
+        screen_draw(s, &mf, force);
+        lines_free(&mf);
+        return;
+    }
     editor_set_rows(U->ed, h);
     Lines dock = {0}, frame = {0};
     render_dock(w, &dock);
@@ -4218,6 +4226,7 @@ static const SlashCmd builtin_cmds[] = {
     {"llama", "Manage llama.cpp router models", NULL},
     {"mcp", "Manage MCP servers: sign in, reconnect, enable or disable, and change exposure", NULL},
     {"theme", "Select color theme", NULL},
+    {"monitor", "Show the model's live statistics (saetta monitor)", NULL},
 };
 
 static bool arg_items(void *ctx, const char *cmd, SelectList *all, Lines *search) {
@@ -4379,6 +4388,11 @@ static void submit(char *text) {
                 if (hit) choose_model(hit, false);
                 else open_model(arg);
             } else open_model(NULL);
+            free(s);
+            return;
+        }
+        if (!strcmp(c, "monitor")) {
+            code_monitor_open();
             free(s);
             return;
         }
@@ -4782,6 +4796,7 @@ Err code_ui_run(const CodeUiConfig *cfg, const CodeUiOps *ops, CodeUiHost *host,
         if (editor_busy(ui.ed)) timeout = MIN(timeout, 10);
         if (g_view.bar_until > now) timeout = MIN(timeout, (int)((g_view.bar_until - now) / 1000000) + 1);
         if (ui.scr.color_query) timeout = MIN(timeout, 10);
+        if (code_monitor_wait_ms() >= 0) timeout = MIN(timeout, code_monitor_wait_ms());
         // asleep only with the ring empty (the producer wakes a sleeping consumer once)
         atomic_store(&g_ui_sleeping, 1);
         if (atomic_load(&g_rhead) != atomic_load(&g_rtail)) timeout = 0;
@@ -4806,6 +4821,7 @@ Err code_ui_run(const CodeUiConfig *cfg, const CodeUiOps *ops, CodeUiHost *host,
             request_render();
         }
         if (editor_tick(ui.ed)) request_render();
+        if (code_monitor_tick()) request_render();
         if (atomic_exchange(&g_git_changed, false)) request_render();
         download_poll();
         // keys
@@ -4823,7 +4839,8 @@ Err code_ui_run(const CodeUiConfig *cfg, const CodeUiOps *ops, CodeUiHost *host,
                 screen_reply(&ui.scr, &k);
                 if (late) ui.scr.color_done = true;
             }
-            else if (k.kind == K_MOUSE) handle_mouse(&k);
+            else if (k.kind == K_MOUSE) { if (!code_monitor_is_open()) handle_mouse(&k); }
+            else if (k.kind != K_NONE && code_monitor_key(&k)) request_render();
             else if (k.kind != K_NONE) {
                 if (g_view.sel_on) {
                     g_view.sel_on = false;

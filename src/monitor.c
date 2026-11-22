@@ -34,10 +34,8 @@ extern char **environ;
 #define RESET "\x1b[0m"
 #define BADGE "\x1b[48;2;138;63;252m\x1b[38;2;255;255;255m\x1b[1m"
 
-typedef struct {
-    double v[64];
-    size_t n;
-} Hist;
+typedef MonitorHist Hist;
+typedef MonitorSys Sys;
 
 static void hist_push(Hist *h, double x) {
     if (h->n == COUNT(h->v)) {
@@ -46,13 +44,6 @@ static void hist_push(Hist *h, double x) {
     }
     h->v[h->n++] = x;
 }
-
-typedef struct {
-    bool has_gpu;
-    double gpu_util;
-    uint64_t ram_total, ram_used, swap_used;
-    int thermal;
-} Sys;
 
 typedef struct {
     size_t w, h;
@@ -119,7 +110,7 @@ static size_t digits_len(Str v) {
     return e;
 }
 
-static Sys sample(void) {
+MonitorSys monitor_sample(void) {
     Sys s = {.thermal = sx_thermal_state()};
     // GPU: "Device Utilization %"=N in the IOAccelerator's PerformanceStatistics
     Buf r = {0};
@@ -373,7 +364,11 @@ static void conversations_panel(Arena *a, Buf *o, const JValue *m, size_t room) 
 }
 
 // The tail of the server log (~/Library/Logs/saetta/serve-<port>.log).
-static void log_panel(Arena *a, Buf *o, const JValue *m, size_t room, size_t w) {
+static void log_panel(Arena *a, Buf *o, const JValue *m, size_t room, size_t w, bool inproc) {
+    if (inproc) {
+        buf_printf(o, "\n %s%sServer log%s\n %sthe model runs in this process: no server log%s\n", BOLD, PURPLE, RESET, DIM, RESET);
+        return;
+    }
     uint16_t port = (uint16_t)num(m, "port");
     const char *home = getenv("HOME");
     char *path = arena_printf(a, "%s/Library/Logs/saetta/serve-%u.log", home ? home : "", port > 0 ? port : 8080);
@@ -401,8 +396,7 @@ static void log_panel(Arena *a, Buf *o, const JValue *m, size_t room, size_t w) 
     free(text);
 }
 
-static void frame(Arena *a, Buf *o, const char *path, Sys sys, Hist *tok_hist, Hist *gpu_hist, Size sz, bool live, View view) {
-    size_t w = MAX(sz.w, 60);
+JValue *monitor_read_snapshot(Arena *a, const char *path) {
     // server snapshot; stale or missing means no server
     JValue *m = NULL;
     char *text;
@@ -414,22 +408,38 @@ static void frame(Arena *a, Buf *o, const char *path, Sys sys, Hist *tok_hist, H
     }
     int32_t pid = (int32_t)num(m, "pid");
     bool up = m && pid > 0 && kill(pid, 0) == 0 && instance_running(NULL);
-    if (!up) m = NULL; // the last server's numbers are stale
+    return up ? m : NULL; // the last server's numbers are stale
+}
+
+void monitor_push(MonitorHists *h, const JValue *m, const MonitorSys *sys) {
+    hist_push(&h->tok, m ? num(m, "tok_s") : 0);
+    hist_push(&h->gpu, sys->has_gpu ? sys->gpu_util : 0);
+}
+
+void monitor_frame(Arena *a, Buf *o, const MonitorFrame *f) {
+    if (f->unavailable) {
+        buf_printf(o, " %s saetta %s \n\n %s%s%s\n %s%s%s\n\n %s%s%s\n", BADGE, RESET, WHITE, f->unavailable, RESET, DIM,
+                   f->unavailable_hint ? f->unavailable_hint : "", RESET, DIM, f->keys, RESET);
+        return;
+    }
+    size_t w = MAX(f->w, 60);
+    const JValue *m = f->m;
+    bool up = m != NULL;
+    Sys sys = f->sys;
+    const Hist *tok_hist = &f->hist->tok, *gpu_hist = &f->hist->gpu;
 
     const char *state = up ? jstr(m, "state") : "offline";
     double tok_s = up ? num(m, "tok_s") : 0;
-    hist_push(tok_hist, tok_s);
-    hist_push(gpu_hist, sys.has_gpu ? sys.gpu_util : 0);
 
     // header
     buf_printf(o, " %s saetta %s ", BADGE, RESET);
     if (up) {
         double uptime = num(m, "now") - num(m, "started");
-        buf_printf(o, " %s%s%s  %s%s%s  %shttp://127.0.0.1:%s%s  %sup %sm%s", WHITE, jstr(m, "model"), RESET, PURPLE,
-                   jstr(m, "pack"), RESET, DIM, fx(a, num(m, "port"), 0), RESET, DIM, fx(a, uptime / 60, 0), RESET);
+        const char *where = f->inproc ? "in this process" : arena_printf(a, "http://127.0.0.1:%s", fx(a, num(m, "port"), 0));
+        buf_printf(o, " %s%s%s  %s%s%s  %s%s%s  %sup %sm%s", WHITE, jstr(m, "model"), RESET, PURPLE, jstr(m, "pack"), RESET,
+                   DIM, where, RESET, DIM, fx(a, uptime / 60, 0), RESET);
     } else
-        buf_printf(o, " %sno saetta server is running%s  %sstart one with: saetta start claude%s", WHITE, RESET, DIM, RESET);
-    (void)live;
+        buf_printf(o, " %s%s%s  %s%s%s", WHITE, f->offline, RESET, DIM, f->offline_hint, RESET);
     buf_adds(o, "\n");
     buf_addc(o, '\n');
 
@@ -478,8 +488,8 @@ static void frame(Arena *a, Buf *o, const char *path, Sys sys, Hist *tok_hist, H
     double gws = num(m, "gpu_working_set");
     static const char *thermal_names[] = {"nominal", "fair", "serious", "critical"};
     size_t th = (size_t)CLAMP(sys.thermal, 0, 3);
-    Client *sessions;
-    size_t n_sessions = instance_clients(a, &sessions);
+    const Client *sessions = f->sessions;
+    size_t n_sessions = f->n_sessions;
     Buf who = {0};
     for (size_t i = 0; i < n_sessions; i++) {
         if (i > 0) buf_adds(&who, ", ");
@@ -521,25 +531,40 @@ static void frame(Arena *a, Buf *o, const char *path, Sys sys, Hist *tok_hist, H
     }
 
     size_t used_lines = per == 4 ? 18 : 28;
-    size_t room = sz.h > used_lines + 2 ? sz.h - used_lines - 2 : 3;
-    switch (view) {
-    case VIEW_REQUESTS: requests_panel(a, o, m, room); break;
-    case VIEW_CONVERSATIONS: conversations_panel(a, o, m, room); break;
-    case VIEW_LOG: log_panel(a, o, m, room, w); break;
+    size_t room = f->h > used_lines + 2 ? f->h - used_lines - 2 : 3;
+    switch (f->view) {
+    case MONITOR_REQUESTS: requests_panel(a, o, m, room); break;
+    case MONITOR_CONVERSATIONS: conversations_panel(a, o, m, room); break;
+    case MONITOR_LOG: log_panel(a, o, m, room, w, f->inproc); break;
     }
-    if (!up) buf_printf(o, " %swaiting for a server...%s\n", DIM, RESET);
-    buf_printf(o, "\n %sr requests  ·  c conversations  ·  l log  ·  space freeze  ·  q quit (the server keeps running)%s\n", DIM, RESET);
+    if (!up && f->waiting) buf_printf(o, " %s%s%s\n", DIM, f->waiting, RESET);
+    buf_printf(o, "\n %s%s%s\n", DIM, f->keys, RESET);
 }
 
-static Err live_loop(const char *path, Hist *tok_hist, Hist *gpu_hist, int *code) {
+// The monitor's own frame: the snapshot at path, the sessions registered on this Mac.
+static void frame(Arena *a, Buf *o, const char *path, MonitorHists *hist, Size sz, MonitorView view) {
+    Sys sys = monitor_sample();
+    const JValue *m = monitor_read_snapshot(a, path);
+    monitor_push(hist, m, &sys);
+    Client *sessions;
+    size_t n_sessions = instance_clients(a, &sessions);
+    MonitorFrame f = {
+        .m = m, .sys = sys, .hist = hist, .w = sz.w, .h = sz.h, .view = view, .sessions = sessions,
+        .n_sessions = n_sessions, .offline = "no saetta server is running",
+        .offline_hint = "start one with: saetta start claude", .waiting = "waiting for a server...",
+        .keys = "r requests  ·  c conversations  ·  l log  ·  space freeze  ·  q quit (the server keeps running)",
+    };
+    monitor_frame(a, o, &f);
+}
+
+static Err live_loop(const char *path, MonitorHists *hist, int *code) {
     bool frozen = false;
-    View view = VIEW_REQUESTS;
+    MonitorView view = MONITOR_REQUESTS;
     for (;;) {
         if (!frozen) {
             Arena a = {0};
             Buf body = {0};
-            Sys sys = sample();
-            frame(&a, &body, path, sys, tok_hist, gpu_hist, size(), true, view);
+            frame(&a, &body, path, hist, size(), view);
             // redrawn in place: clear the rest of each line, then everything below
             Buf out = {0};
             buf_adds(&out, "\x1b[H");
@@ -567,9 +592,9 @@ static Err live_loop(const char *path, Hist *tok_hist, Hist *gpu_hist, int *code
                 switch (b[i]) {
                 case 'q': case 'Q': case 3: case 27: *code = 0; return OK;
                 case ' ': frozen = !frozen; break;
-                case 'r': view = VIEW_REQUESTS; break;
-                case 'c': view = VIEW_CONVERSATIONS; break;
-                case 'l': view = VIEW_LOG; break;
+                case 'r': view = MONITOR_REQUESTS; break;
+                case 'c': view = MONITOR_CONVERSATIONS; break;
+                case 'l': view = MONITOR_LOG; break;
                 default: break;
                 }
             }
@@ -579,11 +604,11 @@ static Err live_loop(const char *path, Hist *tok_hist, Hist *gpu_hist, int *code
 
 Err monitor_run(const char *const *args, size_t n, int *code) {
     bool once = false;
-    View view_once = VIEW_REQUESTS;
+    MonitorView view_once = MONITOR_REQUESTS;
     for (size_t i = 0; i < n; i++) {
         if (strcmp(args[i], "--once") == 0) once = true;
-        else if (strcmp(args[i], "--conversations") == 0) view_once = VIEW_CONVERSATIONS;
-        else if (strcmp(args[i], "--log") == 0) view_once = VIEW_LOG;
+        else if (strcmp(args[i], "--conversations") == 0) view_once = MONITOR_CONVERSATIONS;
+        else if (strcmp(args[i], "--log") == 0) view_once = MONITOR_LOG;
         else {
             dbg("usage: saetta monitor [--once [--conversations | --log]]\n");
             *code = 64;
@@ -595,13 +620,12 @@ Err monitor_run(const char *const *args, size_t n, int *code) {
     Arena pa = {0};
     const char *path = path_join(&pa, path_join(&pa, path_join(&pa, home, ".saetta"), "run"), "metrics.json");
 
-    Hist tok_hist = {0}, gpu_hist = {0};
+    MonitorHists hist = {0};
     Err e = OK;
     if (once) {
         Arena a = {0};
         Buf out = {0};
-        Sys sys = sample();
-        frame(&a, &out, path, sys, &tok_hist, &gpu_hist, size(), false, view_once);
+        frame(&a, &out, path, &hist, size(), view_once);
         e = write_all(out.ptr ? out.ptr : "", out.len);
         buf_free(&out);
         arena_reset(&a);
@@ -620,7 +644,7 @@ Err monitor_run(const char *const *args, size_t n, int *code) {
     }
     e = write_all("\x1b[?1049h\x1b[?25l", 14);
     if (!e) {
-        e = live_loop(path, &tok_hist, &gpu_hist, code);
+        e = live_loop(path, &hist, code);
         (void)write_all("\x1b[?25h\x1b[?1049l", 14);
     }
     if (tty) tcsetattr(0, TCSANOW, &saved);

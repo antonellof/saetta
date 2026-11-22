@@ -11,6 +11,7 @@
 #include "code.h"
 #include "code_oai.h"
 #include "code_tui.h"
+#include "code_monitor.h"
 #include "download.h"
 #include "instance.h"
 #include "server.h"
@@ -1040,6 +1041,7 @@ static bool switch_model(Run *r, const char *provider, const char *id) {
     r->env.provider = r->model.provider;
     r->env.model = r->model.id;
     r->env.thinking = r->model.thinking;
+    code_monitor_set_model(NULL, r->model.provider, r->model.base_url);
     JValue *f = json_new(a, J_OBJECT);
     json_put(a, f, S("provider"), json_string(a, str(r->model.provider)));
     json_put(a, f, S("modelId"), json_string(a, str(r->model.id)));
@@ -1229,6 +1231,7 @@ static Err interactive(Run *r, const Args *o, const JValue *settings) {
         nanosleep(&ts, NULL);
         splash_stop(sp);
     }
+    code_monitor_set_model(r->model.engine, r->model.provider, r->model.base_url);
     Err e = code_ui_run(&cfg, &ops, &host, o->prompts.ptr, o->prompts.len);
     g_tty_saved = 0;
     if (e && !strcmp(e, "AgentBusy")) {

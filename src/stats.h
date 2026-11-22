@@ -32,7 +32,7 @@ typedef struct {
     char finish[12];
 } Done;
 
-typedef struct {
+typedef struct Stats {
     // set once (before stats_spawn)
     const char *model;
     const char *pack;
@@ -67,6 +67,9 @@ void stats_set_convs(Stats *st, const ConvInfo *cv, size_t n);
 int64_t stats_now_ns(void);
 void stats_begin(Stats *st, bool anthropic, size_t prompt, size_t reused, size_t max_tokens);
 void stats_finish(Stats *st, Done d);
+// The snapshot as JSON (what the thread writes to metrics.json), appended to o. Reads the
+// atomics and takes the spin lock as the thread does; any thread may call it.
+void stats_json(Stats *st, Buf *o);
 // Starts the snapshot (and, for an auto-started server, watchdog) thread; detached, it runs
 // for the life of the process. Does nothing without $HOME.
 Err stats_spawn(Stats *st);

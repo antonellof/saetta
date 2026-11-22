@@ -1684,6 +1684,8 @@ static bool hyperlinks_supported(void) {
     return false;
 }
 
+bool tui_hyperlinks(void) { return hyperlinks_supported(); }
+
 void md_render(Str text, int pad_x, int pad_y, const MdStyle *style, int width, Lines *out) {
     if (!str_trim(text).len) return;
     int cw = MAX(1, width - pad_x * 2);

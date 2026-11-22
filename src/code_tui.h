@@ -165,6 +165,8 @@ typedef struct {
 } MdStyle;
 // Markdown(text, paddingX, paddingY, theme, defaultStyle)
 void md_render(Str text, int pad_x, int pad_y, const MdStyle *style, int width, Lines *out);
+// getCapabilities().hyperlinks: the terminal shows OSC 8 hyperlinks (PI_HYPERLINKS, then the terminal).
+bool tui_hyperlinks(void);
 Comp *comp_markdown(Str text, int pad_x, int pad_y, const MdStyle *style);
 // highlight(code, lang): one styled line per source line (utils/syntax-highlight.ts).
 void md_highlight(Str code, Str lang, Lines *out);

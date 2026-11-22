@@ -1846,6 +1846,8 @@ static void mdc_destroy(Comp *c) {
 
 static const CompVt md_vt = {mdc_render, mdc_destroy, false};
 
+bool comp_markdown_is_user(const Comp *c) { return c && c->vt == &md_vt && ((const MdComp *)c)->style.user; }
+
 Comp *comp_markdown(Str text, int pad_x, int pad_y, const MdStyle *style) {
     MdComp *m = xcalloc(1, sizeof *m);
     m->base.vt = &md_vt;

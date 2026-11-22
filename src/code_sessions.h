@@ -104,5 +104,14 @@ bool code_sessions_context_unknown(Arena *a, const JValue *entries, const char *
 // follows "Compaction failed: ".
 const char *code_sessions_compact(Arena *a, CodeSession *s, const CodeModel *m, const CodeEnv *env, const char *instructions,
                                   int64_t keep_recent_tokens, const JValue **entry);
+// The same, with started(ctx) called once the preparation succeeded (before the summary request):
+// "Already compacted" and "Nothing to compact (session too small)" come before it (pi's
+// prepareCompaction returning undefined).
+const char *code_sessions_compact_cb(Arena *a, CodeSession *s, const CodeModel *m, const CodeEnv *env, const char *instructions,
+                                     int64_t keep_recent_tokens, const JValue **entry, void (*started)(void *ctx), void *ctx);
+// buildSessionProjection(...).messages of the branch ending at leaf (pi's roles).
+JValue *code_sessions_projection(Arena *a, const JValue *entries, const char *leaf);
+// estimateProjectedContextTokens of the branch ending at leaf.
+double code_sessions_projected_tokens(Arena *a, const JValue *entries, const char *leaf);
 
 #endif

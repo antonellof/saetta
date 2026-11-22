@@ -35,6 +35,8 @@ typedef struct {
 } CmdsUi;
 
 void cmds_init(const CmdsUi *ui);
+// handleCopyCommand: the last agent message to the clipboard; flash (NULL: the status line) says so.
+void cmds_copy(void (*flash)(const char *msg));
 // A submitted line: true when it was one of these commands (handled).
 bool cmds_submit(const char *text);
 // A dialog of these commands in place of the editor: it takes the keys and draws there.

@@ -110,7 +110,10 @@ static struct {
     bool tail_compaction;    // draw the latest compaction after the kept messages (compaction_end)
     char *tail_summary;
     double tail_tokens;
+    bool compacting;         // between compaction_start and compaction_end
 } G;
+
+bool sess_ui_compacting(void) { return G.compacting; }
 
 static void refresh_name(void) {
     const char *leaf;
@@ -304,17 +307,28 @@ void sess_ui_event(const JValue *ev) {
             if (valid_usage(m)) G.unknown = false;
         }
     } else if (!strcmp(type, "compaction_start")) {
-        // CompactionStatusIndicator (manual) in the editor's border
-        uix_working("Compacting context... (escape to cancel)");
+        G.compacting = true;
+        // CompactionStatusIndicator in the editor's border (manual, threshold or overflow)
+        const char *reason = json_str(json_get(ev, "reason"));
+        if (!reason || !strcmp(reason, "manual")) uix_working("Compacting context... (escape to cancel)");
+        else uix_working(!strcmp(reason, "overflow") ? "Context overflow detected, Auto-compacting... (escape to cancel)" : "Auto-compacting... (escape to cancel)");
     } else if (!strcmp(type, "compaction_end")) {
+        G.compacting = false;
         uix_working(NULL);
+        const char *reason = json_str(json_get(ev, "reason"));
+        bool manual = !reason || !strcmp(reason, "manual");
         bool aborted = json_is(json_get(ev, "aborted"), J_BOOL) && json_get(ev, "aborted")->b;
-        if (aborted) uix_show_error("Compaction cancelled");
-        else if (json_get(ev, "result")) {
+        if (aborted) {
+            if (manual) uix_show_error("Compaction cancelled");
+            else uix_show_status("Auto-compaction cancelled");
+        } else if (json_get(ev, "result")) {
             // the transcript again: the kept messages, then the summary at its place in time
             G.tail_compaction = true;
             uix_render_history();
-        } else if (json_str(json_get(ev, "errorMessage"))) uix_show_error(json_str(json_get(ev, "errorMessage")));
+        } else if (json_str(json_get(ev, "errorMessage"))) {
+            if (manual) uix_show_error(json_str(json_get(ev, "errorMessage")));
+            else chat_themed(T_ERROR, json_str(json_get(ev, "errorMessage"))); // Spacer + ThemedText("error")
+        }
         uix_request_render();
     }
 }

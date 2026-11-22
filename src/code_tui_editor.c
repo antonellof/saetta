@@ -3,10 +3,13 @@
 // b4afddd): packages/tui/src/components/editor.ts (layout, word wrap, cursor, history, paste
 // markers, the autocomplete triggers), autocomplete.ts (CombinedAutocompleteProvider), fuzzy.ts,
 // and packages/coding-agent/src/modes/interactive/components/custom-editor.ts (the working status
-// in the top border).
+// in the top border); the kill ring, undo and character jump of editor.ts with kill-ring.ts and
+// undo-stack.ts (code_tui_ring.c).
 #include "code_tui.h"
+#include "code_tui_ring.h"
 
 #include <ctype.h>
+#include <math.h>
 #include <dirent.h>
 #include <pthread.h>
 #include <signal.h>
@@ -55,6 +58,12 @@ struct Editor {
     uint64_t req_id, debounce_ns;
     bool req_pending, req_force;
     struct AcJob *jobs;
+    // the kill ring (Emacs-style kill and yank), what the last action was, the character jump
+    // awaiting its character, and the undo snapshots (editor.ts)
+    KillRing kill;
+    enum { LA_NONE, LA_KILL, LA_YANK, LA_TYPE_WORD } last_action;
+    int jump; // 1 forward, -1 backward, 0 none
+    UndoStack undo;
 };
 
 // One "@" lookup: what it searches, and its result once done.
@@ -151,6 +160,9 @@ void editor_free(Editor *e) {
     free(e->draft);
     free(e->work_msg);
     buf_free(&e->joined);
+    kill_ring_free(&e->kill);
+    undo_clear(&e->undo);
+    free(e->undo.v);
     free(e);
 }
 
@@ -191,8 +203,13 @@ Str editor_text(const Editor *e) {
 
 bool editor_empty(const Editor *e) { return e->lines.len == 1 && e->lines.ptr[0].len == 0; }
 
+static void push_undo(Editor *e);
+
 void editor_set_text(Editor *e, Str text) {
     ac_close(e);
+    e->last_action = LA_NONE;
+    // setText: a snapshot when the content differs (programmatic changes are undoable)
+    if (!str_eq(editor_text(e), text)) push_undo(e);
     lines_reset(e, text);
     e->cl = e->lines.len - 1;
     e->cc = e->lines.ptr[e->cl].len;
@@ -1192,6 +1209,8 @@ static void ac_show(Editor *e, SelectList list, char *prefix, bool force) {
 
 // applyCompletion
 static void apply_completion(Editor *e, const SelItem *it, const char *prefix_z) {
+    push_undo(e);
+    e->last_action = LA_NONE;
     Str prefix = str(prefix_z);
     Buf *line = cur_line(e);
     Str l = buf_str(line);
@@ -1277,6 +1296,10 @@ static void insert_text_raw(Editor *e, Str text) {
 
 static void insert_char(Editor *e, uint32_t cp) {
     e->hist_idx = -1;
+    // undo coalescing (fish-style): a run of word characters is one unit; a space keeps the
+    // state before it
+    if (tui_is_space(cp) || e->last_action != LA_TYPE_WORD) push_undo(e);
+    e->last_action = LA_TYPE_WORD;
     char enc[5];
     int n = cp < 0x80 ? 1 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4;
     if (n == 1) enc[0] = (char)cp;
@@ -1326,6 +1349,8 @@ static void after_delete(Editor *e) {
 
 static void backspace(Editor *e) {
     e->hist_idx = -1;
+    e->last_action = LA_NONE;
+    if (e->cc > 0 || e->cl > 0) push_undo(e);
     if (e->cc > 0) {
         Buf *line = cur_line(e);
         size_t p = prev_grapheme(buf_str(line), e->cc);
@@ -1347,7 +1372,9 @@ static void backspace(Editor *e) {
 
 static void forward_delete(Editor *e) {
     e->hist_idx = -1;
+    e->last_action = LA_NONE;
     Buf *line = cur_line(e);
+    if (e->cc < line->len || e->cl + 1 < e->lines.len) push_undo(e);
     if (e->cc < line->len) {
         size_t g = tui_grapheme(buf_str(line), e->cc);
         memmove(line->ptr + e->cc, line->ptr + e->cc + g, line->len - e->cc - g + 1);
@@ -1364,12 +1391,15 @@ static void forward_delete(Editor *e) {
 static void new_line(Editor *e) {
     ac_close(e);
     e->hist_idx = -1;
+    e->last_action = LA_NONE;
+    push_undo(e);
     insert_text_raw(e, S("\n"));
 }
 
 static bool word_char(uint32_t cp) { return !tui_is_space(cp) && !(cp < 0x80 && strchr("(){}[]<>.,;:'\"!?+-=*/\\|&%^$#@~`", (int)cp)); }
 
 static void word_left(Editor *e) {
+    e->last_action = LA_NONE;
     if (e->cc == 0) {
         if (e->cl > 0) {
             e->cl--;
@@ -1400,6 +1430,7 @@ static void word_left(Editor *e) {
 }
 
 static void word_right(Editor *e) {
+    e->last_action = LA_NONE;
     Str l = buf_str(cur_line(e));
     if (e->cc >= l.len) {
         if (e->cl + 1 < e->lines.len) {
@@ -1427,32 +1458,243 @@ static void word_right(Editor *e) {
     e->cc = p;
 }
 
+// The current line joined to the one above (the cursor at the join) or the one below.
+static void merge_up(Editor *e) {
+    Buf *prev = &e->lines.ptr[e->cl - 1];
+    size_t pl = prev->len;
+    buf_addstr(prev, buf_str(cur_line(e)));
+    buf_free(cur_line(e));
+    memmove(e->lines.ptr + e->cl, e->lines.ptr + e->cl + 1, (e->lines.len - e->cl - 1) * sizeof(Buf));
+    e->lines.len--;
+    e->cl--;
+    e->cc = pl;
+}
+
+static void merge_down(Editor *e) {
+    Buf *line = cur_line(e);
+    buf_addstr(line, buf_str(&e->lines.ptr[e->cl + 1]));
+    buf_free(&e->lines.ptr[e->cl + 1]);
+    memmove(e->lines.ptr + e->cl + 1, e->lines.ptr + e->cl + 2, (e->lines.len - e->cl - 2) * sizeof(Buf));
+    e->lines.len--;
+}
+
+// deleteWordBackwards: the word before the cursor (or, at a line start, the line break) killed
 static void delete_word_back(Editor *e) {
+    e->hist_idx = -1;
     if (e->cc == 0) {
-        backspace(e);
+        if (e->cl > 0) {
+            push_undo(e);
+            kill_ring_push(&e->kill, S("\n"), true, e->last_action == LA_KILL);
+            e->last_action = LA_KILL;
+            merge_up(e);
+        }
+        after_delete(e);
         return;
     }
+    push_undo(e);
+    bool was_kill = e->last_action == LA_KILL; // word_left resets it
     size_t end = e->cc;
     word_left(e);
     Buf *line = cur_line(e);
+    kill_ring_push(&e->kill, str_n(line->ptr + e->cc, end - e->cc), true, was_kill);
+    e->last_action = LA_KILL;
     memmove(line->ptr + e->cc, line->ptr + end, line->len - end + 1);
     line->len -= end - e->cc;
     after_delete(e);
 }
 
+// deleteWordForward
 static void delete_word_forward(Editor *e) {
-    size_t start = e->cc, cl = e->cl;
-    word_right(e);
-    if (e->cl != cl) {
-        e->cl = cl;
-        e->cc = start;
-        forward_delete(e);
+    e->hist_idx = -1;
+    Buf *line = cur_line(e);
+    if (e->cc >= line->len) {
+        if (e->cl + 1 < e->lines.len) {
+            push_undo(e);
+            kill_ring_push(&e->kill, S("\n"), false, e->last_action == LA_KILL);
+            e->last_action = LA_KILL;
+            merge_down(e);
+        }
         return;
     }
-    Buf *line = cur_line(e);
+    push_undo(e);
+    bool was_kill = e->last_action == LA_KILL; // word_right resets it
+    size_t start = e->cc;
+    word_right(e);
+    line = cur_line(e);
+    kill_ring_push(&e->kill, str_n(line->ptr + start, e->cc - start), false, was_kill);
+    e->last_action = LA_KILL;
     memmove(line->ptr + start, line->ptr + e->cc, line->len - e->cc + 1);
     line->len -= e->cc - start;
     e->cc = start;
+}
+
+// deleteToEndOfLine: the rest of the line (or, at its end, the line break) killed
+static void delete_to_end(Editor *e) {
+    e->hist_idx = -1;
+    Buf *line = cur_line(e);
+    if (e->cc < line->len) {
+        push_undo(e);
+        kill_ring_push(&e->kill, str_n(line->ptr + e->cc, line->len - e->cc), false, e->last_action == LA_KILL);
+        e->last_action = LA_KILL;
+        line->len = e->cc;
+        line->ptr[line->len] = 0;
+    } else if (e->cl + 1 < e->lines.len) {
+        push_undo(e);
+        kill_ring_push(&e->kill, S("\n"), false, e->last_action == LA_KILL);
+        e->last_action = LA_KILL;
+        merge_down(e);
+    }
+}
+
+// deleteToStartOfLine
+static void delete_to_start(Editor *e) {
+    e->hist_idx = -1;
+    Buf *line = cur_line(e);
+    if (e->cc > 0) {
+        push_undo(e);
+        kill_ring_push(&e->kill, str_n(line->ptr, e->cc), true, e->last_action == LA_KILL);
+        e->last_action = LA_KILL;
+        memmove(line->ptr, line->ptr + e->cc, line->len - e->cc + 1);
+        line->len -= e->cc;
+        e->cc = 0;
+    } else if (e->cl > 0) {
+        push_undo(e);
+        kill_ring_push(&e->kill, S("\n"), true, e->last_action == LA_KILL);
+        e->last_action = LA_KILL;
+        merge_up(e);
+    }
+    after_delete(e);
+}
+
+// pushUndoSnapshot
+static void push_undo(Editor *e) { undo_push(&e->undo, editor_text(e), e->cl, e->cc, e->pastes.ptr, e->pastes.len); }
+
+// undo: the last snapshot restored
+static void undo(Editor *e) {
+    e->hist_idx = -1;
+    free(e->draft);
+    e->draft = NULL;
+    UndoSnap u;
+    if (!undo_pop(&e->undo, &u)) return;
+    lines_reset(e, str(u.text));
+    e->cl = u.cl < e->lines.len ? u.cl : e->lines.len - 1;
+    e->cc = u.cc <= cur_line(e)->len ? u.cc : cur_line(e)->len;
+    for (size_t i = 0; i < e->pastes.len; i++) free(e->pastes.ptr[i]);
+    e->pastes.len = 0;
+    for (size_t i = 0; i < u.npastes; i++) vec_push(&e->pastes, strdup(u.pastes[i]));
+    undo_snap_free(&u);
+    e->last_action = LA_NONE;
+}
+
+// insertYankedText: text at the cursor, the cursor after it
+static void insert_yanked(Editor *e, const char *text) {
+    e->hist_idx = -1;
+    insert_text_raw(e, str(text));
+}
+
+// deleteYankedText: the yanked text (the ring's last entry) before the cursor removed
+static void delete_yanked(Editor *e) {
+    const char *y = kill_ring_peek(&e->kill);
+    if (!y) return;
+    size_t nl = 0;
+    for (const char *p = y; *p; p++) nl += *p == '\n';
+    if (!nl) {
+        size_t n = strlen(y);
+        Buf *line = cur_line(e);
+        size_t from = e->cc >= n ? e->cc - n : 0;
+        memmove(line->ptr + from, line->ptr + e->cc, line->len - e->cc + 1);
+        line->len -= e->cc - from;
+        e->cc = from;
+        return;
+    }
+    // multi-line: the cursor is at the end of the last yanked line
+    size_t first_len = (size_t)(strchr(y, '\n') - y);
+    size_t start = e->cl - nl;
+    Buf *sl = &e->lines.ptr[start];
+    size_t start_col = sl->len >= first_len ? sl->len - first_len : 0;
+    Buf merged = {0};
+    buf_add(&merged, sl->ptr, start_col);
+    Buf *cur = cur_line(e);
+    buf_add(&merged, cur->ptr + e->cc, cur->len - e->cc);
+    if (!merged.ptr) buf_adds(&merged, "");
+    for (size_t i = start; i <= e->cl; i++) buf_free(&e->lines.ptr[i]);
+    memmove(e->lines.ptr + start + 1, e->lines.ptr + e->cl + 1, (e->lines.len - e->cl - 1) * sizeof(Buf));
+    e->lines.len -= nl;
+    e->lines.ptr[start] = merged;
+    e->cl = start;
+    e->cc = start_col;
+}
+
+// yank: the most recent kill at the cursor
+static void yank(Editor *e) {
+    const char *t = kill_ring_peek(&e->kill);
+    if (!t) return;
+    push_undo(e);
+    insert_yanked(e, t);
+    e->last_action = LA_YANK;
+}
+
+// yankPop: right after a yank, the yanked text replaced with the entry before it in the ring
+static void yank_pop(Editor *e) {
+    if (e->last_action != LA_YANK || e->kill.n <= 1) return;
+    push_undo(e);
+    delete_yanked(e);
+    kill_ring_rotate(&e->kill);
+    insert_yanked(e, kill_ring_peek(&e->kill));
+    e->last_action = LA_YANK;
+}
+
+// jumpToChar: the first occurrence of the character after the cursor (forward) or before it,
+// across lines; the cursor stays when there is none
+static void jump_to_char(Editor *e, uint32_t cp, int dir) {
+    e->last_action = LA_NONE;
+    char enc[5];
+    int n = tui_utf8(enc, cp);
+    for (long li = (long)e->cl; li >= 0 && li < (long)e->lines.len; li += dir) {
+        Str l = line_at(e, (size_t)li);
+        bool cur = (size_t)li == e->cl;
+        long found = -1;
+        if (dir > 0) {
+            size_t from = cur ? e->cc + 1 : 0;
+            for (size_t i = from; i + (size_t)n <= l.len && found < 0; i++)
+                if (!memcmp(l.ptr + i, enc, (size_t)n)) found = (long)i;
+        } else {
+            // lastIndexOf(char, cursorCol - 1): a negative start searches from 0
+            long from = cur ? (e->cc ? (long)e->cc - 1 : 0) : (long)l.len;
+            for (long i = from; i >= 0 && found < 0; i--)
+                if ((size_t)i + (size_t)n <= l.len && !memcmp(l.ptr + i, enc, (size_t)n)) found = i;
+        }
+        if (found >= 0) {
+            e->cl = (size_t)li;
+            e->cc = (size_t)found;
+            return;
+        }
+    }
+}
+
+void editor_insert_text(Editor *e, Str text) {
+    if (!text.len) return;
+    ac_close(e);
+    push_undo(e);
+    e->last_action = LA_NONE;
+    e->hist_idx = -1;
+    // normalizeText: line endings as \n, tabs as four spaces
+    Buf t = {0};
+    for (size_t i = 0; i < text.len; i++) {
+        if (text.ptr[i] == '\r') {
+            buf_addc(&t, '\n');
+            if (i + 1 < text.len && text.ptr[i + 1] == '\n') i++;
+        } else if (text.ptr[i] == '\t') buf_adds(&t, "    ");
+        else buf_addc(&t, text.ptr[i]);
+    }
+    insert_text_raw(e, buf_str(&t));
+    buf_free(&t);
+}
+
+bool editor_cursor(const Editor *e, size_t *line, size_t *col) {
+    *line = e->cl;
+    *col = e->cc;
+    return true;
 }
 
 // The visual lines (wrapped chunks) and the one holding the cursor.
@@ -1464,13 +1706,18 @@ static size_t visual_lines(Editor *e, LayoutVec *ll) {
     return 0;
 }
 
-static void move_vertical(Editor *e, int dir) {
+// moveToVisualLine: the cursor dir visual lines away (clamped to the text), at its column.
+static void move_vertical(Editor *e, long dir) {
     LayoutVec ll = {0};
     size_t cur = visual_lines(e, &ll);
-    if ((dir < 0 && cur == 0) || (dir > 0 && cur + 1 >= ll.len)) {
+    long target = (long)cur + dir;
+    if (target < 0) target = 0;
+    if (target >= (long)ll.len) target = (long)ll.len - 1;
+    if (target == (long)cur) {
         vec_free(&ll);
         return;
     }
+    dir = target - (long)cur;
     LayoutLine *from = &ll.ptr[cur];
     Str fl = line_at(e, from->line);
     int col = tui_width(str_n(fl.ptr + from->start, e->cc - from->start));
@@ -1509,10 +1756,12 @@ static bool on_last_visual(Editor *e) {
 }
 
 static void history(Editor *e, int dir) {
+    e->last_action = LA_NONE;
     if (!e->hist.len) return;
     long ni = e->hist_idx - dir;
     if (ni < -1 || ni >= (long)e->hist.len) return;
     if (e->hist_idx == -1 && ni >= 0) {
+        push_undo(e);
         free(e->draft);
         Str t = editor_text(e);
         e->draft = strndup(t.ptr, t.len);
@@ -1564,6 +1813,8 @@ static char *submit_text(Editor *e) {
 
 static void submit(Editor *e, char **out) {
     ac_close(e);
+    undo_clear(&e->undo);
+    e->last_action = LA_NONE;
     *out = submit_text(e);
     lines_reset(e, S(""));
     e->cl = e->cc = 0;
@@ -1576,6 +1827,8 @@ static void submit(Editor *e, char **out) {
 static void paste(Editor *e, const char *text) {
     ac_close(e);
     e->hist_idx = -1;
+    e->last_action = LA_NONE;
+    push_undo(e);
     Buf clean = {0};
     for (const char *p = text; *p; p++) {
         if (*p == '\r') {
@@ -1610,11 +1863,31 @@ static void paste(Editor *e, const char *text) {
 
 bool editor_key(Editor *e, const Key *k, char **submitted) {
     *submitted = NULL;
+    bool jump_fwd = k->kind == K_CTRL && k->ch == ']', jump_back = k->kind == K_ALT && k->ch == 0x1d;
+    // the character jump waiting for its character: the hotkey again cancels it, a printable
+    // character jumps, anything else cancels and is handled as usual
+    if (e->jump) {
+        if (jump_fwd || jump_back) {
+            e->jump = 0;
+            return false;
+        }
+        if (k->kind == K_CHAR) {
+            int dir = e->jump;
+            e->jump = 0;
+            jump_to_char(e, k->ch, dir);
+            return false;
+        }
+        e->jump = 0;
+    }
     if (k->kind == K_PASTE) {
         paste(e, k->paste);
         return false;
     }
     if (k->kind == K_CTRL && k->ch == 'c') return false; // the app clears
+    if (k->kind == K_CTRL && (k->ch == '-' || k->ch == '_')) { // tui.editor.undo (ctrl+-, legacy ctrl+_)
+        undo(e);
+        return false;
+    }
     if (e->ac_open) {
         if (k->kind == K_ESC || (k->kind == K_CTRL && k->ch == 'c')) {
             ac_close(e);
@@ -1670,26 +1943,13 @@ bool editor_key(Editor *e, const Key *k, char **submitted) {
         return false;
     }
     case K_CTRL:
+        if (k->ch != 'k' && k->ch != 'u' && k->ch != 'w' && k->ch != 'd' && k->ch != 'y' && k->ch != ']') e->last_action = LA_NONE;
         switch (k->ch) {
-        case 'k': {
-            Buf *line = cur_line(e);
-            if (e->cc < line->len) {
-                line->len = e->cc;
-                line->ptr[line->len] = 0;
-            } else if (e->cl + 1 < e->lines.len) forward_delete(e);
-            return false;
-        }
-        case 'u': {
-            Buf *line = cur_line(e);
-            if (e->cc > 0) {
-                memmove(line->ptr, line->ptr + e->cc, line->len - e->cc + 1);
-                line->len -= e->cc;
-                e->cc = 0;
-            } else if (e->cl > 0) backspace(e);
-            after_delete(e);
-            return false;
-        }
+        case 'k': delete_to_end(e); return false;
+        case 'u': delete_to_start(e); return false;
         case 'w': delete_word_back(e); return false;
+        case 'y': yank(e); return false;
+        case ']': e->jump = 1; return false;
         case 'a': e->cc = 0; return false;
         case 'e': e->cc = cur_line(e)->len; return false;
         case 'b':
@@ -1712,13 +1972,23 @@ bool editor_key(Editor *e, const Key *k, char **submitted) {
         }
     case K_ALT:
         if (k->ch == 'd') delete_word_forward(e);
+        else if (k->ch == 'y') yank_pop(e);
+        else if (k->ch == 0x1d) e->jump = -1;
         return false;
     case K_ALT_BACKSPACE:
     case K_CTRL_BACKSPACE: delete_word_back(e); return false;
     case K_BACKSPACE: backspace(e); return false;
     case K_DELETE: forward_delete(e); return false;
-    case K_HOME: e->cc = 0; return false;
-    case K_END: e->cc = cur_line(e)->len; return false;
+    case K_ALT_DELETE: delete_word_forward(e); return false;
+    case K_CTRL_PGUP:
+    case K_CTRL_PGDN: { // pageScroll: max(5, 30% of the terminal) visual lines
+        e->last_action = LA_NONE;
+        long page = (long)floor(e->rows * 0.3) > 5 ? (long)floor(e->rows * 0.3) : 5;
+        move_vertical(e, k->kind == K_CTRL_PGUP ? -page : page);
+        return false;
+    }
+    case K_HOME: e->last_action = LA_NONE; e->cc = 0; return false;
+    case K_END: e->last_action = LA_NONE; e->cc = cur_line(e)->len; return false;
     case K_ALT_LEFT:
     case K_CTRL_LEFT: word_left(e); return false;
     case K_ALT_RIGHT:
@@ -1736,16 +2006,19 @@ bool editor_key(Editor *e, const Key *k, char **submitted) {
         return true;
     }
     case K_UP:
+        e->last_action = LA_NONE;
         if (on_first_visual(e) && (editor_empty(e) || e->hist_idx > -1 || e->cc == 0)) history(e, -1);
         else if (on_first_visual(e)) e->cc = 0;
         else move_vertical(e, -1);
         return false;
     case K_DOWN:
+        e->last_action = LA_NONE;
         if (e->hist_idx > -1 && on_last_visual(e)) history(e, 1);
         else if (on_last_visual(e)) e->cc = cur_line(e)->len;
         else move_vertical(e, 1);
         return false;
     case K_RIGHT:
+        e->last_action = LA_NONE;
         if (e->cc < cur_line(e)->len) e->cc += tui_grapheme(buf_str(cur_line(e)), e->cc);
         else if (e->cl + 1 < e->lines.len) {
             e->cl++;
@@ -1753,6 +2026,7 @@ bool editor_key(Editor *e, const Key *k, char **submitted) {
         }
         return false;
     case K_LEFT:
+        e->last_action = LA_NONE;
         if (e->cc > 0) e->cc = prev_grapheme(buf_str(cur_line(e)), e->cc);
         else if (e->cl > 0) {
             e->cl--;

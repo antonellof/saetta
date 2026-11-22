@@ -168,6 +168,8 @@ void md_render(Str text, int pad_x, int pad_y, const MdStyle *style, int width, 
 // getCapabilities().hyperlinks: the terminal shows OSC 8 hyperlinks (PI_HYPERLINKS, then the terminal).
 bool tui_hyperlinks(void);
 Comp *comp_markdown(Str text, int pad_x, int pad_y, const MdStyle *style);
+// A user message's markdown (its first row is the prompt start pi marks with OSC 133;A).
+bool comp_markdown_is_user(const Comp *c);
 // highlight(code, lang): one styled line per source line (utils/syntax-highlight.ts).
 void md_highlight(Str code, Str lang, Lines *out);
 bool md_lang_supported(Str lang);
@@ -204,6 +206,7 @@ typedef enum {
     K_REPLY_DA,    // device attributes (the query's sentinel)
     K_REPLY_COLOR, // an OSC 10/11/4 color reply: ch 10, 11 or 100 + palette index; rgb in button, mx, my (release: unparsable)
     K_ALT_DOWN,
+    K_CTRL_PGUP, K_CTRL_PGDN, K_ALT_DELETE, // tui.editor.pageUp / pageDown, deleteWordForward
 } KeyKind;
 typedef struct {
     KeyKind kind;
@@ -260,6 +263,10 @@ void editor_set_waker(Editor *e, int fd);
 bool editor_autocomplete_open(const Editor *e);
 Str editor_text(const Editor *e); // the text, lines joined with "\n" (valid until the next edit)
 void editor_set_text(Editor *e, Str text);
+// insertTextAtCursor: text inserted at the cursor as one undo step (the clipboard paste).
+void editor_insert_text(Editor *e, Str text);
+// getCursor: the cursor's line and byte column.
+bool editor_cursor(const Editor *e, size_t *line, size_t *col);
 bool editor_empty(const Editor *e);
 void editor_add_history(Editor *e, Str text);
 Comp *editor_comp(Editor *e);
@@ -405,5 +412,6 @@ char *code_ui_take_thinking(void);
 // A message the user queued while the run goes on (malloc'd), or NULL: a steering message only
 // when steering_only (between tool calls), else a follow-up too (when the run would end).
 char *code_ui_take_queued(bool steering_only);
+bool code_ui_has_queued(void); // code_autocompact.c: a message is waiting
 
 #endif

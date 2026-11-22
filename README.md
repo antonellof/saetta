@@ -21,7 +21,7 @@ Saetta runs Qwen3.8 coding models on any Apple Silicon Mac with 32 GB of memory 
 
 - **Fast:** on an M5 Max, Flash-Next reads prompts at 1,600 to 1,950 tokens/s and answers at 66 to 85 tokens/s, with speculative decoding.
 - **Follow-up turns read only what is new:** a second turn on a 16K conversation answers in 0.2 s.
-- **One command to code:** `saetta` picks the model and the agent for you; `saetta start claude` (or `pi`, `opencode`) when you know.
+- **One command to code:** `saetta` picks the model and the agent for you; `saetta start claude` (or `pi`, `opencode`, or the built-in `code`) when you know.
 - **LoRA adapters** on Qwen3.8-27B, per request.
 - **Checked** layer by layer against numpy references; one binary, no Python.
 
@@ -90,6 +90,7 @@ A request whose `model` is the adapter's name runs with it, any other with the b
 saetta start claude      # Claude Code
 saetta start pi          # pi
 saetta start opencode    # opencode
+saetta start code        # Saetta Code, built in (below)
 saetta start claude -- -p "fix the failing test"   # anything after -- goes to the agent
 ```
 
@@ -111,6 +112,20 @@ saetta start claude -- -p "fix the failing test"   # anything after -- goes to t
   <img src="docs/assets/demo-pi.gif" width="900" alt="saetta start pi: pi on Saetta writes a Mandelbrot renderer, which then draws the set in color">
   <br><sub><code>saetta start pi</code>: pi writes a Mandelbrot renderer, then it runs.</sub>
 </p>
+
+### Saetta Code
+
+A minimal coding agent inside the `saetta` binary, in C, nothing to install: a port of [pi](https://pi.dev) 1.5.2 that behaves as pi does. The same tools (read, bash, edit, write; grep, find and ls with `--tools`), system prompt, `AGENTS.md` / `CLAUDE.md` files, skills, prompt files and session files, so pi and Saetta Code continue each other's sessions (compacted ones too). The model runs inside it, with no server and no HTTP in between (`--pack`); or it talks to a Saetta server or any OpenAI-compatible server listed in pi's `models.json`. pi's TypeScript extensions are not supported.
+
+```sh
+saetta start code                             # the model inside Saetta Code (or the running server, if one is up)
+saetta code --pack coder                      # the same, by hand: a prompt, Ctrl-C stops a turn
+saetta code -p "fix the failing test"         # print mode against pi's models.json, as pi -p
+saetta code --mode json -p "..."              # pi's JSON event stream
+saetta code -c                                # continue this folder's last session (also pi's)
+```
+
+Its requests, session files and output match pi's byte for byte on 47 recorded scenarios (tool errors, edits, truncation, sessions, compaction, retries, skills, JSON events), and on three coding tasks it solves what pi solves with less time of its own per turn. The interactive view is a simple prompt for now, not pi's full terminal UI. Next: sessions kept on disk with the engine's state, and prompts read while tools run.
 
 Without `saetta start`, point any agent at `http://127.0.0.1:8080/v1` (OpenAI) or `http://127.0.0.1:8080` (Anthropic), any API key: configs in [`config/`](config) ([Claude Code](docs/claude-code.md), [opencode](docs/opencode.md)).
 

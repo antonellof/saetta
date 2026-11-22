@@ -84,6 +84,9 @@ void conn_init(Conn *c, int fd) {
     c->wfail = false;
     c->deadline_ns = 0;
     c->timed_out = false;
+    c->sink = NULL; // a socket; server_engine_chat sets an in-process sink after this
+    c->sink_ctx = NULL;
+    c->status = 0;
 }
 
 // Reads more bytes into rbuf (compacting it first when full). 1: read, 0: end of stream,
@@ -126,6 +129,12 @@ static int conn_fill(Conn *c) {
 
 Err conn_flush(Conn *c) {
     if (c->wfail) return "WriteFailed";
+    if (c->sink) {
+        int stop = c->wlen ? c->sink(c->sink_ctx, c->status, c->wbuf, c->wlen) : 0;
+        c->wlen = 0;
+        if (stop) c->wfail = true;
+        return stop ? "WriteFailed" : OK;
+    }
     size_t off = 0;
     while (off < c->wlen) {
         guard_enter(WRITE_LIMIT_MS);
@@ -159,6 +168,7 @@ Err conn_writes(Conn *c, const char *s) { return conn_write(c, s, strlen(s)); }
 
 bool conn_peer_gone(Conn *c) {
     if (c->wfail) return true;
+    if (c->sink) return c->sink(c->sink_ctx, c->status, NULL, 0) != 0;
     char b;
     for (;;) {
         ssize_t n = recv(c->fd, &b, 1, MSG_PEEK | MSG_DONTWAIT);
@@ -451,6 +461,11 @@ static const char *phrase(int status) {
 
 // Request.respond with keep_alive false: the whole response, then a flush.
 Err http_respond(Conn *c, Req *h, int status, Str body, const char *content_type) {
+    if (c->sink) { // in process: the body alone, with its status
+        c->status = status;
+        if (body.len > 0) TRY(conn_write(c, body.ptr, body.len));
+        return conn_flush(c);
+    }
     TRY(http_write_expect_continue(c, h));
     char head[256];
     int n = snprintf(head, sizeof head, "HTTP/1.1 %d %s\r\nconnection: close\r\ncontent-length: %zu\r\n", status,

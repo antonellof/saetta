@@ -27,6 +27,12 @@ void sx_prefetch(const void *addr, size_t len);
 // Unicode NFC of UTF-8 text (Foundation). Writes up to cap bytes to out and returns the
 // full NFC length; returns (size_t)-1 when the input is not valid UTF-8.
 size_t sx_nfc(const char *in, size_t len, char *out, size_t cap);
+// The same for NFD and NFKC (JavaScript's String.prototype.normalize("NFD"), ("NFKC")).
+size_t sx_nfd(const char *in, size_t len, char *out, size_t cap);
+size_t sx_nfkc(const char *in, size_t len, char *out, size_t cap);
+// Compares two UTF-8 strings as JavaScript's a.toLowerCase().localeCompare(b.toLowerCase())
+// does under an en-US ICU locale: <0, 0 or >0.
+int sx_locale_compare_lower(const char *a, size_t alen, const char *b, size_t blen);
 
 // Thermal state of the machine (NSProcessInfo.thermalState): 0 nominal, 1 fair, 2 serious,
 // 3 critical.
@@ -132,6 +138,12 @@ typedef int (*sx_http_sink)(void *ctx, int status, const void *p, size_t n);
 int sx_http(const char *method, const char *url, const sx_header *headers, size_t nheaders,
             const void *body, size_t body_len, double timeout_s, sx_http_sink on_data, void *ctx,
             int *status, char *err, size_t err_cap);
+// sx_http that also stops when *cancel becomes nonzero (checked every 100 ms, also while no byte
+// arrives): the task is cancelled and the call returns 1 (err holds the system's description of
+// the cancellation; callers tell it from other failures by their own flag).
+int sx_http_cancellable(const char *method, const char *url, const sx_header *headers, size_t nheaders,
+                        const void *body, size_t body_len, double timeout_s, sx_http_sink on_data, void *ctx,
+                        int *status, char *err, size_t err_cap, volatile int *cancel);
 
 #ifdef __cplusplus
 }

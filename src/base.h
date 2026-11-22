@@ -27,6 +27,9 @@ Err err_errno(int e);
 
 // Prints to stderr (std.debug.print).
 void dbg(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+// Where dbg writes (stderr when NULL): Saetta Code points it at a log file while the engine runs
+// in its process, so the server's lines stay out of the agent's output.
+extern FILE *dbg_out;
 // Prints to stderr and exits with code 1.
 _Noreturn void die(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 

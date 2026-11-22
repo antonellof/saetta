@@ -22,6 +22,11 @@ typedef struct {
 // (message on stderr, error "AlreadyRunning"). *fd is the lock file: keep it open for the
 // life of the server (serve() never closes it).
 Err instance_acquire(uint16_t port, int *fd);
+// The in-process engine's lock (~/.saetta/run/inproc.lock, the holder's pid), held for the life
+// of a Saetta Code that runs the model in its own process. Errors: "EngineBusy" (another holds it).
+Err instance_inproc_acquire(int *fd);
+// True when a Saetta Code holds the model in its process (*pid its pid, may be NULL).
+bool instance_inproc_running(int *pid);
 
 // The running server, if one holds the lock (false otherwise or on any error).
 bool instance_running(Server *out);

@@ -19,6 +19,7 @@
 
 #include "base.h"
 #include "chat.h"
+#include "code.h"
 #include "control.h"
 #include "download.h"
 #include "gguf.h"
@@ -576,6 +577,15 @@ static Err run(Arena *arena, int argc, char **argv) {
         }
         exit(code);
     }
+    if (argc >= 2 && eq(cmd, "code")) {
+        int code;
+        Err err = code_run(rest, nrest, &code);
+        if (err) {
+            dbg("saetta code: %s\n", err);
+            exit(1);
+        }
+        exit(code);
+    }
     if (argc >= 2 && eq(cmd, "start")) {
         int code;
         Err err = launch_run(rest, nrest, &code);
@@ -730,7 +740,8 @@ static Err run(Arena *arena, int argc, char **argv) {
                 "  (no command)                 in a terminal: pick a model and a coding agent, then start (also: saetta auto)\n"
                 "\n"
                 "Agents and server (<pack> is a download name, such as coder or 27b-turbo, or a folder):\n"
-                "  start <claude|pi|opencode> [--pack P] [--lora name=adapter] [--port N] [--ctx N] [--keep] [-- agent args]\n"
+                "  start <claude|pi|opencode|code> [--pack P] [--lora name=adapter] [--port N] [--ctx N] [--keep] [-- agent args]\n"
+                "  code [-p] [-c] [--mode json] [prompt]   Saetta Code, the built-in coding agent (pi-compatible; saetta code --help)\n"
                 "  serve <pack> [--port N] [--lora-modules name=path ...] [--default-chat-template-kwargs JSON]\n"
                 "  monitor | status | stop      live view, state, stop the running server\n"
                 "\n"

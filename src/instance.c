@@ -85,6 +85,65 @@ static Err acquire_in(Arena *a, uint16_t port, int *out) {
     return OK;
 }
 
+// ---- the in-process engine (Saetta Code with --pack): its own lock, so a second engine is not
+// loaded beside it -----------------------------------------------------------------------------
+
+static Err inproc_path(Arena *a, char **out) {
+    char *d;
+    TRY(run_dir(a, &d));
+    *out = path_join(a, d, "inproc.lock");
+    return OK;
+}
+
+Err instance_inproc_acquire(int *out) {
+    Arena a = {0};
+    char *dir, *path;
+    Err e = run_dir(&a, &dir);
+    if (!e) e = mkdir_p(dir);
+    if (!e) e = inproc_path(&a, &path);
+    if (e) {
+        arena_reset(&a);
+        return e;
+    }
+    int fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0666);
+    arena_reset(&a);
+    if (fd < 0) return err_errno(errno);
+    if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        int er = errno;
+        close(fd);
+        return er == EWOULDBLOCK ? "EngineBusy" : err_errno(er);
+    }
+    char rec[32];
+    int n = snprintf(rec, sizeof rec, "%-16d", (int)getpid());
+    if (ftruncate(fd, 0) != 0 || pwrite_all(fd, rec, (size_t)n, 0)) {
+        close(fd);
+        return "WriteFailed";
+    }
+    *out = fd;
+    return OK;
+}
+
+bool instance_inproc_running(int *pid) {
+    Arena a = {0};
+    char *path;
+    if (inproc_path(&a, &path)) {
+        arena_reset(&a);
+        return false;
+    }
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    arena_reset(&a);
+    if (fd < 0) return false;
+    bool held = flock(fd, LOCK_SH | LOCK_NB) != 0 && errno == EWOULDBLOCK;
+    if (!held) flock(fd, LOCK_UN);
+    if (held && pid) {
+        char b[32] = {0};
+        ssize_t n = pread(fd, b, sizeof b - 1, 0);
+        *pid = n > 0 ? atoi(b) : 0;
+    }
+    close(fd);
+    return held;
+}
+
 Err instance_acquire(uint16_t port, int *fd) {
     Arena a = {0};
     Err e = acquire_in(&a, port, fd);

@@ -34,12 +34,12 @@ static const char *model_label = "Qwen3.8-Flash-Next (saetta)";
 static const char *lora_arg = NULL;
 
 const char *launch_usage(void) {
-    return "usage: saetta start <claude|pi|opencode> [--pack coder|full|27b-turbo|27b-coder390|27b-fable5|27b-8bit|27b-4bit|<dir>] [--lora name=path] [--port N] "
+    return "usage: saetta start <claude|pi|opencode|code> [--pack coder|full|27b-turbo|27b-coder390|27b-fable5|27b-8bit|27b-4bit|<dir>] [--lora name=path] [--port N] "
            "[--ctx N] [--keep] [-- <agent args>]\n";
 }
 
-typedef enum { AGENT_CLAUDE, AGENT_PI, AGENT_OPENCODE } Agent;
-static const char *agent_names[] = {"claude", "pi", "opencode"};
+typedef enum { AGENT_CLAUDE, AGENT_PI, AGENT_OPENCODE, AGENT_CODE } Agent;
+static const char *agent_names[] = {"claude", "pi", "opencode", "code"};
 
 // A copy of the environment ("K=V" strings in the arena), as std.process.Environ.Map.
 typedef struct {
@@ -97,8 +97,9 @@ const char *launch_install_command(const char *agent) {
 
 static const char *install_hint(Agent agent) {
     static char b[160];
-    static const char *const label[] = {"Claude Code", "pi", "opencode"};
-    snprintf(b, sizeof b, "Install %s: %s", label[agent], launch_install_command(agent_names[agent]));
+    static const char *const label[] = {"Claude Code", "pi", "opencode", "Saetta Code"};
+    const char *cmd = launch_install_command(agent_names[agent]);
+    snprintf(b, sizeof b, "Install %s: %s", label[agent], cmd ? cmd : "it is part of saetta");
     return b;
 }
 
@@ -404,6 +405,58 @@ static Err pi_setup(Arena *a, Env *env, Argv *argv, const char *base, uint32_t c
     return OK;
 }
 
+static Err code_in_process(Arena *a, const char *dir, uint32_t ctx, const char *const *extra, size_t n_extra, int *code);
+
+// Saetta Code (`saetta code`, this binary): pi's configuration, so the two share settings,
+// models and sessions under ~/.saetta/pi.
+static Err code_setup(Arena *a, Env *env, Argv *argv, const char *base, uint32_t ctx) {
+    TRY(pi_setup(a, env, argv, base, ctx));
+    char self[PATH_MAX];
+    uint32_t len = sizeof self;
+    if (_NSGetExecutablePath(self, &len) != 0) return "NoExecutablePath";
+    argv->ptr[0] = arena_strdup(a, self);
+    // pi_setup pushed {"pi", "--provider", "saetta", "--model", id}: insert "code" after the binary
+    vec_push(argv, NULL);
+    memmove(&argv->ptr[2], &argv->ptr[1], (argv->len - 2) * sizeof argv->ptr[0]);
+    argv->ptr[1] = "code";
+    return OK;
+}
+
+// saetta code --pack <dir> [extra], the engine in its own process, waited for.
+static Err code_in_process(Arena *a, const char *dir, uint32_t ctx, const char *const *extra, size_t n_extra, int *code) {
+    const char *home = getenv("HOME");
+    if (!home) return "NoHome";
+    char *cfg = path_join(a, path_join(a, home, ".saetta"), "pi");
+    TRY(mkdir_p(cfg));
+    char self[PATH_MAX];
+    uint32_t len = sizeof self;
+    if (_NSGetExecutablePath(self, &len) != 0) return "NoExecutablePath";
+    Env env;
+    env_clone(&env, a);
+    env_put(&env, "PI_CODING_AGENT_DIR", cfg);
+    Argv argv = {0};
+    vec_push(&argv, arena_strdup(a, self));
+    vec_push(&argv, "code");
+    vec_push(&argv, "--pack");
+    vec_push(&argv, dir);
+    vec_push(&argv, "--ctx");
+    vec_push(&argv, arena_printf(a, "%u", ctx));
+    for (size_t k = 0; k < n_extra; k++) vec_push(&argv, extra[k]);
+    vec_push(&argv, NULL);
+    pid_t child;
+    int rc = posix_spawn(&child, argv.ptr[0], NULL, NULL, (char *const *)argv.ptr, env_block(&env));
+    if (rc != 0) {
+        vec_free(&argv);
+        return err_errno(rc);
+    }
+    ignore_interrupt(); // Ctrl-C belongs to Saetta Code now
+    int st = wait_child(child);
+    vec_free(&argv);
+    if (st < 0) return err_errno(errno);
+    *code = WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st);
+    return OK;
+}
+
 static Err opencode_setup(Arena *a, Env *env, Argv *argv, const char *base, uint32_t ctx) {
     const char *home = getenv("HOME");
     if (!home) return "NoHome";
@@ -480,12 +533,23 @@ static Err session(Arena *a, Session *ss, Agent agent, const char *pack_arg, uin
         }
     }
     if (!joined) {
+        int ipid = 0;
+        if (instance_inproc_running(&ipid)) {
+            dbg("saetta: Saetta Code (pid %d) is running the model in its own process; one model runs at a time. Close it "
+                "first, or run it against a server (start the server first, then saetta start code joins it).\n", ipid);
+            *code = 1;
+            return OK;
+        }
         const char *dir;
         TRY(pack_for(a, pack_arg, &dir));
         if (!dir) {
             *code = 1;
             return OK;
         }
+        // Saetta Code without a server: the model runs inside it (saetta code --pack), with the
+        // configuration and sessions `saetta start pi` uses
+        // (an adapter needs the server: it serves the adapter under its own name)
+        if (agent == AGENT_CODE && !lora_arg) return code_in_process(a, dir, ctx, extra, n_extra, code);
         // another program on the port: the default moves to the next free one, a chosen one is an error
         if (!port_free(port)) {
             if (port_set) {
@@ -558,6 +622,7 @@ static Err session(Arena *a, Session *ss, Agent agent, const char *pack_arg, uin
     case AGENT_CLAUDE: claude_setup(a, &cenv, &argv, base, ctx); break;
     case AGENT_PI: e = pi_setup(a, &cenv, &argv, base, ctx); break;
     case AGENT_OPENCODE: e = opencode_setup(a, &cenv, &argv, base, ctx); break;
+    case AGENT_CODE: e = code_setup(a, &cenv, &argv, base, ctx); break;
     }
     if (e) goto out;
     for (size_t k = 0; k < n_extra; k++) vec_push(&argv, extra[k]);

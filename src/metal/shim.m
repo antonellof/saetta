@@ -52,6 +52,36 @@ size_t sx_nfc(const char *in, size_t len, char *out, size_t cap) {
     }
 }
 
+static size_t sx_norm(const char *in, size_t len, char *out, size_t cap, int form) {
+    @autoreleasepool {
+        NSString *s = [[NSString alloc] initWithBytes:in length:len encoding:NSUTF8StringEncoding];
+        if (s == nil) return (size_t)-1;
+        NSString *n = form == 0 ? [s decomposedStringWithCanonicalMapping] : [s precomposedStringWithCompatibilityMapping];
+        NSData *d = [n dataUsingEncoding:NSUTF8StringEncoding];
+        memcpy(out, d.bytes, d.length < cap ? d.length : cap);
+        return d.length;
+    }
+}
+
+size_t sx_nfd(const char *in, size_t len, char *out, size_t cap) { return sx_norm(in, len, out, cap, 0); }
+size_t sx_nfkc(const char *in, size_t len, char *out, size_t cap) { return sx_norm(in, len, out, cap, 1); }
+
+int sx_locale_compare_lower(const char *a, size_t alen, const char *b, size_t blen) {
+    @autoreleasepool {
+        NSString *x = [[NSString alloc] initWithBytes:a length:alen encoding:NSUTF8StringEncoding];
+        NSString *y = [[NSString alloc] initWithBytes:b length:blen encoding:NSUTF8StringEncoding];
+        if (x == nil || y == nil) {
+            int c = memcmp(a, b, alen < blen ? alen : blen);
+            return c ? c : (alen < blen ? -1 : alen > blen);
+        }
+        x = [x lowercaseString];
+        y = [y lowercaseString];
+        static NSLocale *loc;
+        if (!loc) loc = [NSLocale localeWithLocaleIdentifier:@"en_US"];
+        return (int)[x compare:y options:0 range:NSMakeRange(0, x.length) locale:loc];
+    }
+}
+
 sx_device *sx_device_create(void) {
     id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
     if (!dev) return NULL;
@@ -412,6 +442,12 @@ static BOOL same_parent_domain(NSString *parent, NSString *child) {
 int sx_http(const char *method, const char *url, const sx_header *headers, size_t nheaders,
             const void *body, size_t body_len, double timeout_s, sx_http_sink on_data, void *ctx,
             int *status, char *err, size_t err_cap) {
+    return sx_http_cancellable(method, url, headers, nheaders, body, body_len, timeout_s, on_data, ctx, status, err, err_cap, NULL);
+}
+
+int sx_http_cancellable(const char *method, const char *url, const sx_header *headers, size_t nheaders,
+                        const void *body, size_t body_len, double timeout_s, sx_http_sink on_data, void *ctx,
+                        int *status, char *err, size_t err_cap, volatile int *cancel) {
     @autoreleasepool {
         NSURL *u = [NSURL URLWithString:@(url)];
         if (!u) { copy_err(err, err_cap, @"invalid URL"); return 1; }
@@ -446,7 +482,15 @@ int sx_http(const char *method, const char *url, const sx_header *headers, size_
         NSURLSession *session = [NSURLSession sessionWithConfiguration:cfg delegate:t delegateQueue:q];
         NSURLSessionDataTask *task = [session dataTaskWithRequest:req];
         [task resume];
-        dispatch_semaphore_wait(t.done, DISPATCH_TIME_FOREVER);
+        if (!cancel) dispatch_semaphore_wait(t.done, DISPATCH_TIME_FOREVER);
+        else { // wake every 100 ms to see the flag, then cancel the task and wait for it to finish
+            bool cancelled = false;
+            while (dispatch_semaphore_wait(t.done, dispatch_time(DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC)) != 0)
+                if (*cancel && !cancelled) {
+                    cancelled = true;
+                    [task cancel];
+                }
+        }
         [session finishTasksAndInvalidate]; // releases the delegate
 
         if (status) *status = t.status;

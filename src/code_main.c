@@ -9,6 +9,7 @@
 // utils/shell.ts (killTrackedDetachedChildren), packages/ai/src/utils/transcript.ts
 // (getCurrentSystemMessage, getToolStateChanges), utils/retry.ts (the retryable patterns).
 #include "code.h"
+#include "code_cfg.h"
 #include "code_oai.h"
 #include "code_tui.h"
 #include "download.h"
@@ -170,12 +171,9 @@ static bool jbool(const JValue *v, bool dflt) { return json_is(v, J_BOOL) ? v->b
 
 static uint64_t juint(const JValue *v, uint64_t dflt) { return json_is(v, J_INTEGER) && v->i >= 0 ? (uint64_t)v->i : dflt; }
 
-// resolveConfigValue: an environment variable of that name, else the literal.
-static const char *config_value(const char *v) {
-    if (!v) return NULL;
-    const char *e = getenv(v);
-    return e && e[0] ? e : v;
-}
+// resolveConfigValue (resolve-config-value.ts): "$NAME" / "${NAME}" interpolated, "!command"
+// run, the rest literal (code_cfg.c).
+static const char *config_value(Arena *a, const char *v) { return cfg_resolve_value(a, v); }
 
 static Err find_model(Run *r, const Args *args, const JValue *settings) {
     Arena *a = r->a;
@@ -215,7 +213,7 @@ static Err find_model(Run *r, const Args *args, const JValue *settings) {
             cm->id = json_str(json_get(m, "id"));
             cm->name = json_str(json_get(m, "name"));
             cm->base_url = json_str(json_get(m, "baseUrl")) ? json_str(json_get(m, "baseUrl")) : json_str(json_get(p->val, "baseUrl"));
-            cm->api_key = config_value(json_str(json_get(p->val, "apiKey")));
+            cm->api_key = config_value(a, json_str(json_get(p->val, "apiKey")));
             cm->reasoning = jbool(json_get(m, "reasoning"), false);
             cm->context_window = juint(json_get(m, "contextWindow"), 128000);
             cm->max_tokens = juint(json_get(m, "maxTokens"), 16384);
@@ -1075,6 +1073,7 @@ static CodeUiModel *list_models(Arena *a, const Run *r, size_t *n, CodeUiModel *
         CodeUiModel m = {.provider = "saetta", .id = p->name, .name = p->title ? p->title : p->name, .reasoning = true,
                          .context_window = 204800, .pack = true, .unavailable = !have,
                          .too_big = ram && ((uint64_t)p->min_ram_gb << 30) > ram, .disk_gb = p->disk_gb, .min_ram_gb = p->min_ram_gb};
+        if (have) cfg_pack_label(a, m.name, p->gguf_file, dir, &m.label, &m.label_brief);
         if (pack_is_current(a, r, p)) {
             m.unavailable = false;
             m.context_window = r->model.context_window;
@@ -1085,6 +1084,7 @@ static CodeUiModel *list_models(Arena *a, const Run *r, size_t *n, CodeUiModel *
     if (r->pack && !current->id) { // a pack folder that is not a known download
         CodeUiModel m = {.provider = "saetta", .id = r->pack, .name = r->model.id, .reasoning = true,
                          .context_window = r->model.context_window, .pack = true};
+        cfg_pack_label(a, NULL, NULL, r->pack, &m.label, &m.label_brief);
         *current = m;
         out[(*n)++] = m;
     }
@@ -1161,6 +1161,15 @@ static void restart_on(Run *r) {
     vec_free(&v);
 }
 
+// /model's list after /model added, edited or removed a provider of models.json: built in an arena
+// of its own (the UI thread calls it, maybe while the agent thread uses r->a), never freed, since
+// the UI may still hold the previous list's strings.
+static const CodeUiModel *host_reload_models(CodeUiHost *h, size_t *n) {
+    static Arena lists;
+    CodeUiModel cur = {0};
+    return list_models(&lists, h->r, n, &cur);
+}
+
 static void host_abort(CodeUiHost *h) {
     (void)h;
     g_abort = 1;
@@ -1219,7 +1228,7 @@ static Err interactive(Run *r, const Args *o, const JValue *settings) {
     cfg.engine = r->model.engine != NULL;
     cfg.self_exe = self_exe(a);
     CodeUiOps ops = {host_prompt, host_new_session, host_set_thinking, host_entries, host_messages,
-                     host_set_leaf, host_set_model, host_abort, host_restart};
+                     host_set_leaf, host_set_model, host_abort, host_restart, host_reload_models};
     CodeUiHost host = {r};
     // a stand-in for a slow model load, for the loader's test scenario: SAETTA_CODE_LOAD_DEMO_MS
     const char *demo = getenv("SAETTA_CODE_LOAD_DEMO_MS");

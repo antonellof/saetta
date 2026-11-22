@@ -1497,6 +1497,11 @@ static Err open_engine(Arena *a, Run *r, const char *arg, const char *ctx, bool 
     const DownloadPack *pk = download_find(arg);
     char *dir = (char *)arg;
     if (pk) TRY(download_pack_dir(a, pk, &dir));
+    // a folder given by path (saetta start code passes one): the known pack in it, for its name
+    for (size_t i = 0; !pk && i < DOWNLOAD_NPACKS; i++) {
+        char *d;
+        if (!download_pack_dir(a, &download_packs[i], &d) && !strcmp(d, dir)) pk = &download_packs[i];
+    }
     if (!file_exists(path_join(a, dir, "config.json"))) {
         dbg("saetta code: no model at %s%s%s\n", dir, pk ? "; download it with: saetta download " : "", pk ? arg : "");
         return "NoModel";
@@ -1514,7 +1519,7 @@ static Err open_engine(Arena *a, Run *r, const char *arg, const char *ctx, bool 
     else if (!getenv("SAETTA_CTX")) setenv("SAETTA_CTX", "204800", 1);
     uint64_t t0 = now_ns();
     // the loader while the engine loads (interactive runs only); the load itself runs here at full speed
-    Splash *sp = splash ? splash_start(arena_printf(a, "Loading %s ...", pk && pk->title ? pk->title : arg)) : NULL;
+    Splash *sp = splash ? splash_start(arena_printf(a, "Loading %s ...", pk && pk->title ? pk->title : (strrchr(arg, '/') && strrchr(arg, '/')[1] ? strrchr(arg, '/') + 1 : arg))) : NULL;
     if (!sp && isatty(2)) fprintf(stderr, "saetta code: loading %s ...\r", pk ? arg : dir);
     Engine *e;
     Err err = server_engine_open(a, dir, NULL, &e);

@@ -61,7 +61,9 @@ JValue *code_tool_schemas(Arena *a, const char *const *tools, size_t ntools);
 // Runs one tool call ({"type":"toolCall","id","name","arguments"}) in env->cwd and returns
 // pi's toolResult message. A failing tool is a result with "isError":true, not an Err; Err
 // is for the harness failing (out of memory, no such tool name is a result too).
-Err code_tool_run(Arena *a, const CodeEnv *env, const JValue *call, JValue **result);
+// *raw (when raw is not NULL) is the tool's own return value as pi's tool_execution_end event
+// carries it: {"content":[...],"details":...,"structuredContent":...}.
+Err code_tool_run(Arena *a, const CodeEnv *env, const JValue *call, JValue **result, JValue **raw);
 
 // ---- OpenAI chat completions client (code_oai.c; pi-ai: api/openai-completions.js,
 // transform-messages.js)
@@ -90,8 +92,15 @@ typedef struct CodeSession CodeSession;
 Err code_session_open(Arena *a, const CodeEnv *env, bool cont, bool no_session, CodeSession **out);
 // The messages on the current branch, in order (pi buildSessionContext).
 const JValue *code_session_messages(const CodeSession *s);
-// Appends an entry ("message", "model_change", "thinking_level_change", ...).
+// Appends an entry ("message", "model_change", "thinking_level_change", ...): type, id,
+// parentId, timestamp, then the members of fields in order.
 Err code_session_append(CodeSession *s, const char *type, JValue *fields);
+// The header entry ({"type":"session","version":3,"id",...}).
+const JValue *code_session_header(const CodeSession *s);
+// The field of the last entry of this type on the current branch, or NULL.
+const JValue *code_session_last(const CodeSession *s, const char *type, const char *field);
+// True when the session has no entry yet besides its header.
+bool code_session_is_new(const CodeSession *s);
 
 // ---- `saetta code` (code_main.c)
 

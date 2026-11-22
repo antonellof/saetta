@@ -53,7 +53,7 @@
    "name": "Does Saetta work with my pi sessions and settings?",
    "acceptedAnswer": {
     "@type": "Answer",
-    "text": "Yes. It reads and writes pi's settings.json, models.json, trust.json and mcp.json in ~/.pi/agent, and keeps its session files in the same folder and format as pi 1.5.2, so either one continues a session the other started. It also reads AGENTS.md and CLAUDE.md files, skills and prompt files as pi does. pi's TypeScript extensions are not supported."
+    "text": "Yes. It reads and writes pi's settings.json, models.json, trust.json and mcp.json (in ~/.pi/agent with saetta code; saetta start code keeps its own copy in ~/.saetta/pi), and keeps its session files in the same folder and format as pi 1.5.2, so either one continues a session the other started. It also reads AGENTS.md and CLAUDE.md files, skills and prompt files as pi does. pi's TypeScript extensions are not supported."
    }
   },
   {
@@ -319,7 +319,7 @@ make && ./build/bin/saetta start code</pre>
       <section class="feature" id="pi">
         <div class="wrap">
           <h2>The same setup as pi</h2>
-          <p class="sub">Saetta Code, the agent in the <code>saetta</code> binary, is a port of the <a href="https://pi.dev">pi</a> coding agent 1.5.2 (MIT): one 2.3 MB binary with no Node.js and no Python. It reads and writes pi's <code>settings.json</code>, <code>models.json</code>, <code>trust.json</code> and <code>mcp.json</code> in <code>~/.pi/agent</code>. Its requests and session files match pi's byte for byte on 54 recorded scenarios, and its screens are compared with pi's on 61.</p>
+          <p class="sub">Saetta Code, the agent in the <code>saetta</code> binary, is a port of the <a href="https://pi.dev">pi</a> coding agent 1.5.2 (MIT): one 2.3 MB binary with no Node.js and no Python. It reads and writes pi's <code>settings.json</code>, <code>models.json</code>, <code>trust.json</code> and <code>mcp.json</code> (in <code>~/.pi/agent</code> with <code>saetta code</code>; <code>saetta start code</code> keeps its own copy in <code>~/.saetta/pi</code>). Its requests and session files match pi's byte for byte on 54 recorded scenarios, and its screens are compared with pi's on 61.</p>
           <div class="qs">
             <div class="code">
               <div class="code-head"><span>run it</span><button class="copy" type="button" data-copy="c3">Copy</button></div>

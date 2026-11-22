@@ -1,4 +1,4 @@
-// saetta.dev: theme toggle, copy buttons, and the terminal replays (what `saetta auto` and the
+// saetta.dev: theme toggle, tabs, copy buttons, and the terminal replays (what `saetta auto` and the
 // local API print; simulated, labelled as such on the page).
 
 const root = document.documentElement;
@@ -7,6 +7,31 @@ document.getElementById("theme").addEventListener("click", () => {
   root.dataset.theme = t;
   try { localStorage.setItem("theme", t); } catch (e) {}
 });
+
+// tabs: the install box (which command block shows; Copy follows it) and the session captures
+for (const box of document.querySelectorAll(".install")) {
+  const copy = box.querySelector(".copy");
+  for (const t of box.querySelectorAll(".itab")) {
+    t.addEventListener("click", () => {
+      for (const o of box.querySelectorAll(".itab")) {
+        const on = o === t;
+        o.setAttribute("aria-selected", on ? "true" : "false");
+        document.getElementById(o.getAttribute("aria-controls")).hidden = !on;
+      }
+      copy.dataset.copy = t.getAttribute("aria-controls");
+    });
+  }
+}
+for (const fig of document.querySelectorAll("[data-tabs]")) {
+  const title = fig.querySelector("[data-title]");
+  for (const t of fig.querySelectorAll("button[data-shot]")) {
+    t.addEventListener("click", () => {
+      for (const o of fig.querySelectorAll("button[data-shot]")) o.setAttribute("aria-selected", o === t ? "true" : "false");
+      for (const img of fig.querySelectorAll("img[data-shot]")) img.hidden = img.dataset.shot !== t.dataset.shot;
+      title.textContent = t.textContent;
+    });
+  }
+}
 
 for (const b of document.querySelectorAll(".copy")) {
   b.addEventListener("click", async () => {

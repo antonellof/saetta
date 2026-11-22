@@ -136,7 +136,7 @@
         Saetta <span class="ver">v0.16.0</span>
       </a>
       <nav class="links">
-        <a href="#code">Saetta Code</a>
+        <a href="#features">Saetta Code</a>
         <a class="hide-sm" href="#benchmarks">Benchmarks</a>
         <a class="hide-sm" href="#models">Models</a>
         <a class="hide-sm" href="#agents">Other agents</a>
@@ -155,17 +155,28 @@
     <section class="hero">
       <canvas id="hero-bg" class="hero-bg" aria-hidden="true"></canvas>
       <div class="wrap">
-        <a class="pill" href="#code">New in 0.16.0: Saetta Code <span aria-hidden="true">&rarr;</span></a>
+        <a class="pill" href="#features">New in 0.16.0: Saetta Code <span aria-hidden="true">&rarr;</span></a>
         <h1>Saetta Code: a coding agent with the model inside it.</h1>
-        <p class="lede">Saetta Code is a local coding agent for Apple Silicon Macs. It is written in C, ships inside the <code>saetta</code> binary, and runs Qwen3.8 in its own process, with no server and no HTTP in between. It is a port of pi, with pi's tools, sessions and terminal UI. The same engine serves Claude Code, pi and opencode.</p>
-        <div class="code hero-cmd">
-          <div class="code-head"><span>install, then start Saetta Code</span><button class="copy" type="button" data-copy="c0">Copy</button></div>
-<pre id="c0">curl -fsSL https://saetta.dev/install.sh | sh
+        <p class="lede">A coding agent in C for Apple Silicon Macs, with Qwen3.8 running in its own process. A port of pi, with pi's tools, sessions and terminal UI.</p>
+        <div class="code hero-cmd install">
+          <div class="code-head">
+            <div class="itabs" role="tablist" aria-label="Install">
+              <button class="itab" type="button" role="tab" aria-selected="true" aria-controls="c0" id="t-c0">Saetta Code</button>
+              <button class="itab" type="button" role="tab" aria-selected="false" aria-controls="c1" id="t-c1">Other agents</button>
+              <button class="itab" type="button" role="tab" aria-selected="false" aria-controls="c2" id="t-c2">From source</button>
+            </div>
+            <button class="copy" type="button" data-copy="c0">Copy</button>
+          </div>
+<pre id="c0" role="tabpanel" aria-labelledby="t-c0">curl -fsSL https://saetta.dev/install.sh | sh
 saetta start code</pre>
+<pre id="c1" role="tabpanel" aria-labelledby="t-c1" hidden>curl -fsSL https://saetta.dev/install.sh | sh
+saetta start claude      <span class="c"># or: saetta start pi, saetta start opencode</span></pre>
+<pre id="c2" role="tabpanel" aria-labelledby="t-c2" hidden>git clone https://github.com/antonellof/saetta.git && cd saetta
+make && ./build/bin/saetta start code</pre>
         </div>
         <p class="hint"><code>saetta start code</code> picks the model that fits this Mac, downloads it and opens the agent on it.</p>
         <div class="actions">
-          <a class="btn primary" href="#code">What Saetta Code does <span aria-hidden="true">&rarr;</span></a>
+          <a class="btn primary" href="#features">What Saetta Code does <span aria-hidden="true">&rarr;</span></a>
           <a class="btn" href="https://github.com/antonellof/saetta">GitHub</a>
         </div>
 
@@ -185,100 +196,167 @@ saetta start code</pre>
       </div>
     </div>
 
-    <section class="block" id="code">
+    <div id="features" class="features">
       <div class="wrap">
-        <span class="eyebrow">Saetta Code</span>
-        <h2>What Saetta Code does</h2>
-        <p class="sub">A port of the <a href="https://pi.dev">pi</a> coding agent 1.5.2 (MIT) in C, built into <code>saetta</code>. One 2.3 MB binary, no Node.js, no Python.</p>
-        <div class="caps">
-          <article class="cap-card">
-<pre class="mini"><span class="a">$</span> saetta start code
+        <p class="note shots-note">The captures below are Saetta Code's own screens. In most of them the model's replies are scripted, so they record without loading a model; the loader and <code>/monitor</code> come from the recording above, with the real model.</p>
+      </div>
 
-agent     Saetta Code, in C
-model     in the same process
-between   no server, no HTTP
-binary    saetta, 2.3 MB
-needs     no Node.js, no Python</pre>
-            <h3>Runs the model itself</h3>
-            <p>The engine loads inside the agent. <code>saetta start code</code> picks the model that fits this Mac, downloads it if needed and opens the agent; a 3D lightning loader is drawn inline while it loads.</p>
-          </article>
-          <article class="cap-card">
-<pre class="mini"><span class="f">~/.pi/agent</span>   shared with pi
-  settings.json   models.json
-  trust.json      mcp.json
-  sessions/       <span class="g">continued both ways</span>
-
-tools   read bash edit write
-        grep find ls</pre>
-            <h3>Compatible with pi</h3>
-            <p>pi's tools, system prompt, <code>AGENTS.md</code> and <code>CLAUDE.md</code> files, skills, prompt files and session files. Requests and sessions match pi's byte for byte on 54 recorded scenarios; the screens are compared with pi's on 61.</p>
-          </article>
-          <article class="cap-card">
-<pre class="mini"><span class="a">&gt;</span> /mo
-  <span class="hl"> /model     Select model       </span>
-    /monitor   live statistics
-<span class="a">&gt;</span> explain @src/ma
-    src/main.c
-<span class="f">~/project</span> on <span class="g">main</span> <span class="o">[!]</span>
-Qwen3.8-Flash-Next Coder</pre>
-            <h3>pi's terminal UI, in C</h3>
-            <p>Differential rendering, an editor with "/" commands and "@" file completion, markdown with highlighted code, tool views and live bash output. Its own macOS-colors theme (<code>/theme</code> for pi's), and a footer with the folder, git branch and status, time per turn and the model's name and quantization.</p>
-          </article>
-          <article class="cap-card">
-<pre class="mini">/resume    another session
-/fork      from an earlier message
-/clone     duplicate this one
-/tree      move through branches
-/compact   shrink the context
-/export    HTML or JSONL
-/share     a secret GitHub gist</pre>
-            <h3>Sessions</h3>
-            <p>Resume, fork, clone and name sessions, browse their tree, compact the context with pi's compaction, export a session as HTML, import a JSONL one, or share it as a gist.</p>
-          </article>
-          <article class="cap-card">
-<pre class="mini"><span class="f">/model</span>
-  <span class="hl"> coder        in process         </span>
-    27b-turbo    download, 20 GB
-    my-server    OpenAI-compatible
-<span class="f">/monitor</span>
-  speed  GPU  memory  prompt cache
-  speculation  recent requests</pre>
-            <h3>Models and live stats</h3>
-            <p><code>/model</code> switches between downloaded packs in process, downloads new ones from the list, and adds OpenAI-compatible models. <code>/monitor</code> shows the engine's live stats inside the agent.</p>
-          </article>
-          <article class="cap-card">
-<pre class="mini"><span class="f">mcp.json</span>   global or .pi/ (trusted)
-  stdio              <span class="g">connected</span>
-  Streamable HTTP    <span class="g">connected</span>
-
-tools   mcp__server__tool
-        server resources
-/mcp    enable, reconnect, expose</pre>
-            <h3>MCP servers</h3>
-            <p>Servers from pi's <code>mcp.json</code>, over stdio or Streamable HTTP. Their tools are offered to the model and <code>/mcp</code> manages them. OAuth sign-in is not supported yet.</p>
-          </article>
+      <section class="feature" id="inside">
+        <div class="wrap">
+          <h2>The model runs inside the agent</h2>
+          <p class="sub"><code>saetta start code</code> picks the model that fits this Mac, downloads it if needed and loads it into Saetta Code's own process. There is no server and no HTTP between the agent and the model. A lightning bolt turns in the terminal while the weights load.</p>
+          <p class="sub"><code>/monitor</code> opens the engine's live view inside the agent: speed, GPU load and memory, how much of each prompt came from the cache, how far speculation runs ahead, and every recent request.</p>
+          <div class="pair">
+            <figure class="term term-small">
+              <div class="term-bar"><span class="dots" aria-hidden="true"><i></i><i></i><i></i></span><span class="term-title">Saetta Code - Load the model</span></div>
+              <img src="/assets/code/loader.gif" alt="The Saetta Code loader: a 3D lightning bolt in half blocks turns next to Loading Qwen3.8-Flash-Next Coder and a timer" width="900" height="302" loading="lazy" decoding="async">
+            </figure>
+            <figure class="term">
+              <div class="term-bar"><span class="dots" aria-hidden="true"><i></i><i></i><i></i></span><span class="term-title">Saetta Code - /monitor</span></div>
+              <img src="/assets/code/monitor.png" alt="/monitor inside Saetta Code: the Coder pack in this process, speed, GPU load, GPU memory, system RAM, prompt cache reuse, speculation, context, sessions and the recent requests of the task" width="1300" height="612" loading="lazy" decoding="async">
+              <figcaption>After the landing-page task, with the Coder pack running in process.</figcaption>
+            </figure>
+          </div>
         </div>
-        <div class="qs qs-code">
-          <div class="code">
-            <div class="code-head"><span>run it</span><button class="copy" type="button" data-copy="c3">Copy</button></div>
+      </section>
+
+      <section class="feature" id="models-switch">
+        <div class="wrap">
+          <h2>Pick and download models</h2>
+          <p class="sub"><code>/model</code> lists every saetta pack: the ones already on this Mac, the ones to download with their size, and the ones too big for its memory, greyed out. A downloaded pack loads in the same process; another is downloaded first, after the free disk is shown.</p>
+          <p class="sub">The same list holds the OpenAI-compatible servers from pi's <code>models.json</code>, a remote saetta among them, and its last entry adds a new one.</p>
+          <figure class="term">
+            <div class="term-bar"><span class="dots" aria-hidden="true"><i></i><i></i><i></i></span><span class="term-title">Saetta Code - Switch or download a model</span></div>
+            <picture>
+              <source srcset="/assets/code/model.png" media="(prefers-reduced-motion: reduce)">
+              <img src="/assets/code/model.gif" alt="/model: a saetta server model, Qwen3.8-Flash-Next Coder and Qwen3.8-27B 4-bit on this Mac, Qwen3.8-Flash-Next greyed out as it needs 128 GB, the other packs with their download size, and Add an OpenAI-compatible model at the end" width="1300" height="732" loading="lazy" decoding="async">
+            </picture>
+            <figcaption>Recorded as a Mac with 96 GB of memory, with two packs downloaded.</figcaption>
+          </figure>
+        </div>
+      </section>
+
+      <section class="feature" id="sessions">
+        <div class="wrap">
+          <h2>Resume, branch and export sessions</h2>
+          <p class="sub">Sessions are pi's JSONL files in pi's folder, so pi and Saetta Code continue each other's sessions. <code>/resume</code> lists this folder's sessions by name and age. <code>/tree</code> shows every branch of a session and moves to any earlier message to continue from there.</p>
+          <p class="sub"><code>/export</code> writes the session as one HTML page, with the tree in a sidebar and tool output and diffs inline. <code>/share</code> uploads it as a secret GitHub gist.</p>
+          <figure class="term" data-tabs>
+            <div class="term-bar">
+              <span class="dots" aria-hidden="true"><i></i><i></i><i></i></span><span class="term-title">Saetta Code - <span data-title>/resume</span></span>
+              <span class="term-tabs" role="tablist" aria-label="Session commands">
+                <button type="button" role="tab" aria-selected="true" data-shot="0">/resume</button>
+                <button type="button" role="tab" aria-selected="false" data-shot="1">/tree</button>
+                <button type="button" role="tab" aria-selected="false" data-shot="2">/export</button>
+              </span>
+            </div>
+            <img data-shot="0" src="/assets/code/resume.png" alt="/resume: four sessions of this folder, by name or first message, with their message count and age" width="1300" height="732" loading="lazy" decoding="async">
+            <img data-shot="1" src="/assets/code/tree.png" alt="/tree: a session with two branches from the first answer, the current one highlighted" width="1300" height="732" loading="lazy" decoding="async" hidden>
+            <img data-shot="2" src="/assets/code/export.png" alt="The HTML page /export wrote, in a browser: the session tree in a sidebar, the user message, a bash run, a read with highlighted code and the model's notes" width="1300" height="820" loading="lazy" decoding="async" hidden>
+          </figure>
+        </div>
+      </section>
+
+      <section class="feature" id="context">
+        <div class="wrap">
+          <h2>Context from AGENTS.md and skills</h2>
+          <p class="sub">At start Saetta Code lists what it put in the context: the <code>AGENTS.md</code> and <code>CLAUDE.md</code> files of your home folder and the project, and the skills it found. The prompt holds each skill's name and description; its instructions load when the model needs them, or when you call it with <code>/skill:name</code>.</p>
+          <figure class="term">
+            <div class="term-bar"><span class="dots" aria-hidden="true"><i></i><i></i><i></i></span><span class="term-title">Saetta Code - /skill:review</span></div>
+            <img src="/assets/code/skill.png" alt="Saetta Code lists two AGENTS.md files and three skills at start; /skill:review runs git diff --stat and answers with three findings" width="1300" height="732" loading="lazy" decoding="async">
+          </figure>
+        </div>
+      </section>
+
+      <section class="feature" id="steer">
+        <div class="wrap">
+          <h2>Steer or follow up while it works</h2>
+          <p class="sub">You can type while the agent runs. Enter queues a steering message, delivered after the current tool call; Alt+Enter queues a follow-up, sent when the run ends. Both wait above the editor, and Alt+Up brings them back to edit.</p>
+          <figure class="term">
+            <div class="term-bar"><span class="dots" aria-hidden="true"><i></i><i></i><i></i></span><span class="term-title">Saetta Code - Steering and follow-up</span></div>
+            <picture>
+              <source srcset="/assets/code/steer.png" media="(prefers-reduced-motion: reduce)">
+              <img src="/assets/code/steer.gif" alt="While Saetta Code works, a steering message and a follow-up wait above the editor; the steering message reaches the model after the read, the follow-up after the run" width="1300" height="732" loading="lazy" decoding="async">
+            </picture>
+          </figure>
+        </div>
+      </section>
+
+      <section class="feature" id="tools">
+        <div class="wrap">
+          <h2>See what each tool did</h2>
+          <p class="sub">Edits show as diffs with line numbers. Bash output streams in while the command runs and is cut to its last lines; Ctrl+O expands every tool's output. Reads, writes, grep, find and ls have their own views.</p>
+          <figure class="term">
+            <div class="term-bar"><span class="dots" aria-hidden="true"><i></i><i></i><i></i></span><span class="term-title">Saetta Code - Edit and bash</span></div>
+            <img src="/assets/code/tools.png" alt="An edit of src/duration.ts shown as a diff, then node --test with 5 tests passing, then the model's summary" width="1300" height="732" loading="lazy" decoding="async">
+          </figure>
+        </div>
+      </section>
+
+      <section class="feature" id="mcp">
+        <div class="wrap">
+          <h2>MCP servers</h2>
+          <p class="sub">Servers from pi's <code>mcp.json</code> connect over stdio or Streamable HTTP, and their tools are offered to the model. <code>/mcp</code> shows each server's state and tools, reconnects it, turns it off everywhere or in one project, and changes how its tools are exposed.</p>
+          <figure class="term">
+            <div class="term-bar"><span class="dots" aria-hidden="true"><i></i><i></i><i></i></span><span class="term-title">Saetta Code - /mcp</span></div>
+            <img src="/assets/code/mcp.png" alt="A call to the echo server's add tool, then /mcp listing two stdio servers, both connected, with their tool counts and exposure" width="1300" height="732" loading="lazy" decoding="async">
+          </figure>
+        </div>
+      </section>
+
+      <section class="feature" id="print">
+        <div class="wrap">
+          <h2>Print and JSON modes for scripts</h2>
+          <p class="sub"><code>saetta code -p</code> answers one prompt and exits, and reads what is piped into it, so it works in shell scripts and CI. <code>--mode json</code> prints pi's event stream, one JSON object per line.</p>
+          <figure class="term">
+            <div class="term-bar"><span class="dots" aria-hidden="true"><i></i><i></i><i></i></span><span class="term-title">Saetta Code - Print and JSON modes</span></div>
+            <img src="/assets/code/print.png" alt="A terminal: saetta code -p answers a question, git diff piped into saetta code -p gives a commit message, and the JSON mode's events counted with jq" width="1300" height="732" loading="lazy" decoding="async">
+          </figure>
+        </div>
+      </section>
+
+      <section class="feature" id="pi">
+        <div class="wrap">
+          <h2>The same setup as pi</h2>
+          <p class="sub">Saetta Code is a port of the <a href="https://pi.dev">pi</a> coding agent 1.5.2 (MIT), in one 2.3 MB binary with no Node.js and no Python. It reads and writes pi's <code>settings.json</code>, <code>models.json</code>, <code>trust.json</code> and <code>mcp.json</code> in <code>~/.pi/agent</code>. Its requests and session files match pi's byte for byte on 54 recorded scenarios, and its screens are compared with pi's on 61.</p>
+          <div class="qs">
+            <div class="code">
+              <div class="code-head"><span>run it</span><button class="copy" type="button" data-copy="c3">Copy</button></div>
 <pre id="c3"><span class="c"># the model inside Saetta Code</span>
 saetta start code
 <span class="c"># the same with a chosen pack</span>
 saetta code --pack coder
 <span class="c"># continue this folder's last session (pi's too)</span>
 saetta code -c</pre>
-          </div>
-          <div class="code">
-            <div class="code-head"><span>scripts and CI</span><button class="copy" type="button" data-copy="c4">Copy</button></div>
+            </div>
+            <div class="code">
+              <div class="code-head"><span>scripts and CI</span><button class="copy" type="button" data-copy="c4">Copy</button></div>
 <pre id="c4"><span class="c"># print mode, as pi -p</span>
 saetta code -p "fix the failing test"
 <span class="c"># pi's JSON event stream</span>
 saetta code --mode json -p "list the TODOs"</pre>
+            </div>
+          </div>
+          <p class="note">Also: <code>/compact</code>, <code>/fork</code>, <code>/clone</code>, <code>/settings</code>, <code>/theme</code>, <code>/thinking</code>, <code>/scoped-models</code>, <code>/hotkeys</code>, <code>/copy</code>, <code>/name</code>, <code>/session</code>, <code>/import</code>, <code>/trust</code>, <code>/reload</code>, <code>/changelog</code>, and an update check at start.</p>
+        </div>
+      </section>
+
+      <section class="feature" id="not-yet">
+        <div class="wrap">
+          <h2>What Saetta Code doesn't do (yet)</h2>
+          <div class="nope">
+            <div><h3>Extensions and packages</h3><p>pi's TypeScript extensions and pi packages do not run. Skills, prompt files and <code>AGENTS.md</code> work as in pi.</p></div>
+            <div><h3>RPC and SDK modes</h3><p>There is no RPC mode over stdin and stdout yet, and no SDK to embed the agent. Print and JSON modes are there.</p></div>
+            <div><h3>OAuth for MCP</h3><p>An MCP server that needs an OAuth sign-in cannot connect yet.</p></div>
+            <div><h3>Image input</h3><p>The models it runs read text only, so pasted or attached images are not supported.</p></div>
+            <div><h3>Sub-agents and plan mode</h3><p>Neither is built in, as in pi. pi adds them with extensions, which Saetta Code does not run.</p></div>
+            <div><h3>Other providers</h3><p>It talks to its own engine and to OpenAI-compatible servers. Anthropic, Google and the other APIs pi supports, and their logins, are not available.</p></div>
+            <div><h3>LoRA in process</h3><p>LoRA adapters need the saetta server; <code>saetta start code --lora</code> starts one.</p></div>
+            <div><h3>Engine state on disk</h3><p>A resumed session's prompt is read again by the model. Keeping the engine's state with the session file, and reading prompts while tools run, come next.</p></div>
           </div>
         </div>
-        <p class="note">Also: <code>/settings</code>, <code>/thinking</code>, <code>/scoped-models</code>, <code>/hotkeys</code>, <code>/copy</code>, <code>/name</code>, <code>/session</code>, <code>/trust</code>, <code>/reload</code>, <code>/changelog</code>, <code>/skill:name</code>, and an update check at start. Not supported: pi's TypeScript extensions and packages, image input.</p>
-      </div>
-    </section>
+      </section>
+    </div>
 
     <section class="block" id="benchmarks">
       <div class="wrap">
@@ -461,8 +539,8 @@ logits       max rel err 6.7e-7</pre>
     <section class="block" id="monitor">
       <div class="wrap">
         <span class="eyebrow">Monitor</span>
-        <h2>See what the model is doing</h2>
-        <p class="sub"><code>saetta monitor</code> is a live view of the local server in your terminal, and <code>/monitor</code> shows the same view inside Saetta Code: what the model is doing now, its speed, GPU load and memory, how much of each prompt came from the cache, how far speculation runs ahead, and every recent request.</p>
+        <h2>The monitor for the other agents</h2>
+        <p class="sub"><code>saetta monitor</code> is the view <code>/monitor</code> opens in Saetta Code, in its own terminal, for the local server that Claude Code, pi or opencode talk to.</p>
         <figure class="shot">
           <img src="/assets/monitor.png" alt="saetta monitor: model state, speed, GPU load, GPU memory, system RAM, prompt cache, speculation, context, sessions and recent requests of a Claude Code session" loading="lazy" width="1400" height="820">
           <figcaption>A Claude Code session on the Coder pack: 74.8% of prompt tokens reused from the cache, 2.07 tokens per pass from the draft head, tool calls answered in 1.3 s.</figcaption>
@@ -493,6 +571,18 @@ logits       max rel err 6.7e-7</pre>
         </div>
       </div>
     </section>
+  <section class="block" id="involved">
+    <div class="wrap">
+      <span class="eyebrow">Get involved</span>
+      <h2>Reports and code welcome</h2>
+      <div class="links-grid">
+        <a href="https://github.com/antonellof/saetta/issues"><b>Issues</b><span>Bugs and requests on GitHub. Reports from M1 to M4 Macs help most.</span></a>
+        <a href="https://github.com/antonellof/saetta/releases/latest"><b>Releases</b><span>Release notes and the macOS build.</span></a>
+        <a href="https://github.com/antonellof/saetta"><b>Source</b><span>The engine, the Metal kernels and Saetta Code, MIT.</span></a>
+        <a href="https://pi.dev"><b>pi</b><span>The coding agent Saetta Code is ported from.</span></a>
+      </div>
+    </div>
+  </section>
   </main>
 
   <footer class="footer">

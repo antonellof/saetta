@@ -70,6 +70,8 @@ Its requests and session files match pi's byte for byte on 54 recorded print and
 
 The interactive view is pi's terminal UI ported to C: differential rendering, an editor with "/" commands and "@" file completion, markdown with highlighted code, tool views with word diffs for edits, bash output shown as it runs, and the model, settings, thinking and session tree selectors. Saetta Code adds its own default theme with macOS's colors (`/theme` switches to pi's themes, with a live preview), a footer like a starship prompt (the folder as `~/...`, the git branch and status, the time of the last turn, the model's full name and quantization), and a 3D lightning loader drawn inline while the model loads. It checks for a new release at start.
 
+<p align="center"><img src="web/assets/code/tools.png" width="900" alt="Saetta Code: an edit of src/duration.ts shown as a diff, node --test with 5 tests passing, and the model's summary"></p>
+
 ### Commands
 
 | command | what it does |
@@ -83,6 +85,8 @@ The interactive view is pi's terminal UI ported to C: differential rendering, an
 | `/settings`, `/theme`, `/thinking`, `/scoped-models`, `/hotkeys` | settings, theme, thinking level, the models Ctrl+P cycles through, keyboard shortcuts |
 | `/trust`, `/reload`, `/mcp`, `/changelog` | project trust, reload skills, prompts and context files, MCP servers, release notes |
 
+<p align="center"><img src="web/assets/code/tree.png" width="900" alt="Saetta Code's /tree: a session with two branches from the first answer, the current one highlighted"></p>
+
 ### MCP
 
 MCP servers come from pi's `mcp.json` (global, or `.pi/mcp.json` in a trusted project), over stdio or Streamable HTTP. Their tools are offered to the model as `mcp__server__tool`, along with tools to read the servers' resources. `/mcp` reconnects, enables or disables a server and changes its exposure; `--no-mcp` turns them all off. OAuth sign-in is not supported yet.
@@ -90,6 +94,8 @@ MCP servers come from pi's `mcp.json` (global, or `.pi/mcp.json` in a trusted pr
 ### Models
 
 By default the model runs inside Saetta Code. It can also use a running Saetta server, or any OpenAI-compatible chat completions server listed in `models.json`; `/model` adds one. LoRA adapters need the server: `saetta start code --lora name=adapter` starts one. Next: sessions kept on disk with the engine's state, and prompts read while tools run.
+
+<p align="center"><img src="web/assets/code/model.png" width="900" alt="Saetta Code's /model: a saetta server model, two packs on this Mac, one greyed out as too big for its memory, and the others with their download size"></p>
 
 ## Other coding agents
 

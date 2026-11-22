@@ -236,13 +236,11 @@ static bool splash_allowed(void) {
     if (getenv("NO_COLOR") && *getenv("NO_COLOR")) return false;
     const char *term = getenv("TERM");
     if (term && !strcmp(term, "dumb")) return false;
-    FILE *p = popen("defaults read com.apple.universalaccess reduceMotion 2>/dev/null", "r");
-    if (p) {
-        char v[16] = {0};
-        bool reduce = fgets(v, sizeof v, p) && v[0] == '1';
-        pclose(p);
-        if (reduce) return false;
-    }
+    static const char *const rm[] = {"defaults", "read", "com.apple.universalaccess", "reduceMotion", NULL};
+    Buf v = {0};
+    bool reduce = tui_run((char *const *)rm, NULL, S(""), &v, 1000) && v.len && v.ptr[0] == '1';
+    buf_free(&v);
+    if (reduce) return false;
     return true;
 }
 
@@ -259,11 +257,9 @@ Splash *splash_start(const char *label) {
     const char *ct = getenv("COLORTERM");
     s->truecolor = ct && (!strcmp(ct, "truecolor") || !strcmp(ct, "24bit"));
     build(s);
-    static const char on[] = "\x1b[?1049h\x1b[?25l\x1b[2J";
-    out(on, sizeof on - 1);
+    screen_quiet_start(0);
     if (pthread_create(&s->th, NULL, splash_main, s)) {
-        static const char off[] = "\x1b[?1049l\x1b[?25h";
-        out(off, sizeof off - 1);
+        screen_quiet_stop();
         free(s->pts);
         free(s);
         return NULL;
@@ -279,9 +275,8 @@ void splash_stop(Splash *s) {
     if (!s) return;
     atomic_store(&s->stop, true);
     pthread_join(s->th, NULL);
-    // the screen as it was: the alternate screen cleared and left, the cursor back
-    static const char off[] = "\x1b[0m\x1b[2J\x1b[?1049l\x1b[?25h";
-    out(off, sizeof off - 1);
+    // the screen as it was: the alternate screen cleared and left, the cursor and echo back
+    screen_quiet_stop();
     free(s->pts);
     free(s);
 }

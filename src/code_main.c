@@ -35,7 +35,7 @@
 static const char *const default_tools[] = {"read", "bash", "edit", "write"};
 
 typedef struct {
-    const char *provider, *model, *thinking, *mode, *system_prompt, *tools, *pack, *ctx;
+    const char *provider, *model, *thinking, *mode, *system_prompt, *tools, *pack, *ctx, *session;
     bool print, cont, no_session, no_tools;
     VEC(const char *) prompts;
     VEC(const char *) append;
@@ -107,6 +107,7 @@ static Err parse_args(const char *const *v, size_t n, Args *o) {
         else if (!strcmp(x, "--tools") && more) o->tools = v[++i];
         else if (!strcmp(x, "--pack") && more) o->pack = v[++i];
         else if (!strcmp(x, "--ctx") && more) o->ctx = v[++i];
+        else if (!strcmp(x, "--session") && more) o->session = v[++i];
         else if (!strcmp(x, "--no-tools") || !strcmp(x, "-nt")) o->no_tools = true;
         else if (!strcmp(x, "--help") || !strcmp(x, "-h")) {
             printf("usage: saetta code [options] [prompt ...]\n"
@@ -120,6 +121,7 @@ static Err parse_args(const char *const *v, size_t n, Args *o) {
                    "  -p, --print              answer the prompt and exit (text output)\n"
                    "  --mode json              print pi's JSON event stream\n"
                    "  -c, --continue           continue the most recent session in this folder\n"
+                   "  --session FILE           continue this session file\n"
                    "  --no-session             do not save the session\n"
                    "  --provider P --model M   the model (M may be provider/id and end in :thinking)\n"
                    "  --thinking LEVEL         off, minimal, low, medium, high, xhigh, max\n"
@@ -961,11 +963,9 @@ static volatile sig_atomic_t g_tty_saved;
 static volatile sig_atomic_t g_interactive;
 
 static void on_term(int sig) {
-    if (g_tty_saved) {
-        static const char off[] = "\x1b[?2004l\x1b[0m\x1b[?7h\x1b[?25h\x1b[?1049l";
-        (void)!write(1, off, sizeof off - 1);
-        tcsetattr(0, TCSANOW, &g_cooked);
-    }
+    // everything the screen turned on (mouse, keyboard protocols, the alternate screen, raw mode)
+    screen_restore_signal_safe();
+    if (g_tty_saved) tcsetattr(0, TCSANOW, &g_cooked);
     code_tools_kill_detached();
     _exit(g_interactive ? 0 : sig == SIGHUP ? 129 : 143);
 }
@@ -1074,7 +1074,7 @@ static CodeUiModel *list_models(Arena *a, const Run *r, size_t *n, CodeUiModel *
         bool have = !download_pack_dir(a, p, &dir) && file_exists(path_join(a, dir, "config.json"));
         CodeUiModel m = {.provider = "saetta", .id = p->name, .name = p->title ? p->title : p->name, .reasoning = true,
                          .context_window = 204800, .pack = true, .unavailable = !have,
-                         .too_big = ((uint64_t)p->min_ram_gb << 30) > ram, .disk_gb = p->disk_gb, .min_ram_gb = p->min_ram_gb};
+                         .too_big = ram && ((uint64_t)p->min_ram_gb << 30) > ram, .disk_gb = p->disk_gb, .min_ram_gb = p->min_ram_gb};
         if (pack_is_current(a, r, p)) {
             m.unavailable = false;
             m.context_window = r->model.context_window;
@@ -1127,9 +1127,9 @@ static void restart_on(Run *r) {
         bool more = i + 1 < r->argc;
         bool takes = !strcmp(x, "--provider") || !strcmp(x, "--model") || !strcmp(x, "--pack") || !strcmp(x, "--thinking") ||
                      !strcmp(x, "--mode") || !strcmp(x, "--system-prompt") || !strcmp(x, "--append-system-prompt") ||
-                     !strcmp(x, "--tools") || !strcmp(x, "--ctx");
+                     !strcmp(x, "--tools") || !strcmp(x, "--ctx") || !strcmp(x, "--session");
         if (takes && more) {
-            if (strcmp(x, "--provider") && strcmp(x, "--model") && strcmp(x, "--pack")) {
+            if (strcmp(x, "--provider") && strcmp(x, "--model") && strcmp(x, "--pack") && strcmp(x, "--session")) {
                 vec_push(&v, x);
                 vec_push(&v, r->argv[i + 1]);
             }
@@ -1146,7 +1146,12 @@ static void restart_on(Run *r) {
         vec_push(&v, "--model");
         vec_push(&v, r->restart_id);
     }
-    vec_push(&v, "-c");
+    // the conversation goes on in this session's own file (never "the latest in the folder"); one
+    // not written yet (no conversation) starts fresh; --no-session stays as it was
+    if (code_session_written(r->session)) {
+        vec_push(&v, "--session");
+        vec_push(&v, code_session_path(r->session));
+    }
     vec_push(&v, NULL);
     code_tools_kill_detached();
     fflush(NULL);
@@ -1208,7 +1213,7 @@ static Err interactive(Run *r, const Args *o, const JValue *settings) {
         .default_provider = json_str(json_get(settings, "defaultProvider")),
         .default_model = json_str(json_get(settings, "defaultModel")),
         .settings = settings,
-        .resumed = o->cont && code_session_messages(r->session)->arr.len > 0,
+        .resumed = (o->cont || o->session) && code_session_messages(r->session)->arr.len > 0,
         .version = code_version,
     };
     cfg.engine = r->model.engine != NULL;
@@ -1282,7 +1287,7 @@ static Err open_engine(Arena *a, Run *r, const char *arg, const char *ctx, bool 
     }
     char *logdir = path_join(a, r->env.home, ".saetta");
     mkdir_p(logdir);
-    FILE *log = fopen(path_join(a, logdir, "code.log"), "a");
+    FILE *log = fopen(path_join(a, logdir, "code.log"), "ae");
     if (log) {
         setvbuf(log, NULL, _IOLBF, 0);
         dbg_out = log;
@@ -1424,12 +1429,29 @@ static bool server_answers(const char *base_url) {
 
 // No model to talk to: guide the user to one (in a terminal only). Sets *pack to a download name
 // to run in process, or returns false to stop (the reason printed).
-static bool first_run(Arena *a, bool server_down, const char *base_url, const char **pack) {
+// The nearest existing folder's free space (the models folder may not exist yet).
+static uint64_t free_bytes(const char *dir) {
+    char probe[PATH_MAX];
+    snprintf(probe, sizeof probe, "%s", dir);
+    struct statfs st;
+    while (statfs(probe, &st) != 0) {
+        char *sl = strrchr(probe, '/');
+        if (!sl || sl == probe) return 0;
+        *sl = 0;
+    }
+    return (uint64_t)st.f_bavail * st.f_bsize;
+}
+
+static bool first_run(Arena *a, const char *agent_dir, bool server_down, const char *base_url, const char **pack) {
     *pack = NULL;
+    // the models.json this run reads, ~ for the home folder
+    const char *home = getenv("HOME");
+    const char *mj = path_join(a, agent_dir, "models.json");
+    if (home && *home && !strncmp(mj, home, strlen(home)) && mj[strlen(home)] == '/') mj = arena_printf(a, "~%s", mj + strlen(home));
     const DownloadPack *have = downloaded_pack(a);
     printf("\x1b[1m\xe2\x86\xaf Saetta Code\x1b[0m\n\n");
     if (server_down) printf("The server at %s does not answer.\n", base_url);
-    else printf("No model is set up yet. Saetta Code runs a model on this Mac, or talks to an OpenAI-compatible\nserver listed in %s.\n", "~/.pi/agent/models.json");
+    else printf("No model is set up yet. Saetta Code runs a model on this Mac, or talks to an OpenAI-compatible\nserver listed in %s.\n", mj);
     if (have) {
         printf("\n%s is downloaded on this Mac.\n", have->title ? have->title : have->name);
         if (ask_yes(arena_printf(a, "Run %s here?", have->title ? have->title : have->name), true)) {
@@ -1443,17 +1465,16 @@ static bool first_run(Arena *a, bool server_down, const char *base_url, const ch
     if (!p) {
         printf("\nThis Mac has %llu GB of memory: no saetta model fits it (they need 32 GB or more).\n",
                (unsigned long long)(fit_ram_bytes() >> 30));
-        printf("Add an OpenAI-compatible server to ~/.pi/agent/models.json to use Saetta Code here.\n");
+        printf("Add an OpenAI-compatible server to %s to use Saetta Code here.\n", mj);
         return false;
     }
     char *mdir = NULL;
-    struct statfs st;
-    uint64_t freeb = !download_models_dir(a, &mdir) && !statfs(mdir, &st) ? (uint64_t)st.f_bavail * st.f_bsize : 0;
+    uint64_t freeb = !download_models_dir(a, &mdir) ? free_bytes(mdir) : 0;
     if (getenv("SAETTA_CODE_FREE_GB")) freeb = (uint64_t)atoll(getenv("SAETTA_CODE_FREE_GB")) * 1000000000ull; // tests
     printf("\nFor this Mac (%llu GB of memory): %s, about %u GB to download (%llu GB free on that disk).\n",
            (unsigned long long)(fit_ram_bytes() >> 30), p->title ? p->title : p->name, p->disk_gb, (unsigned long long)(freeb / 1000000000ull));
     if (freeb && freeb < (uint64_t)p->disk_gb * 1000000000ull) {
-        printf("Not enough free disk for it. Free some space, or add a server to ~/.pi/agent/models.json.\n");
+        printf("Not enough free disk for it. Free some space, or add a server to %s.\n", mj);
         return false;
     }
     if (!ask_yes("Download it now (resumable)?", true)) {
@@ -1540,7 +1561,7 @@ Err code_run(const char *const *args, size_t n, int *code) {
         bool down = !e && tty && r.model.base_url && !server_answers(r.model.base_url);
         if (tty && (e || down)) {
             const char *p;
-            if (first_run(a, down, r.model.base_url, &p)) {
+            if (first_run(a, r.env.agent_dir, down, r.model.base_url, &p)) {
                 o.pack = p;
                 r.pack = p;
                 r.model = (CodeModel){0};
@@ -1562,7 +1583,7 @@ Err code_run(const char *const *args, size_t n, int *code) {
             o.provider ? o.provider : "", o.provider ? "/" : "", o.model ? o.model : "", r.env.agent_dir);
         goto done;
     }
-    e = code_session_open(a, &r.env, o.cont, o.no_session, &r.session);
+    e = o.session ? code_session_open_path(a, o.session, &r.session) : code_session_open(a, &r.env, o.cont, o.no_session, &r.session);
     if (e) goto done;
     // thinking level: the flag, else the session's, else the settings' default, else medium
     const JValue *recorded = code_session_last(r.session, "thinking_level_change", "thinkingLevel");

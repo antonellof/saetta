@@ -120,6 +120,10 @@ typedef struct CodeSession CodeSession;
 // Opens a new session file for env->cwd under agent_dir/sessions, or (cont) the most recent
 // one there; path NULL with no_session keeps it in memory.
 Err code_session_open(Arena *a, const CodeEnv *env, bool cont, bool no_session, CodeSession **out);
+// That session file (--session).
+Err code_session_open_path(Arena *a, const char *path, CodeSession **out);
+// Whether the session has been written to its file (pi writes it once there is a conversation).
+bool code_session_written(const CodeSession *s);
 // The messages on the current branch, in order (pi buildSessionContext).
 const JValue *code_session_messages(const CodeSession *s);
 // Appends an entry ("message", "model_change", "thinking_level_change", ...): type, id,

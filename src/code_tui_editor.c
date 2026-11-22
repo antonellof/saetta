@@ -723,7 +723,7 @@ static void fd_walk(const char *fd, const char *base, Str query, int max_depth, 
     if (query.len) argv[n++] = pat.ptr;
     argv[n] = NULL;
     int pfd[2];
-    if (pipe(pfd)) {
+    if (tui_pipe(pfd)) {
         buf_free(&pat);
         return;
     }
@@ -732,10 +732,8 @@ static void fd_walk(const char *fd, const char *base, Str query, int max_depth, 
     posix_spawn_file_actions_adddup2(&fa, pfd[1], 1);
     posix_spawn_file_actions_addopen(&fa, 2, "/dev/null", 0x0001, 0);
     posix_spawn_file_actions_addopen(&fa, 0, "/dev/null", 0, 0);
-    posix_spawn_file_actions_addclose(&fa, pfd[0]);
-    posix_spawn_file_actions_addclose(&fa, pfd[1]);
     pid_t pid;
-    int rc = posix_spawnp(&pid, fd, &fa, NULL, (char *const *)argv, environ);
+    int rc = tui_spawn(&pid, (char *const *)argv, &fa, false, false);
     posix_spawn_file_actions_destroy(&fa);
     close(pfd[1]);
     if (rc == 0 && job) {

@@ -280,6 +280,10 @@ typedef struct {
     int dl_fd;
     Buf dl_line;
     bool dl_cancelled;
+    uint64_t dl_cancel_ns;
+    // a switch to another pack (or away from the engine) waiting for its confirmation
+    bool confirm_switch;
+    char *sw_provider, *sw_id, *sw_title;
     // the theme: the setting (NULL until chosen), the terminal's colors once reported, macOS's
     // appearance (1 dark, 2 light), and what /theme previews over
     char *theme;
@@ -425,8 +429,15 @@ struct AsstView {
     JValue *msg;
 };
 
+static void stream_render(int width, Lines *out);
+static bool stream_live(const AsstView *v);
+
 static void asst_render(Comp *c, int width, Lines *out) {
     AsstView *v = (AsstView *)c;
+    if (stream_live(v)) { // the message in flight: drawn from the streamed blocks themselves
+        stream_render(width, out);
+        return;
+    }
     const JValue *content = json_get(v->msg, "content");
     bool need_spacer = true, tools = false;
     size_t n = json_is(content, J_ARRAY) ? content->arr.len : 0;
@@ -1459,54 +1470,35 @@ typedef struct {
 
 static pthread_mutex_t g_git_lock = PTHREAD_MUTEX_INITIALIZER;
 static GitState g_git;
-static _Atomic bool g_git_running, g_git_again, g_git_changed;
+static _Atomic bool g_git_running, g_git_again, g_git_changed, g_git_quit;
 static char g_git_cwd[4096];
-static int g_git_wake = -1;
+static _Atomic int g_git_wake = -1;
+static pthread_t g_git_th;
+static bool g_git_started;
 
-// argv's stdout, up to 1 s (the child is killed after); false if it failed or timed out.
-static bool run_out(const char *const *argv, Buf *out) {
-    int pfd[2];
-    if (pipe(pfd)) return false;
-    posix_spawn_file_actions_t fa;
-    posix_spawn_file_actions_init(&fa);
-    posix_spawn_file_actions_addopen(&fa, 0, "/dev/null", O_RDONLY, 0);
-    posix_spawn_file_actions_adddup2(&fa, pfd[1], 1);
-    posix_spawn_file_actions_addopen(&fa, 2, "/dev/null", O_WRONLY, 0);
-    posix_spawn_file_actions_addclose(&fa, pfd[0]);
-    posix_spawn_file_actions_addclose(&fa, pfd[1]);
-    posix_spawn_file_actions_addchdir(&fa, g_git_cwd);
-    pid_t pid;
-    extern char **environ;
-    int rc = posix_spawnp(&pid, argv[0], &fa, NULL, (char *const *)argv, environ);
-    posix_spawn_file_actions_destroy(&fa);
-    close(pfd[1]);
-    if (rc) {
-        close(pfd[0]);
-        return false;
-    }
-    uint64_t until = now_ns() + 1000000000ull;
-    bool ok = true;
+// A .git (folder, or a worktree's file) in the workspace or a folder above it (footer-data-provider.ts
+// findGitPaths): git runs only then.
+static bool in_git_repo(const char *cwd) {
+    char dir[4096];
+    snprintf(dir, sizeof dir, "%s", cwd);
     for (;;) {
-        uint64_t now = now_ns();
-        if (now >= until) {
-            ok = false;
-            break;
+        char gp[4200];
+        snprintf(gp, sizeof gp, "%s/.git", dir);
+        struct stat st;
+        if (stat(gp, &st) == 0) return true;
+        char *sl = strrchr(dir, '/');
+        if (!sl) return false;
+        if (sl == dir) {
+            if (!dir[1]) return false;
+            dir[1] = 0;
+            continue;
         }
-        struct pollfd pf = {pfd[0], POLLIN, 0};
-        int r = poll(&pf, 1, (int)((until - now) / 1000000) + 1);
-        if (r < 0 && errno == EINTR) continue;
-        if (r <= 0) continue;
-        char chunk[4096];
-        ssize_t n = read(pfd[0], chunk, sizeof chunk);
-        if (n <= 0) break;
-        buf_add(out, chunk, (size_t)n);
+        *sl = 0;
     }
-    close(pfd[0]);
-    if (!ok) kill(pid, SIGKILL);
-    int st = 0;
-    while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
-    return ok && WIFEXITED(st) && WEXITSTATUS(st) == 0;
 }
+
+// argv's stdout in the workspace, up to 1 s (the child is stopped after); false if it failed or timed out.
+static bool run_out(const char *const *argv, Buf *out) { return tui_run((char *const *)argv, g_git_cwd, S(""), out, 1000); }
 
 static void *git_main(void *arg) {
     (void)arg;
@@ -1515,7 +1507,13 @@ static void *git_main(void *arg) {
         GitState g = {0};
         Buf o = {0};
         static const char *const st[] = {"git", "--no-optional-locks", "status", "--porcelain=v2", "--branch", NULL};
-        if (run_out(st, &o)) {
+        bool repo = in_git_repo(g_git_cwd);
+        bool ran = repo && run_out(st, &o);
+        if (repo && !ran) { // a timeout or a failure: what is known stays
+            buf_free(&o);
+            continue;
+        }
+        if (ran) {
             g.repo = true;
             char oid[16] = {0};
             Str all = buf_str(&o);
@@ -1550,23 +1548,26 @@ static void *git_main(void *arg) {
         g_git = g;
         pthread_mutex_unlock(&g_git_lock);
         atomic_store(&g_git_changed, true);
-        if (g_git_wake >= 0) (void)!write(g_git_wake, "g", 1);
-    } while (atomic_load(&g_git_again));
+        int wfd = atomic_load(&g_git_wake);
+        if (wfd >= 0) (void)!write(wfd, "g", 1);
+    } while (atomic_load(&g_git_again) && !atomic_load(&g_git_quit));
     atomic_store(&g_git_running, false);
     return NULL;
 }
 
 // Another look at the repository (a refresh asked while one runs is done right after it).
 static void git_refresh(void) {
+    if (atomic_load(&g_git_quit)) return;
     if (atomic_exchange(&g_git_running, true)) {
         atomic_store(&g_git_again, true);
         return;
     }
+    if (g_git_started) pthread_join(g_git_th, NULL); // the last one ended (running was false)
+    g_git_started = false;
     snprintf(g_git_cwd, sizeof g_git_cwd, "%s", U->cfg->cwd);
-    g_git_wake = g_wake[1];
-    pthread_t th;
-    if (pthread_create(&th, NULL, git_main, NULL)) atomic_store(&g_git_running, false);
-    else pthread_detach(th);
+    atomic_store(&g_git_wake, g_wake[1]);
+    if (pthread_create(&g_git_th, NULL, git_main, NULL)) atomic_store(&g_git_running, false);
+    else g_git_started = true;
 }
 
 static uint64_t g_turn_start_ns;
@@ -2119,14 +2120,14 @@ static void model_render(int width, Lines *out) {
         if (m->pack) {
             // a model run on this Mac: its name, where it stands
             const char *nm = m->name ? m->name : m->id;
-            if (m->unavailable && m->too_big) th_fgz(&l, T_DIM, nm);
+            if (m->too_big) th_fgz(&l, T_DIM, nm);
             else if (sel) th_fgz(&l, T_ACCENT, nm);
             else buf_adds(&l, nm);
             Buf st = {0};
-            if (!m->unavailable) buf_adds(&st, " [on this Mac]");
-            else if (m->too_big) buf_printf(&st, " [needs %u GB memory]", m->min_ram_gb);
+            if (m->too_big) buf_printf(&st, " [needs %u GB memory]", m->min_ram_gb);
+            else if (!m->unavailable) buf_adds(&st, " [on this Mac]");
             else buf_printf(&st, " [not downloaded, %u GB]", m->disk_gb);
-            th_fg(&l, m->unavailable && m->too_big ? T_DIM : T_MUTED, buf_str(&st));
+            th_fg(&l, m->too_big ? T_DIM : T_MUTED, buf_str(&st));
             buf_free(&st);
             text_lines(buf_str(&l), 0, width, out);
             buf_free(&l);
@@ -2216,6 +2217,24 @@ static void confirm_download(const CodeUiModel *m) {
 }
 
 static void confirm_render(int width, Lines *out) {
+    if (U->confirm_switch) {
+        border_line(out, width, T_BORDER);
+        lines_addz(out, "");
+        Buf t = {0};
+        buf_printf(&t, "\x1b[1mSwitch to %s?\x1b[22m", U->sw_title);
+        text_lines(buf_str(&t), 1, width, out);
+        lines_addz(out, "");
+        t.len = 0;
+        th_fgz(&t, T_MUTED, "Saetta Code starts again on it; this conversation goes on there.");
+        text_lines(buf_str(&t), 1, width, out);
+        lines_addz(out, "");
+        t.len = 0;
+        th_fgz(&t, T_DIM, "Enter to switch \xc2\xb7 Escape to cancel");
+        text_lines(buf_str(&t), 1, width, out);
+        border_line(out, width, T_BORDER);
+        buf_free(&t);
+        return;
+    }
     border_line(out, width, T_BORDER);
     lines_addz(out, "");
     Buf t = {0};
@@ -2239,7 +2258,7 @@ static void confirm_render(int width, Lines *out) {
 static void start_download(void) {
     const char *cmd = getenv("SAETTA_CODE_DOWNLOAD"); // a stand-in for the tests
     int pfd[2];
-    if (pipe(pfd)) {
+    if (tui_pipe(pfd)) {
         show_error("Could not start the download");
         return;
     }
@@ -2248,8 +2267,6 @@ static void start_download(void) {
     posix_spawn_file_actions_addopen(&fa, 0, "/dev/null", O_RDONLY, 0);
     posix_spawn_file_actions_addopen(&fa, 1, "/dev/null", O_WRONLY, 0);
     posix_spawn_file_actions_adddup2(&fa, pfd[1], 2);
-    posix_spawn_file_actions_addclose(&fa, pfd[0]);
-    posix_spawn_file_actions_addclose(&fa, pfd[1]);
     const char *argv[4];
     if (cmd && *cmd) {
         argv[0] = cmd;
@@ -2262,8 +2279,8 @@ static void start_download(void) {
         argv[3] = NULL;
     }
     pid_t pid;
-    extern char **environ;
-    int rc = posix_spawnp(&pid, argv[0], &fa, NULL, (char *const *)argv, environ);
+    // its own process group: a cancel stops it and whatever it started
+    int rc = tui_spawn(&pid, (char *const *)argv, &fa, false, true);
     posix_spawn_file_actions_destroy(&fa);
     close(pfd[1]);
     if (rc) {
@@ -2272,7 +2289,6 @@ static void start_download(void) {
         return;
     }
     fcntl(pfd[0], F_SETFL, O_NONBLOCK);
-    fcntl(pfd[0], F_SETFD, FD_CLOEXEC);
     U->dl_pid = pid;
     U->dl_fd = pfd[0];
     U->dl_line.len = 0;
@@ -2289,6 +2305,7 @@ static void restart_model(const char *provider, const char *id);
 // The child's progress lines (\r-separated: "  12.3 / 76.0 GB  95 MB/s  3/40 files  ETA 12m03s").
 static void download_poll(void) {
     if (U->dl_fd < 0) return;
+    if (U->dl_cancelled && U->dl_pid > 0 && now_ns() - U->dl_cancel_ns > 2000000000ull) kill(-U->dl_pid, SIGKILL);
     char chunk[4096];
     ssize_t n;
     while ((n = read(U->dl_fd, chunk, sizeof chunk)) > 0) {
@@ -2328,7 +2345,7 @@ static void download_poll(void) {
     U->dl_pid = 0;
     U->working = U->busy;
     editor_set_working(U->ed, U->busy ? "Working" : NULL);
-    if (WIFEXITED(st) && WEXITSTATUS(st) == 0 && !U->dl_cancelled) {
+    if (WIFEXITED(st) && WEXITSTATUS(st) == 0) { // finished, even if a cancel came too late
         for (size_t i = 0; i < U->cfg->nmodels; i++) {
             CodeUiModel *mm = (CodeUiModel *)&U->cfg->models[i];
             if (mm->pack && !strcmp(mm->id, U->dl_name)) mm->unavailable = false;
@@ -2350,10 +2367,13 @@ static void download_poll(void) {
     request_render();
 }
 
+// SIGTERM to the download's process group (download.c keeps its .part files: resumable). The reap
+// happens in download_poll once its pipe closes; SIGKILL follows if it does not stop.
 static void cancel_download(void) {
     if (U->dl_pid > 0) {
         U->dl_cancelled = true;
-        kill(U->dl_pid, SIGINT);
+        U->dl_cancel_ns = now_ns();
+        kill(-U->dl_pid, SIGTERM);
     }
 }
 
@@ -2372,7 +2392,7 @@ static void restart_model(const char *provider, const char *id) {
 }
 
 static void choose_model(const CodeUiModel *m, bool persist) {
-    if (m->pack && m->unavailable) {
+    if (m->pack && (m->unavailable || m->too_big)) {
         close_selector();
         if (m->too_big) {
             Buf b = {0};
@@ -2392,12 +2412,16 @@ static void choose_model(const CodeUiModel *m, bool persist) {
         return;
     }
     if (m->pack || U->cfg->engine) {
-        // another pack, or away from the engine in this process: a restart on it
-        char *prov = strdup(m->provider), *id = strdup(m->id);
+        // another pack, or away from the engine in this process: a restart on it, once confirmed
         close_selector();
-        restart_model(prov, id);
-        free(prov);
-        free(id);
+        free(U->sw_provider);
+        free(U->sw_id);
+        free(U->sw_title);
+        U->sw_provider = strdup(m->provider);
+        U->sw_id = strdup(m->id);
+        U->sw_title = strdup(m->name ? m->name : m->id);
+        U->confirm_switch = true;
+        U->sel = SEL_CONFIRM;
         return;
     }
     char *prov = strdup(m->provider), *id = strdup(m->id);
@@ -2718,26 +2742,70 @@ static void json_pretty(Buf *b, const JValue *v, int depth) {
     } else json_write(b, v);
 }
 
+// pi's settings write: under proper-lockfile's lock (a "settings.json.lock" folder, stale after
+// 10 s), the file read again, the field set, written whole (here through a temporary file and a
+// rename, so a crash never leaves half a file). A file that does not parse is left alone (pi
+// skips saving after a load error).
 static void save_theme_setting(const char *name) {
     Arena a = {0};
-    Buf path = {0}, text = {0};
+    Buf path = {0}, lock = {0}, tmp = {0}, text = {0};
     buf_printf(&path, "%s/settings.json", U->cfg->agent_dir);
-    char *data = NULL;
-    size_t n = 0;
-    JValue *root = NULL;
-    if (!read_file(path.ptr, 1 << 24, &data, &n) && json_parse(&a, str_n(data, n), true, &root)) root = NULL;
-    free(data);
-    if (!json_is(root, J_OBJECT)) root = json_new(&a, J_OBJECT);
-    json_put(&a, root, S("theme"), json_string(&a, str(name)));
-    json_pretty(&text, root, 0);
-    buf_addc(&text, '\n');
+    buf_printf(&lock, "%s.lock", path.ptr);
+    buf_printf(&tmp, "%s.tmp-%d", path.ptr, (int)getpid());
     mkdir(U->cfg->agent_dir, 0755);
-    FILE *f = fopen(path.ptr, "w");
-    if (f) {
-        fwrite(text.ptr, 1, text.len, f);
-        fclose(f);
-    } else show_error("Could not save the theme in settings.json");
+    bool locked = false;
+    for (int i = 0; i < 20 && !locked; i++) {
+        if (mkdir(lock.ptr, 0755) == 0) locked = true;
+        else if (errno == EEXIST) {
+            struct stat st;
+            if (stat(lock.ptr, &st) == 0 && time(NULL) - st.st_mtime > 10) rmdir(lock.ptr); // stale
+            else {
+                struct timespec ts = {0, 25000000};
+                nanosleep(&ts, NULL);
+            }
+        } else break;
+    }
+    const char *problem = NULL;
+    if (!locked) problem = "settings.json is locked by another program; the theme is not saved";
+    else {
+        char *data = NULL;
+        size_t n = 0;
+        JValue *root = NULL;
+        Err re = read_file(path.ptr, 1 << 24, &data, &n);
+        if (re && access(path.ptr, F_OK) == 0) problem = "settings.json could not be read; the theme is not saved";
+        else if (!re) {
+            Str t = str_n(data ? data : "", n);
+            if (str_starts(t, S("\xef\xbb\xbf"))) t = str_sub(t, 3, t.len); // a BOM
+            if (str_trim(t).len && (json_parse(&a, t, true, &root) || !json_is(root, J_OBJECT)))
+                problem = "settings.json does not parse; the theme is not saved (fix the file, then choose it again)";
+        }
+        free(data);
+        if (!problem) {
+            if (!json_is(root, J_OBJECT)) root = json_new(&a, J_OBJECT);
+            json_put(&a, root, S("theme"), json_string(&a, str(name)));
+            json_pretty(&text, root, 0);
+            int fd = open(tmp.ptr, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+            bool ok = fd >= 0;
+            for (size_t off = 0; ok && off < text.len;) {
+                ssize_t w = write(fd, text.ptr + off, text.len - off);
+                if (w < 0 && errno == EINTR) continue;
+                if (w <= 0) ok = false;
+                else off += (size_t)w;
+            }
+            if (ok && fsync(fd)) ok = false;
+            if (fd >= 0 && close(fd)) ok = false;
+            if (ok && rename(tmp.ptr, path.ptr)) ok = false;
+            if (!ok) {
+                unlink(tmp.ptr);
+                problem = "Could not save the theme in settings.json";
+            }
+        }
+        rmdir(lock.ptr);
+    }
+    if (problem) show_warning(problem);
     buf_free(&path);
+    buf_free(&lock);
+    buf_free(&tmp);
     buf_free(&text);
     arena_reset(&a);
 }
@@ -3520,12 +3588,8 @@ static void copy_selection(int width) {
     lines_free(&rows);
     if (text.len) {
         // pbcopy, else an OSC 52 write
-        bool ok = false;
-        FILE *p = popen("pbcopy 2>/dev/null", "w");
-        if (p) {
-            ok = fwrite(text.ptr, 1, text.len, p) == text.len;
-            ok = pclose(p) == 0 && ok;
-        }
+        static const char *const pb[] = {"pbcopy", NULL};
+        bool ok = tui_run((char *const *)pb, NULL, buf_str(&text), NULL, 2000);
         if (!ok) {
             static const char b64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
             Buf o = {0};
@@ -3826,33 +3890,74 @@ static void stream_rec(CodeUiStreamKind k, int index, Str a, Str b) {
 
 static void sync_tools(const JValue *msg);
 
-// The partial message (pi's message_update "message") from the blocks, handed to the view.
+static bool stream_live(const AsstView *v) { return g_stream.on && U && v == U->streaming; }
+
+// The streamed message as asst_render draws a message (text blocks, thinking blocks joined), read
+// from the blocks as they grow: no copy of the message per update.
+static void stream_render(int width, Lines *out) {
+    bool need_spacer = true;
+    size_t n = g_stream.blocks.len;
+    for (size_t i = 0; i < n; i++) {
+        SBlock *b = &g_stream.blocks.ptr[i];
+        if (b->type == 't') {
+            Str t = str_trim(buf_str(&b->text));
+            if (!t.len) continue;
+            if (need_spacer) lines_addz(out, "");
+            need_spacer = false;
+            md_render(t, 1, 0, &md_plain, width, out);
+        } else if (b->type == 'h') {
+            Buf joined = {0};
+            for (; i < n && g_stream.blocks.ptr[i].type == 'h'; i++) {
+                Str t = str_trim(buf_str(&g_stream.blocks.ptr[i].text));
+                if (!t.len) continue;
+                if (joined.len) buf_adds(&joined, "\n\n");
+                buf_addstr(&joined, t);
+            }
+            i--;
+            if (!joined.len) continue;
+            if (need_spacer) lines_addz(out, "");
+            need_spacer = false;
+            if (U->hide_thinking) {
+                Buf l = {0}, it = {0};
+                th_fgz(&it, T_THINKING_TEXT, "Thinking...");
+                buf_adds(&l, "\x1b[3m");
+                buf_addstr(&l, buf_str(&it));
+                buf_adds(&l, "\x1b[23m");
+                Comp *tc = comp_text(buf_str(&l), 1, 0);
+                comp_render(tc, width, out);
+                comp_free(tc);
+                buf_free(&l);
+                buf_free(&it);
+            } else md_render(buf_str(&joined), 1, 0, &md_thinking, width, out);
+            need_spacer = true;
+            buf_free(&joined);
+        }
+    }
+}
+
+// After a batch of deltas: the view drawn again; the tool views get their calls' arguments (a
+// message of the tool-call blocks only, built when a call changed).
 static void stream_flush(void) {
     if (!g_stream.on || !g_stream.dirty || !U->streaming) return;
     g_stream.dirty = false;
+    comp_invalidate(&U->streaming->base);
+    if (!g_stream.tools_dirty) return;
+    g_stream.tools_dirty = false;
     Arena a = {0};
     JValue *m = json_new(&a, J_OBJECT);
-    for (size_t i = 0; g_stream.base && json_is(g_stream.base, J_OBJECT) && i < g_stream.base->obj.len; i++)
-        if (!str_eqz(g_stream.base->obj.items[i].key, "content")) json_put(&a, m, g_stream.base->obj.items[i].key, g_stream.base->obj.items[i].val);
     JValue *content = json_new(&a, J_ARRAY);
     for (size_t i = 0; i < g_stream.blocks.len; i++) {
         SBlock *b = &g_stream.blocks.ptr[i];
+        if (b->type != 'c') continue;
         JValue *o = json_new(&a, J_OBJECT);
-        if (b->type == 'c') {
-            json_put(&a, o, S("type"), json_string(&a, S("toolCall")));
-            json_put(&a, o, S("id"), json_string(&a, str(b->id ? b->id : "")));
-            json_put(&a, o, S("name"), json_string(&a, str(b->name ? b->name : "")));
-            json_put(&a, o, S("arguments"), b->args ? (JValue *)code_args_parser_value(b->args) : json_new(&a, J_OBJECT));
-        } else {
-            json_put(&a, o, S("type"), json_string(&a, b->type == 'h' ? S("thinking") : S("text")));
-            json_put(&a, o, b->type == 'h' ? S("thinking") : S("text"), json_string(&a, buf_str(&b->text)));
-        }
+        json_put(&a, o, S("type"), json_string(&a, S("toolCall")));
+        json_put(&a, o, S("id"), json_string(&a, str(b->id ? b->id : "")));
+        json_put(&a, o, S("name"), json_string(&a, str(b->name ? b->name : "")));
+        json_put(&a, o, S("arguments"), b->args ? (JValue *)code_args_parser_value(b->args) : json_new(&a, J_OBJECT));
         json_push(&a, content, o);
     }
     json_put(&a, m, S("content"), content);
-    asst_set(U->streaming, m);
-    if (g_stream.tools_dirty) sync_tools(m);
-    g_stream.tools_dirty = false;
+    sync_tools(m);
     arena_reset(&a);
 }
 
@@ -4330,6 +4435,17 @@ static void cycle_thinking(void) {
 }
 
 static void selector_key(const Key *k) {
+    if (U->sel == SEL_CONFIRM && U->confirm_switch) {
+        if (k->kind == K_ENTER) {
+            U->sel = SEL_NONE;
+            U->confirm_switch = false;
+            restart_model(U->sw_provider, U->sw_id);
+        } else if (k->kind == K_ESC || (k->kind == K_CTRL && k->ch == 'c')) {
+            U->sel = SEL_NONE;
+            U->confirm_switch = false;
+        }
+        return;
+    }
     if (U->sel == SEL_CONFIRM) {
         if (k->kind == K_ENTER && U->dl_free_gb >= U->dl_disk) {
             U->sel = SEL_NONE;
@@ -4379,7 +4495,7 @@ static void handle_key(const Key *k) {
     }
     // app actions (custom-editor.ts)
     if (k->kind == K_ESC && !editor_autocomplete_open(U->ed)) {
-        if (U->dl_pid > 0) {
+        if (!U->busy && U->dl_pid > 0) {
             cancel_download();
             return;
         }
@@ -4495,8 +4611,7 @@ static void external_editor(void) {
     argv[n++] = path;
     argv[n] = NULL;
     pid_t pid;
-    extern char **environ;
-    int rc = posix_spawnp(&pid, argv[0], NULL, NULL, (char *const *)argv, environ);
+    int rc = tui_spawn(&pid, (char *const *)argv, NULL, true, false);
     int st = 0;
     if (rc == 0)
         while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
@@ -4536,8 +4651,11 @@ static void external_editor(void) {
 static void cycle_model(int dir) {
     size_t n = U->cfg->nmodels, cur = n;
     size_t runnable = 0;
+    // only the models this process switches to in place: the servers of models.json (packs, and
+    // anything while the engine runs here, need a confirmed restart: /model)
+#define CYCLABLE(m) (!(m)->pack && !U->cfg->engine)
     for (size_t i = 0; i < n; i++) {
-        if (!U->cfg->models[i].unavailable) runnable++;
+        if (CYCLABLE(&U->cfg->models[i])) runnable++;
         if (is_current(&U->cfg->models[i])) cur = i;
     }
     if (runnable < 2) {
@@ -4546,7 +4664,8 @@ static void cycle_model(int dir) {
     }
     size_t i = cur == n ? 0 : cur;
     do i = (i + n + (size_t)(dir > 0 ? 1 : n - 1)) % n;
-    while (U->cfg->models[i].unavailable);
+    while (!CYCLABLE(&U->cfg->models[i]));
+#undef CYCLABLE
     const CodeUiModel *m = &U->cfg->models[i];
     choose_model(m, false);
     Buf b = {0};
@@ -4623,10 +4742,10 @@ Err code_ui_run(const CodeUiConfig *cfg, const CodeUiOps *ops, CodeUiHost *host,
     {
         const char *t = json_str(json_get(cfg->settings, "theme"));
         ui.theme = t ? strdup(t) : NULL;
-        FILE *p = popen("defaults read -g AppleInterfaceStyle 2>/dev/null", "r");
-        char v[32] = {0};
-        bool dark = p && fgets(v, sizeof v, p) && !strncmp(v, "Dark", 4);
-        if (p) pclose(p);
+        static const char *const dr[] = {"defaults", "read", "-g", "AppleInterfaceStyle", NULL};
+        Buf v = {0};
+        bool dark = tui_run((char *const *)dr, NULL, S(""), &v, 1000) && v.len >= 4 && !strncmp(v.ptr, "Dark", 4);
+        buf_free(&v);
         ui.mac_appearance = dark ? 1 : 2;
     }
     // pi's system theme is grayscale until the terminal reports its colors; the others draw at once
@@ -4779,10 +4898,7 @@ Err code_ui_run(const CodeUiConfig *cfg, const CodeUiOps *ops, CodeUiHost *host,
     pthread_join(ui.thread, NULL);
     ring_drain(false);
     if (ui.re_id && ops->restart) ops->restart(host, ui.re_provider, ui.re_id);
-    if (ui.dl_pid > 0) {
-        kill(ui.dl_pid, SIGINT);
-        waitpid(ui.dl_pid, NULL, 0);
-    }
+    if (ui.dl_pid > 0) tui_stop_child(ui.dl_pid, true, 2000, NULL); // bounded: SIGKILL after 2 s
     if (ui.dl_fd >= 0) close(ui.dl_fd);
     free(ui.dl_name);
     free(ui.dl_title);
@@ -4806,6 +4922,9 @@ Err code_ui_run(const CodeUiConfig *cfg, const CodeUiOps *ops, CodeUiHost *host,
     for (size_t i = 0; i < ui.ninitial; i++) free(ui.initial[i]);
     free(ui.initial);
     free(ui.re_id);
+    free(ui.sw_provider);
+    free(ui.sw_id);
+    free(ui.sw_title);
     free(ui.theme);
     free(ui.theme_before);
     free(ui.thinking);
@@ -4817,12 +4936,12 @@ Err code_ui_run(const CodeUiConfig *cfg, const CodeUiOps *ops, CodeUiHost *host,
     free(ui.default_model);
     free(g_job);
     g_job = NULL;
-    // the git look may still run: it must not write to the wake pipe once it is closed
-    for (uint64_t until = now_ns() + 1500000000ull; atomic_load(&g_git_running) && now_ns() < until;) {
-        struct timespec ts = {0, 5000000};
-        nanosleep(&ts, NULL);
-    }
-    g_git_wake = -1;
+    // the git look may still run (its commands are bounded, 1 s each): joined before the wake pipe
+    // it writes to is closed
+    atomic_store(&g_git_quit, true);
+    if (g_git_started) pthread_join(g_git_th, NULL);
+    g_git_started = false;
+    atomic_store(&g_git_wake, -1);
     close(g_wake[0]);
     close(g_wake[1]);
     g_wake[0] = g_wake[1] = -1;

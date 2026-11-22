@@ -227,6 +227,30 @@ static long find_close(Str s, size_t from, char c, size_t n, Memo *m) {
     return -1;
 }
 
+// A C0 or C1 control or DEL at s[i]: never part of a link destination.
+static bool ctl_byte(Str s, size_t i) {
+    unsigned char c = (unsigned char)s.ptr[i];
+    return c < 0x20 || c == 0x7f || (c == 0xc2 && i + 1 < s.len && (unsigned char)s.ptr[i + 1] >= 0x80 && (unsigned char)s.ptr[i + 1] <= 0x9f);
+}
+
+static bool has_ctl(Str s) {
+    for (size_t i = 0; i < s.len; i++)
+        if (ctl_byte(s, i)) return true;
+    return false;
+}
+
+// s without its controls (a link destination as written in an OSC 8 sequence or shown).
+static void no_ctl(Buf *b, Str s) {
+    for (size_t i = 0; i < s.len; i++) {
+        if (ctl_byte(s, i)) {
+            if ((unsigned char)s.ptr[i] == 0xc2) i++;
+            continue;
+        }
+        buf_addc(b, s.ptr[i]);
+    }
+    if (!b->ptr) buf_adds(b, "");
+}
+
 static bool scheme_char(char c) { return isalnum((unsigned char)c) || c == '+' || c == '.' || c == '-'; }
 
 // The matching ']' of every '[' (escapes and code spans skipped), in one pass.
@@ -319,7 +343,7 @@ static void lex_inline(Arena *a, Str s, InlineVec *out) {
             while (j < s.len && scheme_char(s.ptr[j])) j++;
             if (j < s.len && s.ptr[j] == ':' && j - i - 1 >= 2 && isalpha((unsigned char)s.ptr[i + 1])) {
                 size_t k = j + 1;
-                while (k < s.len && s.ptr[k] != '>' && s.ptr[k] != '<' && !isspace((unsigned char)s.ptr[k])) k++;
+                while (k < s.len && s.ptr[k] != '>' && s.ptr[k] != '<' && !isspace((unsigned char)s.ptr[k]) && !ctl_byte(s, k)) k++;
                 if (k < s.len && s.ptr[k] == '>') {
                     FLUSH_TEXT();
                     Str url = str_sub(s, i + 1, k);
@@ -402,7 +426,7 @@ static void lex_inline(Arena *a, Str s, InlineVec *out) {
             else if (rest.len > 4 && !strncasecmp(rest.ptr, "www.", 4)) pre = 4;
             if (pre) {
                 size_t k = i + pre;
-                while (k < s.len && !isspace((unsigned char)s.ptr[k]) && s.ptr[k] != '<') k++;
+                while (k < s.len && !isspace((unsigned char)s.ptr[k]) && s.ptr[k] != '<' && !ctl_byte(s, k)) k++;
                 // trailing punctuation is not part of the URL
                 while (k > i + pre && strchr("?!.,:*_~'\"", s.ptr[k - 1])) k--;
                 if (k > i + pre && s.ptr[k - 1] == ')') {
@@ -1219,21 +1243,26 @@ static void render_inlines(const Md *m, const Inline *t, size_t n, const Ctx *c,
             c_underline(&u, buf_str(&in));
             Buf styled = {0};
             th_fg(&styled, T_MD_LINK, buf_str(&u));
-            if (m->hyperlinks) {
-                buf_printf(&r, "\x1b]8;;%.*s\x07", (int)x->href.len, x->href.ptr);
+            // a destination or a label with control characters never goes into an OSC 8 sequence
+            Buf hb = {0};
+            no_ctl(&hb, x->href);
+            Str href = buf_str(&hb);
+            if (m->hyperlinks && !has_ctl(x->href) && !has_ctl(x->text)) {
+                buf_printf(&r, "\x1b]8;;%.*s\x07", (int)href.len, href.ptr);
                 buf_addstr(&r, buf_str(&styled));
                 buf_adds(&r, "\x1b]8;;\x07");
             } else {
-                Str hc = str_starts(x->href, S("mailto:")) ? str_sub(x->href, 7, x->href.len) : x->href;
+                Str hc = str_starts(href, S("mailto:")) ? str_sub(href, 7, href.len) : href;
                 buf_addstr(&r, buf_str(&styled));
-                if (!str_eq(x->text, x->href) && !str_eq(x->text, hc)) {
+                if (!str_eq(x->text, href) && !str_eq(x->text, hc)) {
                     Buf url = {0};
-                    buf_printf(&url, " (%.*s)", (int)x->href.len, x->href.ptr);
+                    buf_printf(&url, " (%.*s)", (int)href.len, href.ptr);
                     th_fg(&r, T_MD_LINK_URL, buf_str(&url));
                     buf_free(&url);
                 }
             }
             buf_adds(&r, c->prefix);
+            buf_free(&hb);
             buf_free(&in);
             buf_free(&u);
             buf_free(&styled);

@@ -206,6 +206,18 @@ static Err load(CodeSession *s, const char *path) {
 
 // ---- public -------------------------------------------------------------------------------------
 
+Err code_session_open_path(Arena *a, const char *path, CodeSession **out) {
+    CodeSession *s = arena_alloc(a, sizeof *s);
+    s->a = a;
+    s->entries = json_new(a, J_ARRAY);
+    TRY(load(s, path));
+    if (!s->entries->arr.len) return "BadSession";
+    *out = s;
+    return OK;
+}
+
+bool code_session_written(const CodeSession *s) { return s->path && s->flushed; }
+
 Err code_session_open(Arena *a, const CodeEnv *env, bool cont, bool no_session, CodeSession **out) {
     CodeSession *s = arena_alloc(a, sizeof *s);
     s->a = a;

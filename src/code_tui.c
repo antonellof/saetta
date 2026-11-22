@@ -17,7 +17,9 @@
 #include <unistd.h>
 
 static struct termios g_saved;
-static volatile sig_atomic_t g_raw, g_alt, g_kitty_pushed, g_mok, g_mouse;
+static volatile sig_atomic_t g_raw, g_alt, g_kitty_pushed, g_mok, g_mouse, g_inline;
+static char g_inline_off[32]; // erases the loader's rows (prepared before they are drawn)
+static size_t g_inline_off_len;
 
 static void out_all(const char *p, size_t n) {
     while (n) {
@@ -34,6 +36,8 @@ static const char k_disable_mouse[] = "\x1b[?1006l\x1b[?1004l\x1b[?1003l\x1b[?10
 
 // Async-signal-safe: only write(2) and tcsetattr(3) on state set up beforehand.
 void screen_restore_signal_safe(void) {
+    if (g_inline) out_all(g_inline_off, g_inline_off_len);
+    g_inline = 0;
     if (g_alt) {
         OUTS("\x1b[?2026l");
         if (g_mouse) OUTS(k_disable_mouse);
@@ -65,6 +69,47 @@ static void install_handlers(void) {
     static const int sigs[] = {SIGSEGV, SIGBUS, SIGABRT, SIGFPE, SIGILL, SIGTRAP};
     for (size_t i = 0; i < COUNT(sigs); i++) sigaction(sigs[i], &sa, NULL);
     atexit(at_exit);
+}
+
+static void on_quiet_int(int sig) {
+    screen_restore_signal_safe();
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+void screen_quiet_start(int inline_rows) {
+    install_handlers();
+    if (tcgetattr(0, &g_saved) == 0) {
+        struct termios t = g_saved;
+        t.c_lflag &= ~(tcflag_t)(ICANON | ECHO); // typed keys do not echo over the loader; Ctrl+C still signals
+        tcsetattr(0, TCSANOW, &t);
+        g_raw = 1;
+    }
+    struct sigaction cur;
+    if (sigaction(SIGINT, NULL, &cur) == 0 && cur.sa_handler == SIG_DFL) {
+        struct sigaction sa = {0};
+        sa.sa_handler = on_quiet_int;
+        sa.sa_flags = (int)SA_RESETHAND;
+        sigaction(SIGINT, &sa, NULL);
+    }
+    if (inline_rows > 0) { // drawn under the cursor: a signal erases those rows (no alternate screen)
+        int n = snprintf(g_inline_off, sizeof g_inline_off, "\x1b[0m\x1b[%dF\x1b[J\x1b[?25h", inline_rows);
+        g_inline_off_len = n > 0 ? (size_t)n : 0;
+        g_inline = 1;
+        return;
+    }
+    OUTS("\x1b[?1049h\x1b[?25l\x1b[2J");
+    g_alt = 1;
+}
+
+void screen_quiet_stop(void) {
+    if (g_alt) OUTS("\x1b[0m\x1b[2J\x1b[?1049l\x1b[?25h");
+    g_alt = 0;
+    g_inline = 0; // the loader erased its rows itself
+    if (g_raw) tcsetattr(0, TCSAFLUSH, &g_saved); // keys typed meanwhile are dropped
+    g_raw = 0;
+    struct sigaction cur;
+    if (sigaction(SIGINT, NULL, &cur) == 0 && cur.sa_handler == on_quiet_int) signal(SIGINT, SIG_DFL);
 }
 
 void screen_size(Screen *s) {
@@ -310,11 +355,17 @@ static void code_key(Key *k, int code, int shifted, int mods) {
     k->ch = (uint32_t)(shift && shifted > 0 ? shifted : shift && code >= 'a' && code <= 'z' ? code - 32 : code);
 }
 
-// The end of an OSC / DCS / APC string at p (BEL or ESC \), or 0.
+// The end of an OSC / DCS / APC string at p (BEL or ESC \), or 0 while it may go on. As pi's
+// stdin buffer: CAN or SUB cancels it (consumed), and an ESC not followed by \ ends it there (the
+// ESC starts the next key), so an unterminated reply never swallows the keys after it.
 static size_t string_end(const char *p, size_t n) {
     for (size_t j = 2; j < n; j++) {
         if (p[j] == 0x07) return j + 1;
-        if (p[j] == 0x1b && j + 1 < n && p[j + 1] == '\\') return j + 2;
+        if (p[j] == 0x18 || p[j] == 0x1a) return j + 1;
+        if (p[j] == 0x1b) {
+            if (j + 1 >= n) return 0;
+            return p[j + 1] == '\\' ? j + 2 : j;
+        }
     }
     return 0;
 }
@@ -455,7 +506,7 @@ size_t key_parse(const char *p, size_t n, bool flush, Key *k) {
         }
         if (c1 == ']' || c1 == 'P' || c1 == '_') { // OSC, DCS, APC: terminal replies
             size_t e = string_end(p, n);
-            if (e && c1 == ']') osc_color(p, e, k);
+            if (e && c1 == ']' && (p[e - 1] == 0x07 || p[e - 1] == '\\')) osc_color(p, e, k);
             if (e) return e;
             if (!flush) return 0;
             // a lone Alt+] (and the like): the key, then what follows it as input
@@ -535,15 +586,33 @@ static int esc_timeout_ms(void) {
     return ms;
 }
 
-// A recognized terminal reply header (OSC 10/11/4;n/7501, DCS >|, APC G): it waits for its end.
+// A recognized terminal reply header, exactly pi's TERMINAL_REPLY_HEADER_PATTERN:
+// ESC ] (1[01]; | 4;\d{1,3}; | 7501;?) | ESC P >| | ESC _ G ([a-z]=\d+,)* [a-z]=\d+;
 static bool reply_header(Str b) {
     if (b.len < 3 || b.ptr[0] != 0x1b) return false;
     if (b.ptr[1] == ']') {
         Str r = str_sub(b, 2, b.len);
-        return str_starts(r, S("10;")) || str_starts(r, S("11;")) || str_starts(r, S("4;")) || str_starts(r, S("7501;?"));
+        if (str_starts(r, S("10;")) || str_starts(r, S("11;")) || str_starts(r, S("7501;?"))) return true;
+        if (!str_starts(r, S("4;"))) return false;
+        size_t i = 2, d = 0;
+        while (i < r.len && r.ptr[i] >= '0' && r.ptr[i] <= '9' && d < 4) i++, d++;
+        return d >= 1 && d <= 3 && i < r.len && r.ptr[i] == ';';
     }
     if (b.ptr[1] == 'P') return b.len >= 4 && b.ptr[2] == '>' && b.ptr[3] == '|';
-    if (b.ptr[1] == '_') return b.ptr[2] == 'G';
+    if (b.ptr[1] == '_') {
+        if (b.ptr[2] != 'G') return false;
+        size_t i = 3;
+        for (;;) { // [a-z]=\d+ then ',' (more) or ';' (the end of the header)
+            if (i >= b.len || b.ptr[i] < 'a' || b.ptr[i] > 'z') return false;
+            if (++i >= b.len || b.ptr[i] != '=') return false;
+            size_t d = 0;
+            while (++i < b.len && b.ptr[i] >= '0' && b.ptr[i] <= '9') d++;
+            if (!d || i >= b.len) return false;
+            if (b.ptr[i] == ';') return true;
+            if (b.ptr[i] != ',') return false;
+            i++;
+        }
+    }
     return false;
 }
 
@@ -555,8 +624,8 @@ void keyin_feed(KeyIn *in, const char *p, size_t n) {
 int keyin_timeout_ms(const KeyIn *in, uint64_t now) {
     if (!in->buf.len || in->paste) return -1;
     Str b = buf_str(&in->buf);
-    if (reply_header(b)) return -1;
-    int ms = b.len == 1 && b.ptr[0] == 0x1b ? esc_timeout_ms() : 50;
+    // a terminal reply waits for its end, up to a second (a stuck one cannot hold the keys forever)
+    int ms = reply_header(b) ? 1000 : b.len == 1 && b.ptr[0] == 0x1b ? esc_timeout_ms() : 50;
     if (!in->pending_ns) return ms;
     uint64_t due = in->pending_ns + (uint64_t)ms * 1000000ull;
     return now >= due ? 0 : (int)((due - now + 999999) / 1000000);

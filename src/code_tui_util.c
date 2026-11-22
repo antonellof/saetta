@@ -10,6 +10,131 @@
 
 #include <stdlib.h>
 
+// ---- child processes -----------------------------------------------------------------------------
+
+#include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <signal.h>
+#include <spawn.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+
+extern char **environ;
+
+int tui_pipe(int fds[2]) {
+    if (pipe(fds)) return -1;
+    for (int i = 0; i < 2; i++) fcntl(fds[i], F_SETFD, FD_CLOEXEC);
+    return 0;
+}
+
+int tui_spawn(pid_t *pid, char *const argv[], posix_spawn_file_actions_t *fa, bool inherit_stdio, bool group) {
+    posix_spawn_file_actions_t own;
+    if (!fa) {
+        posix_spawn_file_actions_init(&own);
+        fa = &own;
+    }
+    if (inherit_stdio)
+        for (int i = 0; i < 3; i++) posix_spawn_file_actions_addinherit_np(fa, i);
+    posix_spawnattr_t at;
+    posix_spawnattr_init(&at);
+    sigset_t none, all;
+    sigemptyset(&none);
+    sigfillset(&all);
+    posix_spawnattr_setsigmask(&at, &none);
+    posix_spawnattr_setsigdefault(&at, &all); // the UI ignores SIGINT: the child must not
+    short flags = POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_CLOEXEC_DEFAULT;
+    if (group) {
+        flags |= POSIX_SPAWN_SETPGROUP;
+        posix_spawnattr_setpgroup(&at, 0);
+    }
+    posix_spawnattr_setflags(&at, flags);
+    int rc = posix_spawnp(pid, argv[0], fa, &at, argv, environ);
+    posix_spawnattr_destroy(&at);
+    if (fa == &own) posix_spawn_file_actions_destroy(&own);
+    return rc;
+}
+
+bool tui_stop_child(pid_t pid, bool group, int ms, int *status) {
+    kill(group ? -pid : pid, SIGTERM);
+    uint64_t until = now_ns() + (uint64_t)ms * 1000000ull;
+    int st = 0;
+    for (;;) {
+        pid_t r = waitpid(pid, &st, WNOHANG);
+        if (r == pid || (r < 0 && errno != EINTR)) break;
+        if (now_ns() >= until) {
+            kill(group ? -pid : pid, SIGKILL);
+            while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+            break;
+        }
+        struct timespec ts = {0, 10000000};
+        nanosleep(&ts, NULL);
+    }
+    if (status) *status = st;
+    return true;
+}
+
+bool tui_run(char *const argv[], const char *cwd, Str in, Buf *out, int ms) {
+    int po[2], pi[2] = {-1, -1};
+    if (tui_pipe(po)) return false;
+    if (in.len && tui_pipe(pi)) {
+        close(po[0]);
+        close(po[1]);
+        return false;
+    }
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    if (in.len) posix_spawn_file_actions_adddup2(&fa, pi[0], 0);
+    else posix_spawn_file_actions_addopen(&fa, 0, "/dev/null", O_RDONLY, 0);
+    posix_spawn_file_actions_adddup2(&fa, po[1], 1);
+    posix_spawn_file_actions_addopen(&fa, 2, "/dev/null", O_WRONLY, 0);
+    if (cwd) posix_spawn_file_actions_addchdir(&fa, cwd);
+    pid_t pid;
+    int rc = tui_spawn(&pid, argv, &fa, false, false);
+    posix_spawn_file_actions_destroy(&fa);
+    close(po[1]);
+    if (in.len) close(pi[0]);
+    if (rc) {
+        close(po[0]);
+        if (in.len) close(pi[1]);
+        return false;
+    }
+    if (in.len) {
+        signal(SIGPIPE, SIG_IGN);
+        for (size_t off = 0; off < in.len;) {
+            ssize_t w = write(pi[1], in.ptr + off, in.len - off);
+            if (w < 0 && errno == EINTR) continue;
+            if (w <= 0) break;
+            off += (size_t)w;
+        }
+        close(pi[1]);
+    }
+    uint64_t until = now_ns() + (uint64_t)ms * 1000000ull;
+    bool ok = true;
+    for (;;) {
+        uint64_t now = now_ns();
+        if (now >= until) {
+            ok = false;
+            break;
+        }
+        struct pollfd pf = {po[0], POLLIN, 0};
+        int r = poll(&pf, 1, (int)((until - now) / 1000000) + 1);
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) continue;
+        char chunk[4096];
+        ssize_t n = read(po[0], chunk, sizeof chunk);
+        if (n <= 0) break;
+        if (out) buf_add(out, chunk, (size_t)n);
+    }
+    close(po[0]);
+    int st = 0;
+    if (!ok) tui_stop_child(pid, false, 200, &st);
+    else
+        while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+    return ok && WIFEXITED(st) && WEXITSTATUS(st) == 0;
+}
+
 // ---- lines -----------------------------------------------------------------------------------
 
 void lines_push(Lines *l, char *owned) {

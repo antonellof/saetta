@@ -14,6 +14,23 @@
 #include "code_tui_theme.h"
 #include "json.h"
 
+// ---- child processes (code_tui_util.c) -------------------------------------------------------------
+
+#include <spawn.h>
+#include <sys/types.h>
+
+// pipe(2) with both ends close-on-exec.
+int tui_pipe(int fds[2]);
+// posix_spawnp with every signal back to its default (the UI ignores SIGINT; a child must not), an
+// empty mask, only the descriptors fa names (close-on-exec by default; inherit_stdio keeps 0..2,
+// the terminal), and in its own process group when group. Returns 0 or the errno.
+int tui_spawn(pid_t *pid, char *const argv[], posix_spawn_file_actions_t *fa, bool inherit_stdio, bool group);
+// SIGTERM to the child (its group), at most ms waited, then SIGKILL; reaped.
+bool tui_stop_child(pid_t pid, bool group, int ms, int *status);
+// argv's stdout into out (stdin fed from in), in cwd, at most ms: false if it failed or timed out
+// (the child is then stopped).
+bool tui_run(char *const argv[], const char *cwd, Str in, Buf *out, int ms);
+
 // ---- lines (code_tui_util.c) ------------------------------------------------------------------
 
 // A component's output: rows of text with ANSI escapes, each malloc'd.
@@ -275,6 +292,11 @@ void screen_size(Screen *s);
 // Writes frame (rows lines; shorter is padded with blank rows) where it differs from the last one.
 // The frame's lines move into the screen (frame is left empty).
 void screen_draw(Screen *s, Lines *frame, bool force);
+// The loader's terminal: no echo, with the restore handlers (crash signals, Ctrl+C, SIGTERM, exit)
+// in place; inline_rows > 0: it draws that many rows under the cursor, which a signal erases (CSI
+// <rows> F, CSI J, the cursor shown); 0: the alternate screen. Stopped by screen_quiet_stop.
+void screen_quiet_start(int inline_rows);
+void screen_quiet_stop(void);
 // The terminal back as it was (async-signal-safe), for signal handlers.
 void screen_restore_signal_safe(void);
 

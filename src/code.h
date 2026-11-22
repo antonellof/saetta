@@ -43,6 +43,9 @@ typedef struct {
     const char *home;      // $HOME
     const char *agent_dir; // $PI_CODING_AGENT_DIR, else ~/.pi/agent
     double now_ms;         // wall clock in ms since the epoch (pi's Date.now()), for timestamps
+    // The session facts pi's bash tool exports as PI_SESSION_ID, PI_SESSION_FILE, PI_PROVIDER,
+    // PI_MODEL and PI_REASONING_LEVEL (bash.ts resolveSpawnContext); NULL leaves one unset.
+    const char *session_id, *session_file, *provider, *model, *thinking;
 } CodeEnv;
 
 // ---- system prompt (code_prompt.c; pi: core/system-prompt.js, resource-loader.js, skills.js)
@@ -59,9 +62,12 @@ Str code_system_text(Arena *a, const JValue *system);
 // The OpenAI "tools" entries for these tool names, in order ({"type":"function","function":...}).
 JValue *code_tool_schemas(Arena *a, const char *const *tools, size_t ntools);
 // Runs one tool call ({"type":"toolCall","id","name","arguments"}) in env->cwd and returns
-// pi's toolResult message. A failing tool is a result with "isError":true, not an Err; Err
-// is for the harness failing (out of memory, no such tool name is a result too).
-Err code_tool_run(Arena *a, const CodeEnv *env, const JValue *call, JValue **result);
+// pi's toolResult message: the whole per-call path of pi's agent loop (unknown tool,
+// prepareArguments, argument validation and coercion, execution, thrown errors). A failing
+// tool is a result with "isError":true, not an Err; Err is for the harness failing (no such
+// tool name is a result too). raw (may be NULL) gets the tool's own return value as json
+// mode's tool_execution_end prints it ({"content","details","structuredContent",...}).
+Err code_tool_run(Arena *a, const CodeEnv *env, const JValue *call, JValue **result, JValue **raw);
 
 // ---- OpenAI chat completions client (code_oai.c; pi-ai: api/openai-completions.js,
 // transform-messages.js)

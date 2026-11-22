@@ -843,6 +843,23 @@ static bool hint_is_light(const TermColors *tc) {
 
 static Rgb rgb_of(const uint8_t c[3]) { return (Rgb){c[0], c[1], c[2]}; }
 
+// Theme.fg / Theme.bg: each token's opening and closing sequences.
+static void emit_sgr(const ThemeValue vals[NTOK], ColorMode mode, ThemeSgr fg[THEME_NFG], ThemeSgr bg[THEME_NBG],
+                     ThemeValue fg_values[THEME_NFG], ThemeValue bg_values[THEME_NBG]) {
+    for (int tok = 0; tok < NTOK; tok++) {
+        bool back = is_panel(tok);
+        ThemeSgr *s = back ? &bg[tok - THEME_NFG] : &fg[tok];
+        sgr_of(&vals[tok], mode, back, s->open, sizeof s->open);
+        if (back) snprintf(s->close, sizeof s->close, "\x1b[49m");
+        else if (vals[tok].dim) {
+            strcat(s->open, "\x1b[2m");
+            snprintf(s->close, sizeof s->close, "\x1b[22;39m");
+        } else snprintf(s->close, sizeof s->close, "\x1b[39m");
+        if (back && bg_values) bg_values[tok - THEME_NFG] = vals[tok];
+        if (!back && fg_values) fg_values[tok] = vals[tok];
+    }
+}
+
 void theme_system_ex(const TermColors *tc, ColorMode mode, bool pending, ThemeSgr fg[THEME_NFG],
                      ThemeSgr bg[THEME_NBG], ThemeValue fg_values[THEME_NFG], ThemeValue bg_values[THEME_NBG],
                      bool *is_light) {
@@ -869,22 +886,182 @@ void theme_system_ex(const TermColors *tc, ColorMode mode, bool pending, ThemeSg
         generate(&g, vals);
         light = g.light;
     }
-    for (int tok = 0; tok < NTOK; tok++) {
-        bool back = is_panel(tok);
-        ThemeSgr *s = back ? &bg[tok - THEME_NFG] : &fg[tok];
-        sgr_of(&vals[tok], mode, back, s->open, sizeof s->open);
-        if (back) snprintf(s->close, sizeof s->close, "\x1b[49m");
-        else if (vals[tok].dim) {
-            strcat(s->open, "\x1b[2m");
-            snprintf(s->close, sizeof s->close, "\x1b[22;39m");
-        } else snprintf(s->close, sizeof s->close, "\x1b[39m");
-        if (back && bg_values) bg_values[tok - THEME_NFG] = vals[tok];
-        if (!back && fg_values) fg_values[tok] = vals[tok];
-    }
+    emit_sgr(vals, mode, fg, bg, fg_values, bg_values);
     if (is_light) *is_light = light;
 }
 
 void theme_system(const TermColors *tc, ColorMode mode, ThemeSgr fg[THEME_NFG], ThemeSgr bg[THEME_NBG],
                   bool *is_light) {
     theme_system_ex(tc, mode, false, fg, bg, NULL, NULL, is_light);
+}
+
+// ---- named themes ---------------------------------------------------------------------------------
+
+// pi's built-in dark.json and light.json, their var references resolved: okhsl(h s% l%) per token,
+// parsed as pi's parseColor does (percentages divided by 100). They declare their appearance and
+// set no token to "" (terminal default), so the terminal's reported colors play no part.
+typedef struct {
+    double h, s, l;
+} Okhsl;
+
+static const Okhsl PI_DARK[NTOK] = {
+    [TH_FG_ACCENT] = {295, 50, 67}, [TH_FG_BORDER] = {231, 57, 65}, [TH_FG_BORDER_ACCENT] = {295, 53, 64},
+    [TH_FG_BORDER_MUTED] = {229, 8, 53}, [TH_FG_SUCCESS] = {159, 59, 67}, [TH_FG_ERROR] = {20, 72, 67},
+    [TH_FG_WARNING] = {83, 88, 67}, [TH_FG_MUTED] = {229, 6, 67}, [TH_FG_DIM] = {229, 8, 56},
+    [TH_FG_TEXT] = {234, 3, 89}, [TH_FG_THINKING_TEXT] = {226, 7, 65}, [BG(TH_BG_SELECTED)] = {233, 41, 24},
+    [TH_FG_SCROLLBAR_TRACK] = {237, 7, 33}, [TH_FG_SCROLLBAR_THUMB] = {232, 7, 65},
+    [BG(TH_BG_SEARCH_MATCH)] = {53, 51, 24}, [TH_FG_SEARCH_MATCH_TEXT] = {229, 6, 67},
+    [BG(TH_BG_USER_MESSAGE)] = {233, 41, 24}, [TH_FG_USER_MESSAGE_TEXT] = {234, 3, 89},
+    [BG(TH_BG_CUSTOM_MESSAGE)] = {295, 42, 24}, [TH_FG_CUSTOM_MESSAGE_TEXT] = {229, 6, 67},
+    [TH_FG_CUSTOM_MESSAGE_LABEL] = {295, 50, 67}, [BG(TH_BG_TOOL_PENDING)] = {229, 5, 24},
+    [BG(TH_BG_TOOL_SUCCESS)] = {158, 46, 25}, [BG(TH_BG_TOOL_ERROR)] = {19, 54, 25},
+    [TH_FG_TOOL_TITLE] = {234, 3, 89}, [TH_FG_TOOL_OUTPUT] = {229, 6, 67}, [TH_FG_MD_HEADING] = {83, 88, 67},
+    [TH_FG_MD_LINK] = {232, 54, 67}, [TH_FG_MD_LINK_URL] = {229, 6, 67}, [TH_FG_MD_CODE] = {295, 50, 67},
+    [TH_FG_MD_CODE_BLOCK] = {159, 59, 67}, [TH_FG_MD_CODE_BLOCK_BORDER] = {229, 6, 67},
+    [TH_FG_MD_QUOTE] = {229, 6, 67}, [TH_FG_MD_QUOTE_BORDER] = {229, 6, 67}, [TH_FG_MD_HR] = {229, 6, 67},
+    [TH_FG_MD_LIST_BULLET] = {295, 50, 67}, [TH_FG_TOOL_DIFF_ADDED] = {159, 59, 67},
+    [TH_FG_TOOL_DIFF_REMOVED] = {20, 72, 67}, [TH_FG_TOOL_DIFF_CONTEXT] = {229, 6, 67},
+    [TH_FG_SYNTAX_COMMENT] = {229, 6, 67}, [TH_FG_SYNTAX_KEYWORD] = {232, 54, 67},
+    [TH_FG_SYNTAX_FUNCTION] = {83, 88, 67}, [TH_FG_SYNTAX_VARIABLE] = {202, 58, 67},
+    [TH_FG_SYNTAX_STRING] = {52, 67, 67}, [TH_FG_SYNTAX_NUMBER] = {159, 59, 67}, [TH_FG_SYNTAX_TYPE] = {295, 50, 67},
+    [TH_FG_SYNTAX_OPERATOR] = {229, 6, 67}, [TH_FG_SYNTAX_PUNCTUATION] = {229, 6, 67},
+    [TH_FG_THINKING_OFF] = {229, 8, 49}, [TH_FG_THINKING_MINIMAL] = {232, 20, 52}, [TH_FG_THINKING_LOW] = {232, 45, 54},
+    [TH_FG_THINKING_MEDIUM] = {263, 59, 56}, [TH_FG_THINKING_HIGH] = {295, 73, 59},
+    [TH_FG_THINKING_XHIGH] = {337, 81, 61}, [TH_FG_THINKING_MAX] = {20, 99, 63}, [TH_FG_BASH_MODE] = {159, 64, 65},
+};
+
+static const Okhsl PI_LIGHT[NTOK] = {
+    [TH_FG_ACCENT] = {295, 60, 46}, [TH_FG_BORDER] = {231, 67, 55}, [TH_FG_BORDER_ACCENT] = {295, 59, 55},
+    [TH_FG_BORDER_MUTED] = {235, 7, 66}, [TH_FG_SUCCESS] = {159, 75, 46}, [TH_FG_ERROR] = {20, 91, 47},
+    [TH_FG_WARNING] = {83, 99, 47}, [TH_FG_MUTED] = {229, 8, 47}, [TH_FG_DIM] = {229, 7, 59},
+    [TH_FG_TEXT] = {225, 5, 27}, [TH_FG_THINKING_TEXT] = {234, 8, 55}, [BG(TH_BG_SELECTED)] = {235, 19, 91},
+    [TH_FG_SCROLLBAR_TRACK] = {248, 3, 90}, [TH_FG_SCROLLBAR_THUMB] = {226, 7, 65},
+    [BG(TH_BG_SEARCH_MATCH)] = {56, 22, 91}, [TH_FG_SEARCH_MATCH_TEXT] = {229, 8, 47},
+    [BG(TH_BG_USER_MESSAGE)] = {235, 19, 91}, [TH_FG_USER_MESSAGE_TEXT] = {225, 5, 27},
+    [BG(TH_BG_CUSTOM_MESSAGE)] = {295, 25, 91}, [TH_FG_CUSTOM_MESSAGE_TEXT] = {229, 8, 47},
+    [TH_FG_CUSTOM_MESSAGE_LABEL] = {295, 60, 46}, [BG(TH_BG_TOOL_PENDING)] = {248, 3, 91},
+    [BG(TH_BG_TOOL_SUCCESS)] = {156, 21, 91}, [BG(TH_BG_TOOL_ERROR)] = {24, 23, 91},
+    [TH_FG_TOOL_TITLE] = {225, 5, 27}, [TH_FG_TOOL_OUTPUT] = {229, 8, 47}, [TH_FG_MD_HEADING] = {83, 99, 47},
+    [TH_FG_MD_LINK] = {231, 68, 47}, [TH_FG_MD_LINK_URL] = {229, 8, 47}, [TH_FG_MD_CODE] = {295, 60, 46},
+    [TH_FG_MD_CODE_BLOCK] = {159, 75, 46}, [TH_FG_MD_CODE_BLOCK_BORDER] = {229, 8, 47},
+    [TH_FG_MD_QUOTE] = {229, 8, 47}, [TH_FG_MD_QUOTE_BORDER] = {229, 8, 47}, [TH_FG_MD_HR] = {229, 8, 47},
+    [TH_FG_MD_LIST_BULLET] = {295, 60, 46}, [TH_FG_TOOL_DIFF_ADDED] = {159, 75, 46},
+    [TH_FG_TOOL_DIFF_REMOVED] = {20, 91, 47}, [TH_FG_TOOL_DIFF_CONTEXT] = {229, 8, 47},
+    [TH_FG_SYNTAX_COMMENT] = {229, 8, 47}, [TH_FG_SYNTAX_KEYWORD] = {231, 68, 47},
+    [TH_FG_SYNTAX_FUNCTION] = {83, 99, 47}, [TH_FG_SYNTAX_VARIABLE] = {203, 73, 46},
+    [TH_FG_SYNTAX_STRING] = {52, 84, 46}, [TH_FG_SYNTAX_NUMBER] = {159, 75, 46}, [TH_FG_SYNTAX_TYPE] = {295, 60, 46},
+    [TH_FG_SYNTAX_OPERATOR] = {229, 8, 47}, [TH_FG_SYNTAX_PUNCTUATION] = {229, 8, 47},
+    [TH_FG_THINKING_OFF] = {223, 5, 80}, [TH_FG_THINKING_MINIMAL] = {229, 14, 78}, [TH_FG_THINKING_LOW] = {232, 33, 76},
+    [TH_FG_THINKING_MEDIUM] = {264, 48, 74}, [TH_FG_THINKING_HIGH] = {295, 62, 72},
+    [TH_FG_THINKING_XHIGH] = {337, 74, 70}, [TH_FG_THINKING_MAX] = {20, 98, 68}, [TH_FG_BASH_MODE] = {159, 74, 55},
+};
+
+static void pi_builtin(const Okhsl *t, ThemeValue vals[NTOK]) {
+    for (int tok = 0; tok < NTOK; tok++) {
+        memset(&vals[tok], 0, sizeof vals[tok]);
+        set_rgb(&vals[tok], okhsl_rgb(t[tok].h, t[tok].s / 100, t[tok].l / 100));
+    }
+}
+
+// Saetta Code's own theme: macOS system colors (dark and light), Xcode's default syntax colors.
+// SAETTA_DEFAULT marks the terminal's default color.
+#define SAETTA_DEFAULT (-1)
+#define BORDERS_D 0x3A3A3C
+#define BORDERS_L 0xD1D1D6
+#define MUTED_D 0x98989D
+#define MUTED_L 0x8E8E93
+
+static const int32_t SAETTA_DARK[NTOK] = {
+    [TH_FG_ACCENT] = 0x0A84FF, [TH_FG_BORDER] = BORDERS_D, [TH_FG_BORDER_ACCENT] = 0x0A84FF,
+    [TH_FG_BORDER_MUTED] = 0x636366, [TH_FG_SUCCESS] = 0x30D158, [TH_FG_ERROR] = 0xFF453A,
+    [TH_FG_WARNING] = 0xFF9F0A, [TH_FG_MUTED] = MUTED_D, [TH_FG_DIM] = 0x7C7C80, [TH_FG_TEXT] = SAETTA_DEFAULT,
+    [TH_FG_THINKING_TEXT] = MUTED_D, [TH_FG_SCROLLBAR_TRACK] = BORDERS_D, [TH_FG_SCROLLBAR_THUMB] = 0x636366,
+    [TH_FG_SEARCH_MATCH_TEXT] = SAETTA_DEFAULT, [TH_FG_USER_MESSAGE_TEXT] = SAETTA_DEFAULT,
+    [TH_FG_CUSTOM_MESSAGE_TEXT] = MUTED_D, [TH_FG_CUSTOM_MESSAGE_LABEL] = 0xBF5AF2,
+    [TH_FG_TOOL_TITLE] = SAETTA_DEFAULT, [TH_FG_TOOL_OUTPUT] = MUTED_D, [TH_FG_MD_HEADING] = 0x0A84FF,
+    [TH_FG_MD_LINK] = 0x0A84FF, [TH_FG_MD_LINK_URL] = MUTED_D, [TH_FG_MD_CODE] = 0xE5E5EA,
+    [TH_FG_MD_CODE_BLOCK] = 0x30D158, [TH_FG_MD_CODE_BLOCK_BORDER] = BORDERS_D, [TH_FG_MD_QUOTE] = MUTED_D,
+    [TH_FG_MD_QUOTE_BORDER] = BORDERS_D, [TH_FG_MD_HR] = BORDERS_D, [TH_FG_MD_LIST_BULLET] = 0x0A84FF,
+    [TH_FG_TOOL_DIFF_ADDED] = 0x30D158, [TH_FG_TOOL_DIFF_REMOVED] = 0xFF453A, [TH_FG_TOOL_DIFF_CONTEXT] = MUTED_D,
+    [TH_FG_SYNTAX_COMMENT] = 0x7F8C98, [TH_FG_SYNTAX_KEYWORD] = 0xFF7AB2, [TH_FG_SYNTAX_FUNCTION] = 0x67B7A4,
+    [TH_FG_SYNTAX_VARIABLE] = 0xA167E6, [TH_FG_SYNTAX_STRING] = 0xFC6A5D, [TH_FG_SYNTAX_NUMBER] = 0xD9C97C,
+    [TH_FG_SYNTAX_TYPE] = 0x5DD8FF, [TH_FG_SYNTAX_OPERATOR] = MUTED_D, [TH_FG_SYNTAX_PUNCTUATION] = MUTED_D,
+    [TH_FG_THINKING_OFF] = 0x636366, [TH_FG_THINKING_MINIMAL] = 0x5E7CE2, [TH_FG_THINKING_LOW] = 0x0A84FF,
+    [TH_FG_THINKING_MEDIUM] = 0x5E5CE6, [TH_FG_THINKING_HIGH] = 0xBF5AF2, [TH_FG_THINKING_XHIGH] = 0xFF375F,
+    [TH_FG_THINKING_MAX] = 0xFF453A, [TH_FG_BASH_MODE] = 0x30D158,
+    [BG(TH_BG_SELECTED)] = 0x1C3A5E, [BG(TH_BG_SEARCH_MATCH)] = 0x3D2E14, [BG(TH_BG_USER_MESSAGE)] = 0x2C2C2E,
+    [BG(TH_BG_CUSTOM_MESSAGE)] = 0x2A1F33, [BG(TH_BG_TOOL_PENDING)] = 0x242426,
+    [BG(TH_BG_TOOL_SUCCESS)] = 0x1E2B22, [BG(TH_BG_TOOL_ERROR)] = 0x2E1F1F,
+};
+
+static const int32_t SAETTA_LIGHT[NTOK] = {
+    [TH_FG_ACCENT] = 0x007AFF, [TH_FG_BORDER] = BORDERS_L, [TH_FG_BORDER_ACCENT] = 0x007AFF,
+    [TH_FG_BORDER_MUTED] = 0xAEAEB2, [TH_FG_SUCCESS] = 0x34C759, [TH_FG_ERROR] = 0xFF3B30,
+    [TH_FG_WARNING] = 0xFF9500, [TH_FG_MUTED] = MUTED_L, [TH_FG_DIM] = 0xAEAEB2, [TH_FG_TEXT] = SAETTA_DEFAULT,
+    [TH_FG_THINKING_TEXT] = MUTED_L, [TH_FG_SCROLLBAR_TRACK] = BORDERS_L, [TH_FG_SCROLLBAR_THUMB] = 0xAEAEB2,
+    [TH_FG_SEARCH_MATCH_TEXT] = SAETTA_DEFAULT, [TH_FG_USER_MESSAGE_TEXT] = SAETTA_DEFAULT,
+    [TH_FG_CUSTOM_MESSAGE_TEXT] = MUTED_L, [TH_FG_CUSTOM_MESSAGE_LABEL] = 0xAF52DE,
+    [TH_FG_TOOL_TITLE] = SAETTA_DEFAULT, [TH_FG_TOOL_OUTPUT] = MUTED_L, [TH_FG_MD_HEADING] = 0x007AFF,
+    [TH_FG_MD_LINK] = 0x007AFF, [TH_FG_MD_LINK_URL] = MUTED_L, [TH_FG_MD_CODE] = 0x1C1C1E,
+    [TH_FG_MD_CODE_BLOCK] = 0x34C759, [TH_FG_MD_CODE_BLOCK_BORDER] = BORDERS_L, [TH_FG_MD_QUOTE] = MUTED_L,
+    [TH_FG_MD_QUOTE_BORDER] = BORDERS_L, [TH_FG_MD_HR] = BORDERS_L, [TH_FG_MD_LIST_BULLET] = 0x007AFF,
+    [TH_FG_TOOL_DIFF_ADDED] = 0x34C759, [TH_FG_TOOL_DIFF_REMOVED] = 0xFF3B30, [TH_FG_TOOL_DIFF_CONTEXT] = MUTED_L,
+    [TH_FG_SYNTAX_COMMENT] = 0x5D6C79, [TH_FG_SYNTAX_KEYWORD] = 0xAD3DA4, [TH_FG_SYNTAX_FUNCTION] = 0x326D74,
+    [TH_FG_SYNTAX_VARIABLE] = 0x6C36A9, [TH_FG_SYNTAX_STRING] = 0xD12F1B, [TH_FG_SYNTAX_NUMBER] = 0x272AD8,
+    [TH_FG_SYNTAX_TYPE] = 0x3900A0, [TH_FG_SYNTAX_OPERATOR] = MUTED_L, [TH_FG_SYNTAX_PUNCTUATION] = MUTED_L,
+    [TH_FG_THINKING_OFF] = 0xAEAEB2, [TH_FG_THINKING_MINIMAL] = 0x4A63C9, [TH_FG_THINKING_LOW] = 0x007AFF,
+    [TH_FG_THINKING_MEDIUM] = 0x5856D6, [TH_FG_THINKING_HIGH] = 0xAF52DE, [TH_FG_THINKING_XHIGH] = 0xFF2D55,
+    [TH_FG_THINKING_MAX] = 0xFF3B30, [TH_FG_BASH_MODE] = 0x34C759,
+    [BG(TH_BG_SELECTED)] = 0xDCEBFF, [BG(TH_BG_SEARCH_MATCH)] = 0xFFF0D9, [BG(TH_BG_USER_MESSAGE)] = 0xF2F2F7,
+    [BG(TH_BG_CUSTOM_MESSAGE)] = 0xF5EEFA, [BG(TH_BG_TOOL_PENDING)] = 0xF5F5F7,
+    [BG(TH_BG_TOOL_SUCCESS)] = 0xEEF6F0, [BG(TH_BG_TOOL_ERROR)] = 0xFBEFEF,
+};
+
+static void saetta_values(const int32_t *t, ThemeValue vals[NTOK]) {
+    for (int tok = 0; tok < NTOK; tok++) {
+        memset(&vals[tok], 0, sizeof vals[tok]);
+        if (t[tok] == SAETTA_DEFAULT) continue;
+        vals[tok].kind = TH_VALUE_RGB;
+        vals[tok].rgb[0] = (uint8_t)(t[tok] >> 16);
+        vals[tok].rgb[1] = (uint8_t)(t[tok] >> 8);
+        vals[tok].rgb[2] = (uint8_t)t[tok];
+    }
+}
+
+void theme_brand(bool light, uint8_t amber[3], uint8_t purple[3]) {
+    uint32_t a = light ? 0xB36400 : 0xFFB020, p = light ? 0xAF52DE : 0xBF5AF2;
+    for (int i = 0; i < 3; i++) {
+        amber[i] = (uint8_t)(a >> (16 - 8 * i));
+        purple[i] = (uint8_t)(p >> (16 - 8 * i));
+    }
+}
+
+static const char *const THEME_NAMES[] = {"saetta", "system", "dark", "light"};
+
+size_t theme_names(const char *const **names) {
+    *names = THEME_NAMES;
+    return sizeof THEME_NAMES / sizeof THEME_NAMES[0];
+}
+
+bool theme_named(const char *name, const TermColors *tc, ColorMode mode, int appearance, ThemeSgr fg[THEME_NFG],
+                 ThemeSgr bg[THEME_NBG], bool *is_light) {
+    ThemeValue vals[NTOK];
+    bool light;
+    if (!strcmp(name, "system")) {
+        theme_system(tc, mode, fg, bg, is_light);
+        return true;
+    } else if (!strcmp(name, "dark") || !strcmp(name, "light")) {
+        light = name[0] == 'l';
+        pi_builtin(light ? PI_LIGHT : PI_DARK, vals);
+    } else if (!strcmp(name, "saetta")) {
+        if (appearance == 1 || appearance == 2) light = appearance == 2;
+        else if (tc && tc->has_bg) {
+            Rgb f = rgb_of(tc->fg);
+            light = terminal_is_light(rgb_of(tc->bg), tc->has_fg ? &f : NULL);
+        } else light = hint_is_light(tc);
+        saetta_values(light ? SAETTA_LIGHT : SAETTA_DARK, vals);
+    } else return false;
+    emit_sgr(vals, mode, fg, bg, NULL, NULL);
+    if (is_light) *is_light = light;
+    return true;
 }

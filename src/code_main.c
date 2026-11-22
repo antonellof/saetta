@@ -1194,6 +1194,14 @@ static Err interactive(Run *r, const Args *o, const JValue *settings) {
     CodeUiOps ops = {host_prompt, host_new_session, host_set_thinking, host_entries, host_messages,
                      host_set_leaf, host_set_model, host_abort, host_restart};
     CodeUiHost host = {r};
+    // a stand-in for a slow model load, for the loader's test scenario: SAETTA_CODE_LOAD_DEMO_MS
+    const char *demo = getenv("SAETTA_CODE_LOAD_DEMO_MS");
+    if (demo && atoi(demo) > 0) {
+        Splash *sp = splash_start(arena_printf(a, "Loading %s ...", r->model.name ? r->model.name : r->model.id));
+        struct timespec ts = {atoi(demo) / 1000, (long)(atoi(demo) % 1000) * 1000000L};
+        nanosleep(&ts, NULL);
+        splash_stop(sp);
+    }
     Err e = code_ui_run(&cfg, &ops, &host, o->prompts.ptr, o->prompts.len);
     g_tty_saved = 0;
     if (e && !strcmp(e, "AgentBusy")) {
@@ -1242,7 +1250,7 @@ static const char *find_pi_docs(Arena *a) {
 // --pack: the engine in this process, described as `saetta start pi` describes the server to pi
 // (launch.c pi_setup), so the requests stay byte for byte the same. The engine's own log lines
 // go to ~/.saetta/code.log.
-static Err open_engine(Arena *a, Run *r, const char *arg, const char *ctx) {
+static Err open_engine(Arena *a, Run *r, const char *arg, const char *ctx, bool splash) {
     const DownloadPack *pk = download_find(arg);
     char *dir = (char *)arg;
     if (pk) TRY(download_pack_dir(a, pk, &dir));
@@ -1262,10 +1270,13 @@ static Err open_engine(Arena *a, Run *r, const char *arg, const char *ctx) {
     if (ctx) setenv("SAETTA_CTX", ctx, 1);
     else if (!getenv("SAETTA_CTX")) setenv("SAETTA_CTX", "204800", 1);
     uint64_t t0 = now_ns();
-    if (isatty(2)) fprintf(stderr, "saetta code: loading %s ...\r", pk ? arg : dir);
+    // the loader while the engine loads (interactive runs only); the load itself runs here at full speed
+    Splash *sp = splash ? splash_start(arena_printf(a, "Loading %s ...", pk && pk->title ? pk->title : arg)) : NULL;
+    if (!sp && isatty(2)) fprintf(stderr, "saetta code: loading %s ...\r", pk ? arg : dir);
     Engine *e;
     Err err = server_engine_open(a, dir, NULL, &e);
-    if (isatty(2)) fprintf(stderr, "\x1b[K");
+    splash_stop(sp);
+    if (!sp && isatty(2)) fprintf(stderr, "\x1b[K");
     if (err && !strcmp(err, "EngineBusy")) {
         Server srv;
         int pid = 0;
@@ -1383,7 +1394,7 @@ Err code_run(const char *const *args, size_t n, int *code) {
         buf_free(&in);
     }
     if (o.pack) {
-        e = open_engine(a, &r, o.pack, o.ctx);
+        e = open_engine(a, &r, o.pack, o.ctx, !o.print && !piped && !r.json && isatty(0) && isatty(1));
         if (e) goto done;
         if (o.thinking) r.model.thinking = o.thinking;
     } else e = find_model(&r, &o, settings);

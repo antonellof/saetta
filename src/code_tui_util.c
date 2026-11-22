@@ -797,6 +797,18 @@ void theme_set(const TermColors *tc, bool pending) {
     g_th_appearance = tc && tc->has_bg && !pending ? (light ? 2 : 1) : 0;
 }
 
+bool theme_use(const char *name, const TermColors *tc, int appearance) {
+    bool light = false;
+    if (!name || !strcmp(name, "system")) {
+        theme_set(tc, false);
+        return true;
+    }
+    if (!theme_named(name, tc, theme_color_mode(), appearance, g_fg, g_bg, &light)) return false;
+    g_theme_ready = true;
+    g_th_appearance = light ? 2 : 1;
+    return true;
+}
+
 static void theme_init(void) {
     if (!g_theme_ready) theme_set(NULL, false);
 }

@@ -90,6 +90,9 @@ void th_bg(Buf *b, ThemeBgToken t, Str text);
 void th_bg_line(Buf *out, ThemeBgToken t, Str line, int width);
 // The theme for the colors the terminal reported (NULL: none); pending: grayscale until they come.
 void theme_set(const TermColors *tc, bool pending);
+// A named theme ("saetta", "system", "dark", "light"); appearance for saetta: 1 dark, 2 light, 0
+// from the terminal's background. False for an unknown name (nothing changes).
+bool theme_use(const char *name, const TermColors *tc, int appearance);
 // What the terminal reported: 0 no colors, 1 a dark background, 2 a light one.
 int th_appearance(void);
 // The editor border color for a thinking level (getThinkingBorderColor).
@@ -274,6 +277,14 @@ void screen_size(Screen *s);
 void screen_draw(Screen *s, Lines *frame, bool force);
 // The terminal back as it was (async-signal-safe), for signal handlers.
 void screen_restore_signal_safe(void);
+
+// ---- the loader (code_ui_splash.c) -------------------------------------------------------------------
+
+// The turning bolt on the alternate screen with label under it, drawn from its own thread until
+// splash_stop; NULL (nothing drawn) without a terminal, with NO_COLOR or "Reduce motion".
+typedef struct Splash Splash;
+Splash *splash_start(const char *label);
+void splash_stop(Splash *s);
 
 // ---- interactive mode (code_ui.c) ----------------------------------------------------------------
 

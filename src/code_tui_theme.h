@@ -13,6 +13,7 @@
 #define SAETTA_CODE_TUI_THEME_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 // Foreground tokens, in pi's THEME_TOKENS order (theme-tokens.ts).
@@ -80,5 +81,22 @@ typedef struct {
 void theme_system_ex(const TermColors *tc, ColorMode mode, bool pending, ThemeSgr fg[THEME_NFG],
                      ThemeSgr bg[THEME_NBG], ThemeValue fg_values[THEME_NFG], ThemeValue bg_values[THEME_NBG],
                      bool *is_light);
+
+// ---- named themes ------------------------------------------------------------------------------
+
+// Names in the order /theme lists them: "saetta", "system", "dark", "light".
+size_t theme_names(const char *const **names);
+
+// The named theme. "system" is theme_system. "dark" and "light" are pi's built-in themes (dark.json,
+// light.json): fixed OKHSL colors, independent of the terminal's colors and of appearance.
+// "saetta" is Saetta Code's own (macOS system colors, Xcode's syntax colors) in a dark and a light
+// variant: appearance 1 dark, 2 light, 0 from tc as pi decides (the background, else the mode 2031
+// report, then COLORFGBG, then dark). is_light (may be NULL) receives the theme's appearance.
+// Returns false for an unknown name.
+bool theme_named(const char *name, const TermColors *tc, ColorMode mode, int appearance, ThemeSgr fg[THEME_NFG],
+                 ThemeSgr bg[THEME_NBG], bool *is_light);
+
+// The saetta theme's header and brand colors: amber and purple, for the dark or light variant.
+void theme_brand(bool light, uint8_t amber[3], uint8_t purple[3]);
 
 #endif

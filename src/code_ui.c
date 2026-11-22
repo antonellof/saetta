@@ -234,7 +234,7 @@ typedef struct {
 typedef struct ToolView ToolView;
 typedef struct AsstView AsstView;
 
-typedef enum { SEL_NONE, SEL_THINKING, SEL_MODEL, SEL_SETTINGS, SEL_TREE, SEL_CONFIRM } SelKind;
+typedef enum { SEL_NONE, SEL_THINKING, SEL_MODEL, SEL_SETTINGS, SEL_TREE, SEL_CONFIRM, SEL_THEME } SelKind;
 
 typedef struct {
     Buf value;
@@ -280,6 +280,14 @@ typedef struct {
     int dl_fd;
     Buf dl_line;
     bool dl_cancelled;
+    // the theme: the setting (NULL until chosen), the terminal's colors once reported, macOS's
+    // appearance (1 dark, 2 light), and what /theme previews over
+    char *theme;
+    bool have_colors;
+    TermColors colors;
+    int mac_appearance;
+    char *theme_before;
+    bool theme_first;
     // the current model (/model changes it) and the settings the UI uses
     CodeUiModel model;
     bool auto_compact;
@@ -2406,7 +2414,7 @@ static void settings_build(SetSel *s) {
     set_add(s, "fullscreen-wheel-scroll-lines", "Fullscreen wheel scrolling",
             "Lines per mouse-wheel event in fullscreen mode; 'auto' speeds up fast wheel spins where the terminal does not", "auto",
             (const char *const[]){"auto", "1", "2", "3", "5", "10", NULL});
-    set_add(s, "theme", "Theme", "Color theme for the interface", setting_str("theme", "system"), NULL);
+    set_add(s, "theme", "Theme", "Color theme for the interface", U->theme ? U->theme : "saetta", NULL);
 }
 
 static void set_sel_free(void *p) {
@@ -2512,6 +2520,135 @@ static void setting_changed(const char *id, const char *v) {
     }
 }
 
+// ---- themes (/theme, theme-selector.ts; the first-start choice) --------------------------------------------
+
+static void invalidate_all(void);
+
+static void apply_theme(const char *name) {
+    // the saetta theme follows the terminal's background when it reports one, else macOS's appearance
+    int ap = U->have_colors && U->colors.has_bg ? 0 : U->mac_appearance;
+    theme_use(name ? name : "system", U->have_colors ? &U->colors : NULL, ap);
+    invalidate_all();
+    editor_set_border(U->ed, th_thinking_color(U->thinking));
+    request_render();
+}
+
+// settings.json with "theme" set (written back as pi writes it: two-space JSON)
+static void json_pretty(Buf *b, const JValue *v, int depth) {
+    if (json_is(v, J_OBJECT) && v->obj.len) {
+        buf_adds(b, "{\n");
+        for (size_t i = 0; i < v->obj.len; i++) {
+            tui_spaces(b, (depth + 1) * 2);
+            JValue key = {.kind = J_STRING, .s = v->obj.items[i].key};
+            json_write(b, &key);
+            buf_adds(b, ": ");
+            json_pretty(b, v->obj.items[i].val, depth + 1);
+            buf_adds(b, i + 1 < v->obj.len ? ",\n" : "\n");
+        }
+        tui_spaces(b, depth * 2);
+        buf_addc(b, '}');
+    } else if (json_is(v, J_ARRAY) && v->arr.len) {
+        buf_adds(b, "[\n");
+        for (size_t i = 0; i < v->arr.len; i++) {
+            tui_spaces(b, (depth + 1) * 2);
+            json_pretty(b, v->arr.items[i], depth + 1);
+            buf_adds(b, i + 1 < v->arr.len ? ",\n" : "\n");
+        }
+        tui_spaces(b, depth * 2);
+        buf_addc(b, ']');
+    } else json_write(b, v);
+}
+
+static void save_theme_setting(const char *name) {
+    Arena a = {0};
+    Buf path = {0}, text = {0};
+    buf_printf(&path, "%s/settings.json", U->cfg->agent_dir);
+    char *data = NULL;
+    size_t n = 0;
+    JValue *root = NULL;
+    if (!read_file(path.ptr, 1 << 24, &data, &n) && json_parse(&a, str_n(data, n), true, &root)) root = NULL;
+    free(data);
+    if (!json_is(root, J_OBJECT)) root = json_new(&a, J_OBJECT);
+    json_put(&a, root, S("theme"), json_string(&a, str(name)));
+    json_pretty(&text, root, 0);
+    buf_addc(&text, '\n');
+    mkdir(U->cfg->agent_dir, 0755);
+    FILE *f = fopen(path.ptr, "w");
+    if (f) {
+        fwrite(text.ptr, 1, text.len, f);
+        fclose(f);
+    } else show_error("Could not save the theme in settings.json");
+    buf_free(&path);
+    buf_free(&text);
+    arena_reset(&a);
+}
+
+static void open_theme(bool first) {
+    close_selector();
+    U->sel = SEL_THEME;
+    U->theme_first = first;
+    free(U->theme_before);
+    U->theme_before = dupz(U->theme ? U->theme : "system");
+    const char *const *names;
+    size_t n = theme_names(&names);
+    sel_free(&U->list);
+    sel_init(&U->list, 10, 12, 32);
+    const char *cur = first ? "saetta" : U->theme ? U->theme : "system";
+    for (size_t i = 0; i < n; i++) {
+        const char *d = NULL;
+        if (first)
+            d = !strcmp(names[i], "saetta")   ? "macOS colors, light or dark as this Mac is"
+                : !strcmp(names[i], "system") ? "pi's colors, matched to this terminal's"
+                : !strcmp(names[i], "dark")   ? "pi's dark theme"
+                                              : "pi's light theme";
+        else if (!strcmp(names[i], cur)) d = "(current)";
+        sel_add(&U->list, names[i], names[i], d);
+        if (!strcmp(names[i], cur)) U->list.selected = i;
+    }
+    if (first) apply_theme(cur);
+}
+
+static void theme_render(int width, Lines *out) {
+    border_line(out, width, T_BORDER);
+    if (U->theme_first) {
+        Buf t = {0};
+        buf_adds(&t, "\x1b[1m Choose a theme\x1b[22m");
+        text_lines(buf_str(&t), 0, width, out);
+        t.len = 0;
+        th_fgz(&t, T_MUTED, " \xe2\x86\x91/\xe2\x86\x93 to preview \xc2\xb7 Enter to keep it \xc2\xb7 /theme changes it later");
+        text_lines(buf_str(&t), 0, width, out);
+        buf_free(&t);
+    }
+    sel_render(&U->list, width, out);
+    border_line(out, width, T_BORDER);
+}
+
+static void theme_key(const Key *k) {
+    if (k->kind == K_UP || k->kind == K_DOWN) {
+        if (k->kind == K_UP) sel_up(&U->list);
+        else sel_down(&U->list);
+        const SelItem *it = sel_current(&U->list);
+        if (it) apply_theme(it->value); // live preview
+    } else if (k->kind == K_ENTER || (U->theme_first && (k->kind == K_ESC || (k->kind == K_CTRL && k->ch == 'c')))) {
+        const SelItem *it = sel_current(&U->list);
+        char *name = strdup(it ? it->value : "saetta");
+        close_selector();
+        free(U->theme);
+        U->theme = name;
+        apply_theme(name);
+        save_theme_setting(name);
+        Buf m = {0};
+        buf_printf(&m, "Theme: %s", name);
+        show_status(m.ptr);
+        buf_free(&m);
+    } else if (k->kind == K_ESC || (k->kind == K_CTRL && k->ch == 'c')) {
+        char *back = U->theme_before ? strdup(U->theme_before) : NULL;
+        close_selector();
+        apply_theme(back);
+        free(back);
+    }
+}
+
 static void open_settings(void) {
     close_selector();
     U->sel = SEL_SETTINGS;
@@ -2529,6 +2666,10 @@ static void settings_key(const Key *k) {
     else if (k->kind == K_ENTER || (k->kind == K_CHAR && k->ch == ' ' && !U->search.value.len)) {
         if (!s->nshown) return;
         SetItem *it = &s->items[s->shown[s->selected]];
+        if (!strcmp(it->id, "theme")) {
+            open_theme(false);
+            return;
+        }
         if (!it->values[0]) {
             Buf b = {0};
             buf_printf(&b, "%s is not available in Saetta Code yet.", it->label);
@@ -3090,6 +3231,7 @@ static void render_dock(int width, Lines *out) {
     else if (U->sel == SEL_SETTINGS) settings_render(width, out);
     else if (U->sel == SEL_TREE) tree_render(width, out);
     else if (U->sel == SEL_CONFIRM) confirm_render(width, out);
+    else if (U->sel == SEL_THEME) theme_render(width, out);
     else editor_render(U->ed, width, out);
     footer_render(NULL, width, out);
 }
@@ -3801,6 +3943,7 @@ static const SlashCmd builtin_cmds[] = {
     {"quit", "Quit Saetta Code", NULL},
     {"llama", "Manage llama.cpp router models", NULL},
     {"mcp", "Manage MCP servers: sign in, reconnect, enable or disable, and change exposure", NULL},
+    {"theme", "Select color theme", NULL},
 };
 
 static bool arg_items(void *ctx, const char *cmd, SelectList *all, Lines *search) {
@@ -3932,6 +4075,11 @@ static void submit(char *text) {
             free(s);
             return;
         }
+        if (!strcmp(c, "theme")) {
+            open_theme(false);
+            free(s);
+            return;
+        }
         if (!strcmp(c, "settings")) {
             open_settings();
             free(s);
@@ -4023,6 +4171,10 @@ static void selector_key(const Key *k) {
             U->sel = SEL_NONE;
             start_download();
         } else if (k->kind == K_ESC || (k->kind == K_CTRL && k->ch == 'c')) U->sel = SEL_NONE;
+        return;
+    }
+    if (U->sel == SEL_THEME) {
+        theme_key(k);
         return;
     }
     if (U->sel == SEL_MODEL) model_key(k);
@@ -4303,7 +4455,18 @@ Err code_ui_run(const CodeUiConfig *cfg, const CodeUiOps *ops, CodeUiHost *host,
     struct sigaction sa = {0};
     sa.sa_handler = on_winch;
     sigaction(SIGWINCH, &sa, NULL);
-    theme_set(NULL, true); // grayscale until the terminal reports its colors
+    {
+        const char *t = json_str(json_get(cfg->settings, "theme"));
+        ui.theme = t ? strdup(t) : NULL;
+        FILE *p = popen("defaults read -g AppleInterfaceStyle 2>/dev/null", "r");
+        char v[32] = {0};
+        bool dark = p && fgets(v, sizeof v, p) && !strncmp(v, "Dark", 4);
+        if (p) pclose(p);
+        ui.mac_appearance = dark ? 1 : 2;
+    }
+    // pi's system theme is grayscale until the terminal reports its colors; the others draw at once
+    if (!ui.theme || !strcmp(ui.theme, "system")) theme_set(NULL, true);
+    else theme_use(ui.theme, NULL, ui.mac_appearance);
     screen_start(&ui.scr);
     if (cfg->resumed) render_history();
     draw(true);
@@ -4319,6 +4482,7 @@ Err code_ui_run(const CodeUiConfig *cfg, const CodeUiOps *ops, CodeUiHost *host,
     }
     KeyIn kin = {0};
     uint64_t last_draw = 0;
+    bool first_asked = false;
     g_dirty = true;
     while (!ui.quit) {
         uint64_t now = now_ns();
@@ -4392,9 +4556,15 @@ Err code_ui_run(const CodeUiConfig *cfg, const CodeUiOps *ops, CodeUiHost *host,
         // (TERMINAL_QUERY_TIMEOUT_MS)
         if (ui.scr.color_query && (ui.scr.color_done || now - ui.scr.color_query_ns >= 100000000ull)) {
             ui.scr.color_query = ui.scr.color_done = false;
-            TermColors tc = ui.scr.colors;
-            theme_set(&tc, false);
-            invalidate_all();
+            ui.colors = ui.scr.colors;
+            ui.have_colors = ui.colors.has_fg || ui.colors.has_bg || ui.colors.has_palette;
+            const SelItem *it = ui.sel == SEL_THEME ? sel_current(&ui.list) : NULL;
+            apply_theme(it ? it->value : ui.theme);
+            // the first start: the theme choice, before the first prompt
+            if (!ui.theme && ui.sel == SEL_NONE && !first_asked) {
+                first_asked = true;
+                open_theme(true);
+            }
             g_dirty = true;
         }
         if (ui.working && now - g_last_spin >= 80000000ull) {
@@ -4470,6 +4640,8 @@ Err code_ui_run(const CodeUiConfig *cfg, const CodeUiOps *ops, CodeUiHost *host,
     for (size_t i = 0; i < ui.ninitial; i++) free(ui.initial[i]);
     free(ui.initial);
     free(ui.re_id);
+    free(ui.theme);
+    free(ui.theme_before);
     free(ui.thinking);
     free(ui.default_thinking);
     free((char *)ui.model.provider);

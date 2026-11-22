@@ -2831,7 +2831,10 @@ static void choose_model(const CodeUiModel *m, bool persist) {
         free((char *)U->model.provider);
         free((char *)U->model.id);
         free((char *)U->model.name);
-        U->model = (CodeUiModel){.provider = strdup(prov), .id = strdup(id), .name = dupz(copy.name), .reasoning = copy.reasoning,
+        free((char *)U->model.label);
+        free((char *)U->model.label_brief);
+        U->model = (CodeUiModel){.provider = strdup(prov), .id = strdup(id), .name = dupz(copy.name), .label = dupz(copy.label),
+                                 .label_brief = dupz(copy.label_brief), .reasoning = copy.reasoning,
                                  .context_window = copy.context_window};
         if (!copy.reasoning) {
             free(U->thinking);
@@ -5118,6 +5121,7 @@ Err code_ui_run(const CodeUiConfig *cfg, const CodeUiOps *ops, CodeUiHost *host,
     ui.host = host;
     ui.thinking = dupz(cfg->thinking ? cfg->thinking : "off");
     ui.model = (CodeUiModel){.provider = dupz(cfg->model.provider), .id = dupz(cfg->model.id), .name = dupz(cfg->model.name),
+                             .label = dupz(cfg->model.label), .label_brief = dupz(cfg->model.label_brief),
                              .reasoning = cfg->model.reasoning, .context_window = cfg->model.context_window};
     ui.auto_compact = cfg->auto_compact;
     ui.default_provider = dupz(cfg->default_provider);
@@ -5349,6 +5353,8 @@ Err code_ui_run(const CodeUiConfig *cfg, const CodeUiOps *ops, CodeUiHost *host,
     free((char *)ui.model.provider);
     free((char *)ui.model.id);
     free((char *)ui.model.name);
+    free((char *)ui.model.label);
+    free((char *)ui.model.label_brief);
     free(ui.default_provider);
     free(ui.default_model);
     free(g_job);

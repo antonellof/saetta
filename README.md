@@ -2,11 +2,11 @@
   <img src="docs/assets/saetta-banner.png" alt="Saetta" width="900">
 </p>
 
-<h3 align="center">Local coding models on Apple Silicon, and Saetta Code, a coding agent that runs the model in its own process.</h3>
-<p align="center">Saetta Code is built into the <code>saetta</code> binary: pi's tools, sessions and terminal UI, written in C, with Qwen3.8 running inside it. The same engine, in C and hand-written Metal, serves Claude Code, pi and opencode. Qwen3.8-27B from 32 GB of memory, Qwen3.8-Flash-Next from 96 GB. <a href="https://saetta.dev">saetta.dev</a></p>
+<h3 align="center">Saetta: a local coding agent for Apple Silicon Macs, with the model running inside it.</h3>
+<p align="center">The agent is a port of pi to C, with pi's tools, sessions and terminal UI, and runs Qwen3.8 in its own process. Its engine, in C and hand-written Metal, also serves Claude Code, pi and opencode. Qwen3.8-27B from 32 GB of memory, Qwen3.8-Flash-Next from 96 GB. <a href="https://saetta.dev">saetta.dev</a></p>
 
 <p align="center">
-  <a href="#install"><b>Install</b></a> · <a href="#saetta-code"><b>Saetta Code</b></a> · <a href="#other-coding-agents">Other agents</a> ·
+  <a href="#install"><b>Install</b></a> · <a href="#saetta-code"><b>Coding agent</b></a> · <a href="#other-coding-agents">Other agents</a> ·
   <a href="#models">Models</a> · <a href="#server">Server</a> · <a href="#performance">Performance</a> · <a href="#build-from-source">Build from source</a>
 </p>
 
@@ -29,10 +29,10 @@ Saetta runs Qwen3.8 coding models on any Apple Silicon Mac with 32 GB of memory 
 
 ```sh
 curl -fsSL https://saetta.dev/install.sh | sh    # into ~/.local/bin
-saetta start code        # Saetta Code: picks the model that fits this Mac, downloads it and opens it
+saetta start code        # the built-in agent: picks the model that fits this Mac, downloads it and opens it
 ```
 
-`saetta` alone (or `saetta auto`) is a guided start: it shows this Mac's chip, memory and free disk, lists the models best first (the ones that do not fit are greyed out), downloads the one you pick, finds Saetta Code, Claude Code, pi and opencode, offers the official installer for a missing one, and starts it. The same by hand:
+`saetta` alone (or `saetta auto`) is a guided start: it shows this Mac's chip, memory and free disk, lists the models best first (the ones that do not fit are greyed out), downloads the one you pick, offers the built-in agent or the Claude Code, pi and opencode it finds (with the official installer for a missing one), and starts it. The same by hand:
 
 ```sh
 saetta download          # the model that fits this Mac, into ~/Models, resumable, hash-checked
@@ -46,14 +46,14 @@ Needs an Apple Silicon Mac (M1 or later) with 32 GB of memory or more, and macOS
 ## Saetta Code
 
 <p align="center">
-  <img src="docs/assets/demo-code.gif" width="900" alt="saetta start code: Saetta Code loads the model, writes a one-page site for a coffee roastery, checks and fixes it; the page it wrote at the end">
-  <br><sub><code>saetta start code</code>: Saetta Code loads the model, writes a landing page for a coffee roastery in one HTML file, checks it and fixes what it finds; then the page as a browser shows it. The typing, the thinking and the waits are cut, the checks play at 8x.</sub>
+  <img src="docs/assets/demo-code.gif" width="900" alt="saetta start code: the agent loads the model, writes a one-page site for a coffee roastery, checks and fixes it; the page it wrote at the end">
+  <br><sub><code>saetta start code</code> loads the model, writes a landing page for a coffee roastery in one HTML file, checks it and fixes what it finds; then the page as a browser shows it. The typing, the thinking and the waits are cut, the checks play at 8x.</sub>
 </p>
 
-Saetta Code is the coding agent inside the `saetta` binary. It is written in C and runs the model in its own process: no server, and no HTTP between the agent and the model. The binary is 2.3 MB and needs no Node.js and no Python. `saetta start code` picks the model that fits this Mac, downloads it if needed and opens Saetta Code on it.
+Saetta Code is the coding agent inside the `saetta` binary. It is written in C and runs the model in its own process, with no server and no HTTP between the agent and the model. The binary is 2.3 MB and needs neither Node.js nor Python. `saetta start code` picks the model that fits this Mac, downloads it if needed and opens the agent on it.
 
 ```sh
-saetta start code                       # the model inside Saetta Code (or the running server, if one is up)
+saetta start code                       # the model inside the agent (or the running server, if one is up)
 saetta code --pack coder                # the same with a chosen pack; Escape stops a turn
 saetta code -c                          # continue this folder's last session (pi's too)
 saetta code -p "fix the failing test"   # print mode, as pi -p
@@ -62,15 +62,15 @@ saetta code --mode json -p "..."        # pi's JSON event stream
 
 ### Compatible with pi
 
-Saetta Code is a port of the [pi](https://pi.dev) coding agent 1.5.2 (MIT). It has pi's tools (read, bash, edit, write; grep, find and ls with `--tools`), its system prompt, `AGENTS.md` and `CLAUDE.md` context files, skills (and `/skill:name`), prompt files and session files. It reads and writes pi's `settings.json`, `models.json`, `trust.json` and `mcp.json` in `~/.pi/agent`, so the two share one setup, and each continues the other's sessions, compacted ones included.
+It is a port of the [pi](https://pi.dev) coding agent 1.5.2 (MIT). It has pi's tools (read, bash, edit, write; grep, find and ls with `--tools`), its system prompt, `AGENTS.md` and `CLAUDE.md` context files, skills (and `/skill:name`), prompt files and session files. It reads and writes pi's `settings.json`, `models.json`, `trust.json` and `mcp.json` in `~/.pi/agent`, so the two share one setup, and each continues the other's sessions, compacted ones included.
 
 Its requests and session files match pi's byte for byte on 54 recorded print and JSON scenarios (tool errors, edits, truncation, sessions, compaction, retries, skills), apart from its own system prompt preamble. Its interactive screens are compared with pi's on 61 recorded scenarios. pi's TypeScript extensions and packages are not supported, and there is no image input.
 
 ### The terminal UI
 
-The interactive view is pi's terminal UI ported to C: differential rendering, an editor with "/" commands and "@" file completion, markdown with highlighted code, tool views with word diffs for edits, bash output shown as it runs, and the model, settings, thinking and session tree selectors. Saetta Code adds its own default theme with macOS's colors (`/theme` switches to pi's themes, with a live preview), a footer like a starship prompt (the folder as `~/...`, the git branch and status, the time of the last turn, the model's full name and quantization), and a 3D lightning loader drawn inline while the model loads. It checks for a new release at start.
+The interactive view is pi's terminal UI ported to C: differential rendering, an editor with "/" commands and "@" file completion, markdown with highlighted code, tool views with word diffs for edits, bash output shown as it runs, and the model, settings, thinking and session tree selectors. On top of it come a default theme with macOS's colors (`/theme` switches to pi's themes, with a live preview), a footer like a starship prompt (the folder as `~/...`, the git branch and status, the time of the last turn, the model's full name and quantization), and a 3D lightning loader drawn inline while the model loads. The agent checks for a new release at start.
 
-<p align="center"><img src="web/assets/code/tools.png" width="900" alt="Saetta Code: an edit of src/duration.ts shown as a diff, node --test with 5 tests passing, and the model's summary"></p>
+<p align="center"><img src="web/assets/code/tools.png" width="900" alt="An edit of src/duration.ts shown as a diff, node --test with 5 tests passing, and the model's summary"></p>
 
 ### Commands
 
@@ -85,7 +85,7 @@ The interactive view is pi's terminal UI ported to C: differential rendering, an
 | `/settings`, `/theme`, `/thinking`, `/scoped-models`, `/hotkeys` | settings, theme, thinking level, the models Ctrl+P cycles through, keyboard shortcuts |
 | `/trust`, `/reload`, `/mcp`, `/changelog` | project trust, reload skills, prompts and context files, MCP servers, release notes |
 
-<p align="center"><img src="web/assets/code/tree.png" width="900" alt="Saetta Code's /tree: a session with two branches from the first answer, the current one highlighted"></p>
+<p align="center"><img src="web/assets/code/tree.png" width="900" alt="/tree: a session with two branches from the first answer, the current one highlighted"></p>
 
 ### MCP
 
@@ -93,9 +93,9 @@ MCP servers come from pi's `mcp.json` (global, or `.pi/mcp.json` in a trusted pr
 
 ### Models
 
-By default the model runs inside Saetta Code. It can also use a running Saetta server, or any OpenAI-compatible chat completions server listed in `models.json`; `/model` adds one. LoRA adapters need the server: `saetta start code --lora name=adapter` starts one. Next: sessions kept on disk with the engine's state, and prompts read while tools run.
+By default the model runs inside the agent. It can also use a running Saetta server, or any OpenAI-compatible chat completions server listed in `models.json`; `/model` adds one. LoRA adapters need the server: `saetta start code --lora name=adapter` starts one. Next: sessions kept on disk with the engine's state, and prompts read while tools run.
 
-<p align="center"><img src="web/assets/code/model.png" width="900" alt="Saetta Code's /model: a saetta server model, two packs on this Mac, one greyed out as too big for its memory, and the others with their download size"></p>
+<p align="center"><img src="web/assets/code/model.png" width="900" alt="/model: a saetta server model, two packs on this Mac, one greyed out as too big for its memory, and the others with their download size"></p>
 
 ## Other coding agents
 

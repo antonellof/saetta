@@ -84,7 +84,7 @@ async function auto(id) {
   if (!(await show(id, m + menu("Choose a coding agent", agents, 0), 1300))) return;
   const s = m + "Starting Saetta Code on coder (next time: saetta start code --pack coder)\n\n";
   if (!(await show(id, s + '<span class="cursor"></span>', 1400))) return;
-  await show(id, s + '<span class="d">the model loads inside Saetta Code: no server, no HTTP</span>\n\n' +
+  await show(id, s + '<span class="d">the model loads in the agent's process: no server, no HTTP</span>\n\n' +
     '<span class="a">&gt;</span> fix the failing test<span class="cursor"></span>', 4000);
 }
 

@@ -1251,6 +1251,33 @@ static const char *shell_path(void) {
     return "sh";
 }
 
+// emitOutputUpdate: the output so far as a partial result (a throwaway arena: one per update).
+static void bash_update(const CodeEnv *env, Acc *acc, bool empty) {
+    if (!env->on_partial) return;
+    Arena t = {0};
+    JValue *r = json_new(&t, J_OBJECT);
+    JValue *content = json_new(&t, J_ARRAY);
+    if (!empty) {
+        Arena *keep = acc->a;
+        acc->a = &t; // the snapshot's text lives in the throwaway arena (the temp file's path stays in the run's)
+        bool had_path = acc->tmp_path != NULL;
+        Trunc tr = acc_snapshot(&t, acc);
+        acc->a = keep;
+        if (!had_path && acc->tmp_path) acc->tmp_path = arena_strdup(keep, acc->tmp_path);
+        JValue *b = json_new(&t, J_OBJECT);
+        jput(&t, b, "type", jstr(&t, S("text")));
+        jput(&t, b, "text", jstr(&t, tr.content));
+        json_push(&t, content, b);
+        jput(&t, r, "content", content);
+        JValue *d = json_new(&t, J_OBJECT);
+        if (tr.truncated) jput(&t, d, "truncation", trunc_json(&t, &tr));
+        if (acc->tmp_path) jput(&t, d, "fullOutputPath", jstr(&t, str(acc->tmp_path)));
+        jput(&t, r, "details", d);
+    } else jput(&t, r, "content", content);
+    env->on_partial(env->partial_ctx, r);
+    arena_reset(&t);
+}
+
 static void tool_bash(Arena *a, const CodeEnv *env, const JValue *args, ToolOut *o) {
     Str command = json_strs(json_get(args, "command"));
     double timeout = 0;
@@ -1325,6 +1352,10 @@ static void tool_bash(Arena *a, const CodeEnv *env, const JValue *args, ToolOut 
             int fds[2] = {out[0], err[0]};
             int nopen = 2;
             uint64_t t0 = now_ns();
+            // the live output (scheduleOutputUpdate): an empty update at once, then at most every 100 ms
+            bash_update(env, &acc, true);
+            uint64_t last_update = 0;
+            bool update_dirty = false;
             double exited_at = exited ? 0 : -1, idle_until = exited ? 100 : -1;
             char buf[65536];
             while (!werr) {
@@ -1344,6 +1375,14 @@ static void tool_bash(Arena *a, const CodeEnv *env, const JValue *args, ToolOut 
                 if (has_to && !timed_out) wait = timeout_ms - now;
                 if (exited && (wait < 0 || idle_until - now < wait)) wait = idle_until - now;
                 if (ab && !aborted && (wait < 0 || wait > ABORT_POLL_MS)) wait = ABORT_POLL_MS;
+                if (update_dirty) {
+                    double due = 100 - (double)(now_ns() - last_update) / 1e6;
+                    if (due <= 0) {
+                        bash_update(env, &acc, false);
+                        last_update = now_ns();
+                        update_dirty = false;
+                    } else if (wait < 0 || wait > due) wait = due;
+                }
                 struct timespec ts, *tsp = NULL;
                 if (wait >= 0) {
                     ts.tv_sec = (time_t)(wait / 1000);
@@ -1378,9 +1417,11 @@ static void tool_bash(Arena *a, const CodeEnv *env, const JValue *args, ToolOut 
                         continue;
                     }
                     acc_append(&acc, buf, (size_t)r);
+                    update_dirty = env->on_partial != NULL;
                     if (exited) idle_until = ms_since(t0) + 100;
                 }
             }
+            if (update_dirty) bash_update(env, &acc, false); // finishOutput's last update
             if (!exited) { // the wait failed: never leave the group running or a zombie behind
                 kill_tree(pid);
                 if (!reap(pid, &st) && !werr) werr = arena_printf(a, "waitpid %s", errno_code(errno));

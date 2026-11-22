@@ -566,6 +566,21 @@ static void error_result(Arena *a, const JValue *call, const char *text, JValue 
     *msg = m;
 }
 
+// tool_execution_update (emitToolExecutionUpdate): a tool's partial result, built in a throwaway
+// arena (a long command sends one every 100 ms)
+static void on_tool_partial(void *ctx, const JValue *partial) {
+    Run *r = ctx;
+    if (!r->call || (!r->ui && !r->json)) return;
+    Arena t = {0};
+    JValue *e = ev_new(&t, "tool_execution_update");
+    json_put(&t, e, S("toolCallId"), (JValue *)json_get(r->call, "id"));
+    json_put(&t, e, S("toolName"), (JValue *)json_get(r->call, "name"));
+    json_put(&t, e, S("args"), (JValue *)json_get(r->call, "arguments"));
+    json_put(&t, e, S("partialResult"), (JValue *)partial);
+    emit(r, e);
+    arena_reset(&t);
+}
+
 static void emit_tool_start(Run *r, const JValue *call) {
     JValue *e = ev_new(r->a, "tool_execution_start");
     json_put(r->a, e, S("toolCallId"), (JValue *)json_get(call, "id"));
@@ -631,7 +646,9 @@ static Err run_tools(Run *r, const JValue *assistant, JValue *results) {
             continue;
         }
         prepare_edit_in_place(a, calls.ptr[i]);
+        r->call = calls.ptr[i];
         err = code_tool_run(a, &r->env, calls.ptr[i], &msgs[i], &raws[i]);
+        r->call = NULL;
         if (!err && !json_get(msgs[i], "durationMs")) emit_tool_end(r, calls.ptr[i], msgs[i], raws[i]);
     }
     // pi runs the executed calls concurrently and ends each as it settles; a call that throws
@@ -1369,6 +1386,8 @@ Err code_run(const char *const *args, size_t n, int *code) {
     r.env.append_system_prompt = o.append.ptr;
     r.env.nappend_system_prompt = o.append.len;
     pick_tools(a, &o, &r);
+    r.env.on_partial = on_tool_partial;
+    r.env.partial_ctx = &r;
     JValue *settings = read_json(a, path_join(a, r.env.agent_dir, "settings.json"));
     const JValue *rs = json_get(settings, "retry");
     g_retry.enabled = jbool(json_get(rs, "enabled"), true);

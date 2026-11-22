@@ -1445,53 +1445,207 @@ static void fmt_tokens(Buf *b, double n) {
     else buf_printf(b, "%.0fM", round(n / 1000000));
 }
 
-// The git branch (footer-data-provider.ts): .git found walking up from the working directory, a
-// worktree's .git file followed to its gitdir; HEAD read again at most once a second.
-static const char *git_branch(void) {
-    static char branch[256];
-    static bool have;
-    static uint64_t at;
-    uint64_t now = now_ns();
-    if (at && now - at < 1000000000ull) return have ? branch : NULL;
-    at = now;
-    have = false;
-    char dir[4096], head[4200];
-    snprintf(dir, sizeof dir, "%s", U->cfg->cwd);
+// ---- the footer's first line: a starship-style prompt (Saetta Code's own) -----------------------------
+//
+// "folder on ⎇ branch [=$!+»✘?⇡1⇣2] took 13s": the git state comes from `git status --porcelain=v2
+// --branch` and the stash count, run on their own thread with a 1 s limit, at start, after the tools
+// that change files and at the end of each run; the UI never waits for them.
+
+typedef struct {
+    bool repo;
+    char branch[128];
+    int conflicted, stashed, modified, staged, renamed, deleted, untracked, ahead, behind;
+} GitState;
+
+static pthread_mutex_t g_git_lock = PTHREAD_MUTEX_INITIALIZER;
+static GitState g_git;
+static _Atomic bool g_git_running, g_git_again, g_git_changed;
+static char g_git_cwd[4096];
+static int g_git_wake = -1;
+
+// argv's stdout, up to 1 s (the child is killed after); false if it failed or timed out.
+static bool run_out(const char *const *argv, Buf *out) {
+    int pfd[2];
+    if (pipe(pfd)) return false;
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_addopen(&fa, 0, "/dev/null", O_RDONLY, 0);
+    posix_spawn_file_actions_adddup2(&fa, pfd[1], 1);
+    posix_spawn_file_actions_addopen(&fa, 2, "/dev/null", O_WRONLY, 0);
+    posix_spawn_file_actions_addclose(&fa, pfd[0]);
+    posix_spawn_file_actions_addclose(&fa, pfd[1]);
+    posix_spawn_file_actions_addchdir(&fa, g_git_cwd);
+    pid_t pid;
+    extern char **environ;
+    int rc = posix_spawnp(&pid, argv[0], &fa, NULL, (char *const *)argv, environ);
+    posix_spawn_file_actions_destroy(&fa);
+    close(pfd[1]);
+    if (rc) {
+        close(pfd[0]);
+        return false;
+    }
+    uint64_t until = now_ns() + 1000000000ull;
+    bool ok = true;
     for (;;) {
-        char gp[4200];
-        snprintf(gp, sizeof gp, "%s/.git", dir);
-        struct stat st;
-        if (stat(gp, &st) == 0) {
-            if (S_ISDIR(st.st_mode)) snprintf(head, sizeof head, "%s/HEAD", gp);
-            else {
-                FILE *f = fopen(gp, "r");
-                char line[4096] = {0};
-                if (!f) return NULL;
-                bool ok = fgets(line, sizeof line, f) != NULL;
-                fclose(f);
-                Str l = str_trim(str(line));
-                if (!ok || !str_starts(l, S("gitdir: "))) return NULL;
-                Str g = str_trim(str_sub(l, 8, l.len));
-                if (g.len && g.ptr[0] == '/') snprintf(head, sizeof head, "%.*s/HEAD", (int)g.len, g.ptr);
-                else snprintf(head, sizeof head, "%s/%.*s/HEAD", dir, (int)g.len, g.ptr);
-            }
+        uint64_t now = now_ns();
+        if (now >= until) {
+            ok = false;
             break;
         }
-        char *sl = strrchr(dir, '/');
-        if (!sl || sl == dir) return NULL;
-        *sl = 0;
+        struct pollfd pf = {pfd[0], POLLIN, 0};
+        int r = poll(&pf, 1, (int)((until - now) / 1000000) + 1);
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) continue;
+        char chunk[4096];
+        ssize_t n = read(pfd[0], chunk, sizeof chunk);
+        if (n <= 0) break;
+        buf_add(out, chunk, (size_t)n);
     }
-    FILE *f = fopen(head, "r");
-    if (!f) return NULL;
-    char line[512];
-    if (fgets(line, sizeof line, f)) {
-        Str l = str_trim(str(line));
-        if (str_starts(l, S("ref: refs/heads/"))) snprintf(branch, sizeof branch, "%.*s", (int)(l.len - 16), l.ptr + 16);
-        else snprintf(branch, sizeof branch, "detached");
-        have = true;
+    close(pfd[0]);
+    if (!ok) kill(pid, SIGKILL);
+    int st = 0;
+    while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+    return ok && WIFEXITED(st) && WEXITSTATUS(st) == 0;
+}
+
+static void *git_main(void *arg) {
+    (void)arg;
+    do {
+        atomic_store(&g_git_again, false);
+        GitState g = {0};
+        Buf o = {0};
+        static const char *const st[] = {"git", "--no-optional-locks", "status", "--porcelain=v2", "--branch", NULL};
+        if (run_out(st, &o)) {
+            g.repo = true;
+            char oid[16] = {0};
+            Str all = buf_str(&o);
+            for (size_t i = 0; i < all.len;) {
+                size_t j = i;
+                while (j < all.len && all.ptr[j] != '\n') j++;
+                Str l = str_sub(all, i, j);
+                i = j + 1;
+                if (str_starts(l, S("# branch.head "))) {
+                    Str h = str_sub(l, 14, l.len);
+                    if (!str_eqz(h, "(detached)")) snprintf(g.branch, sizeof g.branch, "%.*s", (int)h.len, h.ptr);
+                } else if (str_starts(l, S("# branch.oid "))) snprintf(oid, sizeof oid, "%.7s", l.ptr + 13);
+                else if (str_starts(l, S("# branch.ab "))) sscanf(l.ptr + 12, "+%d -%d", &g.ahead, &g.behind);
+                else if (l.len > 3 && (l.ptr[0] == '1' || l.ptr[0] == '2')) {
+                    char x = l.ptr[2], y = l.ptr[3];
+                    if (l.ptr[0] == '2') g.renamed++;
+                    else if (x != '.' && x != 'D') g.staged++;
+                    if (x == 'D' || y == 'D') g.deleted++;
+                    if (y == 'M' || y == 'T') g.modified++;
+                } else if (l.len && l.ptr[0] == 'u') g.conflicted++;
+                else if (l.len && l.ptr[0] == '?') g.untracked++;
+            }
+            if (!g.branch[0] && oid[0] && strcmp(oid, "(initial")) snprintf(g.branch, sizeof g.branch, "%s", oid);
+            Buf s2 = {0};
+            static const char *const stash[] = {"git", "--no-optional-locks", "stash", "list", NULL};
+            if (run_out(stash, &s2))
+                for (size_t k = 0; k < s2.len; k++) g.stashed += s2.ptr[k] == '\n';
+            buf_free(&s2);
+        }
+        buf_free(&o);
+        pthread_mutex_lock(&g_git_lock);
+        g_git = g;
+        pthread_mutex_unlock(&g_git_lock);
+        atomic_store(&g_git_changed, true);
+        if (g_git_wake >= 0) (void)!write(g_git_wake, "g", 1);
+    } while (atomic_load(&g_git_again));
+    atomic_store(&g_git_running, false);
+    return NULL;
+}
+
+// Another look at the repository (a refresh asked while one runs is done right after it).
+static void git_refresh(void) {
+    if (atomic_exchange(&g_git_running, true)) {
+        atomic_store(&g_git_again, true);
+        return;
     }
-    fclose(f);
-    return have ? branch : NULL;
+    snprintf(g_git_cwd, sizeof g_git_cwd, "%s", U->cfg->cwd);
+    g_git_wake = g_wake[1];
+    pthread_t th;
+    if (pthread_create(&th, NULL, git_main, NULL)) atomic_store(&g_git_running, false);
+    else pthread_detach(th);
+}
+
+static uint64_t g_turn_start_ns;
+static double g_last_turn_s = -1;
+
+// starship's duration: 13s, 1m20s, 1h2m
+static void fmt_took(Buf *b, double s) {
+    long t = (long)s;
+    if (t < 60) buf_printf(b, "%lds", t);
+    else if (t < 3600) buf_printf(b, "%ldm%lds", t / 60, t % 60);
+    else buf_printf(b, "%ldh%ldm", t / 3600, (t % 3600) / 60);
+}
+
+static void prompt_line(Buf *out) {
+    int ap = th_appearance();
+    bool saetta = U->theme && !strcmp(U->theme, "saetta");
+    uint8_t amber[3], purple[3];
+    theme_brand(ap == 2, amber, purple);
+    const char *base = strrchr(U->cfg->cwd, '/');
+    base = base && base[1] ? base + 1 : U->cfg->cwd;
+    // the folder in bold cyan
+    if (saetta) buf_adds(out, ap == 2 ? "\x1b[1m\x1b[38;2;0;122;164m" : "\x1b[1m\x1b[38;2;100;210;255m");
+    else buf_adds(out, "\x1b[1m\x1b[36m");
+    buf_adds(out, base);
+    buf_adds(out, "\x1b[22m\x1b[39m");
+    GitState g;
+    pthread_mutex_lock(&g_git_lock);
+    g = g_git;
+    pthread_mutex_unlock(&g_git_lock);
+    if (g.repo && g.branch[0]) {
+        buf_adds(out, " on ");
+        Buf br = {0};
+        buf_printf(&br, "\xe2\x8e\x87 %s", g.branch);
+        if (saetta) {
+            buf_printf(out, "\x1b[1m\x1b[38;2;%d;%d;%dm", purple[0], purple[1], purple[2]);
+            buf_addstr(out, buf_str(&br));
+            buf_adds(out, "\x1b[22m\x1b[39m");
+        } else {
+            buf_adds(out, "\x1b[1m");
+            th_fg(out, T_ACCENT, buf_str(&br));
+            buf_adds(out, "\x1b[22m");
+        }
+        buf_free(&br);
+        Buf st = {0};
+        if (g.conflicted) buf_addc(&st, '=');
+        if (g.stashed) buf_addc(&st, '$');
+        if (g.modified) buf_addc(&st, '!');
+        if (g.staged) buf_addc(&st, '+');
+        if (g.renamed) buf_adds(&st, "\xc2\xbb");
+        if (g.deleted) buf_adds(&st, "\xe2\x9c\x98");
+        if (g.untracked) buf_addc(&st, '?');
+        if (g.ahead) buf_printf(&st, "\xe2\x87\xa1%d", g.ahead);
+        if (g.behind) buf_printf(&st, "\xe2\x87\xa3%d", g.behind);
+        if (st.len) {
+            Buf br2 = {0};
+            buf_printf(&br2, "[%s]", st.ptr);
+            buf_addc(out, ' ');
+            buf_adds(out, "\x1b[1m");
+            th_fg(out, T_ERROR, buf_str(&br2));
+            buf_adds(out, "\x1b[22m");
+            buf_free(&br2);
+        }
+        buf_free(&st);
+    }
+    if (g_last_turn_s >= 2) {
+        Buf d = {0};
+        fmt_took(&d, g_last_turn_s);
+        buf_adds(out, " took ");
+        if (saetta) {
+            buf_printf(out, "\x1b[1m\x1b[38;2;%d;%d;%dm", amber[0], amber[1], amber[2]);
+            buf_addstr(out, buf_str(&d));
+            buf_adds(out, "\x1b[22m\x1b[39m");
+        } else {
+            buf_adds(out, "\x1b[1m");
+            th_fg(out, T_WARNING, buf_str(&d));
+            buf_adds(out, "\x1b[22m");
+        }
+        buf_free(&d);
+    }
 }
 
 static void footer_render(void *ctx, int width, Lines *out) {
@@ -1522,15 +1676,9 @@ static void footer_render(void *ctx, int width, Lines *out) {
     }
     double window = (double)U->model.context_window;
     double pct = window > 0 ? tokens / window * 100 : 0;
-    // the working directory, ~ for the home folder
+    (void)cfg;
     Buf pwd = {0};
-    size_t hl = cfg->home ? strlen(cfg->home) : 0;
-    if (hl && !strncmp(cfg->cwd, cfg->home, hl) && (cfg->cwd[hl] == 0 || cfg->cwd[hl] == '/') && strcmp(cfg->home, "/")) {
-        buf_addc(&pwd, '~');
-        buf_adds(&pwd, cfg->cwd + hl);
-    } else buf_adds(&pwd, cfg->cwd);
-    const char *branch = git_branch();
-    if (branch) buf_printf(&pwd, " (%s)", branch);
+    prompt_line(&pwd);
     Buf stats = {0};
     Buf t = {0};
 #define PART(...)                            \
@@ -1600,7 +1748,7 @@ static void footer_render(void *ctx, int width, Lines *out) {
     th_fg(&line, T_DIM, buf_str(&stats));
     th_fg(&line, T_DIM, buf_str(&rem));
     Buf p = {0}, ell = {0}, pl = {0};
-    th_fg(&p, T_DIM, buf_str(&pwd));
+    buf_addstr(&p, buf_str(&pwd));
     th_fgz(&ell, T_DIM, "...");
     tui_truncate(&pl, buf_str(&p), width, ell.ptr, false);
     lines_addb(out, &pl);
@@ -3566,6 +3714,7 @@ static void *agent_main(void *arg) {
 
 static void start_prompt(const char *text) {
     U->busy = true;
+    g_turn_start_ns = now_ns();
     pthread_mutex_lock(&g_tlock);
     free(g_job);
     g_job = strdup(text);
@@ -3773,6 +3922,8 @@ static void handle_event(const JValue *ev) {
     Str type = json_strs(json_get(ev, "type"));
     if (str_eqz(type, "ui_idle")) {
         U->busy = false;
+        g_last_turn_s = g_turn_start_ns ? (double)(now_ns() - g_turn_start_ns) / 1e9 : -1;
+        git_refresh();
         set_working(false);
         // what was chosen while the run went on and its last turn did not take
         char *rp, *rm;
@@ -3878,6 +4029,8 @@ static void handle_event(const JValue *ev) {
             tool_set_result(v, json_get(ev, "result"), jtrue(json_get(ev, "isError")), false, json_get(ev, "durationMs"));
             drop_pending(v);
         }
+        Str tn = json_strs(json_get(ev, "toolName"));
+        if (str_eqz(tn, "bash") || str_eqz(tn, "edit") || str_eqz(tn, "write")) git_refresh();
     } else if (str_eqz(type, "agent_end")) {
         set_working(false);
         if (U->streaming) {
@@ -4448,6 +4601,7 @@ Err code_ui_run(const CodeUiConfig *cfg, const CodeUiOps *ops, CodeUiHost *host,
         fcntl(g_wake[1], F_SETFD, FD_CLOEXEC);
     }
     editor_set_waker(ui.ed, g_wake[1]);
+    git_refresh();
     g_tops = ops;
     g_thost = host;
     g_tquit = false;
@@ -4517,6 +4671,7 @@ Err code_ui_run(const CodeUiConfig *cfg, const CodeUiOps *ops, CodeUiHost *host,
             request_render();
         }
         if (editor_tick(ui.ed)) request_render();
+        if (atomic_exchange(&g_git_changed, false)) request_render();
         download_poll();
         // keys
         if (r > 0 && (fds[0].revents & (POLLIN | POLLHUP))) {
@@ -4651,6 +4806,12 @@ Err code_ui_run(const CodeUiConfig *cfg, const CodeUiOps *ops, CodeUiHost *host,
     free(ui.default_model);
     free(g_job);
     g_job = NULL;
+    // the git look may still run: it must not write to the wake pipe once it is closed
+    for (uint64_t until = now_ns() + 1500000000ull; atomic_load(&g_git_running) && now_ns() < until;) {
+        struct timespec ts = {0, 5000000};
+        nanosleep(&ts, NULL);
+    }
+    g_git_wake = -1;
     close(g_wake[0]);
     close(g_wake[1]);
     g_wake[0] = g_wake[1] = -1;

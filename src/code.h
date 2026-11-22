@@ -61,6 +61,10 @@ typedef struct {
     // "Operation aborted" and a running bash command has its process group killed ("Command
     // aborted"). NULL when nothing aborts.
     volatile int *abort;
+    // A running tool's partial result (pi's onUpdate: the bash tool's output so far, at most every
+    // 100 ms), or NULL. The value is valid during the call only.
+    void (*on_partial)(void *ctx, const JValue *partial);
+    void *partial_ctx;
 } CodeEnv;
 
 // ---- system prompt (code_prompt.c; pi: core/system-prompt.js, resource-loader.js, skills.js)

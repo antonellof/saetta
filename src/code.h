@@ -94,6 +94,14 @@ Err code_tool_run(Arena *a, const CodeEnv *env, const JValue *call, JValue **res
 // command still running (pi tracks a group from spawn until its wait ends). Async-signal-safe,
 // for exit and the SIGTERM / SIGHUP handlers.
 void code_tools_kill_detached(void);
+// The user's own shell command (rpc mode's bash: pi's createLocalShellOperations().exec, no
+// timeout): run in env->cwd in its own process group, stdin /dev/null, each chunk of stdout and
+// stderr to on_data as it arrives; *abort_flag nonzero kills the group (*aborted). Returns the exit
+// code (128 + the signal); *thrown when it could not run.
+int code_tools_exec(Arena *a, const CodeEnv *env, const char *command, void (*on_data)(void *ctx, const void *p, size_t n), void *ctx,
+                    volatile int *abort_flag, bool *aborted, const char **thrown);
+// truncateTail with the defaults (2000 lines, 50 KB): the tail kept, *truncated.
+Str code_tools_truncate_tail(Str s, bool *truncated);
 
 // ---- OpenAI chat completions client (code_oai.c; pi-ai: api/openai-completions.js,
 // transform-messages.js)

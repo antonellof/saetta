@@ -45,6 +45,9 @@ static int g_trusted = -1;
 // hand-off of one): with the trust store's own "trusted" entries, the folders whose repository the
 // footer may look into (code_trust_explicit).
 static VEC(char *) g_approved;
+// folders whose "trusted" entry /reload saved without asking (pi's implicit save): not an explicit
+// decision for code_trust_explicit, which gates running the repository's git config
+static VEC(char *) g_implicit;
 
 // g_tmu held
 static void approve_l(const char *real) {
@@ -601,8 +604,10 @@ bool code_trust_explicit(const char *cwd) {
     const char *real = norm_cwd(&a, c);
     pthread_mutex_lock(&g_tmu);
     bool ok = approved_l(real);
+    bool implicit = false;
+    for (size_t i = 0; !ok && i < g_implicit.len; i++) implicit |= !strcmp(g_implicit.ptr[i], c);
     pthread_mutex_unlock(&g_tmu);
-    if (!ok) ok = store_get(&a, code_path_resolve(&a, c, cfg->agent_dir), c) == 1;
+    if (!ok && !implicit) ok = store_get(&a, code_path_resolve(&a, c, cfg->agent_dir), c) == 1;
     arena_reset(&a);
     return ok;
 }
@@ -842,7 +847,12 @@ bool code_trust_after_reload(const CodeEnv *env) {
             TrustUpdate u = {cwd, 1};
             const char *err = store_set_many(&a, agent_dir, &u, 1);
             if (err) code_ui_warning(arena_printf(&a, "Could not save project trust after reload: %s", err));
-            else saved = true;
+            else {
+                saved = true;
+                pthread_mutex_lock(&g_tmu);
+                vec_push(&g_implicit, strdup(cwd));
+                pthread_mutex_unlock(&g_tmu);
+            }
         }
         if (saved || store_get(&a, agent_dir, cwd) >= 0) {
             free(g_auto_cwd);

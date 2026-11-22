@@ -2093,8 +2093,18 @@ static char *http_send(Client *c, const char *json, bool is_request, int64_t id)
         http_free(h);
         return strdup("fetch failed");
     }
+    // listed while it runs, so closing the client cancels this POST too (its own flag)
+    pthread_mutex_lock(&g_mu);
+    bool closed = c->http_cancel;
+    if (!closed) http_live_add_l(h);
+    pthread_mutex_unlock(&g_mu);
+    if (closed) {
+        http_free(h);
+        return strdup("MCP connection closed");
+    }
     int kind = 0;
     char *e = http_exchange(h, &kind);
+    http_live_del(h);
     http_free(h);
     return e;
 }

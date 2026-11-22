@@ -1562,10 +1562,18 @@ static bool run_out(const char *const *argv, Buf *out) { return tui_run((char *c
 // HEAD is detached, shown as its commit's short id when HEAD holds one, else "detached".
 static void head_branch(const char *head, GitState *g) {
     char buf[512] = {0};
-    FILE *f = fopen(head, "r");
-    if (!f) return;
-    size_t n = fread(buf, 1, sizeof buf - 1, f);
-    fclose(f);
+    // a regular file only: a FIFO or a link to a device (the repository's choice) would block or
+    // read the terminal
+    int fd = open(head, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0) return;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+        close(fd);
+        return;
+    }
+    ssize_t n = read(fd, buf, sizeof buf - 1);
+    close(fd);
+    if (n < 0) return;
     buf[n] = 0;
     char *t = buf;
     while (*t && isspace((unsigned char)*t)) t++;
@@ -1573,8 +1581,14 @@ static void head_branch(const char *head, GitState *g) {
     while (l && isspace((unsigned char)t[l - 1])) t[--l] = 0;
     // the file is the repository's, not git's checked output: a control character (an escape
     // sequence for the terminal) is never drawn
+    // also the C1 controls (U+0080..U+009F, bytes C2 80..9F) and the bidi overrides and
+    // isolates (U+202A..U+202E, U+2066..U+2069)
     for (size_t i = 0; i < l; i++)
-        if ((unsigned char)t[i] < 0x20 || t[i] == 0x7f) {
+        if ((unsigned char)t[i] < 0x20 || t[i] == 0x7f ||
+            ((unsigned char)t[i] == 0xC2 && i + 1 < l && (unsigned char)t[i + 1] >= 0x80 && (unsigned char)t[i + 1] <= 0x9F) ||
+            ((unsigned char)t[i] == 0xE2 && i + 2 < l &&
+             (((unsigned char)t[i + 1] == 0x80 && (unsigned char)t[i + 2] >= 0xAA && (unsigned char)t[i + 2] <= 0xAE) ||
+              ((unsigned char)t[i + 1] == 0x81 && (unsigned char)t[i + 2] >= 0xA6 && (unsigned char)t[i + 2] <= 0xA9)))) {
             snprintf(g->branch, sizeof g->branch, "detached");
             return;
         }

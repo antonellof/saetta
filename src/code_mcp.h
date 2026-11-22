@@ -76,7 +76,7 @@ typedef struct {
 void code_mcp_menu_free(McpMenu *m);
 // The open view: its menu is rebuilt on every change of what it shows, keeping its selection
 // (the item the user moved to, else the menu's own, else the first), as pi's subscribed menu does.
-typedef enum { MCP_VIEW_NONE, MCP_VIEW_SERVERS, MCP_VIEW_SERVER, MCP_VIEW_TOOLS, MCP_VIEW_EXPOSURE } McpView;
+typedef enum { MCP_VIEW_NONE, MCP_VIEW_SERVERS, MCP_VIEW_SERVER, MCP_VIEW_TOOLS, MCP_VIEW_EXPOSURE, MCP_VIEW_SIGNIN } McpView;
 void code_mcp_view_set(McpView kind, const char *server);
 McpView code_mcp_view(char **server); // *server malloc'd (may be NULL)
 // The open view's menu; returns the selected item's index.
@@ -84,7 +84,8 @@ size_t code_mcp_view_menu(McpMenu *m);
 // onSelectionChange
 void code_mcp_view_select(const char *value);
 // runAction for an item of the server menu ("reconnect", "enable", "disable", "enable-project",
-// "disable-project"; the background ones return at once and report through the menu).
+// "disable-project", "signin", "signout"; the background ones return at once and report through
+// the menu; "signin" opens the sign-in screen, MCP_VIEW_SIGNIN).
 void code_mcp_run_action(const char *name, const char *action);
 // The exposure menu's choice (chooseExposure, setExposure).
 void code_mcp_choose_exposure(const char *name, const char *exposure);
@@ -98,5 +99,27 @@ uint64_t code_mcp_generation(void);
 char **code_mcp_subcommand(const char *args, size_t *npick);
 // A notice for the UI (kind as in code_mcp_ui_tick).
 void code_mcp_notify(int kind, const char *msg);
+
+// ---- OAuth sign-in (index.ts signInWithUi; code_mcp_oauth.c) -----------------------------------------
+
+// The sign-in screen (MCP_VIEW_SIGNIN, from the server menu's "Sign in" or /mcp login): its title,
+// and either a status message (ui.status) or the authorization URL to show with the paste prompt
+// (ui.redirectUrl). Each malloc'd; false when no sign-in runs.
+bool code_mcp_signin_screen(char **title, char **message, char **url);
+// The cancel key on it: the sign-in stops ("Sign-in cancelled.").
+void code_mcp_signin_cancel(void);
+// A redirect URL pasted on the redirect screen (empty: ignored).
+void code_mcp_signin_submit(const char *url);
+
+// turn_start: servers waiting for a sign-in reconnect when their stored tokens changed since
+// (a sign-in in another process, pi's `pi mcp login`). True when one did (the tools to declare
+// may have changed).
+bool code_mcp_turn_start(void);
+
+// The session moved to another folder (/resume, /import): pi's session_shutdown then session_start.
+// Every connection closes, global servers' too; the configuration is read again for env->cwd (its
+// .pi/mcp.json only when that folder is trusted, code_project_trusted) and the enabled servers
+// connect again, with the same --no-mcp and --tools choices.
+void code_mcp_restart(const CodeEnv *env);
 
 #endif

@@ -35,6 +35,8 @@ typedef struct {
 } CmdsUi;
 
 void cmds_init(const CmdsUi *ui);
+// copyToClipboard: pbcopy, then OSC 52 in a remote session. NULL, or the error message.
+const char *cmds_copy_text(Str text);
 // handleCopyCommand: the last agent message to the clipboard; flash (NULL: the status line) says so.
 void cmds_copy(void (*flash)(const char *msg));
 // A submitted line: true when it was one of these commands (handled).

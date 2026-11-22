@@ -354,7 +354,7 @@ static bool emit_osc52(Str text) {
 
 // copyToClipboard on macOS: pbcopy (pi tries its native helper first; Saetta Code has none), then
 // OSC 52 for a remote session (SSH, mosh, PI_CLIPBOARD_OSC52=1). NULL, or the error message.
-static const char *copy_to_clipboard(Str text) {
+const char *cmds_copy_text(Str text) {
     bool copied = clipboard_command("pbcopy", text, 5000);
     const char *e;
     bool remote = ((e = getenv("SSH_CONNECTION")) && *e) || ((e = getenv("SSH_CLIENT")) && *e) ||
@@ -376,7 +376,7 @@ void cmds_copy(void (*flash)(const char *msg)) {
         G.show_error("No agent messages to copy yet.");
         return;
     }
-    const char *err = copy_to_clipboard(str(text));
+    const char *err = cmds_copy_text(str(text));
     if (err) G.show_error(err);
     else if (flash) flash("Copied!");
     else G.show_status("Copied last agent message to clipboard");

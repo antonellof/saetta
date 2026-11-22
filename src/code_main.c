@@ -931,9 +931,6 @@ static void raw_off(void) {
     tcsetattr(0, TCSANOW, &g_cooked);
 }
 
-// the tools module's (code_tools.c) replaces this when it tracks background jobs
-__attribute__((weak)) void code_tools_kill_detached(void) {}
-
 static volatile sig_atomic_t g_tty_saved;
 
 // SIGTERM / SIGHUP: the terminal back as it was, the bash jobs stopped, exit as pi does (143, 129)

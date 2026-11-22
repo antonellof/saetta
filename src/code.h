@@ -85,10 +85,6 @@ Err code_tool_run(Arena *a, const CodeEnv *env, const JValue *call, JValue **res
 // for exit and the SIGTERM / SIGHUP handlers.
 void code_tools_kill_detached(void);
 
-// Kills the process groups of bash jobs still running in the background (pi's
-// killTrackedDetachedChildren), at exit and on SIGTERM / SIGHUP. Async-signal-safe.
-void code_tools_kill_detached(void);
-
 // ---- OpenAI chat completions client (code_oai.c; pi-ai: api/openai-completions.js,
 // transform-messages.js)
 

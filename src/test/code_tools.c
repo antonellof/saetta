@@ -1,7 +1,7 @@
 // Tests for src/code_tools.c against pi 1.5.2's own behaviour: each scenario's scripted tool
 // calls run through code_tool_run in a fresh workspace, and the toolResult messages, normalized
-// as tools/code/run_scenario.py does, must equal the session lines pi wrote, byte for byte.
-// SAETTA_CODE_GOLDEN is the golden-pi folder (skipped when unset); the scenarios are read from
+// as the captures are normalized, must equal the session lines pi wrote, byte for byte.
+// SAETTA_CODE_GOLDEN is the folder of pi captures, one per scenario (skipped when unset); the scenarios are read from
 // SAETTA_CODE_SCENARIOS, else the scenarios folder beside it.
 #include "../code.h"
 #include "../metal/shim.h"
@@ -37,7 +37,7 @@ static Str replace_all(Arena *a, Str s, Str from, Str to) {
 
 static bool is_hex(char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); }
 
-// "key":<digits> -> "key":0, and pi-bash-<16 hex> -> pi-bash-$RANDOM (a random temp file name, as run_scenario.py writes it)
+// "key":<digits> -> "key":0, and pi-bash-<16 hex> -> pi-bash-$RANDOM (a random temp file name, as the captures hold it)
 static Str normalize(Arena *a, Str s, const char *ws, const char *ws_real, const char *home, const char *home_real) {
     // the longer (real) path first: it contains the other
     s = replace_all(a, s, str(ws_real), S("$WS"));

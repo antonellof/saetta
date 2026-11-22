@@ -46,8 +46,8 @@ Needs an Apple Silicon Mac (M1 or later) with 32 GB of memory or more, and macOS
 ## Saetta Code
 
 <p align="center">
-  <img src="docs/assets/demo-code.gif" width="900" alt="saetta start code: Saetta Code loads the model, writes a Game of Life in Python, and it runs">
-  <br><sub><code>saetta start code</code>: Saetta Code loads the model and writes a Game of Life (the typing, the thinking and the waits cut), then it runs.</sub>
+  <img src="docs/assets/demo-code.gif" width="900" alt="saetta start code: Saetta Code loads the model, writes a one-page site for a coffee roastery, checks and fixes it; the page it wrote at the end">
+  <br><sub><code>saetta start code</code>: Saetta Code loads the model, writes a landing page for a coffee roastery in one HTML file, checks it and fixes what it finds; then the page as a browser shows it. The typing, the thinking and the waits are cut, the checks play at 8x.</sub>
 </p>
 
 Saetta Code is the coding agent inside the `saetta` binary. It is written in C and runs the model in its own process: no server, and no HTTP between the agent and the model. The binary is 2.3 MB and needs no Node.js and no Python. `saetta start code` picks the model that fits this Mac, downloads it if needed and opens Saetta Code on it.

@@ -1458,7 +1458,7 @@ static void fmt_tokens(Buf *b, double n) {
 
 // ---- the footer's first line: a starship-style prompt (Saetta Code's own) -----------------------------
 //
-// "folder on ⎇ branch [=$!+»✘?⇡1⇣2] took 13s": the git state comes from `git status --porcelain=v2
+// "~/path/to/folder on ⎇ branch [=$!+»✘?⇡1⇣2] took 13s": the git state comes from `git status --porcelain=v2
 // --branch` and the stash count, run on their own thread with a 1 s limit, at start, after the tools
 // that change files and at the end of each run; the UI never waits for them.
 
@@ -1586,8 +1586,13 @@ static void prompt_line(Buf *out) {
     bool saetta = U->theme && !strcmp(U->theme, "saetta");
     uint8_t amber[3], purple[3];
     theme_brand(ap == 2, amber, purple);
-    const char *base = strrchr(U->cfg->cwd, '/');
-    base = base && base[1] ? base + 1 : U->cfg->cwd;
+    // the folder as pi shows it: the working directory with the home folder as ~
+    const char *cwd = U->cfg->cwd, *home = getenv("HOME");
+    size_t hl = home ? strlen(home) : 0;
+    char where[4096];
+    if (hl > 1 && !strncmp(cwd, home, hl) && (cwd[hl] == '/' || cwd[hl] == 0)) snprintf(where, sizeof where, "~%s", cwd + hl);
+    else snprintf(where, sizeof where, "%s", cwd);
+    const char *base = where;
     // the folder in bold cyan
     if (saetta) buf_adds(out, ap == 2 ? "\x1b[1m\x1b[38;2;0;122;164m" : "\x1b[1m\x1b[38;2;100;210;255m");
     else buf_adds(out, "\x1b[1m\x1b[36m");

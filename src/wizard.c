@@ -249,6 +249,10 @@ static const Choice models[] = {
     {"full", "Qwen3.8-Flash-Next, all 512 experts"},
     {"27b-turbo", "Qwen3.8-27B TURBO fine-tune, shorter thinking, MTP drafts"},
     {"27b-turbo-8bit", "Qwen3.8-27B TURBO fine-tune, 8-bit"},
+    {"27b-coder390", "Qwen3.8-27B Coder390 fine-tune, SFT + RL on code, MTP drafts"},
+    {"27b-coder390-8bit", "Qwen3.8-27B Coder390 fine-tune, 8-bit"},
+    {"27b-fable5", "Qwen3.8-27B Fable-5 coding distill, MTP drafts"},
+    {"27b-fable5-8bit", "Qwen3.8-27B Fable-5 coding distill, 8-bit"},
     {"27b-8bit", "Qwen3.8-27B, 8-bit, takes LoRA adapters"},
     {"27b-4bit", "Qwen3.8-27B, 4-bit, the smallest"},
 };

@@ -28,6 +28,20 @@
 static const char *const turbo_files[] = {"config.json", "tokenizer.json", "tokenizer_config.json", "chat_template.jinja",
                                           "generation_config.json", "vocab.json", NULL};
 
+// nerkyor's Coder390 (SFT + RLOO on coding over Qwen3.8-27B): config and tokenizer from the
+// BF16 folder of the main repo, weights from the GGUF repo (imatrix quants with the MTP
+// layer), both Apache-2.0.
+#define C390_REPO "nerkyor/Qwen3.8-27B-Coder390-EfficientThink-Opus5.5-GPT6Astra-Grok4.7-DSV4Pro-K3-SFT-RLOO-MTP-DFlash2"
+#define C390_REV "7eced947d7132dffbc2c0ea4db332081360afbf8"
+#define C390_GGUF_REPO "nerkyor/Qwen3.8-27B-Coder390-EfficientThink-Opus5.5-GPT6Astra-Grok4.7-DSV4Pro-K3-SFT-RLOO-GGUF-NInfer"
+#define C390_GGUF_REV "635a4b3d48fd634850d41ade45b4578ad9211e47"
+// khazarai's Fable-5 coding distill of Qwen3.8-27B: config and tokenizer from its BF16 repo,
+// weights from mradermacher's GGUF quants (with the MTP layer), both Apache-2.0.
+#define FABLE_REPO "khazarai/Qwen3.8-27B-Fable-5-Coding-Distilled"
+#define FABLE_REV "dbf6da43b26174c26d36c6d85adba5e29280f63e"
+static const char *const hf_files[] = {"config.json", "tokenizer.json", "tokenizer_config.json", "chat_template.jinja",
+                                       "generation_config.json", NULL};
+
 const DownloadPack download_packs[DOWNLOAD_NPACKS] = {
     {.name = "coder", .disk_gb = 80, .min_ram_gb = 96, .repo = "mbrown-uno/Qwen3.8-Flash-Next-GSQ-RCO-Coder-MLX", .rev = "50fa68c5e9cebf53276d8eae8af594fa8b3de9e4", .note = "256 experts, pruned for code, 76 GB"},
     {.name = "full", .disk_gb = 110, .min_ram_gb = 128, .repo = "mlx-community/Qwen3.8-Flash-Next-4bit-mtp", .rev = "825df623302aeebc434f44ca9122827b04f9a0f1", .note = "512 experts, the original model, 105 GB"},
@@ -42,6 +56,26 @@ const DownloadPack download_packs[DOWNLOAD_NPACKS] = {
      .gguf_file = "Qwen3.8-27B-TurboFCFusion-735-882-Here-Uncen-NEO-CODER-MAX-MTP-Q8_0.gguf",
      .dir = "DavidAU/Qwen3.8-27B-TURBO-NEO-CODER-MAX-MTP-Q8_0",
      .note = "the same fine-tune, Q8_0 GGUF with MTP, imported, 30 GB"},
+    {.name = "27b-coder390", .disk_gb = 45, .min_ram_gb = 48, .repo = C390_REPO, .rev = C390_REV, .subdir = "BF16", .only = hf_files,
+     .gguf_repo = C390_GGUF_REPO, .gguf_rev = C390_GGUF_REV, .gguf_subdir = "GGUF",
+     .gguf_file = "Qwen3.8-27B-Coder390-EfficientThink-Q4LynnStyle-Q8MTP.gguf",
+     .dir = "nerkyor/Qwen3.8-27B-Coder390-EfficientThink-Q4LynnStyle-Q8MTP",
+     .note = "Qwen3.8-27B Coder390 fine-tune (nerkyor), Q4 LynnStyle GGUF with Q8 MTP, imported, 23 GB"},
+    {.name = "27b-coder390-8bit", .disk_gb = 62, .min_ram_gb = 48, .repo = C390_REPO, .rev = C390_REV, .subdir = "BF16", .only = hf_files,
+     .gguf_repo = C390_GGUF_REPO, .gguf_rev = C390_GGUF_REV, .gguf_subdir = "GGUF",
+     .gguf_file = "Qwen3.8-27B-Coder390-EfficientThink-Q8_0-MTP.gguf",
+     .dir = "nerkyor/Qwen3.8-27B-Coder390-EfficientThink-Q8_0-MTP",
+     .note = "the same fine-tune, Q8_0 GGUF with MTP, imported, 31 GB"},
+    {.name = "27b-fable5", .disk_gb = 40, .min_ram_gb = 36, .repo = FABLE_REPO, .rev = FABLE_REV, .only = hf_files,
+     .gguf_repo = "mradermacher/Qwen3.8-27B-Fable-5-Coding-Distilled-i1-GGUF", .gguf_rev = "55f3b23db4b7aab28f6e68e8a49be5bc2e076a6c",
+     .gguf_file = "Qwen3.8-27B-Fable-5-Coding-Distilled.i1-Q4_K_M.gguf",
+     .dir = "khazarai/Qwen3.8-27B-Fable-5-Coding-Distilled-i1-Q4_K_M",
+     .note = "Qwen3.8-27B Fable-5 coding distill (khazarai), imatrix Q4_K_M GGUF with MTP, imported, 20 GB"},
+    {.name = "27b-fable5-8bit", .disk_gb = 62, .min_ram_gb = 48, .repo = FABLE_REPO, .rev = FABLE_REV, .only = hf_files,
+     .gguf_repo = "mradermacher/Qwen3.8-27B-Fable-5-Coding-Distilled-GGUF", .gguf_rev = "e8eeb91df17f4b8c107dbaaf3edeeff9f9bfb928",
+     .gguf_file = "Qwen3.8-27B-Fable-5-Coding-Distilled.Q8_0.gguf",
+     .dir = "khazarai/Qwen3.8-27B-Fable-5-Coding-Distilled-Q8_0",
+     .note = "the same fine-tune, Q8_0 GGUF with MTP, imported, 31 GB"},
 };
 
 // Idle timeout of a transfer (between bytes); a stalled connection fails and is retried.
@@ -73,12 +107,13 @@ Err download_pack_dir(Arena *a, const DownloadPack *p, char **out) {
 }
 
 const char *download_usage(void) {
-    return "usage: saetta download [coder|full|all|27b-8bit|27b-4bit|27b-pi|27b-turbo|27b-turbo-8bit] [--jobs N]   (default: coder with 96 GB of memory or more, 27b-turbo with 36, 27b-4bit with 32; all = coder and "
+    return "usage: saetta download [coder|full|all|27b-8bit|27b-4bit|27b-pi|27b-turbo|27b-turbo-8bit|27b-coder390|27b-coder390-8bit|27b-fable5|27b-fable5-8bit] [--jobs N]   (default: coder with 96 GB of memory or more, 27b-turbo with 36, 27b-4bit with 32; all = coder and "
            "full; into $SAETTA_MODELS, default ~/Models)\n";
 }
 
 typedef struct {
-    const char *path; // relative to the repo
+    const char *path;  // relative to the repo
+    const char *local; // relative to the pack folder (path without the pack's subdir)
     uint64_t size;
     const char *sha256; // LFS files, else NULL
     const char *git_oid; // git blob SHA-1 otherwise
@@ -185,12 +220,19 @@ static Err list_files(Arena *a, const DownloadPack *p, const char *token, Item *
             vec_free(&items);
             return "BadListing";
         }
+        // a subdir's files land at the pack folder's root; the others are not fetched
+        Str local = path->s;
+        if (p->subdir) {
+            Str pre = str(p->subdir);
+            if (local.len <= pre.len + 1 || memcmp(local.ptr, pre.ptr, pre.len) != 0 || local.ptr[pre.len] != '/') continue;
+            local = str_n(local.ptr + pre.len + 1, local.len - pre.len - 1);
+        }
         if (p->only) {
             bool keep = false;
-            for (const char *const *f = p->only; *f && !keep; f++) keep = str_eqz(path->s, *f);
+            for (const char *const *f = p->only; *f && !keep; f++) keep = str_eqz(local, *f);
             if (!keep) continue;
         }
-        vec_push(&items, ((Item){.path = path->s.ptr, .size = (uint64_t)size->i, .sha256 = sha, .git_oid = oid->s.ptr}));
+        vec_push(&items, ((Item){.path = path->s.ptr, .local = local.ptr, .size = (uint64_t)size->i, .sha256 = sha, .git_oid = oid->s.ptr}));
     }
     if (items.len == 0) {
         vec_free(&items);
@@ -320,7 +362,7 @@ static Err fetch_body(Shared *sh, const Item *it, int fd, Hasher *h, uint64_t *o
 
 static Err fetch_one(Shared *sh, const Item *it) {
     char dest[512], part[512];
-    if ((size_t)snprintf(dest, sizeof dest, "%s/%s", sh->root, it->path) >= sizeof dest) return "NoSpaceLeft";
+    if ((size_t)snprintf(dest, sizeof dest, "%s/%s", sh->root, it->local) >= sizeof dest) return "NoSpaceLeft";
     if ((size_t)snprintf(part, sizeof part, "%s.part", dest) >= sizeof part) return "NoSpaceLeft";
     char *slash = strrchr(dest, '/');
     if (slash && slash != dest) {
@@ -459,7 +501,7 @@ static Err fetch_repo(Arena *a, const DownloadPack *p, const char *root, const c
     for (size_t i = 0; i < n_all; i++) {
         const Item *it = &all[i];
         total += it->size;
-        char *dest = path_join(a, root, it->path);
+        char *dest = path_join(a, root, it->local);
         struct stat st;
         if (stat(dest, &st) != 0) {
             todo[n_todo++] = *it;
@@ -519,8 +561,9 @@ static Err one(Arena *a, const DownloadPack *p, const char *token, size_t jobs) 
     }
     TRY(fetch_repo(a, p, root, token, jobs));
     if (!p->gguf_file) return OK;
-    DownloadPack g = {.name = p->name, .repo = p->gguf_repo, .rev = p->gguf_rev, .only = (const char *const[]){p->gguf_file, NULL}};
-    dbg("  %s at %.7s: %s\n", g.repo, g.rev, p->gguf_file);
+    DownloadPack g = {.name = p->name, .repo = p->gguf_repo, .rev = p->gguf_rev, .subdir = p->gguf_subdir,
+                      .only = (const char *const[]){p->gguf_file, NULL}};
+    dbg("  %s at %.7s: %s%s%s\n", g.repo, g.rev, p->gguf_subdir ? p->gguf_subdir : "", p->gguf_subdir ? "/" : "", p->gguf_file);
     TRY(fetch_repo(a, &g, root, token, jobs));
     const char *gf = path_join(a, root, p->gguf_file);
     dbg("  importing the GGUF into a saetta pack\n");

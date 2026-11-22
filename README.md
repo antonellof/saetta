@@ -56,14 +56,18 @@ Needs an Apple Silicon Mac (M1 or later) with 32 GB of memory or more, and macOS
 | `27b-pi` | [the pi LoRA adapter](https://huggingface.co/harness-hub/Qwen3.8-27B-pi-adapted) for Qwen3.8-27B | 0.6 GB | |
 | **`27b-turbo`** · with MTP | [TURBO Fable Cold Fusion](https://huggingface.co/DavidAU/Qwen3.8-27B-TURBO-Fable-Cold-Fusion-735-882-Heretic-Uncensored-NEO-CODER-MAX-MTP-GGUF), a Qwen3.8-27B fine-tune with shorter thinking, from its Q4_K_M GGUF | 20 GB | 36 GB |
 | `27b-turbo-8bit` · with MTP | the same, from its Q8_0 GGUF | 30 GB | 48 GB |
+| `27b-coder390` · with MTP | [Coder390 EfficientThink](https://huggingface.co/nerkyor/Qwen3.8-27B-Coder390-EfficientThink-Opus5.5-GPT6Astra-Grok4.7-DSV4Pro-K3-SFT-RLOO-GGUF-NInfer), a Qwen3.8-27B fine-tune (SFT and RL on code, shorter thinking), from its Q4 LynnStyle GGUF | 23 GB | 48 GB |
+| `27b-coder390-8bit` · with MTP | the same, from its Q8_0 GGUF | 31 GB | 48 GB |
+| `27b-fable5` · with MTP | [Fable-5 Coding Distilled](https://huggingface.co/khazarai/Qwen3.8-27B-Fable-5-Coding-Distilled), a Qwen3.8-27B coding distill, from [mradermacher's](https://huggingface.co/mradermacher/Qwen3.8-27B-Fable-5-Coding-Distilled-i1-GGUF) imatrix Q4_K_M GGUF | 20 GB | 36 GB |
+| `27b-fable5-8bit` · with MTP | the same, from its Q8_0 GGUF | 31 GB | 48 GB |
 
 With less memory the context is smaller: about 37K tokens with `27b-4bit` on 32 GB. `SAETTA_IGNORE_MEMORY=1` skips the memory checks.
 
-Licenses: Flash-Next Qwen Community License 1.0, Qwen3.8-27B, the pi adapter and TURBO Apache-2.0; no weights are part of this repository.
+Licenses: Flash-Next Qwen Community License 1.0, Qwen3.8-27B, the pi adapter, TURBO, Coder390 and Fable-5 Apache-2.0; no weights are part of this repository.
 
 ### GGUF fine-tunes of Qwen3.8-27B
 
-`saetta download 27b-turbo` fetches the GGUF, converts it into a Saetta pack and deletes it. `saetta import <file.gguf> <folder>` does the same for any Qwen3.8-27B GGUF (llama.cpp `qwen35`; Q8_0, Q4_K, Q5_K, Q6_K, F16 or BF16 tensors), with the model's `config.json` and tokenizer files in the folder. A GGUF's MTP layer becomes the draft head: Qwen3.8-27B speculates with it as Flash-Next does (`SAETTA_MTP=0` turns it off).
+`saetta download 27b-turbo` (or `27b-coder390`, `27b-fable5`) fetches the GGUF, converts it into a Saetta pack and deletes it. `saetta import <file.gguf> <folder>` does the same for any Qwen3.8-27B GGUF (llama.cpp `qwen35`; Q8_0, Q4_K, Q5_K, Q6_K, F16 or BF16 tensors), with the model's `config.json` and tokenizer files in the folder. A GGUF's MTP layer becomes the draft head: Qwen3.8-27B speculates with it as Flash-Next does (`SAETTA_MTP=0` turns it off).
 
 ### LoRA adapters
 

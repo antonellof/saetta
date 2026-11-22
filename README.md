@@ -2,8 +2,8 @@
   <img src="docs/assets/saetta-banner.png" alt="Saetta" width="900">
 </p>
 
-<h3 align="center">Saetta: a local coding agent for Apple Silicon Macs, with the model running inside it.</h3>
-<p align="center">The agent is a port of pi to C, with pi's tools, sessions and terminal UI, and runs Qwen3.8 in its own process. Its engine, in C and hand-written Metal, also serves Claude Code, pi and opencode. Qwen3.8-27B from 32 GB of memory, Qwen3.8-Flash-Next from 96 GB. <a href="https://saetta.dev">saetta.dev</a></p>
+<h3 align="center">Saetta: a local coding agent with the model built in.</h3>
+<p align="center">Written in C and hand-written Metal for Apple Silicon Macs. Qwen3.8 runs in the same process, with no server in between. Tools, sessions and terminal UI come from pi, and the engine also serves Claude Code, opencode and pi itself. Qwen3.8-27B from 32 GB of memory, Flash-Next from 96 GB. <a href="https://saetta.dev">saetta.dev</a></p>
 
 <p align="center">
   <a href="#install"><b>Install</b></a> · <a href="#saetta-code"><b>Coding agent</b></a> · <a href="#other-coding-agents">Other agents</a> ·

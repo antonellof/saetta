@@ -3,8 +3,10 @@
 // b4afddd): packages/coding-agent/src/extensions/mcp/ui.ts (McpManagerView, frame), index.ts
 // (manage, runAction, the command's handler and argument completions), tools.ts
 // (createMcpToolRenderers), core/tools/render-utils.ts (formatToolCallWithArgs, replaceTabs),
-// modes/interactive/components/visual-truncate.ts (VisualLinePreview), keybinding-hints.ts.
+// modes/interactive/components/visual-truncate.ts (VisualLinePreview), keybinding-hints.ts,
+// auth-url.ts (AuthUrlComponent); packages/tui/src/components/input.ts (the paste prompt).
 #include "code_mcp_ui.h"
+#include "code_cmds.h"
 #include "code_oai.h"
 
 #include <stdlib.h>
@@ -64,6 +66,202 @@ static void frame_close(Str footer, int width, Lines *out) {
         buf_free(&b);
     }
     border(width, out);
+}
+
+// ---- the sign-in screen (McpManagerView.status and redirectUrl, AuthUrlComponent) -------------------
+
+static struct {
+    char *url;     // the URL the prompt is for (a new one starts it empty)
+    Buf value;     // the pasted redirect URL (pi-tui Input)
+    size_t cursor;
+    char *hint;    // the copy hint after ctrl+x: NULL, or the result (copied, or the error)
+    bool hint_ok;
+} SI;
+
+static void si_sync(const char *url) {
+    if (url && SI.url && !strcmp(url, SI.url)) return;
+    free(SI.url);
+    SI.url = url ? strdup(url) : NULL;
+    SI.value.len = 0;
+    if (SI.value.ptr) SI.value.ptr[0] = 0;
+    SI.cursor = 0;
+    free(SI.hint);
+    SI.hint = NULL;
+}
+
+// a URL from the authorization server, without control characters
+static char *clean_url(const char *u) {
+    Buf b = {0};
+    for (const unsigned char *p = (const unsigned char *)u; *p; p++)
+        if (*p >= 0x20 && *p != 0x7f) buf_addc(&b, (char)*p);
+    return b.ptr ? b.ptr : strdup("");
+}
+
+static void hyperlink(Buf *b, const char *text, const char *url) { buf_printf(b, "\x1b]8;;%s\x1b\\%s\x1b]8;;\x1b\\", url, text); }
+
+// Input.render: "> ", the value (scrolled to keep the cursor in view) with the fake cursor,
+// padded to the width
+static void input_render(int width, Lines *out) {
+    Buf b = {0}, vis = {0};
+    buf_adds(&b, "> ");
+    int avail = width - 2;
+    if (avail <= 0) {
+        lines_addb(out, &b);
+        return;
+    }
+    Str v = buf_str(&SI.value);
+    int total = tui_width(v);
+    size_t cur = MIN(SI.cursor, v.len);
+    Str shown = v;
+    size_t cd = cur; // the cursor's byte offset in what is shown
+    if (total >= avail) {
+        int scroll = cur == v.len ? avail - 1 : avail;
+        int ccol = tui_width(str_n(v.ptr, cur)), half = scroll / 2;
+        int start = ccol < half ? 0 : ccol > total - half ? MAX(0, total - scroll) : MAX(0, ccol - half);
+        if (scroll > 0) {
+            tui_slice(&vis, v, start, scroll, true);
+            Buf before = {0};
+            tui_slice(&before, v, start, MAX(0, ccol - start), true);
+            cd = before.len;
+            buf_free(&before);
+        } else cd = 0;
+        shown = buf_str(&vis);
+    }
+    buf_add(&b, shown.ptr, MIN(cd, shown.len));
+    size_t g = cd < shown.len ? tui_grapheme(shown, cd) : 0;
+    buf_adds(&b, "\x1b[7m");
+    if (g) buf_add(&b, shown.ptr + cd, g);
+    else buf_addc(&b, ' ');
+    buf_adds(&b, "\x1b[27m");
+    if (cd + g < shown.len) buf_add(&b, shown.ptr + cd + g, shown.len - cd - g);
+    int w = tui_width(buf_str(&b)) - 2;
+    tui_spaces(&b, MAX(0, avail - w));
+    buf_free(&vis);
+    lines_addb(out, &b);
+}
+
+static void input_key(const Key *k) {
+    Buf *v = &SI.value;
+    if (!v->ptr) buf_adds(v, "");
+    if (k->kind == K_CHAR && k->ch >= 0x20) {
+        char enc[4];
+        int n = tui_utf8(enc, k->ch);
+        buf_reserve(v, (size_t)n);
+        memmove(v->ptr + SI.cursor + n, v->ptr + SI.cursor, v->len - SI.cursor + 1);
+        memcpy(v->ptr + SI.cursor, enc, (size_t)n);
+        v->len += (size_t)n;
+        SI.cursor += (size_t)n;
+    } else if (k->kind == K_PASTE && k->paste) {
+        for (const char *p = k->paste; *p; p++)
+            if ((unsigned char)*p >= 0x20) {
+                buf_reserve(v, 1);
+                memmove(v->ptr + SI.cursor + 1, v->ptr + SI.cursor, v->len - SI.cursor + 1);
+                v->ptr[SI.cursor++] = *p;
+                v->len++;
+            }
+    } else if (k->kind == K_BACKSPACE && SI.cursor > 0) {
+        size_t p = SI.cursor - 1;
+        while (p > 0 && ((unsigned char)v->ptr[p] & 0xc0) == 0x80) p--;
+        memmove(v->ptr + p, v->ptr + SI.cursor, v->len - SI.cursor + 1);
+        v->len -= SI.cursor - p;
+        SI.cursor = p;
+    } else if (k->kind == K_LEFT && SI.cursor > 0) {
+        SI.cursor--;
+        while (SI.cursor > 0 && ((unsigned char)v->ptr[SI.cursor] & 0xc0) == 0x80) SI.cursor--;
+    } else if (k->kind == K_RIGHT && SI.cursor < v->len) SI.cursor += tui_grapheme(buf_str(v), SI.cursor);
+    else if (k->kind == K_HOME || (k->kind == K_CTRL && k->ch == 'a')) SI.cursor = 0;
+    else if (k->kind == K_END || (k->kind == K_CTRL && k->ch == 'e')) SI.cursor = v->len;
+    else if (k->kind == K_CTRL && k->ch == 'u') {
+        memmove(v->ptr, v->ptr + SI.cursor, v->len - SI.cursor + 1);
+        v->len -= SI.cursor;
+        SI.cursor = 0;
+    }
+}
+
+static void signin_render(int width, Lines *out) {
+    char *title, *msg, *url;
+    if (!code_mcp_signin_screen(&title, &msg, &url)) {
+        title = strdup("MCP servers");
+        msg = strdup("Loading\xe2\x80\xa6");
+        url = NULL;
+    }
+    char *u = url ? clean_url(url) : NULL;
+    si_sync(u);
+    Lines ls = {0};
+    frame_open(title ? title : "", width, &ls);
+    Buf footer = {0};
+    lines_addz(&ls, "");
+    if (u) {
+        themed_text(T_MUTED, "Approve access in your browser. If it did not open, visit:", width, &ls);
+        // AuthUrlComponent: the link, then the click and copy hints
+        Buf l = {0}, h = {0}, t = {0};
+        hyperlink(&t, u, u);
+        th_fg(&l, T_ACCENT, buf_str(&t));
+        text(buf_str(&l), 1, width, &ls);
+        t.len = 0;
+        hyperlink(&t, "Cmd+click to open", u);
+        th_fg(&h, T_DIM, buf_str(&t));
+        buf_addc(&h, ' ');
+        th_fgz(&h, T_DIM, "\xe2\x80\xa2");
+        buf_addc(&h, ' ');
+        if (SI.hint) th_fgz(&h, SI.hint_ok ? T_SUCCESS : T_ERROR, SI.hint);
+        else key_hint(&h, "ctrl+x", "to copy");
+        text(buf_str(&h), 1, width, &ls);
+        buf_free(&l);
+        buf_free(&h);
+        buf_free(&t);
+        lines_addz(&ls, "");
+        themed_text(T_MUTED, "If the browser runs on another machine, paste the URL it was redirected to:", width, &ls);
+        input_render(width, &ls);
+        key_hint(&footer, CONFIRM_KEYS, "submit");
+        buf_adds(&footer, " \xe2\x80\xa2 ");
+        key_hint(&footer, CANCEL_KEYS, "cancel");
+    } else {
+        themed_text(T_MUTED, msg ? msg : "", width, &ls);
+        key_hint(&footer, CANCEL_KEYS, "cancel");
+    }
+    frame_close(buf_str(&footer), width, &ls);
+    buf_free(&footer);
+    for (size_t i = 0; i < ls.n; i++) {
+        if (tui_width(str(ls.v[i])) > width) {
+            Buf c = {0};
+            tui_truncate(&c, str(ls.v[i]), width, "", false);
+            lines_addb(out, &c);
+        } else lines_addz(out, ls.v[i]);
+    }
+    lines_free(&ls);
+    free(title);
+    free(msg);
+    free(url);
+    free(u);
+}
+
+static void signin_key(const Key *k) {
+    char *title, *msg, *url;
+    if (!code_mcp_signin_screen(&title, &msg, &url)) return;
+    bool cancel = k->kind == K_ESC || (k->kind == K_CTRL && k->ch == 'c');
+    if (!url) {
+        if (cancel) code_mcp_signin_cancel(); // status(): the cancel key calls onCancel
+    } else if (k->kind == K_ENTER) {
+        Str v = str_trim(buf_str(&SI.value));
+        if (v.len) {
+            char *z = strndup(v.ptr, v.len);
+            code_mcp_signin_submit(z);
+            free(z);
+        }
+    } else if (cancel) code_mcp_signin_cancel();
+    else if (k->kind == K_CTRL && k->ch == 'x') {
+        // AuthUrlComponent.copy
+        char *u = clean_url(url);
+        const char *err = cmds_copy_text(str(u));
+        free(u);
+        free(SI.hint);
+        SI.hint = strdup(err ? err : "Copied URL to clipboard");
+        SI.hint_ok = !err;
+    } else input_key(k);
+    free(title);
+    free(msg);
+    free(url);
 }
 
 // ---- the manager (McpManagerView.menu and index.ts manage) ------------------------------------------
@@ -199,6 +397,10 @@ void code_mcp_ui_render(int width, Lines *out) {
         pick_render(width, out);
         return;
     }
+    if (code_mcp_view(NULL) == MCP_VIEW_SIGNIN) {
+        signin_render(width, out);
+        return;
+    }
     McpMenu m;
     size_t sel = code_mcp_view_menu(&m);
     Lines ls = {0};
@@ -265,6 +467,10 @@ static void menu_done(McpView kind, const char *server, const char *value) {
 void code_mcp_ui_key(const Key *k) {
     if (picking()) {
         pick_key(k);
+        return;
+    }
+    if (code_mcp_view(NULL) == MCP_VIEW_SIGNIN) {
+        signin_key(k);
         return;
     }
     char *server = NULL;

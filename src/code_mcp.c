@@ -14,6 +14,7 @@
 // on a server that stops reading.
 #include "code_mcp.h"
 #include "code_cfg.h"
+#include "code_mcp_oauth.h"
 #include "code_oai.h"
 #include "code_tui.h"
 #include "hash.h"
@@ -834,6 +835,8 @@ struct Client {
     char **hdr_names, **hdr_values;
     size_t nhdr;
     char *session_id, *protocol_version;
+    McpAuth *auth;    // the connection's OAuth provider (NULL: the server does not use OAuth)
+    char *last_token; // lastToken: the access token of the latest request, which the DELETE reuses (g_mu)
     volatile int http_cancel; // set by close(): the requests in flight are cancelled
     struct HttpX *http_live;  // the POSTs in flight (g_mu), each cancellable on its own
     int http_detached;        // the detached POST threads running (g_mu), at most MAX_HTTP_DETACHED
@@ -860,6 +863,8 @@ struct Conn {
     bool opening, shut;
     char *open_err; // why the last open failed, for the callers that waited on it
     char *stderr_tail;
+    McpAuth *auth;           // createMcpAuthProvider, for a server that uses OAuth (usesOAuth)
+    char *tokens_at_sign_in; // tokensAtSignIn: the stored tokens when it came to need a sign-in
 };
 
 // McpServer (index.ts)
@@ -1143,6 +1148,7 @@ static void client_free(Client *c) {
     free(c->hdr_values);
     free(c->session_id);
     free(c->protocol_version);
+    free(c->last_token);
     free(c->instructions);
     free(c);
 }
@@ -1762,7 +1768,8 @@ end:
 
 // error kinds (in a request's *code, outside JSON-RPC's codes): McpAuthRequiredError,
 // McpSessionExpiredError, and the network failures and statuses worth another attempt
-enum { ERR_AUTH = -1, ERR_SESSION_EXPIRED = -2, ERR_TRANSIENT = -3 };
+// McpOAuthAuthorizationRequiredError
+enum { ERR_AUTH = -1, ERR_SESSION_EXPIRED = -2, ERR_TRANSIENT = -3, ERR_AUTH_REQUIRED = -4 };
 
 enum { MAX_HTTP_DETACHED = 8 };
 
@@ -1776,6 +1783,7 @@ struct HttpX {
     double idle_s; // the exchange's idle timeout, 0 for the default (300 s, the DELETE 1 s)
     char ctype[128]; // the response's media type, lowercased
     char *session;
+    char *www;  // WWW-Authenticate
     Buf body; // a JSON or an error body
     Buf sse, data;
     char event[64];
@@ -1792,6 +1800,7 @@ static void http_header(void *ctx, const char *name, const char *value) {
         for (size_t i = 0; i < k; i++) h->ctype[i] = (char)((t.ptr[i] >= 'A' && t.ptr[i] <= 'Z') ? t.ptr[i] + 32 : t.ptr[i]);
         h->ctype[k] = 0;
     } else if (!strcasecmp(name, "mcp-session-id") && *value) set_str(&h->session, strdup(value));
+    else if (!strcasecmp(name, "www-authenticate")) set_str(&h->www, strdup(value));
 }
 
 // consumeSse's dispatch: an event's data (lines joined) handed over as one message, unless the
@@ -1877,38 +1886,95 @@ static char *http_failure(int status, Str body) {
     return t.len ? mfmt("MCP HTTP request failed with status %d: %.*s", status, (int)t.len, t.ptr) : mfmt("MCP HTTP request failed with status %d", status);
 }
 
+// needsAuthorization: 401, or 403 with an insufficient_scope bearer challenge (step-up)
+static bool needs_authorization(int status, const char *www) {
+    if (status == 401) return true;
+    if (status != 403 || !www) return false;
+    for (const char *p = www; *p; p++) {
+        if (p != www && !strchr(" \t\n\r\f\v,", p[-1])) continue;
+        if (strncasecmp(p, "error=", 6)) continue;
+        const char *v = p + 6;
+        if (*v == '"') v++;
+        if (!strncasecmp(v, "insufficient_scope", 18)) return true;
+    }
+    return false;
+}
+
 // StreamableHttpTransport.send (and close's DELETE): one exchange. NULL or the error, its kind in
 // *kind.
 static char *http_exchange(HttpX *h, int *kind) {
     Client *c = h->c;
     *kind = 0;
-    VEC(sx_header) hs = {0};
-    for (size_t i = 0; i < c->nhdr; i++) vec_push(&hs, ((sx_header){c->hdr_names[i], c->hdr_values[i]}));
-    if (h->json) {
-        vec_push(&hs, ((sx_header){"accept", "application/json, text/event-stream"}));
-        vec_push(&hs, ((sx_header){"content-type", "application/json"}));
-    }
-    pthread_mutex_lock(&g_mu);
-    char *sid = dupz(c->session_id), *pv = dupz(c->protocol_version);
-    pthread_mutex_unlock(&g_mu);
-    if (sid) vec_push(&hs, ((sx_header){"Mcp-Session-Id", sid}));
-    if (pv) vec_push(&hs, ((sx_header){"MCP-Protocol-Version", pv}));
+    char *sid = NULL, *pv = NULL, *token = NULL, *bearer = NULL;
     int status = 0;
-    char err[512] = {0};
-    volatile int never = 0;
-    int rc = sx_http_ex(h->json ? "POST" : "DELETE", c->url, hs.ptr, hs.len, h->json, h->json ? strlen(h->json) : 0,
-                        h->idle_s > 0 ? h->idle_s : h->json ? 300 : 1,
-                        http_header, http_data, h, &status, err, sizeof err, h->json ? &h->cancel : &never);
-    vec_free(&hs);
     char *e = NULL;
-    if (rc) {
-        // fetch's TypeError (a network failure), or the transport closed meanwhile
-        if (c->http_cancel) e = strdup("MCP connection closed");
-        else if (h->cancel) e = strdup("MCP request aborted");
-        else {
-            e = strdup("fetch failed");
-            *kind = ERR_TRANSIENT;
+    // authorizedFetch: a 401 (or a 403 asking for more scope) goes to the auth provider once, and
+    // the request is sent again with what it left behind
+    for (int attempt = 0;; attempt++) {
+        free(sid);
+        free(pv);
+        free(token);
+        free(bearer);
+        token = bearer = NULL;
+        if (c->auth) {
+            // headers(): the provider's token for each POST (maybe refreshed first); the DELETE
+            // reuses the last request's
+            if (h->json) token = mcp_auth_token(c->auth);
+            pthread_mutex_lock(&g_mu);
+            if (h->json) set_str(&c->last_token, dupz(token));
+            else token = dupz(c->last_token);
+            pthread_mutex_unlock(&g_mu);
+            if (token) bearer = mfmt("Bearer %s", token);
         }
+        VEC(sx_header) hs = {0};
+        for (size_t i = 0; i < c->nhdr; i++) vec_push(&hs, ((sx_header){c->hdr_names[i], c->hdr_values[i]}));
+        if (h->json) {
+            vec_push(&hs, ((sx_header){"accept", "application/json, text/event-stream"}));
+            vec_push(&hs, ((sx_header){"content-type", "application/json"}));
+        }
+        pthread_mutex_lock(&g_mu);
+        sid = dupz(c->session_id);
+        pv = dupz(c->protocol_version);
+        pthread_mutex_unlock(&g_mu);
+        if (sid) vec_push(&hs, ((sx_header){"Mcp-Session-Id", sid}));
+        if (pv) vec_push(&hs, ((sx_header){"MCP-Protocol-Version", pv}));
+        if (bearer) vec_push(&hs, ((sx_header){"Authorization", bearer}));
+        status = 0;
+        char err[512] = {0};
+        volatile int never = 0;
+        int rc = sx_http_ex(h->json ? "POST" : "DELETE", c->url, hs.ptr, hs.len, h->json, h->json ? strlen(h->json) : 0,
+                            h->idle_s > 0 ? h->idle_s : h->json ? 300 : 1,
+                            http_header, http_data, h, &status, err, sizeof err, h->json ? &h->cancel : &never);
+        vec_free(&hs);
+        if (rc) {
+            // fetch's TypeError (a network failure), or the transport closed meanwhile
+            if (c->http_cancel) e = strdup("MCP connection closed");
+            else if (h->cancel) e = strdup("MCP request aborted");
+            else {
+                e = strdup("fetch failed");
+                *kind = ERR_TRANSIENT;
+            }
+            goto out;
+        }
+        if (attempt > 0 || !c->auth || !h->json || !needs_authorization(status, h->www)) break;
+        char *why = NULL;
+        int r = mcp_auth_unauthorized(c->auth, h->www, token, &why);
+        // the rejected response discarded
+        h->body.len = 0;
+        h->ctype[0] = 0;
+        set_str(&h->session, NULL);
+        set_str(&h->www, NULL);
+        h->too_big = h->captured = false;
+        if (r == MCP_AUTH_RETRY) continue;
+        if (r == MCP_AUTH_REQUIRED) {
+            e = strdup("MCP OAuth authorization requires user interaction");
+            *kind = ERR_AUTH_REQUIRED;
+        } else {
+            e = why ? why : strdup("OAuth refresh failed");
+            if (!strcmp(e, "fetch failed")) *kind = ERR_TRANSIENT;
+            why = NULL;
+        }
+        free(why);
         goto out;
     }
     if (!h->json) goto out;
@@ -1967,6 +2033,8 @@ static char *http_exchange(HttpX *h, int *kind) {
 out:
     free(sid);
     free(pv);
+    free(token);
+    free(bearer);
     return e;
 }
 
@@ -1996,6 +2064,7 @@ static void http_cancel_l(Client *c, int64_t id) {
 static void http_free(HttpX *h) {
     free(h->json);
     free(h->session);
+    free(h->www);
     buf_free(&h->body);
     buf_free(&h->sse);
     buf_free(&h->data);
@@ -2117,8 +2186,13 @@ static void register_tools_l(Conn *conn);
 static void sync_resource_tools_l(void);
 
 // The server's state changed: the manager shows it at once.
+// onConnectionChange: a server that comes to need a sign-in remembers the stored tokens, so a
+// sign-in done elsewhere (another process) is noticed at the next turn (reconnectSignedIn)
 static void conn_changed_l(Conn *c) {
-    (void)c;
+    if (c->auth) {
+        if (c->state != ST_NEEDS_AUTH) set_str(&c->tokens_at_sign_in, NULL);
+        else if (!c->tokens_at_sign_in) c->tokens_at_sign_in = mcp_auth_stored_tokens(c->auth);
+    }
     changed_l();
 }
 
@@ -2218,6 +2292,7 @@ static Client *connect_once(Conn *conn, char **err, int *kind) {
     if (is_http(config)) {
         c->http = true;
         c->url = strdup(json_str(json_get(config, "url")));
+        c->auth = conn->auth;
         const JValue *hd = json_get(config, "headers");
         size_t n = is_record(hd) ? hd->obj.len : 0;
         c->hdr_names = xcalloc(n + 1, sizeof(char *));
@@ -2421,7 +2496,7 @@ static Client *conn_get_client(Conn *c, char **err) {
     }
     pthread_mutex_lock(&g_mu);
     if (cl) client_ref_l(cl);
-    else if (kind == ERR_AUTH && needs_sign_in(c->config) && !c->shut) {
+    else if ((kind == ERR_AUTH_REQUIRED || (kind == ERR_AUTH && needs_sign_in(c->config))) && !c->shut) {
         // markNeedsAuth
         c->state = ST_NEEDS_AUTH;
         set_str(&c->error, NULL);
@@ -2492,10 +2567,35 @@ static void conn_close(Conn *c) {
     pthread_mutex_lock(&g_mu);
     conn_wait_opening_l(c);
     pthread_mutex_unlock(&g_mu);
+    // a refresh the server already answered may have rotated the refresh token: saved first
+    if (c->auth) mcp_auth_settled(c->auth);
 }
 
-// usesOAuth: an HTTP server without an Authorization header or auth; such servers, and the ones
-// with auth.provider, need a sign-in when they answer 401
+// signOut: the client dropped after the stored credentials were removed
+static void conn_sign_out(Conn *c) {
+    pthread_mutex_lock(&g_mu);
+    conn_wait_opening_l(c);
+    pthread_mutex_unlock(&g_mu);
+    conn_drop_client(c);
+    pthread_mutex_lock(&g_mu);
+    if (!c->shut) {
+        c->state = ST_NEEDS_AUTH;
+        set_str(&c->error, NULL);
+        conn_changed_l(c);
+    }
+    pthread_mutex_unlock(&g_mu);
+}
+
+// usesOAuth: an HTTP server without an Authorization header or auth
+static bool uses_oauth(const JValue *config) {
+    if (!is_http(config) || json_get(config, "auth")) return false;
+    const JValue *h = json_get(config, "headers");
+    for (size_t i = 0; is_record(h) && i < h->obj.len; i++)
+        if (h->obj.items[i].key.len == 13 && !strncasecmp(h->obj.items[i].key.ptr, "authorization", 13)) return false;
+    return true;
+}
+
+// Servers with an auth provider (OAuth, or auth.provider) need a sign-in when they answer 401
 static bool needs_sign_in(const JValue *config) {
     if (!is_http(config)) return false;
     if (json_get(config, "auth")) return true;
@@ -2535,7 +2635,7 @@ static char *conn_request(Conn *conn, const char *method, const JValue *params, 
             continue;
         }
         client_unref(cl);
-        if (!res && *code == ERR_AUTH && needs_sign_in(conn->config)) {
+        if (!res && (*code == ERR_AUTH_REQUIRED || (*code == ERR_AUTH && needs_sign_in(conn->config)))) {
             conn_drop_client(conn);
             pthread_mutex_lock(&g_mu);
             conn->state = ST_NEEDS_AUTH;
@@ -2549,11 +2649,38 @@ static char *conn_request(Conn *conn, const char *method, const JValue *params, 
     }
 }
 
+// oauthSettings: the server's "oauth" object, its clientSecret resolved
+static bool oauth_settings(void *ctx, Arena *a, McpOAuthSettings *st, char **err) {
+    Conn *c = ctx;
+    const JValue *o = json_get(c->config, "oauth");
+    memset(st, 0, sizeof *st);
+    if (!is_record(o)) return true;
+    st->client_id = json_str(json_get(o, "clientId"));
+    const char *secret = json_str(json_get(o, "clientSecret"));
+    if (secret) {
+        char *desc = mfmt("MCP server \"%s\" oauth.clientSecret", c->name);
+        char *v = resolve_config_value(secret, desc, err);
+        free(desc);
+        if (!v) return false;
+        st->client_secret = arena_strdup(a, v);
+        free(v);
+    }
+    double port = 0;
+    if (jnum(json_get(o, "callbackPort"), &port)) st->callback_port = (int)port;
+    st->callback_url = json_str(json_get(o, "callbackUrl"));
+    st->scope = json_str(json_get(o, "scope"));
+    st->client_name = json_str(json_get(o, "clientName"));
+    st->client_registration = json_str(json_get(o, "clientRegistration"));
+    st->auth_server_metadata_url = json_str(json_get(o, "authServerMetadataUrl"));
+    return true;
+}
+
 static Conn *conn_new_l(Server *s) {
     Conn *c = xcalloc(1, sizeof *c);
     c->name = strdup(s->name);
     c->config = s->config;
     c->state = ST_CONNECTING;
+    if (uses_oauth(c->config)) c->auth = mcp_auth_new(G.agent_dir, c->name, json_str(json_get(c->config, "url")), oauth_settings, c);
     return c;
 }
 
@@ -3145,6 +3272,8 @@ void code_mcp_start(const CodeEnv *env, bool enabled, const char *const *allow, 
     pthread_mutex_unlock(&g_mu);
 }
 
+static void signin_abort_l(void);
+
 void code_mcp_shutdown(void) {
     pthread_mutex_lock(&g_mu);
     if (!G.started || G.shutdown) {
@@ -3152,6 +3281,7 @@ void code_mcp_shutdown(void) {
         return;
     }
     G.shutdown = true;
+    signin_abort_l(); // the session's end stops a sign-in
     VEC(Conn *) conns = {0};
     for (size_t i = 0; i < G.servers.len; i++)
         if (G.servers.ptr[i]->conn) vec_push(&conns, G.servers.ptr[i]->conn);
@@ -3928,10 +4058,16 @@ static void *action_main(void *arg) {
         goto out;
     }
     uint64_t attempt;
-    if (!strcmp(a->action, "signin") || !strcmp(a->action, "signout")) {
-        // OAuth sign-in (oauth.ts) is not ported yet
+    if (!strcmp(a->action, "signout")) {
+        // signOut: the stored credentials removed, the connection waits for a sign-in
         attempt = s->attempt;
-        message = strdup("Sign-in failed: Saetta Code does not support MCP OAuth sign-in yet.");
+        Conn *c = s->conn;
+        if (c && c->auth) {
+            pthread_mutex_unlock(&g_mu);
+            (void)mcp_auth_remove(c->auth);
+            conn_sign_out(c);
+            pthread_mutex_lock(&g_mu);
+        }
     } else if (!strcmp(a->action, "reconnect")) {
         // reconnect: the connection state and error report failures
         attempt = s->attempt;
@@ -3984,10 +4120,16 @@ out:
     return NULL;
 }
 
+static void start_sign_in_l(Server *s, bool from_command);
+
 void code_mcp_run_action(const char *name, const char *action) {
     pthread_mutex_lock(&g_mu);
     Server *s = find_server_l(name);
-    if (s) {
+    if (s && !strcmp(action, "signin")) {
+        // signInWithUi: the manager shows the sign-in screen until it ends
+        set_str(&s->message, NULL);
+        start_sign_in_l(s, false);
+    } else if (s) {
         // runAction: the message of the last action cleared, the background work started
         set_str(&s->message, NULL);
         ActionArg *a = xcalloc(1, sizeof *a);
@@ -4115,6 +4257,7 @@ static void menu_server_l(const char *name, McpMenu *m) {
         if (c && st == ST_NEEDS_AUTH) menu_item(m, "signin", "Sign in", strdup("opens the browser"));
         if (c && st == ST_CONNECTED) menu_item(m, "tools", "Tools", mfmt("%zu offered", c->tools.len));
         if (c && (st == ST_FAILED || st == ST_DISCONNECTED || st == ST_CONNECTED || st == ST_NEEDS_AUTH)) menu_item(m, "reconnect", "Reconnect", NULL);
+        if (c && st == ST_CONNECTED && c->auth) menu_item(m, "signout", "Sign out", strdup("deletes the stored credentials"));
         menu_item(m, "exposure", "Exposure", strdup(exposure_of(s->config)));
         menu_item(m, "disable", "Disable", strdup(saved));
         if (in_project) menu_item(m, "disable-project", "Disable in this project", strdup(ips));
@@ -4213,6 +4356,27 @@ static void *reconnect_cmd_main(void *arg) {
     return NULL;
 }
 
+// /mcp logout: signOut, then the notice
+static void *logout_cmd_main(void *arg) {
+    ReconnectArg *a = arg;
+    pthread_mutex_lock(&g_mu);
+    Server *s = find_server_l(a->name);
+    Conn *c = s ? s->conn : NULL;
+    if (c && c->auth) {
+        pthread_mutex_unlock(&g_mu);
+        bool removed = mcp_auth_remove(c->auth);
+        conn_sign_out(c);
+        pthread_mutex_lock(&g_mu);
+        notify_l(0, removed ? mfmt("Signed out of MCP server \"%s\".", a->name) : mfmt("No stored credentials for MCP server \"%s\".", a->name));
+        changed_l();
+    }
+    pthread_mutex_unlock(&g_mu);
+    free(a->name);
+    free(a);
+    bg_end();
+    return NULL;
+}
+
 char **code_mcp_subcommand(const char *args, size_t *npick) {
     *npick = 0;
     char **pick = NULL;
@@ -4232,13 +4396,49 @@ char **code_mcp_subcommand(const char *args, size_t *npick) {
     const char *action = words[0], *name = words[1];
     pthread_mutex_lock(&g_mu);
     if (!strcmp(action, "login") || !strcmp(action, "logout")) {
-        // only HTTP servers without an Authorization header use OAuth, which Saetta Code does not
-        // support yet: no server is eligible
+        // pickServer with oauthPick: HTTP servers without an Authorization header use OAuth; one
+        // that needs a sign-in is preferred
         const char *none = "No enabled MCP server uses OAuth. Only HTTP servers without an Authorization header do.";
+        Server *s = NULL;
         if (name) {
-            if (!find_server_l(name)) notify_l(2, mfmt("No MCP server named \"%s\".", name));
-            else notify_l(2, strdup(none));
-        } else notify_l(0, strdup(none));
+            s = find_server_l(name);
+            if (!s) notify_l(2, mfmt("No MCP server named \"%s\".", name));
+            else if (!s->conn || !s->conn->auth) {
+                notify_l(2, strdup(none));
+                s = NULL;
+            }
+        } else {
+            Server *only = NULL, *pref = NULL;
+            int nc = 0, np = 0;
+            for (size_t i = 0; i < G.servers.len; i++) {
+                Server *x = G.servers.ptr[i];
+                if (!x->conn || !x->conn->auth) continue;
+                nc++;
+                only = x;
+                if (x->conn->state == ST_NEEDS_AUTH) {
+                    np++;
+                    pref = x;
+                }
+            }
+            if (!nc) notify_l(0, strdup(none));
+            else if (nc == 1) s = only;
+            else if (np == 1) s = pref;
+            else {
+                pick = xcalloc((size_t)nc + 1, sizeof(char *));
+                for (size_t i = 0; i < G.servers.len; i++)
+                    if (G.servers.ptr[i]->conn && G.servers.ptr[i]->conn->auth) pick[(*npick)++] = strdup(G.servers.ptr[i]->name);
+            }
+        }
+        if (s && !strcmp(action, "login")) start_sign_in_l(s, true); // loginCommand in the TUI: the manager's sign-in screen
+        else if (s) {
+            ReconnectArg *a = xcalloc(1, sizeof *a);
+            a->name = strdup(s->name);
+            bg_begin_l();
+            if (!spawn_bg_l(logout_cmd_main, a)) {
+                free(a->name);
+                free(a);
+            }
+        }
     } else if (!strcmp(action, "reconnect")) {
         Server *s = NULL;
         if (name) {
@@ -4364,4 +4564,239 @@ void code_mcp_view_select(const char *value) {
     pthread_mutex_lock(&g_mu);
     set_str(&MV.selected, dupz(value));
     pthread_mutex_unlock(&g_mu);
+}
+
+// ---- the sign-in (index.ts signIn, signInWithUi, loginCommand; ui.ts status, redirectUrl) -------------
+
+static struct {
+    bool active, from_command;
+    char *server, *title;
+    char *message; // the status screen's message (NULL while the redirect screen shows)
+    char *url;     // the authorization URL, for the redirect screen
+    McpSignIn *si;
+} SV;
+
+typedef struct {
+    char *name;
+    bool from_command;
+    McpSignIn si;
+} SignInArg;
+
+// showAuthorizationUrl: the browser opened, the URL shown with the paste prompt
+static void si_show_url(void *ctx, const char *url) {
+    (void)ctx;
+    mcp_oauth_open_url(url);
+    pthread_mutex_lock(&g_mu);
+    set_str(&SV.url, strdup(url));
+    set_str(&SV.message, NULL);
+    changed_l();
+    pthread_mutex_unlock(&g_mu);
+}
+
+// the prompt ended (the browser reached the callback, or a URL was pasted): status "Connecting…"
+static void si_responded(void *ctx) {
+    (void)ctx;
+    pthread_mutex_lock(&g_mu);
+    set_str(&SV.url, NULL);
+    set_str(&SV.message, strdup("Connecting\xe2\x80\xa6"));
+    changed_l();
+    pthread_mutex_unlock(&g_mu);
+}
+
+static void *signin_main(void *arg) {
+    SignInArg *a = arg;
+    pthread_mutex_lock(&g_mu);
+    Server *s = find_server_l(a->name);
+    Conn *c = s ? s->conn : NULL;
+    pthread_mutex_unlock(&g_mu);
+    char *message = NULL;
+    if (!c || !c->auth) message = mfmt("MCP server \"%s\" does not use OAuth.", a->name);
+    else {
+        char *err = NULL;
+        int rc = mcp_auth_sign_in(c->auth, &a->si, &err);
+        if (rc == MCP_SIGNIN_CANCELLED) message = strdup("Sign-in cancelled.");
+        else if (rc == MCP_SIGNIN_FAILED) message = mfmt("Sign-in failed: %s", err);
+        else {
+            // the challenge that asked for this sign-in is answered; then a new connection
+            mcp_auth_clear_challenge(c->auth);
+            pthread_mutex_lock(&g_mu);
+            s->inflight++;
+            pthread_mutex_unlock(&g_mu);
+            char *re = conn_reconnect(c);
+            pthread_mutex_lock(&g_mu);
+            s->inflight--;
+            pthread_mutex_unlock(&g_mu);
+            if (re) message = mfmt("Signed in, but %s", re);
+            free(re);
+        }
+        free(err);
+    }
+    pthread_mutex_lock(&g_mu);
+    SV.active = false;
+    SV.si = NULL;
+    set_str(&SV.server, NULL);
+    set_str(&SV.title, NULL);
+    set_str(&SV.message, NULL);
+    set_str(&SV.url, NULL);
+    if (a->from_command) {
+        // loginCommand: the manager closes, a notice tells how it went
+        if (MV.kind == MCP_VIEW_SIGNIN) MV.kind = MCP_VIEW_NONE;
+        if (G.shutdown) {
+        } else if (message) {
+            notify_l(strcmp(message, "Sign-in cancelled.") ? 2 : 0, message);
+            message = NULL;
+        } else notify_l(0, mfmt("Signed in to MCP server \"%s\" (%zu tools).", a->name, c ? c->tools.len : 0));
+    } else {
+        // runAction: back to the server's menu (a new one), the message under it
+        if (MV.kind == MCP_VIEW_SIGNIN) {
+            MV.kind = MCP_VIEW_SERVER;
+            set_str(&MV.server, strdup(a->name));
+            set_str(&MV.selected, NULL);
+        }
+        if (!G.shutdown && s && server_listed_l(s)) {
+            set_str(&s->message, message);
+            message = NULL;
+        }
+    }
+    view_changed_l();
+    changed_l();
+    pthread_mutex_unlock(&g_mu);
+    free(message);
+    mcp_sign_in_destroy(&a->si);
+    free(a->name);
+    free(a);
+    bg_end();
+    return NULL;
+}
+
+static void start_sign_in_l(Server *s, bool from_command) {
+    if (SV.active) return;
+    SignInArg *a = xcalloc(1, sizeof *a);
+    a->name = strdup(s->name);
+    a->from_command = from_command;
+    mcp_sign_in_init(&a->si);
+    a->si.show_url = si_show_url;
+    a->si.responded = si_responded;
+    SV.active = true;
+    SV.from_command = from_command;
+    SV.si = &a->si;
+    set_str(&SV.server, strdup(s->name));
+    set_str(&SV.title, mfmt("Sign in to %s", s->name));
+    set_str(&SV.message, strdup("Contacting the authorization server\xe2\x80\xa6"));
+    set_str(&SV.url, NULL);
+    MV.kind = MCP_VIEW_SIGNIN;
+    set_str(&MV.server, strdup(s->name));
+    set_str(&MV.selected, NULL);
+    bg_begin_l();
+    if (!spawn_bg_l(signin_main, a)) {
+        SV.active = false;
+        SV.si = NULL;
+        MV.kind = from_command ? MCP_VIEW_NONE : MCP_VIEW_SERVER;
+        mcp_sign_in_destroy(&a->si);
+        free(a->name);
+        free(a);
+    }
+    changed_l();
+}
+
+static void signin_abort_l(void) {
+    if (SV.active && SV.si) SV.si->cancel = 1;
+}
+
+bool code_mcp_signin_screen(char **title, char **message, char **url) {
+    pthread_mutex_lock(&g_mu);
+    bool on = SV.active;
+    *title = on ? term_safe(dupz(SV.title), false) : NULL;
+    *message = on ? dupz(SV.message) : NULL;
+    *url = on ? dupz(SV.url) : NULL;
+    pthread_mutex_unlock(&g_mu);
+    return on;
+}
+
+void code_mcp_signin_cancel(void) {
+    pthread_mutex_lock(&g_mu);
+    if (SV.active && SV.si) {
+        SV.si->cancel = 1;
+        mcp_sign_in_paste(SV.si, NULL);
+    }
+    pthread_mutex_unlock(&g_mu);
+}
+
+void code_mcp_signin_submit(const char *url) {
+    pthread_mutex_lock(&g_mu);
+    if (SV.active && SV.si && url && str_trim(str(url)).len) {
+        mcp_sign_in_paste(SV.si, url);
+        // the prompt resolved: "Connecting…" while the code is exchanged
+        set_str(&SV.url, NULL);
+        set_str(&SV.message, strdup("Connecting\xe2\x80\xa6"));
+        changed_l();
+    }
+    pthread_mutex_unlock(&g_mu);
+}
+
+// ---- turn_start: sign-ins done outside the session (index.ts reconnectSignedIn) ----------------------
+
+bool code_mcp_turn_start(void) {
+    pthread_mutex_lock(&g_mu);
+    VEC(Conn *) signed_in = {0};
+    for (size_t i = 0; G.started && !G.shutdown && i < G.servers.len; i++) {
+        Conn *c = G.servers.ptr[i]->conn;
+        if (!c || !c->auth || !c->tokens_at_sign_in) continue;
+        char *now = mcp_auth_stored_tokens(c->auth);
+        if (strcmp(now, c->tokens_at_sign_in)) {
+            set_str(&c->tokens_at_sign_in, NULL);
+            vec_push(&signed_in, c);
+        }
+        free(now);
+    }
+    pthread_mutex_unlock(&g_mu);
+    for (size_t i = 0; i < signed_in.len; i++) free(conn_reconnect(signed_in.ptr[i]));
+    bool any = signed_in.len > 0;
+    vec_free(&signed_in);
+    return any;
+}
+
+// ---- a folder switch (AgentSessionRuntime.switchSession: session_shutdown, then session_start) --------
+
+void code_mcp_restart(const CodeEnv *env) {
+    pthread_mutex_lock(&g_mu);
+    if (!G.started) {
+        pthread_mutex_unlock(&g_mu);
+        return;
+    }
+    bool enabled = G.enabled, allow_given = G.allow_given;
+    size_t nallow = G.nallow;
+    char **allow = G.allow;
+    G.allow = NULL;
+    G.nallow = 0;
+    G.allow_mcp = false;
+    pthread_mutex_unlock(&g_mu);
+    // the old session's servers close (pi's session_shutdown closes every connection, the global
+    // servers' too, and the new runtime connects them again)
+    code_mcp_shutdown();
+    pthread_mutex_lock(&g_mu);
+    // the old servers, connections and tool registrations stay allocated (a thread that outlived the
+    // shutdown may still hold them) but are no longer listed
+    G.servers.len = 0;
+    for (size_t i = 0; i < G.config_errors.len; i++) free(G.config_errors.ptr[i]);
+    G.config_errors.len = 0;
+    G.regs.len = 0;
+    for (size_t i = 0; i < G.owners.len; i++) free(G.owners.ptr[i]);
+    G.owners.len = 0;
+    set_str(&G.project_config, NULL);
+    set_str(&G.cwd, NULL);
+    set_str(&G.agent_dir, NULL);
+    set_str(&G.log_path, NULL);
+    G.allow_mcp = false;
+    G.nallow = 0;
+    G.startup_left = 0;
+    G.waited_startup = false;
+    G.resources_exposure = NULL;
+    G.started = G.shutdown = false;
+    if (MV.kind != MCP_VIEW_NONE) MV.kind = MCP_VIEW_NONE;
+    changed_l();
+    pthread_mutex_unlock(&g_mu);
+    code_mcp_start(env, enabled, (const char *const *)allow, nallow, allow_given);
+    for (size_t i = 0; i < nallow; i++) free(allow[i]);
+    free(allow);
 }

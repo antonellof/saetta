@@ -1042,6 +1042,7 @@ static Err run_turns(Run *r, JValue **last_out, const char **last_id) {
         if (!first && !turn_started) emit(r, ev_new(a, "turn_start"));
         turn_started = false;
         ui_requests(r);
+        if (code_mcp_turn_start()) mcp_tools(r); // turn_start: MCP sign-ins done elsewhere meanwhile (code_mcp.c)
         JValue *msg;
         TRY(stream_assistant(r, &msg));
         *last_out = msg;
@@ -1241,9 +1242,11 @@ static const char *host_resume(CodeUiHost *h, const char *path, bool stay) {
             return m;
         }
         r->env.cwd = arena_strdup(r->a, cwd);
-        // createRuntime in another folder: its own project trust, then its resources under it
+        // createRuntime in another folder: its own project trust, then its resources under it,
+        // and the MCP servers of that folder (code_mcp.c)
         (void)code_trust_trusted(&r->env);
         code_resources_reload(&r->env);
+        code_mcp_restart(&r->env);
     }
     use_session(r, s);
     session_arena_use(r, sa);
@@ -1518,9 +1521,11 @@ static Err host_open_session(CodeUiHost *h, const char *path, const char *cwd) {
     r->env.session_id = json_str(json_get(code_session_header(s), "id"));
     r->env.session_file = code_session_path(s);
     if (moved) {
-        // createRuntime in another folder: its own project trust, then its resources under it
+        // createRuntime in another folder: its own project trust, then its resources under it,
+        // and the MCP servers of that folder (code_mcp.c)
         (void)code_trust_trusted(&r->env);
         code_resources_reload(&r->env);
+        code_mcp_restart(&r->env);
     }
     // the session's thinking level when it recorded one; else the current level, recorded (as the
     // start of a resumed session does)

@@ -16,6 +16,16 @@ Err control_stop(FILE *out, int *code);
 // Replaces this binary with the latest GitHub release when it is newer than `current`
 // (checksum verified, then an atomic rename over the running binary's path).
 Err control_update(FILE *out, const char *current, int *code);
+// The latest GitHub release (the API's releases/latest), as `saetta update` reads it: the HTTP
+// status, and with 200 the tag without its leading v ("" when absent) and the release notes (the
+// body, "" when absent), in a. timeout_s: the idle timeout. An Err on a transport failure or a
+// reply that does not parse.
+typedef struct {
+    int status;
+    const char *version;
+    const char *notes;
+} ControlRelease;
+Err control_latest_release(Arena *a, double timeout_s, ControlRelease *r);
 
 // std.SemanticVersion: major.minor.patch[-pre][+build].
 typedef struct {

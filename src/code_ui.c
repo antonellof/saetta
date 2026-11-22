@@ -13,6 +13,7 @@
 #include "code_oai.h"
 #include "code_monitor.h"
 #include "code_res_ui.h"
+#include "code_update.h"
 #include "download.h"
 
 #include <ctype.h>
@@ -5238,6 +5239,7 @@ Err code_ui_run(const CodeUiConfig *cfg, const CodeUiOps *ops, CodeUiHost *host,
     screen_start(&ui.scr);
     if (cfg->resumed) render_history();
     code_startup_notices(cfg->resumed); // the changelog notice and the trust warning (code_changelog.c)
+    code_update_check_start(g_wake[1]); // the version check, off the UI thread (code_update.c)
     draw(true);
     if (ninitial) {
         ui.initial = xcalloc(ninitial, sizeof *ui.initial);
@@ -5289,6 +5291,7 @@ Err code_ui_run(const CodeUiConfig *cfg, const CodeUiOps *ops, CodeUiHost *host,
         if (editor_tick(ui.ed)) request_render();
         if (code_monitor_tick()) request_render();
         if (atomic_exchange(&g_git_changed, false)) request_render();
+        if (code_update_check_poll()) request_render();
         download_poll();
         // keys
         if (r > 0 && (fds[0].revents & (POLLIN | POLLHUP))) {
@@ -5432,6 +5435,7 @@ Err code_ui_run(const CodeUiConfig *cfg, const CodeUiOps *ops, CodeUiHost *host,
     if (g_git_started) pthread_join(g_git_th, NULL);
     g_git_started = false;
     atomic_store(&g_git_wake, -1);
+    code_update_check_stop();
     close(g_wake[0]);
     close(g_wake[1]);
     g_wake[0] = g_wake[1] = -1;

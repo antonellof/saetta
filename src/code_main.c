@@ -14,6 +14,7 @@
 #include "code_mcp.h"
 #include "code_oai.h"
 #include "code_res.h"
+#include "code_rpc.h"
 #include "code_sessions.h"
 #include "code_tui.h"
 #include "code_monitor.h"
@@ -71,6 +72,10 @@ typedef struct {
     char *restart_provider, *restart_id; // set by the interactive mode: start again on this model
     CodeAutoCompact ac;   // automatic compaction (code_autocompact.c)
     bool deliver_queued;  // the run continues to deliver queued messages (agent.continue())
+    // the rpc mode (code_rpc.c): the model's answers and the tools run without its lock, in an
+    // arena of their own (the rpc thread uses a only under the lock)
+    bool rpc;
+    Arena *io;
 } Run;
 
 static double wall_ms(void) { return (double)(wall_ns() / 1000000); }
@@ -78,6 +83,10 @@ static double wall_ms(void) { return (double)(wall_ns() / 1000000); }
 // ---- output --------------------------------------------------------------------------------------
 
 static void emit(Run *r, JValue *ev) {
+    if (r->rpc) {
+        code_rpc_event(ev);
+        return;
+    }
     if (r->ui) {
         code_ui_event(ev);
         return;
@@ -139,6 +148,7 @@ static Err parse_args(const char *const *v, size_t n, Args *o) {
                    "\n"
                    "  -p, --print              answer the prompt and exit (text output)\n"
                    "  --mode json              print pi's JSON event stream\n"
+                   "  --mode rpc               pi's rpc protocol: JSON commands on stdin, responses and events on stdout\n"
                    "  -c, --continue           continue the most recent session in this folder\n"
                    "  --session FILE           continue this session file\n"
                    "  --no-session             do not save the session\n"
@@ -164,7 +174,7 @@ static Err parse_args(const char *const *v, size_t n, Args *o) {
             return "UnknownOption";
         } else vec_push(&o->prompts, x);
     }
-    if (o->mode && strcmp(o->mode, "text") && strcmp(o->mode, "json")) return "UnknownMode";
+    if (o->mode && strcmp(o->mode, "text") && strcmp(o->mode, "json") && strcmp(o->mode, "rpc")) return "UnknownMode";
     if (o->thinking) {
         static const char *const levels[] = {"off", "minimal", "low", "medium", "high", "xhigh", "max"};
         bool ok = false;
@@ -442,7 +452,7 @@ static volatile int g_abort;
 
 // pi's message_update, as json mode prints it: usage, and the event without its partial
 // (toolcall_start gains the call's id and name).
-static void on_event(void *ctx, const JValue *event, const JValue *partial) {
+static void on_event_locked(void *ctx, const JValue *event, const JValue *partial) {
     Stream *st = ctx;
     Run *r = st->r;
     Arena *a = r->a;
@@ -495,6 +505,14 @@ static void on_event(void *ctx, const JValue *event, const JValue *partial) {
     emit(r, e);
 }
 
+// The rpc mode: the stream's events arrive while the run has let its lock go (code_rpc.h).
+static void on_event(void *ctx, const JValue *event, const JValue *partial) {
+    Run *r = ((Stream *)ctx)->r;
+    if (r->rpc) code_rpc_lock();
+    on_event_locked(ctx, event, partial);
+    if (r->rpc) code_rpc_unlock();
+}
+
 static const char *level_of(const Run *r) { return r->model.thinking ? r->model.thinking : "off"; }
 
 static Err stream_assistant(Run *r, JValue **out) {
@@ -510,7 +528,14 @@ static Err stream_assistant(Run *r, JValue **out) {
     CodeSink sink = {.on_event = on_event, .ctx = &st};
     r->env.now_ms = wall_ms();
     JValue *msg;
-    Err e = code_oai_complete(a, &r->model, &r->env, buf_str(&body), &sink, &msg);
+    Err e;
+    if (r->rpc) { // the answer streams without the lock, on copies the rpc thread cannot change
+        CodeModel m = r->model;
+        CodeEnv env = r->env;
+        code_rpc_unlock();
+        e = code_oai_complete(r->io, &m, &env, buf_str(&body), &sink, &msg);
+        code_rpc_lock();
+    } else e = code_oai_complete(a, &r->model, &r->env, buf_str(&body), &sink, &msg);
     buf_free(&body);
     TRY(e);
     json_put(a, msg, S("thinkingLevel"), json_string(a, str(level_of(r))));
@@ -599,7 +624,8 @@ static void error_result(Arena *a, const JValue *call, const char *text, JValue 
 // arena (a long command sends one every 100 ms)
 static void on_tool_partial(void *ctx, const JValue *partial) {
     Run *r = ctx;
-    if (!r->call || (!r->ui && !r->json)) return;
+    if (!r->call || (!r->ui && !r->json && !r->rpc)) return;
+    if (r->rpc) code_rpc_lock();
     Arena t = {0};
     JValue *e = ev_new(&t, "tool_execution_update");
     json_put(&t, e, S("toolCallId"), (JValue *)json_get(r->call, "id"));
@@ -608,6 +634,7 @@ static void on_tool_partial(void *ctx, const JValue *partial) {
     json_put(&t, e, S("partialResult"), (JValue *)partial);
     emit(r, e);
     arena_reset(&t);
+    if (r->rpc) code_rpc_unlock();
 }
 
 static void emit_tool_start(Run *r, const JValue *call) {
@@ -676,7 +703,12 @@ static Err run_tools(Run *r, const JValue *assistant, JValue *results) {
         }
         prepare_edit_in_place(a, calls.ptr[i]);
         r->call = calls.ptr[i];
-        err = code_tool_run(a, &r->env, calls.ptr[i], &msgs[i], &raws[i]);
+        if (r->rpc) {
+            CodeEnv env = r->env;
+            code_rpc_unlock();
+            err = code_tool_run(r->io, &env, calls.ptr[i], &msgs[i], &raws[i]);
+            code_rpc_lock();
+        } else err = code_tool_run(a, &r->env, calls.ptr[i], &msgs[i], &raws[i]);
         r->call = NULL;
         if (!err && !json_get(msgs[i], "durationMs")) emit_tool_end(r, calls.ptr[i], msgs[i], raws[i]);
     }
@@ -793,6 +825,15 @@ static Err run_agent(Run *r, bool started);
 static bool finish_agent(Run *r, bool will_retry, const JValue *last, const char *last_id);
 static Err run_turns(Run *r, JValue **last_out, const char **last_id);
 
+// The queued messages (the interactive mode's or the rpc mode's): the next one for the run, NULL
+// when none; more: a further one in the same turn (rpc's queue mode "all").
+static char *take_queued(Run *r, bool steering, bool more) {
+    if (r->rpc) return code_rpc_take_queued(steering, more);
+    return r->ui && !more ? code_ui_take_queued(steering) : NULL;
+}
+
+static volatile int g_retry_waiting; // a retry's backoff is running (the rpc mode's abort_retry)
+
 static void sleep_abortable(int64_t ms) {
     for (int64_t t = 0; t < ms && !g_abort; t += 50) {
         struct timespec ts = {0, 50 * 1000000L};
@@ -830,7 +871,10 @@ static void mcp_tools(Run *r) {
 // The automatic compaction's view of the run (code_autocompact.c).
 static void ac_emit(void *ctx, JValue *ev) { emit(ctx, ev); }
 
-static bool ac_has_queued(void *ctx) { return ((Run *)ctx)->ui && code_ui_has_queued(); }
+static bool ac_has_queued(void *ctx) {
+    Run *r = ctx;
+    return r->rpc ? code_rpc_has_queued() : r->ui && code_ui_has_queued();
+}
 
 static void ac_bind(Run *r) {
     r->ac.a = r->a;
@@ -849,6 +893,7 @@ static Err prompt(Run *r, const char *text) {
     // _prepareRun: compact first when needed (catches aborted responses)
     code_autocompact_before_prompt(&r->ac);
     mcp_tools(r);
+    if (r->rpc) code_rpc_prompt_started(); // the rpc mode's response to the prompt (preflightResult)
     r->new_messages = json_new(a, J_ARRAY);
     emit(r, ev_new(a, "agent_start"));
     emit(r, ev_new(a, "turn_start"));
@@ -871,8 +916,8 @@ static Err run_agent(Run *r, bool started) {
             emit(r, ev_new(a, "agent_start"));
             emit(r, ev_new(a, "turn_start"));
             // agent.continue() after an auto-compaction with messages queued: they start the run
-            char *queued = r->deliver_queued ? code_ui_take_queued(true) : NULL;
-            if (r->deliver_queued && !queued) queued = code_ui_take_queued(false);
+            char *queued = r->deliver_queued ? take_queued(r, true, false) : NULL;
+            if (r->deliver_queued && !queued) queued = take_queued(r, false, false);
             r->deliver_queued = false;
             if (queued) {
                 JValue *user = user_message(a, code_skill_expand(a, &r->env, queued, NULL));
@@ -907,7 +952,11 @@ static Err run_agent(Run *r, bool started) {
             JValue *ea = ev_new(a, "entry_appended");
             json_put(a, ea, S("entry"), (JValue *)code_session_entry_last(r->session));
             emit(r, ea);
+            g_retry_waiting = 1;
+            if (r->rpc) code_rpc_unlock();
             sleep_abortable(delay);
+            if (r->rpc) code_rpc_lock();
+            g_retry_waiting = 0;
             again = !g_abort;
             if (!again) {
                 JValue *end = ev_new(a, "auto_retry_end");
@@ -1013,16 +1062,20 @@ static Err run_turns(Run *r, JValue **last_out, const char **last_id) {
         if (g_abort || str_eqz(stop, "error") || str_eqz(stop, "aborted")) break;
         // the interactive mode's queues (runLoop's getSteeringMessages, then getFollowUpMessages
         // when the run would end): the message joins the run before its next turn
-        char *queued = r->ui ? code_ui_take_queued(true) : NULL;
-        if (!queued && !more && r->ui) queued = code_ui_take_queued(false);
+        bool steering = true;
+        char *queued = take_queued(r, true, false);
+        if (!queued && !more) queued = take_queued(r, steering = false, false);
         if (!more && !queued) break;
         // prepareNextTurn: _compactBeforeNextAssistantResponse
         code_autocompact_before_turn(&r->ac);
         if (queued) {
             emit(r, ev_new(a, "turn_start"));
-            JValue *user = user_message(a, code_skill_expand(a, &r->env, queued, NULL));
-            free(queued);
-            TRY(add_message(r, user));
+            // steering or follow-up mode "all": every queued message joins this turn
+            for (; queued; queued = take_queued(r, steering, true)) {
+                JValue *user = user_message(a, code_skill_expand(a, &r->env, queued, NULL));
+                free(queued);
+                TRY(add_message(r, user));
+            }
             turn_started = true;
             continue;
         }
@@ -1503,6 +1556,92 @@ static const char *self_exe(Arena *a) {
     return _NSGetExecutablePath(self, &sz) == 0 ? arena_strdup(a, self) : NULL;
 }
 
+// ---- the rpc mode's side (code_rpc.c runs the protocol) ---------------------------------------------
+
+static CodeModel *rpc_model(CodeUiHost *h) { return &h->r->model; }
+static CodeEnv *rpc_env(CodeUiHost *h) { return &h->r->env; }
+static Arena *rpc_arena(CodeUiHost *h) { return h->r->a; }
+
+static Err rpc_prompt(CodeUiHost *h, const char *text) {
+    g_abort = 0;
+    return prompt(h->r, text);
+}
+
+// setThinkingLevel's recording: the level set, an entry when it changes from before
+static void rpc_set_thinking(CodeUiHost *h, const char *level, const char *before) {
+    Run *r = h->r;
+    Arena *a = r->a;
+    const char *prev = before ? before : level_of(r);
+    bool changing = strcmp(prev, level) != 0;
+    r->model.thinking = arena_strdup(a, level);
+    r->env.thinking = r->model.thinking;
+    if (!changing) return;
+    JValue *f = json_new(a, J_OBJECT);
+    json_put(a, f, S("thinkingLevel"), json_string(a, str(level)));
+    (void)code_session_append(r->session, "thinking_level_change", f);
+}
+
+// AgentSessionRuntime.newSession: SessionManager.create (inMemory for a session not persisted),
+// newSession({parentSession}), then createRuntime's model and thinking level entries
+static Err rpc_new_session(CodeUiHost *h, const char *parent) {
+    Run *r = h->r;
+    Arena *a = r->a;
+    r->env.now_ms = wall_ms();
+    CodeSession *s;
+    TRY(code_session_open(a, &r->env, false, code_session_path(r->session) == NULL, &s));
+    if (parent) json_put(a, (JValue *)code_session_header(s), S("parentSession"), json_string(a, str(parent)));
+    use_session(r, s);
+    return OK;
+}
+
+// AgentSessionRuntime.switchSession: SessionManager.open(path); a file that does not exist is a
+// new session kept at that path (written at its first message)
+static const char *rpc_switch_session(CodeUiHost *h, const char *path) {
+    Run *r = h->r;
+    char *abs = path[0] == '/' ? arena_strdup(r->a, path) : path_join(r->a, r->env.cwd, path);
+    if (access(abs, F_OK) == 0) return host_resume(h, abs, false);
+    Arena *sa = session_arena_new();
+    r->env.now_ms = wall_ms();
+    CodeSession *fresh, *s;
+    Err e = code_session_open(sa, &r->env, false, true, &fresh);
+    if (!e) e = code_session_from_entries(sa, abs, (JValue *)code_session_entries(fresh), &s);
+    if (e) {
+        session_arena_drop(sa);
+        return arena_printf(r->a, "%s", e);
+    }
+    use_session(r, s);
+    session_arena_use(r, sa);
+    return NULL;
+}
+
+static void rpc_set_auto_retry(CodeUiHost *h, bool enabled) {
+    (void)h;
+    g_retry.enabled = enabled;
+}
+
+static void rpc_abort_retry(CodeUiHost *h) {
+    if (g_retry_waiting) host_abort(h);
+}
+
+static Err rpc_mode(Run *r) {
+    r->rpc = true;
+    r->io = xcalloc(1, sizeof(Arena));
+    r->env.abort = &g_abort;
+    static CodeUiOps ui;
+    ui = (CodeUiOps){host_prompt, host_new_session, host_set_thinking, host_entries, host_messages, host_set_leaf, host_set_model, host_abort,
+                     host_restart, host_reload_models, .session_file = host_session_file, .session_dir = host_session_dir,
+                     .session_cwd = host_session_cwd, .system_prompt = host_system_prompt, .tool_decls = host_tool_decls,
+                     .open_session = host_open_session, .session = host_session, .fork = host_fork, .resume = host_resume,
+                     .compact = host_compact};
+    static CodeRpcOps ops;
+    ops = (CodeRpcOps){.ui = &ui, .model = rpc_model, .env = rpc_env, .arena = rpc_arena, .prompt = rpc_prompt,
+                       .set_thinking = rpc_set_thinking, .new_session = rpc_new_session, .switch_session = rpc_switch_session,
+                       .set_auto_retry = rpc_set_auto_retry, .abort_retry = rpc_abort_retry};
+    static CodeUiHost host;
+    host.r = r;
+    return code_rpc_run(&ops, &host);
+}
+
 static Err interactive(Run *r, const Args *o, const JValue *settings) {
     Arena *a = r->a;
     r->ui = true;
@@ -1865,7 +2004,8 @@ Err code_run(const char *const *args, size_t n, int *code) {
     // piped stdin (readPipedStdin, buildInitialMessage): trimmed, joined to the first prompt with
     // nothing between, and it makes the run a print run
     bool piped = false;
-    if (!isatty(0)) {
+    bool rpc = o.mode && !strcmp(o.mode, "rpc");
+    if (!isatty(0) && !rpc) { // rpc mode reads its commands from stdin
         Buf in = {0};
         char chunk[65536];
         ssize_t got;
@@ -1880,7 +2020,7 @@ Err code_run(const char *const *args, size_t n, int *code) {
         }
         buf_free(&in);
     }
-    bool tty = !o.print && !piped && !r.json && isatty(0) && isatty(1);
+    bool tty = !o.print && !piped && !r.json && !rpc && isatty(0) && isatty(1);
     if (!o.pack) {
         e = find_model(&r, &o, settings);
         // the first run: nothing configured, or a server that does not answer
@@ -1946,6 +2086,11 @@ Err code_run(const char *const *args, size_t n, int *code) {
     r.base_tools = r.tools;
     r.nbase_tools = r.ntools;
     code_mcp_start(&r.env, !o.no_mcp, r.tools, r.ntools, o.tools || o.no_tools);
+    if (rpc) {
+        e = rpc_mode(&r);
+        if (!e) *code = 0;
+        goto done;
+    }
     if (!o.print && !piped && !r.json && isatty(0) && isatty(1)) {
         e = interactive(&r, &o, settings);
         if (!e) *code = 0;

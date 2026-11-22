@@ -58,13 +58,14 @@ saetta code --pack coder                # the same with a chosen pack; Escape st
 saetta code -c                          # continue this folder's last session (pi's too)
 saetta code -p "fix the failing test"   # print mode, as pi -p
 saetta code --mode json -p "..."        # pi's JSON event stream
+saetta code --mode rpc                  # pi's rpc protocol: JSON commands on stdin, events on stdout
 ```
 
 ### Compatible with pi
 
 Saetta Code is a port of the [pi](https://pi.dev) coding agent 1.5.2 (MIT). It has pi's tools (read, bash, edit, write; grep, find and ls with `--tools`), its system prompt, `AGENTS.md` and `CLAUDE.md` context files, skills (and `/skill:name`), prompt files and session files. It reads and writes pi's `settings.json`, `models.json`, `trust.json` and `mcp.json` in `~/.pi/agent`, so the two share one setup, and each continues the other's sessions, compacted ones included.
 
-Its requests and session files match pi's byte for byte on 54 recorded print and JSON scenarios (tool errors, edits, truncation, sessions, compaction, retries, skills), apart from its own system prompt preamble. Its interactive screens are compared with pi's on 61 recorded scenarios. pi's TypeScript extensions and packages are not supported, and there is no image input.
+Its requests and session files match pi's byte for byte on 54 recorded print and JSON scenarios (tool errors, edits, truncation, sessions, compaction, retries, skills), apart from its own system prompt preamble. Its interactive screens are compared with pi's on 61 recorded scenarios, and its rpc mode with pi's, driven by pi's own rpc client, on 12. pi's TypeScript extensions and packages are not supported, and there is no image input.
 
 ### The terminal UI
 

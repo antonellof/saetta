@@ -2527,6 +2527,12 @@ Err code_oai_complete(Arena *a, const CodeModel *m, const CodeEnv *env, Str body
     int rc = sx_http_cancellable("POST", url, h, nh, body.ptr, body.len, 300, on_http, &hc, &status, err, sizeof err, hc.abort);
     if (s->failed) {
         *assistant = code_oai_stream_end(s, NULL);
+    } else if (rc != 0 && hc.ok_status && hc.abort && *hc.abort) {
+        // pi: the OpenAI SDK's stream returns quietly on an AbortError (openai-node Stream: "if
+        // (isAbortError(e)) return"), so the loop's end finishes the open blocks (thinking_end,
+        // text_end, toolcall_end) before "Request was aborted" is thrown
+        for (size_t i = 0; i < s->blocks.len; i++) finish_block(s, s->blocks.ptr[i]);
+        *assistant = code_oai_stream_end(s, "Request was aborted");
     } else if (rc != 0) {
         const char *msg;
         if (hc.ok_status) msg = arena_printf(a, "terminated: %s", err);

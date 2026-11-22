@@ -1492,6 +1492,105 @@ static void tool_bash(Arena *a, const CodeEnv *env, const JValue *args, ToolOut 
     buf_free(&acc.tail);
 }
 
+// The user's own commands (rpc mode's bash, AgentSession.executeBash): pi's
+// createLocalShellOperations().exec (core/tools/bash.ts) without a timeout, the loop of tool_bash.
+int code_tools_exec(Arena *a, const CodeEnv *env, const char *command, void (*on_data)(void *ctx, const void *p, size_t n), void *ctx,
+                    volatile int *abort_flag, bool *aborted, const char **thrown) {
+    *aborted = false;
+    *thrown = NULL;
+    if (access(env->cwd, F_OK)) {
+        *thrown = arena_printf(a, "Working directory does not exist: %s\nCannot execute bash commands.", env->cwd);
+        return 0;
+    }
+    int out[2] = {-1, -1}, err[2] = {-1, -1};
+    pid_t pid = -1;
+    int rc = pipe(out) ? errno : pipe(err) ? errno : 0;
+    if (!rc) {
+        fcntl(out[0], F_SETFD, FD_CLOEXEC);
+        fcntl(err[0], F_SETFD, FD_CLOEXEC);
+        posix_spawn_file_actions_t fa;
+        posix_spawn_file_actions_init(&fa);
+        posix_spawn_file_actions_addopen(&fa, 0, "/dev/null", O_RDONLY, 0);
+        posix_spawn_file_actions_adddup2(&fa, out[1], 1);
+        posix_spawn_file_actions_adddup2(&fa, err[1], 2);
+        posix_spawn_file_actions_addchdir(&fa, env->cwd);
+        posix_spawnattr_t at;
+        posix_spawnattr_init(&at);
+        sigset_t none, all;
+        sigemptyset(&none);
+        sigfillset(&all);
+        posix_spawnattr_setsigmask(&at, &none);
+        posix_spawnattr_setsigdefault(&at, &all);
+        posix_spawnattr_setflags(&at, POSIX_SPAWN_SETSID | POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_CLOEXEC_DEFAULT);
+        const char *sh = shell_path();
+        const char *argv[] = {sh, "-c", command, NULL};
+        rc = posix_spawnp(&pid, sh, &fa, &at, (char *const *)argv, shell_env(a, env));
+        posix_spawn_file_actions_destroy(&fa);
+        posix_spawnattr_destroy(&at);
+    }
+    if (out[1] >= 0) close(out[1]);
+    if (err[1] >= 0) close(err[1]);
+    if (rc) {
+        if (out[0] >= 0) close(out[0]);
+        if (err[0] >= 0) close(err[0]);
+        *thrown = arena_printf(a, "spawn %s %s", shell_path(), errno_code(rc));
+        return 0;
+    }
+    track_group(pid);
+    int st = 0;
+    bool exited = false, killed = false;
+    struct pollfd pf[2] = {{out[0], POLLIN, 0}, {err[0], POLLIN, 0}};
+    int nopen = 2;
+    uint64_t t0 = now_ns();
+    double idle_until = -1;
+    char buf[65536];
+    for (;;) {
+        if (!exited) {
+            pid_t w = waitpid(pid, &st, WNOHANG);
+            if (w == pid) {
+                exited = true;
+                idle_until = ms_since(t0) + 100;
+            }
+        }
+        if (exited && (nopen == 0 || ms_since(t0) >= idle_until)) break;
+        if (abort_flag && *abort_flag && !killed) { // the abort signal: the whole tree killed
+            killed = true;
+            kill_tree(pid);
+        }
+        int n = poll(pf, 2, (int)ABORT_POLL_MS);
+        if (n < 0 && errno != EINTR) break;
+        for (int k = 0; k < 2 && n > 0; k++) {
+            if (pf[k].fd < 0 || !(pf[k].revents & (POLLIN | POLLHUP | POLLERR))) continue;
+            ssize_t r = read(pf[k].fd, buf, sizeof buf);
+            if (r < 0 && (errno == EINTR || errno == EAGAIN)) continue;
+            if (r <= 0) {
+                close(pf[k].fd);
+                pf[k].fd = -1;
+                nopen--;
+                continue;
+            }
+            if (on_data) on_data(ctx, buf, (size_t)r);
+            if (exited) idle_until = ms_since(t0) + 100;
+        }
+    }
+    if (!exited) {
+        kill_tree(pid);
+        reap(pid, &st);
+    }
+    for (int k = 0; k < 2; k++)
+        if (pf[k].fd >= 0) close(pf[k].fd);
+    untrack_group(pid);
+    if (abort_flag && *abort_flag) *aborted = true;
+    return WIFEXITED(st) ? WEXITSTATUS(st) : WIFSIGNALED(st) ? 128 + WTERMSIG(st) : 1;
+}
+
+// truncateTail with the defaults (2000 lines, 50 KB).
+Str code_tools_truncate_tail(Str s, bool *truncated) {
+    Trunc t = truncate_tail(s, MAX_LINES, MAX_BYTES);
+    *truncated = t.truncated;
+    return t.content;
+}
+
 // ---------------------------------------------------------------------------------------
 // line diff (jsdiff 8.0.4 diffLines, structuredPatch, formatPatch)
 // ---------------------------------------------------------------------------------------

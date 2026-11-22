@@ -1487,7 +1487,8 @@ typedef struct {
 static pthread_mutex_t g_git_lock = PTHREAD_MUTEX_INITIALIZER;
 static GitState g_git;
 static _Atomic bool g_git_running, g_git_again, g_git_changed, g_git_quit;
-static char g_git_cwd[4096];
+static char g_git_cwd[4096];  // the git thread's own
+static char g_git_next[4096]; // the folder of the next look (g_git_lock)
 static _Atomic int g_git_wake = -1;
 static pthread_t g_git_th;
 static bool g_git_started;
@@ -1516,71 +1517,89 @@ static bool in_git_repo(const char *cwd) {
 // argv's stdout in the workspace, up to 1 s (the child is stopped after); false if it failed or timed out.
 static bool run_out(const char *const *argv, Buf *out) { return tui_run((char *const *)argv, g_git_cwd, S(""), out, 1000); }
 
+// The read-only calls never run what a repository's own config names: no fsmonitor, hooks,
+// pager, signature check (gpg.program) or submodule walk, whatever .git/config says (the user's
+// global config still applies).
+#define GIT_SAFE "git", "--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-c", \
+                 "core.pager=cat", "-c", "log.showSignature=false", "-c", "status.submoduleSummary=false"
+
 static void *git_main(void *arg) {
     (void)arg;
-    do {
-        atomic_store(&g_git_again, false);
-        GitState g = {0};
-        Buf o = {0};
-        static const char *const st[] = {"git", "--no-optional-locks", "status", "--porcelain=v2", "--branch", NULL};
-        bool repo = in_git_repo(g_git_cwd);
-        bool ran = repo && run_out(st, &o);
-        if (repo && !ran) { // a timeout or a failure: what is known stays
-            buf_free(&o);
-            continue;
-        }
-        if (ran) {
-            g.repo = true;
-            char oid[16] = {0};
-            Str all = buf_str(&o);
-            for (size_t i = 0; i < all.len;) {
-                size_t j = i;
-                while (j < all.len && all.ptr[j] != '\n') j++;
-                Str l = str_sub(all, i, j);
-                i = j + 1;
-                if (str_starts(l, S("# branch.head "))) {
-                    Str h = str_sub(l, 14, l.len);
-                    if (!str_eqz(h, "(detached)")) snprintf(g.branch, sizeof g.branch, "%.*s", (int)h.len, h.ptr);
-                } else if (str_starts(l, S("# branch.oid "))) snprintf(oid, sizeof oid, "%.7s", l.ptr + 13);
-                else if (str_starts(l, S("# branch.ab "))) sscanf(l.ptr + 12, "+%d -%d", &g.ahead, &g.behind);
-                else if (l.len > 3 && (l.ptr[0] == '1' || l.ptr[0] == '2')) {
-                    char x = l.ptr[2], y = l.ptr[3];
-                    if (l.ptr[0] == '2') g.renamed++;
-                    else if (x != '.' && x != 'D') g.staged++;
-                    if (x == 'D' || y == 'D') g.deleted++;
-                    if (y == 'M' || y == 'T') g.modified++;
-                } else if (l.len && l.ptr[0] == 'u') g.conflicted++;
-                else if (l.len && l.ptr[0] == '?') g.untracked++;
+    for (;;) {
+        do {
+            atomic_store(&g_git_again, false);
+            pthread_mutex_lock(&g_git_lock);
+            snprintf(g_git_cwd, sizeof g_git_cwd, "%s", g_git_next);
+            pthread_mutex_unlock(&g_git_lock);
+            GitState g = {0};
+            Buf o = {0};
+            static const char *const st[] = {GIT_SAFE, "status", "--porcelain=v2", "--branch", "--ignore-submodules=all", NULL};
+            // git only in a folder whose project trust holds (code_trust.c): an untrusted folder's
+            // repository is never looked at
+            bool repo = in_git_repo(g_git_cwd) && code_trust_folder(g_git_cwd);
+            bool ran = repo && run_out(st, &o);
+            if (repo && !ran) { // a timeout or a failure: what is known stays
+                buf_free(&o);
+                continue;
             }
-            if (!g.branch[0] && oid[0] && strcmp(oid, "(initial")) snprintf(g.branch, sizeof g.branch, "%s", oid);
-            Buf s2 = {0};
-            static const char *const stash[] = {"git", "--no-optional-locks", "stash", "list", NULL};
-            if (run_out(stash, &s2))
-                for (size_t k = 0; k < s2.len; k++) g.stashed += s2.ptr[k] == '\n';
-            buf_free(&s2);
-        }
-        buf_free(&o);
-        pthread_mutex_lock(&g_git_lock);
-        g_git = g;
-        pthread_mutex_unlock(&g_git_lock);
-        atomic_store(&g_git_changed, true);
-        int wfd = atomic_load(&g_git_wake);
-        if (wfd >= 0) (void)!write(wfd, "g", 1);
-    } while (atomic_load(&g_git_again) && !atomic_load(&g_git_quit));
-    atomic_store(&g_git_running, false);
+            if (ran) {
+                g.repo = true;
+                char oid[16] = {0};
+                Str all = buf_str(&o);
+                for (size_t i = 0; i < all.len;) {
+                    size_t j = i;
+                    while (j < all.len && all.ptr[j] != '\n') j++;
+                    Str l = str_sub(all, i, j);
+                    i = j + 1;
+                    if (str_starts(l, S("# branch.head "))) {
+                        Str h = str_sub(l, 14, l.len);
+                        if (!str_eqz(h, "(detached)")) snprintf(g.branch, sizeof g.branch, "%.*s", (int)h.len, h.ptr);
+                    } else if (str_starts(l, S("# branch.oid "))) snprintf(oid, sizeof oid, "%.7s", l.ptr + 13);
+                    else if (str_starts(l, S("# branch.ab "))) sscanf(l.ptr + 12, "+%d -%d", &g.ahead, &g.behind);
+                    else if (l.len > 3 && (l.ptr[0] == '1' || l.ptr[0] == '2')) {
+                        char x = l.ptr[2], y = l.ptr[3];
+                        if (l.ptr[0] == '2') g.renamed++;
+                        else if (x != '.' && x != 'D') g.staged++;
+                        if (x == 'D' || y == 'D') g.deleted++;
+                        if (y == 'M' || y == 'T') g.modified++;
+                    } else if (l.len && l.ptr[0] == 'u') g.conflicted++;
+                    else if (l.len && l.ptr[0] == '?') g.untracked++;
+                }
+                if (!g.branch[0] && oid[0] && strcmp(oid, "(initial")) snprintf(g.branch, sizeof g.branch, "%s", oid);
+                Buf s2 = {0};
+                static const char *const stash[] = {GIT_SAFE, "stash", "list", NULL};
+                if (run_out(stash, &s2))
+                    for (size_t k = 0; k < s2.len; k++) g.stashed += s2.ptr[k] == '\n';
+                buf_free(&s2);
+            }
+            buf_free(&o);
+            pthread_mutex_lock(&g_git_lock);
+            g_git = g;
+            pthread_mutex_unlock(&g_git_lock);
+            atomic_store(&g_git_changed, true);
+            int wfd = atomic_load(&g_git_wake);
+            if (wfd >= 0) (void)!write(wfd, "g", 1);
+        } while (atomic_load(&g_git_again) && !atomic_load(&g_git_quit));
+        atomic_store(&g_git_running, false);
+        // a refresh asked between the check above and the store: this thread takes it again, unless
+        // a new thread already did (it set running itself)
+        if (!atomic_load(&g_git_again) || atomic_load(&g_git_quit) || atomic_exchange(&g_git_running, true)) break;
+    }
     return NULL;
 }
 
 // Another look at the repository (a refresh asked while one runs is done right after it).
 static void git_refresh(void) {
     if (atomic_load(&g_git_quit)) return;
+    pthread_mutex_lock(&g_git_lock);
+    snprintf(g_git_next, sizeof g_git_next, "%s", U->cfg->cwd);
+    pthread_mutex_unlock(&g_git_lock);
     if (atomic_exchange(&g_git_running, true)) {
         atomic_store(&g_git_again, true);
         return;
     }
     if (g_git_started) pthread_join(g_git_th, NULL); // the last one ended (running was false)
     g_git_started = false;
-    snprintf(g_git_cwd, sizeof g_git_cwd, "%s", U->cfg->cwd);
     atomic_store(&g_git_wake, g_wake[1]);
     if (pthread_create(&g_git_th, NULL, git_main, NULL)) atomic_store(&g_git_running, false);
     else g_git_started = true;
@@ -3173,97 +3192,26 @@ static void apply_theme(const char *name) {
 }
 
 // settings.json with "theme" set (written back as pi writes it: two-space JSON)
-static void json_pretty(Buf *b, const JValue *v, int depth) {
-    if (json_is(v, J_OBJECT) && v->obj.len) {
-        buf_adds(b, "{\n");
-        for (size_t i = 0; i < v->obj.len; i++) {
-            tui_spaces(b, (depth + 1) * 2);
-            JValue key = {.kind = J_STRING, .s = v->obj.items[i].key};
-            json_write(b, &key);
-            buf_adds(b, ": ");
-            json_pretty(b, v->obj.items[i].val, depth + 1);
-            buf_adds(b, i + 1 < v->obj.len ? ",\n" : "\n");
-        }
-        tui_spaces(b, depth * 2);
-        buf_addc(b, '}');
-    } else if (json_is(v, J_ARRAY) && v->arr.len) {
-        buf_adds(b, "[\n");
-        for (size_t i = 0; i < v->arr.len; i++) {
-            tui_spaces(b, (depth + 1) * 2);
-            json_pretty(b, v->arr.items[i], depth + 1);
-            buf_adds(b, i + 1 < v->arr.len ? ",\n" : "\n");
-        }
-        tui_spaces(b, depth * 2);
-        buf_addc(b, ']');
-    } else json_write(b, v);
+static bool put_theme(Arena *a, JValue *root, void *ctx) {
+    json_put(a, root, S("theme"), json_string(a, str((const char *)ctx)));
+    return true;
 }
 
-// pi's settings write: under proper-lockfile's lock (a "settings.json.lock" folder, stale after
-// 10 s), the file read again, the field set, written whole (here through a temporary file and a
-// rename, so a crash never leaves half a file). A file that does not parse is left alone (pi
-// skips saving after a load error).
+// pi's settings write: under proper-lockfile's lock, the file read again, the field set, written
+// whole (code_cfg.c cfg_json_update_ex). A file that does not parse is left alone (pi skips
+// saving after a load error).
 static void save_theme_setting(const char *name) {
-    Arena a = {0};
-    Buf path = {0}, lock = {0}, tmp = {0}, text = {0};
+    Buf path = {0}, why = {0};
     buf_printf(&path, "%s/settings.json", U->cfg->agent_dir);
-    buf_printf(&lock, "%s.lock", path.ptr);
-    buf_printf(&tmp, "%s.tmp-%d", path.ptr, (int)getpid());
-    mkdir(U->cfg->agent_dir, 0755);
-    bool locked = false;
-    for (int i = 0; i < 20 && !locked; i++) {
-        if (mkdir(lock.ptr, 0755) == 0) locked = true;
-        else if (errno == EEXIST) {
-            struct stat st;
-            if (stat(lock.ptr, &st) == 0 && time(NULL) - st.st_mtime > 10) rmdir(lock.ptr); // stale
-            else {
-                struct timespec ts = {0, 25000000};
-                nanosleep(&ts, NULL);
-            }
-        } else break;
-    }
-    const char *problem = NULL;
-    if (!locked) problem = "settings.json is locked by another program; the theme is not saved";
-    else {
-        char *data = NULL;
-        size_t n = 0;
-        JValue *root = NULL;
-        Err re = read_file(path.ptr, 1 << 24, &data, &n);
-        if (re && access(path.ptr, F_OK) == 0) problem = "settings.json could not be read; the theme is not saved";
-        else if (!re) {
-            Str t = str_n(data ? data : "", n);
-            if (str_starts(t, S("\xef\xbb\xbf"))) t = str_sub(t, 3, t.len); // a BOM
-            if (str_trim(t).len && (json_parse(&a, t, true, &root) || !json_is(root, J_OBJECT)))
-                problem = "settings.json does not parse; the theme is not saved (fix the file, then choose it again)";
-        }
-        free(data);
-        if (!problem) {
-            if (!json_is(root, J_OBJECT)) root = json_new(&a, J_OBJECT);
-            json_put(&a, root, S("theme"), json_string(&a, str(name)));
-            json_pretty(&text, root, 0);
-            int fd = open(tmp.ptr, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-            bool ok = fd >= 0;
-            for (size_t off = 0; ok && off < text.len;) {
-                ssize_t w = write(fd, text.ptr + off, text.len - off);
-                if (w < 0 && errno == EINTR) continue;
-                if (w <= 0) ok = false;
-                else off += (size_t)w;
-            }
-            if (ok && fsync(fd)) ok = false;
-            if (fd >= 0 && close(fd)) ok = false;
-            if (ok && rename(tmp.ptr, path.ptr)) ok = false;
-            if (!ok) {
-                unlink(tmp.ptr);
-                problem = "Could not save the theme in settings.json";
-            }
-        }
-        rmdir(lock.ptr);
-    }
-    if (problem) show_warning(problem);
+    CfgUpdateOpts o = {.parse_numbers = true,
+                       .lock_tries = 20,
+                       .locked = "settings.json is locked by another program; the theme is not saved",
+                       .unreadable = "settings.json could not be read; the theme is not saved",
+                       .unparsable = "settings.json does not parse; the theme is not saved (fix the file, then choose it again)",
+                       .unwritable = "Could not save the theme in settings.json"};
+    if (!cfg_json_update_ex(path.ptr, &o, put_theme, (void *)name, &why)) show_warning(why.ptr ? why.ptr : "");
     buf_free(&path);
-    buf_free(&lock);
-    buf_free(&tmp);
-    buf_free(&text);
-    arena_reset(&a);
+    buf_free(&why);
 }
 
 static void open_theme(bool first) {
@@ -5238,7 +5186,12 @@ static const char *cmds_theme(void) { return U->theme ? U->theme : "system"; }
 static const TermColors *cmds_colors(void) { return U->have_colors ? &U->colors : NULL; }
 static int cmds_appearance(void) { return U->have_colors && U->colors.has_bg ? 0 : U->mac_appearance; }
 static void cmds_set_cwd(const char *cwd) {
-    ((CodeUiConfig *)U->cfg)->cwd = strdup(cwd); // the caller's own config; kept to the end
+    // the caller's own config; the copy made here is freed when the next one replaces it
+    static char *owned;
+    char *prev = owned;
+    owned = strdup(cwd);
+    ((CodeUiConfig *)U->cfg)->cwd = owned;
+    free(prev);
     git_refresh();
 }
 

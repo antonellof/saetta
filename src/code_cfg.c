@@ -41,30 +41,118 @@ static const char *base_name(const char *path) {
     const char *s = strrchr(path, '/');
     return s ? s + 1 : path;
 }
-
-// settings-manager.ts FileSettingsStorage.withLock: proper-lockfile's lock, the file read under
-// it, the new text written whole (here through a temporary file and a rename).
-bool cfg_json_update(const char *path, CfgEditFn edit, void *ctx, Buf *why) {
-    Arena a = {0};
-    Buf lock = {0}, tmp = {0}, text = {0};
+// proper-lockfile's lockSync with realpath false: a "<path>.lock" folder, stale after 10 s.
+bool cfg_lock(const char *path, int tries, int sleep_ms) {
+    Buf lock = {0};
     buf_printf(&lock, "%s.lock", path);
-    buf_printf(&tmp, "%s.tmp-%d", path, (int)getpid());
-    const char *name = base_name(path);
     bool locked = false;
-    for (int i = 0; i < 40 && !locked; i++) {
+    for (int i = 0; i < tries && !locked; i++) {
         if (mkdir(lock.ptr, 0755) == 0) locked = true;
         else if (errno == EEXIST) {
             struct stat st;
             if (stat(lock.ptr, &st) == 0 && time(NULL) - st.st_mtime > 10) rmdir(lock.ptr); // stale
             else {
-                struct timespec ts = {0, 25000000};
+                struct timespec ts = {sleep_ms / 1000, (long)(sleep_ms % 1000) * 1000000L};
                 nanosleep(&ts, NULL);
             }
         } else break;
     }
+    buf_free(&lock);
+    return locked;
+}
+
+void cfg_unlock(const char *path) {
+    Buf lock = {0};
+    buf_printf(&lock, "%s.lock", path);
+    rmdir(lock.ptr);
+    buf_free(&lock);
+}
+
+// The file a write to path changes: path, or the file its symbolic links lead to (followed as
+// writeFileSync follows them, a dangling one too), so the link itself stays.
+static char *write_target(const char *path) {
+    char *cur = strdup(path);
+    for (int hops = 0; hops < 40; hops++) {
+        struct stat st;
+        if (lstat(cur, &st) != 0 || !S_ISLNK(st.st_mode)) break;
+        char to[4096];
+        ssize_t n = readlink(cur, to, sizeof to - 1);
+        if (n <= 0) break;
+        to[n] = 0;
+        Buf next = {0};
+        if (to[0] == '/') buf_adds(&next, to);
+        else {
+            const char *sl = strrchr(cur, '/');
+            if (sl) buf_add(&next, cur, (size_t)(sl - cur + 1));
+            buf_adds(&next, to);
+        }
+        free(cur);
+        cur = next.ptr;
+    }
+    return cur;
+}
+
+bool cfg_write_file(const char *path, const void *data, size_t n, Buf *why) {
+    char *target = write_target(path);
+    Buf tmp = {0};
+    buf_printf(&tmp, "%s.tmp-%d", target, (int)getpid());
+    const char *name = base_name(path);
+    int fd = open(tmp.ptr, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    bool ok = fd >= 0;
+    if (fd >= 0) {
+        // the file's mode kept (a models.json holding keys may be private); a new one gets
+        // writeFileSync's 0666 less the umask
+        struct stat st;
+        mode_t um = umask(0);
+        umask(um);
+        fchmod(fd, stat(target, &st) == 0 ? (st.st_mode & 07777) : (0666 & ~um));
+    }
+    const char *p = data;
+    for (size_t off = 0; ok && off < n;) {
+        ssize_t w = write(fd, p + off, n - off);
+        if (w < 0 && errno == EINTR) continue;
+        if (w <= 0) ok = false;
+        else off += (size_t)w;
+    }
+    if (ok && fsync(fd)) ok = false;
+    if (fd >= 0 && close(fd)) ok = false;
+    if (ok && rename(tmp.ptr, target)) ok = false;
+    if (!ok) {
+        int e = errno;
+        unlink(tmp.ptr);
+        if (why) buf_printf(why, "Could not write %s: %s", name, strerror(e));
+        errno = e;
+    }
+    buf_free(&tmp);
+    free(target);
+    return ok;
+}
+
+// settings-manager.ts FileSettingsStorage.withLock: proper-lockfile's lock, the file read under
+// it, the new text written whole (cfg_write_file).
+bool cfg_json_update_ex(const char *path, const CfgUpdateOpts *o, CfgEditFn edit, void *ctx, Buf *why) {
+    static const CfgUpdateOpts defaults = {0};
+    if (!o) o = &defaults;
+    Arena a = {0};
+    Buf text = {0};
+    const char *name = base_name(path);
+    {
+        // the folder made first, as pi's storage does
+        char *dir = strdup(path);
+        char *sl = strrchr(dir, '/');
+        if (sl && sl != dir) {
+            *sl = 0;
+            mkdir(dir, 0755);
+        }
+        free(dir);
+    }
+    bool locked = cfg_lock(path, o->lock_tries ? o->lock_tries : 40, 25);
     bool ok = false;
     if (!locked) {
-        if (why) buf_printf(why, "%s is locked by another program; it is not changed", name);
+        if (why) {
+            if (o->locked) buf_adds(why, o->locked);
+            else buf_printf(why, "%s is locked by another program; it is not changed", name);
+        }
         goto done;
     }
     char *data = NULL;
@@ -72,56 +160,49 @@ bool cfg_json_update(const char *path, CfgEditFn edit, void *ctx, Buf *why) {
     JValue *root = NULL;
     Err re = read_file(path, (size_t)16 << 20, &data, &n);
     if (re && access(path, F_OK) == 0) {
-        if (why) buf_printf(why, "%s could not be read; it is not changed", name);
-        rmdir(lock.ptr);
+        if (why) {
+            if (o->unreadable) buf_adds(why, o->unreadable);
+            else buf_printf(why, "%s could not be read; it is not changed", name);
+        }
+        cfg_unlock(path);
         goto done;
     }
     if (!re) {
         Str t = str_n(data ? data : "", n);
         if (str_starts(t, S("\xef\xbb\xbf"))) t = str_sub(t, 3, t.len); // stripBom
-        if (str_trim(t).len && (json_parse(&a, t, false, &root) || !json_is(root, J_OBJECT))) {
+        if (str_trim(t).len && (json_parse(&a, t, o->parse_numbers, &root) || !json_is(root, J_OBJECT))) {
             free(data);
-            if (why) buf_printf(why, "%s does not parse; it is not changed (fix the file, then try again)", path);
-            rmdir(lock.ptr);
+            if (why) {
+                if (o->unparsable) buf_adds(why, o->unparsable);
+                else buf_printf(why, "%s does not parse; it is not changed (fix the file, then try again)", path);
+            }
+            cfg_unlock(path);
             goto done;
         }
     }
     free(data);
     if (!json_is(root, J_OBJECT)) root = json_new(&a, J_OBJECT);
     if (!edit(&a, root, ctx)) {
-        rmdir(lock.ptr);
+        cfg_unlock(path);
         ok = true;
         goto done;
     }
     cfg_json_pretty(&text, root, 0);
-    int fd = open(tmp.ptr, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
-    ok = fd >= 0;
-    if (fd >= 0) {
-        // keep the file's mode (a models.json holding keys may be private)
-        struct stat st;
-        fchmod(fd, stat(path, &st) == 0 ? (st.st_mode & 07777) : 0644);
+    Buf werr = {0};
+    ok = cfg_write_file(path, text.ptr, text.len, &werr);
+    if (!ok && why) {
+        if (o->unwritable) buf_adds(why, o->unwritable);
+        else buf_addstr(why, buf_str(&werr));
     }
-    for (size_t off = 0; ok && off < text.len;) {
-        ssize_t w = write(fd, text.ptr + off, text.len - off);
-        if (w < 0 && errno == EINTR) continue;
-        if (w <= 0) ok = false;
-        else off += (size_t)w;
-    }
-    if (ok && fsync(fd)) ok = false;
-    if (fd >= 0 && close(fd)) ok = false;
-    if (ok && rename(tmp.ptr, path)) ok = false;
-    if (!ok) {
-        unlink(tmp.ptr);
-        if (why) buf_printf(why, "Could not write %s: %s", name, strerror(errno));
-    }
-    rmdir(lock.ptr);
+    buf_free(&werr);
+    cfg_unlock(path);
 done:
-    buf_free(&lock);
-    buf_free(&tmp);
     buf_free(&text);
     arena_reset(&a);
     return ok;
 }
+
+bool cfg_json_update(const char *path, CfgEditFn edit, void *ctx, Buf *why) { return cfg_json_update_ex(path, NULL, edit, ctx, why); }
 
 // ---- settings.json ----------------------------------------------------------------------------
 

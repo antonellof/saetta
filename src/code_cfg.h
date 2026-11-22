@@ -21,6 +21,25 @@ typedef bool (*CfgEditFn)(Arena *a, JValue *root, void *ctx);
 // be read or does not parse as an object is never written: false, and why says so. Numbers
 // keep their literal text.
 bool cfg_json_update(const char *path, CfgEditFn edit, void *ctx, Buf *why);
+// The same with the caller's choices: numbers parsed (JSON.parse's values, not their literal
+// text), the lock's tries (25 ms apart, default 40), and its own messages for each failure (NULL
+// for the default ones).
+typedef struct {
+    bool parse_numbers;
+    int lock_tries;
+    const char *locked, *unreadable, *unparsable, *unwritable;
+} CfgUpdateOpts;
+bool cfg_json_update_ex(const char *path, const CfgUpdateOpts *o, CfgEditFn edit, void *ctx, Buf *why);
+
+// The lock of every Saetta Code write to pi's files (settings.json, models.json, trust.json):
+// proper-lockfile's "<path>.lock" folder (realpath false), stale after 10 s; tries, sleep_ms apart.
+bool cfg_lock(const char *path, int tries, int sleep_ms);
+void cfg_unlock(const char *path);
+// A whole file replaced as writeFileSync changes it, and never half written: through a
+// temporary file beside the target, fsync'd, renamed over it; a symbolic link is followed (the
+// file it leads to replaced, the link kept); the file's mode kept (a new one 0666 less the umask).
+// false (why says so, errno set) on failure.
+bool cfg_write_file(const char *path, const void *data, size_t n, Buf *why);
 
 // settings.json: defaultProvider and defaultModel set, every other key kept.
 bool cfg_set_default_model(const char *agent_dir, const char *provider, const char *model, Buf *why);

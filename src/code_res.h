@@ -91,9 +91,20 @@ const char *code_skill_expand(Arena *a, const CodeEnv *env, const char *text, co
 bool code_trust_has_project_resources(Arena *a, const char *cwd, const char *home);
 // The session's project trust (main.ts createRuntime and resolveProjectTrusted): --approve /
 // --no-approve, the trust store, settings defaultProjectTrust, and in the interactive mode pi's
-// startup prompt ("Trust project folder?"). Resolved once per session.
+// startup prompt ("Trust project folder?"). Resolved per folder (main.ts projectTrustByCwd):
+// code_trust_trusted for an env->cwd other than the last one resolves that folder's trust
+// (without a prompt) and makes it the current runtime's.
 void code_trust_override(int trusted); // -1 none, 0 --no-approve, 1 --approve
 void code_trust_resolve(const CodeEnv *env, bool interactive);
 bool code_trust_trusted(const CodeEnv *env);
+// Before a restart on another model (exec of saetta code): the current folder's decision handed to
+// the next process for that folder only.
+void code_trust_export_restart(const CodeEnv *env);
+// A session switch into cwd in the interactive mode (switchSession's projectTrustContextFactory):
+// true when its trust needs the question (project resources, no override, nothing decided or
+// stored, defaultProjectTrust "ask"); code_trust_switch_ask asks it in place of the editor, saves
+// and remembers the answer (cancel: untrusted), then calls done(ctx).
+bool code_trust_switch_asks(const char *cwd);
+void code_trust_switch_ask(const char *cwd, void (*done)(void *), void *ctx);
 
 #endif

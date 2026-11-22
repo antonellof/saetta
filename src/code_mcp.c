@@ -9,9 +9,13 @@
 //
 // Threads: every server connects on a thread of its own; a stdio server's output is read by a
 // reader thread per process; a request blocks its caller until the answer, a timeout or an abort.
-// One mutex (g_mu) guards all the state; writes to a server take its own write lock, never g_mu.
+// One mutex (g_mu) guards all the state; a stdio server's input is a queue under it, written
+// without blocking (the sender, then the reader thread when the pipe drains), so no thread waits
+// on a server that stops reading.
 #include "code_mcp.h"
+#include "code_cfg.h"
 #include "code_oai.h"
+#include "code_tui.h"
 #include "hash.h"
 #include "metal/shim.h"
 
@@ -59,6 +63,28 @@ static void set_str(char **slot, char *owned) {
 }
 
 static char *buf_take(Buf *b) { return b->ptr ? b->ptr : strdup(""); }
+
+// Server-provided text made safe for the terminal before the UI shows it (stderr tails, HTTP
+// error bodies, server and tool names, descriptions, notices): escape sequences dropped (as the
+// tool results' text is), then every other C0 control (newlines kept when multiline, tabs kept),
+// DEL and the C1 controls (U+0080..U+009F). Takes s (malloc'd or NULL), returns a malloc'd copy.
+static char *term_safe(char *s, bool multiline) {
+    if (!s) return NULL;
+    Buf t = {0}, o = {0};
+    tui_strip(&t, str(s));
+    for (size_t i = 0; i < t.len; i++) {
+        unsigned char c = (unsigned char)t.ptr[i];
+        if (c == 0xc2 && i + 1 < t.len && (unsigned char)t.ptr[i + 1] >= 0x80 && (unsigned char)t.ptr[i + 1] <= 0x9f) {
+            i++;
+            continue;
+        }
+        if ((c < 0x20 && c != '\t' && !(multiline && c == '\n')) || c == 0x7f) continue;
+        buf_addc(&o, (char)c);
+    }
+    buf_free(&t);
+    free(s);
+    return buf_take(&o);
+}
 
 // JSON.stringify, malloc'd
 static char *js_text(const JValue *v) {
@@ -795,7 +821,11 @@ struct Client {
     // stdio
     pid_t pid;
     int in_fd, out_fd, err_fd;
-    pthread_mutex_t wmu;
+    // what goes to the server's stdin (g_mu): whole lines queued, written without blocking by the
+    // sender and by the reader thread when stdin is writable again; the reader woken by wake_w
+    Buf outq;
+    size_t outq_off;
+    int wake_r, wake_w;
     bool exited;
     Buf errtail;
     // http
@@ -939,8 +969,9 @@ bool code_mcp_ui_tick(void (*notify)(int kind, const char *msg)) {
     G.notices.len = G.notices.cap = 0;
     pthread_mutex_unlock(&g_mu);
     for (size_t i = 0; i < len; i++) {
-        notify(n[i].kind, n[i].msg);
-        free(n[i].msg);
+        char *msg = term_safe(n[i].msg, true);
+        notify(n[i].kind, msg);
+        free(msg);
     }
     free(n);
     uint64_t g = code_mcp_generation();
@@ -1082,7 +1113,9 @@ static void client_ref_l(Client *c) { c->refs++; }
 
 static void client_free(Client *c) {
     if (c->in_fd >= 0) close(c->in_fd);
-    pthread_mutex_destroy(&c->wmu);
+    if (c->wake_r >= 0) close(c->wake_r);
+    if (c->wake_w >= 0) close(c->wake_w);
+    buf_free(&c->outq);
     buf_free(&c->errtail);
     free(c->server);
     free(c->cwd);
@@ -1127,25 +1160,43 @@ static void unlink_pending_l(Client *c, Pending *p) {
 }
 
 static char *http_send(Client *c, const char *json, bool is_request, int64_t id);
+static void http_send_detached(Client *c, const char *json, double idle_s);
 
-// transport.send: one line on the server's stdin (or one POST). Returns NULL or the error.
+enum { MAX_OUTQ_BYTES = 64 * 1024 * 1024 };
+
+// The queued bytes written as far as stdin takes them now (g_mu held): never blocks (stdin is
+// O_NONBLOCK). A write error drops the queue (the reader sees the server go).
+static void outq_flush_l(Client *c) {
+    while (c->outq_off < c->outq.len && c->in_fd >= 0) {
+        ssize_t w = write(c->in_fd, c->outq.ptr + c->outq_off, c->outq.len - c->outq_off);
+        if (w < 0 && errno == EINTR) continue;
+        if (w <= 0) {
+            if (w < 0 && errno != EAGAIN) c->outq_off = c->outq.len;
+            break;
+        }
+        c->outq_off += (size_t)w;
+    }
+    if (c->outq_off == c->outq.len) c->outq.len = c->outq_off = 0;
+}
+
+// transport.send: one line on the server's stdin (or one POST). Returns NULL or the error. A
+// stdio line is queued and written without blocking: what the pipe does not take now the reader
+// thread writes when it can, so neither the agent nor the reader (answering a ping) ever waits on
+// a server that does not read; the request's own timeout and abort still apply.
 static char *client_send(Client *c, const char *json, bool is_request, int64_t id) {
     if (c->http) return http_send(c, json, is_request, id);
-    char *line = mfmt("%s\n", json);
-    pthread_mutex_lock(&c->wmu);
     char *err = NULL;
-    if (c->in_fd < 0) err = strdup("MCP connection closed");
-    for (size_t left = strlen(line), off = 0; !err && left;) {
-        ssize_t w = write(c->in_fd, line + off, left);
-        if (w < 0 && errno == EINTR) continue;
-        if (w < 0) err = mfmt("write %s", errno_code(errno));
-        else {
-            off += (size_t)w;
-            left -= (size_t)w;
-        }
+    size_t n = strlen(json);
+    pthread_mutex_lock(&g_mu);
+    if (c->in_fd < 0 || c->closing) err = strdup("MCP connection closed");
+    else if (c->outq.len - c->outq_off + n + 1 > MAX_OUTQ_BYTES) err = strdup("MCP server is not reading its input");
+    else {
+        buf_add(&c->outq, json, n);
+        buf_addc(&c->outq, '\n');
+        outq_flush_l(c);
+        if (c->outq.len && c->wake_w >= 0) (void)!write(c->wake_w, "", 1);
     }
-    pthread_mutex_unlock(&c->wmu);
-    free(line);
+    pthread_mutex_unlock(&g_mu);
     return err;
 }
 
@@ -1159,7 +1210,9 @@ static void send_cancelled(Client *c, int64_t id, const char *reason) {
     if (reason && *reason) jput(&t, p, "reason", jstr(&t, reason));
     jput(&t, m, "params", p);
     char *s = js_text(m);
-    free(client_send(c, s, false, -1));
+    // never waits: stdio queues it, HTTP posts it in the background with a 2 s idle timeout
+    if (c->http) http_send_detached(c, s, 2);
+    else free(client_send(c, s, false, -1));
     free(s);
     arena_reset(&t);
 }
@@ -1223,7 +1276,8 @@ static void client_message(Client *c, Str line) {
             jput(&t, r, "error", e);
         }
         char *s = js_text(r);
-        free(client_send(c, s, false, -1));
+        if (c->http) http_send_detached(c, s, 0); // not inside the response stream that asked
+        else free(client_send(c, s, false, -1));
         free(s);
         goto done;
     }
@@ -1283,8 +1337,20 @@ static void *reader_main(void *arg) {
     bool out_open = true, err_open = c->err_fd >= 0;
     char *buf = xmalloc(65536);
     while (out_open || err_open) {
-        struct pollfd fds[2];
-        int n = 0, io = -1, ie = -1;
+        struct pollfd fds[4];
+        int n = 0, io = -1, ie = -1, iw = -1, iq = -1;
+        pthread_mutex_lock(&g_mu);
+        bool queued = c->outq.len > 0 && c->in_fd >= 0;
+        int in_fd = c->in_fd;
+        pthread_mutex_unlock(&g_mu);
+        if (c->wake_r >= 0) {
+            iw = n;
+            fds[n++] = (struct pollfd){c->wake_r, POLLIN, 0};
+        }
+        if (queued) {
+            iq = n;
+            fds[n++] = (struct pollfd){in_fd, POLLOUT, 0};
+        }
         if (out_open) {
             io = n;
             fds[n++] = (struct pollfd){c->out_fd, POLLIN, 0};
@@ -1293,10 +1359,19 @@ static void *reader_main(void *arg) {
             ie = n;
             fds[n++] = (struct pollfd){c->err_fd, POLLIN, 0};
         }
-        int r = poll(fds, (nfds_t)n, -1);
+        int r = poll(fds, (nfds_t)n, queued ? 100 : -1);
         if (r < 0) {
             if (errno == EINTR) continue;
             break;
+        }
+        if (iw >= 0 && fds[iw].revents) {
+            char drain[64];
+            while (read(c->wake_r, drain, sizeof drain) > 0) {}
+        }
+        if (iq >= 0 || iw >= 0) {
+            pthread_mutex_lock(&g_mu);
+            outq_flush_l(c);
+            pthread_mutex_unlock(&g_mu);
         }
         if (io >= 0 && fds[io].revents) {
             ssize_t got = read(c->out_fd, buf, 65536);
@@ -1368,6 +1443,16 @@ static char *client_spawn(Client *c, char **argv, char **envp, const char *cwd) 
     fcntl(out[0], F_SETFD, FD_CLOEXEC);
     fcntl(er[0], F_SETFD, FD_CLOEXEC);
     fcntl(in[1], F_SETNOSIGPIPE, 1);
+    fcntl(in[1], F_SETFL, fcntl(in[1], F_GETFL) | O_NONBLOCK); // client_send never blocks
+    int wk[2];
+    if (pipe(wk) == 0) {
+        for (int i = 0; i < 2; i++) {
+            fcntl(wk[i], F_SETFD, FD_CLOEXEC);
+            fcntl(wk[i], F_SETFL, O_NONBLOCK);
+        }
+        c->wake_r = wk[0];
+        c->wake_w = wk[1];
+    }
     posix_spawn_file_actions_t fa;
     posix_spawn_file_actions_init(&fa);
     posix_spawn_file_actions_adddup2(&fa, in[0], 0);
@@ -1433,11 +1518,13 @@ static void client_close(Client *c) {
         return;
     }
     if (c->pid <= 0) return;
-    pthread_mutex_lock(&c->wmu);
+    // stdin closed at once (no write ever holds it: client_send does not block), what was still
+    // queued dropped
+    pthread_mutex_lock(&g_mu);
     if (c->in_fd >= 0) close(c->in_fd);
     c->in_fd = -1;
-    pthread_mutex_unlock(&c->wmu);
-    pthread_mutex_lock(&g_mu);
+    c->outq.len = c->outq_off = 0;
+    if (c->wake_w >= 0) (void)!write(c->wake_w, "", 1);
     uint64_t t0 = now_ns();
     int stage = 0;
     while (!c->exited) {
@@ -1637,6 +1724,7 @@ typedef struct {
     char *json; // the message, NULL for the session's DELETE
     bool is_request;
     int64_t id;
+    double idle_s; // the exchange's idle timeout, 0 for the default (300 s, the DELETE 1 s)
     char ctype[128]; // the response's media type, lowercased
     char *session;
     Buf body; // a JSON or an error body
@@ -1759,7 +1847,8 @@ static char *http_exchange(HttpX *h, int *kind) {
     int status = 0;
     char err[512] = {0};
     volatile int never = 0;
-    int rc = sx_http_ex(h->json ? "POST" : "DELETE", c->url, hs.ptr, hs.len, h->json, h->json ? strlen(h->json) : 0, h->json ? 300 : 1,
+    int rc = sx_http_ex(h->json ? "POST" : "DELETE", c->url, hs.ptr, hs.len, h->json, h->json ? strlen(h->json) : 0,
+                        h->idle_s > 0 ? h->idle_s : h->json ? 300 : 1,
                         http_header, http_data, h, &status, err, sizeof err, h->json ? &c->http_cancel : &never);
     vec_free(&hs);
     char *e = NULL;
@@ -1865,6 +1954,30 @@ static void *http_request_main(void *arg) {
     client_unref(h->c);
     http_free(h);
     return NULL;
+}
+
+static void *http_detached_main(void *arg) {
+    HttpX *h = arg;
+    int kind = 0;
+    free(http_exchange(h, &kind));
+    client_unref(h->c);
+    http_free(h);
+    return NULL;
+}
+
+// A notification or a response POSTed on a thread of its own, its error dropped: the cancellation
+// of an aborted or timed-out request (at most idle_s of silence) and the answers to the server's
+// requests, so neither the agent nor a response stream waits on the POST.
+static void http_send_detached(Client *c, const char *json, double idle_s) {
+    HttpX *h = xcalloc(1, sizeof *h);
+    h->c = c;
+    h->json = dupz(json);
+    h->id = -1;
+    h->idle_s = idle_s;
+    pthread_mutex_lock(&g_mu);
+    client_ref_l(c);
+    pthread_mutex_unlock(&g_mu);
+    spawn_detached(http_detached_main, h);
 }
 
 // A request's POST runs on its own thread (its answer may stream for long; the caller waits with
@@ -1982,9 +2095,9 @@ static Client *connect_once(Conn *conn, char **err, int *kind) {
     c->server = strdup(conn->name);
     c->cwd = cwd;
     c->in_fd = c->out_fd = c->err_fd = -1;
+    c->wake_r = c->wake_w = -1;
     c->next_id = 1;
     c->conn = conn;
-    pthread_mutex_init(&c->wmu, NULL);
     pthread_mutex_lock(&g_mu);
     if (conn->shut) c->closed = true;
     conn->connecting = c;
@@ -2724,8 +2837,9 @@ static char *update_server_config(const char *path, const char *name, int enable
         mkdir_p(dir);
     }
     free(dir);
-    Err we = write_file(path, out.ptr, out.len);
-    if (we) err = mfmt("%s", we);
+    // writeFileSync through the shared writer (code_cfg.c): a symlinked mcp.json stays a link, its
+    // mode kept, never half written
+    if (!cfg_write_file(path, out.ptr, out.len, NULL)) err = mfmt("%s", strerror(errno));
     buf_free(&out);
 done:
     free(text);
@@ -3036,7 +3150,7 @@ char *code_mcp_tool_label(const char *name) {
         const char *sep = strstr(rest + 1, "__");
         if (sep && sep > rest && sep[2]) l = mfmt("%.*s/%s", (int)(sep - rest), rest, sep + 2);
     }
-    return l;
+    return term_safe(l, false);
 }
 
 // ---------------------------------------------------------------------------------------
@@ -4114,6 +4228,13 @@ size_t code_mcp_view_menu(McpMenu *m) {
     pthread_mutex_lock(&g_mu);
     size_t sel = view_resolve_l(m);
     pthread_mutex_unlock(&g_mu);
+    // what the servers sent (names, descriptions, errors, stderr) never reaches the terminal raw
+    char **multi[] = {&m->title, &m->details, &m->error, &m->empty};
+    for (size_t i = 0; i < COUNT(multi); i++) *multi[i] = term_safe(*multi[i], true);
+    for (size_t i = 0; i < m->n; i++) {
+        m->items[i].label = term_safe(m->items[i].label, false);
+        m->items[i].description = term_safe(m->items[i].description, true);
+    }
     return sel;
 }
 

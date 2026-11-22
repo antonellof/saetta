@@ -54,6 +54,7 @@ typedef struct {
     CodeEnv env;
     CodeModel model;
     CodeSession *session;
+    Arena *session_arena; // the arena of a session loaded after the start (/resume, /import), else NULL
     const char **tools;
     size_t ntools;
     const char **base_tools; // the built-in ones (--tools); tools adds the MCP tools (code_mcp.c)
@@ -1093,6 +1094,25 @@ static void use_session(Run *r, CodeSession *s) {
     r->env.thinking = level;
 }
 
+// A session loaded after the start lives in an arena of its own, freed when the next one replaces
+// it (a long session that resumes and imports many keeps one tree in memory, not all of them).
+static Arena *session_arena_new(void) { return xcalloc(1, sizeof(Arena)); }
+
+static void session_arena_drop(Arena *sa) {
+    if (!sa) return;
+    arena_reset(sa);
+    free(sa);
+}
+
+// The session in sa made current; the previous loaded one's arena freed.
+static void session_arena_use(Run *r, Arena *sa) {
+    Arena *old = r->session_arena;
+    r->session_arena = sa;
+    if (old != sa) session_arena_drop(old);
+}
+
+// A fork may share its parent's entries: it stays in the run's arena, and the parent's arena (a
+// loaded session's) is kept until the next /resume or /import replaces them both.
 static const char *host_fork(CodeUiHost *h, const char *entry_id, bool at, char **selected) {
     Run *r = h->r;
     CodeSession *s;
@@ -1106,14 +1126,27 @@ static const char *host_fork(CodeUiHost *h, const char *entry_id, bool at, char 
 static const char *host_resume(CodeUiHost *h, const char *path, bool stay) {
     Run *r = h->r;
     CodeSession *s;
-    Err e = code_session_open_path(r->a, path, &s);
-    if (e) return arena_printf(r->a, "Failed to resume session: %s", e);
+    Arena *sa = session_arena_new();
+    Err e = code_session_open_path(sa, path, &s);
+    if (e) {
+        const char *m = arena_printf(r->a, "Failed to resume session: %s", e);
+        session_arena_drop(sa);
+        return m;
+    }
     const char *cwd = json_str(json_get(code_session_header(s), "cwd"));
     if (!stay && cwd && *cwd && strcmp(cwd, r->env.cwd)) {
-        if (chdir(cwd) != 0) return arena_printf(r->a, "Failed to resume session: %s", strerror(errno));
+        if (chdir(cwd) != 0) {
+            const char *m = arena_printf(r->a, "Failed to resume session: %s", strerror(errno));
+            session_arena_drop(sa);
+            return m;
+        }
         r->env.cwd = arena_strdup(r->a, cwd);
+        // createRuntime in another folder: its own project trust, then its resources under it
+        (void)code_trust_trusted(&r->env);
+        code_resources_reload(&r->env);
     }
     use_session(r, s);
+    session_arena_use(r, sa);
     return NULL;
 }
 
@@ -1272,8 +1305,9 @@ static void restart_on(Run *r) {
         vec_push(&v, "--model");
         vec_push(&v, r->restart_id);
     }
-    // the session's project trust, decided once (pi keeps it per folder across its runtimes)
-    vec_push(&v, code_trust_trusted(&r->env) ? "--approve" : "--no-approve");
+    // the current folder's project trust goes on, for that folder only (never --approve: the
+    // next process resolves every other folder by its own decision, as pi's projectTrustByCwd)
+    code_trust_export_restart(&r->env);
     // the conversation goes on in this session's own file (never "the latest in the folder"); one
     // not written yet (no conversation) starts fresh; --no-session stays as it was
     if (code_session_written(r->session)) {
@@ -1290,12 +1324,18 @@ static void restart_on(Run *r) {
 }
 
 // /model's list after /model added, edited or removed a provider of models.json: built in an arena
-// of its own (the UI thread calls it, maybe while the agent thread uses r->a), never freed, since
-// the UI may still hold the previous list's strings.
+// of its own (the UI thread calls it, maybe while the agent thread uses r->a). Two arenas take
+// turns: the list before stays valid (the UI may still hold its strings until it takes the new
+// one), the one before that is freed.
 static const CodeUiModel *host_reload_models(CodeUiHost *h, size_t *n) {
-    static Arena lists;
+    static Arena lists[2];
+    static int shown = 1; // the arena of the list the UI holds now
+    int next = shown ^ 1;
+    arena_reset(&lists[next]);
     CodeUiModel cur = {0};
-    return list_models(&lists, h->r, n, &cur);
+    const CodeUiModel *m = list_models(&lists[next], h->r, n, &cur);
+    if (m) shown = next;
+    return m;
 }
 
 static void host_abort(CodeUiHost *h) {
@@ -1359,11 +1399,24 @@ static Err host_open_session(CodeUiHost *h, const char *path, const char *cwd) {
     Run *r = h->r;
     Arena *a = r->a;
     CodeSession *s;
-    TRY(code_session_open_path(a, path, &s));
+    Arena *sa = session_arena_new();
+    Err e = code_session_open_path(sa, path, &s);
+    if (e) {
+        e = arena_strdup(a, e);
+        session_arena_drop(sa);
+        return e;
+    }
     r->session = s;
+    session_arena_use(r, sa);
+    bool moved = strcmp(cwd, r->env.cwd) != 0;
     r->env.cwd = arena_strdup(a, cwd);
     r->env.session_id = json_str(json_get(code_session_header(s), "id"));
     r->env.session_file = code_session_path(s);
+    if (moved) {
+        // createRuntime in another folder: its own project trust, then its resources under it
+        (void)code_trust_trusted(&r->env);
+        code_resources_reload(&r->env);
+    }
     // the session's thinking level when it recorded one; else the current level, recorded (as the
     // start of a resumed session does)
     const char *lv = json_str(code_session_last(s, "thinking_level_change", "thinkingLevel"));

@@ -69,7 +69,7 @@
    "name": "Does Saetta support MCP servers?",
    "acceptedAnswer": {
     "@type": "Answer",
-    "text": "Yes. It reads pi's mcp.json (global, or .pi/mcp.json in a trusted project) and connects to stdio and Streamable HTTP servers. Their tools are offered to the model, and /mcp manages the servers. OAuth sign-in is not supported yet."
+    "text": "Yes. It reads pi's mcp.json (global, or .pi/mcp.json in a trusted project) and connects to stdio and Streamable HTTP servers. Their tools are offered to the model, and /mcp manages the servers."
    }
   },
   {
@@ -341,18 +341,14 @@ saetta code --mode json -p "list the TODOs"</pre>
         </div>
       </section>
 
-      <section class="feature" id="not-yet">
+      <section class="feature" id="next">
         <div class="wrap">
-          <h2>What the agent doesn't do yet</h2>
+          <h2>Coming next</h2>
           <div class="nope">
-            <div><h3>Extensions and packages</h3><p>pi's TypeScript extensions and pi packages do not run. Skills, prompt files and <code>AGENTS.md</code> work as in pi.</p></div>
-            <div><h3>RPC and SDK modes</h3><p>There is no RPC mode over stdin and stdout yet, and no SDK to embed the agent. Print and JSON modes are there.</p></div>
-            <div><h3>OAuth for MCP</h3><p>An MCP server that needs an OAuth sign-in cannot connect yet.</p></div>
-            <div><h3>Image input</h3><p>The models it runs read text only, so pasted or attached images are not supported.</p></div>
-            <div><h3>Sub-agents and plan mode</h3><p>Neither is built in, as in pi. pi adds them with extensions, which this agent does not run.</p></div>
-            <div><h3>Other providers</h3><p>It talks to its own engine and to OpenAI-compatible servers. Anthropic, Google and the other APIs pi supports, and their logins, are not available.</p></div>
-            <div><h3>LoRA in process</h3><p>LoRA adapters need the saetta server; <code>saetta start code --lora</code> starts one.</p></div>
-            <div><h3>Engine state on disk</h3><p>A resumed session's prompt is read again by the model. Keeping the engine's state with the session file, and reading prompts while tools run, come next.</p></div>
+            <div><h3>Sessions that resume at once</h3><p>The engine's state saved with each session, so a resumed session does not read its prompt again.</p></div>
+            <div><h3>Prompts read ahead</h3><p>Tool output and your draft read by the model while the tool runs and while you type.</p></div>
+            <div><h3>RPC mode</h3><p>pi's JSON protocol over stdin and stdout, for editors and scripts that drive the agent.</p></div>
+            <div><h3>MCP sign-in</h3><p>OAuth for MCP servers that ask for an account.</p></div>
           </div>
         </div>
       </section>
@@ -561,7 +557,7 @@ logits       max rel err 6.7e-7</pre>
         <div class="faq">
           <details class="qa"><summary>Does Saetta work with my pi sessions and settings?</summary><p>Yes. It reads and writes pi's <code>settings.json</code>, <code>models.json</code>, <code>trust.json</code> and <code>mcp.json</code> in <code>~/.pi/agent</code>, and keeps its session files in the same folder and format as pi 1.5.2, so either one continues a session the other started. It also reads <code>AGENTS.md</code> and <code>CLAUDE.md</code> files, skills and prompt files as pi does. pi's TypeScript extensions are not supported.</p></details>
           <details class="qa"><summary>Can Saetta use a model other than the local one?</summary><p>Yes. By default the model runs inside the agent. It can also use a running Saetta server, or any OpenAI-compatible chat completions server listed in pi's <code>models.json</code>. <code>/model</code> switches between them and adds new ones.</p></details>
-          <details class="qa"><summary>Does Saetta support MCP servers?</summary><p>Yes. It reads pi's <code>mcp.json</code> (global, or <code>.pi/mcp.json</code> in a trusted project) and connects to stdio and Streamable HTTP servers. Their tools are offered to the model, and <code>/mcp</code> manages the servers. OAuth sign-in is not supported yet.</p></details>
+          <details class="qa"><summary>Does Saetta support MCP servers?</summary><p>Yes. It reads pi's <code>mcp.json</code> (global, or <code>.pi/mcp.json</code> in a trusted project) and connects to stdio and Streamable HTTP servers. Their tools are offered to the model, and <code>/mcp</code> manages the servers.</p></details>
           <details class="qa"><summary>Can I use Claude Code with a local model?</summary><p>Yes. <code>saetta start claude</code> runs Claude Code against Saetta's Anthropic-compatible API on your own Mac, without editing your Claude Code configuration. pi and opencode work the same way with <code>saetta start pi</code> and <code>saetta start opencode</code>.</p></details>
           <details class="qa"><summary>Which Mac do I need to run a coding LLM locally?</summary><p>Any Apple Silicon Mac (M1 or later) with 32 GB of memory or more and macOS 27.2. 32 GB runs Qwen3.8-27B in 4-bit, 36 GB the 27B TURBO or Fable-5 coding fine-tunes, 48 GB the Coder390 fine-tune, 96 GB Qwen3.8-Flash-Next Coder and 128 GB the full Flash-Next. Saetta picks the one that fits.</p></details>
           <details class="qa"><summary>Does my code leave my machine?</summary><p>No. The model runs on your Mac, inside the agent or in a server that listens only on 127.0.0.1, so prompts and code stay local. The network is used to download the model weights from Hugging Face, for the agent's update check at start (<code>SAETTA_SKIP_VERSION_CHECK=1</code> turns it off), and for what you ask for: <code>/share</code>, a remote model or an MCP server you configure.</p></details>

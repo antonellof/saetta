@@ -141,6 +141,38 @@ static int check_scenario(const char *golden, const char *name, const char *inst
     free(sess);
     free(req);
     if (!gold_sections || !gold_text.ptr) goto out;
+    // Saetta Code's accepted differences from pi's prompt (tools/code/compare.py applies the same
+    // mapping): its own preamble, and no <docs> section pointing at pi's install
+    static const char pi_pre[] = "You are a coding assistant running inside pi, a coding agent harness. Help users inspect files, run "
+                                 "commands, and modify code.";
+    static const char sc_pre[] = "You are a coding assistant running inside Saetta Code, a coding agent harness. Help users inspect "
+                                 "files, run commands, and modify code.";
+    if (json_is(gold_sections, J_OBJECT)) {
+        size_t k = 0;
+        for (size_t i = 0; i < gold_sections->obj.len; i++) {
+            if (str_eqz(gold_sections->obj.items[i].key, "docs")) continue;
+            if (str_eqz(gold_sections->obj.items[i].key, "preamble") && str_eqz(json_strs(gold_sections->obj.items[i].val), pi_pre))
+                gold_sections->obj.items[i].val = json_string(&a, S(sc_pre));
+            gold_sections->obj.items[k++] = gold_sections->obj.items[i];
+        }
+        gold_sections->obj.len = k;
+    }
+    {
+        Buf t = {0};
+        buf_addstr(&t, gold_text);
+        replace_all(&t, pi_pre, sc_pre);
+        Str ts = buf_str(&t);
+        ptrdiff_t d0 = str_find(ts, S("\n\n<docs>\n"), 0);
+        ptrdiff_t d1 = d0 >= 0 ? str_find(ts, S("\n</docs>"), (size_t)d0) : -1;
+        if (d1 >= 0) {
+            size_t e = (size_t)d1 + 8;
+            memmove(t.ptr + d0, t.ptr + e, t.len - e);
+            t.len -= e - (size_t)d0;
+            t.ptr[t.len] = 0;
+        }
+        gold_text = str(arena_strdup(&a, t.ptr ? t.ptr : ""));
+        buf_free(&t);
+    }
 
     JValue *msg;
     if (code_system_message(&a, &env, tools, ntools, &msg)) goto out;

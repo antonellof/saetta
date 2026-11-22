@@ -11,6 +11,7 @@
 #define SAETTA_CODE_TUI_H
 
 #include "base.h"
+#include "code_tui_theme.h"
 #include "json.h"
 
 // ---- lines (code_tui_util.c) ------------------------------------------------------------------
@@ -52,6 +53,8 @@ void tui_spaces(Buf *b, int n);
 void tui_repeat(Buf *b, const char *s, int n);
 // JavaScript's string length (UTF-16 code units), for pi's estimates.
 size_t tui_js_len(Str s);
+// A code point as UTF-8 (out holds 4 bytes); returns its length.
+int tui_utf8(char *out, uint32_t cp);
 // \s as JavaScript defines it, for one code point.
 bool tui_is_space(uint32_t cp);
 
@@ -82,6 +85,13 @@ void th_italic(Buf *b, Str text);
 void th_underline(Buf *b, Str text);
 void th_inverse(Buf *b, Str text);
 void th_strike(Buf *b, Str text);
+// A panel background (theme.bg), and a line padded to width on it (applyBackgroundToLine).
+void th_bg(Buf *b, ThemeBgToken t, Str text);
+void th_bg_line(Buf *out, ThemeBgToken t, Str line, int width);
+// The theme for the colors the terminal reported (NULL: none); pending: grayscale until they come.
+void theme_set(const TermColors *tc, bool pending);
+// What the terminal reported: 0 no colors, 1 a dark background, 2 a light one.
+int th_appearance(void);
 // The editor border color for a thinking level (getThinkingBorderColor).
 ThemeColor th_thinking_color(const char *level);
 
@@ -91,11 +101,19 @@ typedef struct Comp Comp;
 typedef struct {
     void (*render)(Comp *c, int width, Lines *out);
     void (*destroy)(Comp *c); // frees c
+    bool live; // renders from state kept elsewhere: never cached
 } CompVt;
+// A component keeps its rendered lines until it changes (comp_invalidate) or the width does, as
+// pi's components cache theirs.
 struct Comp {
     const CompVt *vt;
+    Lines cache;
+    int cache_w;
+    bool cached;
 };
-void comp_render(Comp *c, int width, Lines *out);
+void comp_render(Comp *c, int width, Lines *out); // appends copies of the lines
+const Lines *comp_lines(Comp *c, int width);      // the cached lines (valid until the next change)
+void comp_invalidate(Comp *c);
 void comp_free(Comp *c);
 
 // Text(text, paddingX, paddingY): wrapped, padded to the width.
@@ -122,6 +140,8 @@ typedef struct {
     ThemeColor color;
     bool italic;
     bool user; // a user message: list markers and backslash escapes kept as written
+    bool has_bg; // every line on this panel background (bgColor)
+    ThemeBgToken bg;
 } MdStyle;
 // Markdown(text, paddingX, paddingY, theme, defaultStyle)
 void md_render(Str text, int pad_x, int pad_y, const MdStyle *style, int width, Lines *out);
@@ -155,16 +175,39 @@ void sel_down(SelectList *s);
 typedef enum {
     K_NONE, K_CHAR, K_ENTER, K_TAB, K_SHIFT_TAB, K_BACKSPACE, K_DELETE, K_ESC, K_UP, K_DOWN, K_LEFT, K_RIGHT,
     K_HOME, K_END, K_PGUP, K_PGDN, K_CTRL, K_ALT, K_PASTE, K_ALT_LEFT, K_ALT_RIGHT, K_CTRL_LEFT, K_CTRL_RIGHT,
-    K_SHIFT_ENTER, K_ALT_ENTER, K_ALT_BACKSPACE, K_CTRL_BACKSPACE, K_ALT_UP,
+    K_SHIFT_ENTER, K_ALT_ENTER, K_ALT_BACKSPACE, K_CTRL_BACKSPACE, K_ALT_UP, K_CTRL_UP, K_CTRL_DOWN, K_CTRL_HOME,
+    K_CTRL_END,
+    K_MOUSE,       // button (SGR code: 64/65 wheel, bit 5 motion), mx, my (0-based cells), release
+    K_REPLY_KITTY, // the terminal's Kitty keyboard flags (ch)
+    K_REPLY_DA,    // device attributes (the query's sentinel)
+    K_REPLY_COLOR, // an OSC 10/11/4 color reply: ch 10, 11 or 100 + palette index; rgb in button, mx, my (release: unparsable)
 } KeyKind;
 typedef struct {
     KeyKind kind;
     uint32_t ch;   // K_CHAR: the code point; K_CTRL / K_ALT: the letter ('a'..'z', ...)
+    bool shift;    // K_CTRL: with shift (Kitty, modifyOtherKeys)
+    bool kitty_text; // K_CHAR from an unmodified Kitty CSI u (its text copy is dropped)
     char *paste;   // K_PASTE: the pasted text (malloc'd, the caller frees it)
+    int button, mx, my;
+    bool release;
 } Key;
-// Splits what stdin delivered into keys. Returns the bytes consumed; an incomplete sequence at
-// the end stays (unless flush, which takes a lone ESC as the Escape key).
+// One key at p. Returns the bytes consumed, 0 for an incomplete sequence (unless flush: a lone
+// ESC is then the Escape key, any other split sequence is dropped).
 size_t key_parse(const char *p, size_t n, bool flush, Key *out);
+// What stdin delivered, split into keys (pi's StdinBuffer): a bracketed paste of any size, split
+// sequences and split UTF-8 kept until the rest arrives or their timeout (10 ms for a lone ESC,
+// 100 over SSH, PI_TUI_ESC_TIMEOUT; 50 ms for other sequences; terminal replies wait for their end).
+typedef struct {
+    Buf buf;
+    bool paste;
+    Buf paste_buf;
+    uint64_t pending_ns; // when an incomplete sequence was first seen
+    uint32_t last_kitty_cp;
+} KeyIn;
+void keyin_feed(KeyIn *in, const char *p, size_t n);
+bool keyin_next(KeyIn *in, uint64_t now_ns, Key *out);
+int keyin_timeout_ms(const KeyIn *in, uint64_t now_ns); // -1: nothing pending
+void keyin_free(KeyIn *in);
 
 // ---- editor (code_tui_editor.c; pi-tui components/editor.ts with autocomplete.ts) ---------------
 
@@ -185,8 +228,12 @@ void editor_set_rows(Editor *e, int terminal_rows);
 void editor_render(Editor *e, int width, Lines *out);
 // Handles a key. Returns true when the text was submitted (*submitted gets it, malloc'd).
 bool editor_key(Editor *e, const Key *k, char **submitted);
-// Autocomplete timers (debounce): call when idle; returns true if it changed the editor.
+// Autocomplete timers (debounce) and the file lookup running off the UI thread: call on every
+// wake-up; returns true if it changed the editor. editor_busy: a timer or a lookup is pending.
 bool editor_tick(Editor *e);
+bool editor_busy(const Editor *e);
+// The pipe the lookup writes to when it finishes (wakes the UI's poll).
+void editor_set_waker(Editor *e, int fd);
 bool editor_autocomplete_open(const Editor *e);
 Str editor_text(const Editor *e); // the text, lines joined with "\n" (valid until the next edit)
 void editor_set_text(Editor *e, Str text);
@@ -203,13 +250,30 @@ typedef struct {
     int cols, rows;
     Lines prev;    // the frame on screen
     bool started;
+    bool kitty;    // the terminal confirmed the Kitty keyboard protocol
+    int pending_da;
+    // the color query (the theme): replies so far, and done once DA1 or every reply came
+    bool color_query, color_done;
+    uint64_t color_query_ns;
+    TermColors colors;
+    uint32_t palette_got;
 } Screen;
-// The alternate screen with the hardware cursor hidden, raw input, bracketed paste.
+// The alternate screen with the hardware cursor hidden, raw input, bracketed paste, mouse
+// reporting, the Kitty keyboard protocol (modifyOtherKeys when the terminal has none). Crash
+// signals and exit restore the terminal.
 void screen_start(Screen *s);
 void screen_stop(Screen *s);
+// Ctrl+Z: the terminal restored, the process group stopped; returns once continued, the screen
+// started again (the caller redraws it).
+bool screen_suspend(Screen *s);
+// A terminal reply (K_REPLY_KITTY, K_REPLY_DA): the keyboard protocol negotiation.
+void screen_reply(Screen *s, const Key *k);
 void screen_size(Screen *s);
 // Writes frame (rows lines; shorter is padded with blank rows) where it differs from the last one.
+// The frame's lines move into the screen (frame is left empty).
 void screen_draw(Screen *s, Lines *frame, bool force);
+// The terminal back as it was (async-signal-safe), for signal handlers.
+void screen_restore_signal_safe(void);
 
 // ---- interactive mode (code_ui.c) ----------------------------------------------------------------
 
@@ -219,6 +283,11 @@ typedef struct {
     const char *provider, *id, *name;
     bool reasoning;
     uint64_t context_window;
+    // a model pack run in this process (provider "saetta", id the download name)
+    bool pack;
+    bool unavailable;   // a pack not downloaded yet (choosing it offers the download)
+    bool too_big;       // its memory need exceeds this Mac's
+    unsigned disk_gb, min_ram_gb;
 } CodeUiModel;
 typedef struct {
     // Runs one prompt to its end (on the agent thread); events arrive through code_ui_event.
@@ -236,6 +305,10 @@ typedef struct {
     bool (*set_model)(CodeUiHost *h, const char *provider, const char *id);
     // Abort the run in flight (any thread).
     void (*abort)(CodeUiHost *h);
+    // A model this process cannot switch to in place (another pack, or away from the in-process
+    // engine): recorded, and once the UI has ended the program starts again on it, the session
+    // continued. Called from the UI thread with the agent idle.
+    void (*restart)(CodeUiHost *h, const char *provider, const char *id);
 } CodeUiOps;
 typedef struct {
     const char *cwd, *home, *agent_dir;
@@ -248,13 +321,26 @@ typedef struct {
     const char *default_provider, *default_model; // settings.json
     const JValue *settings; // settings.json, or NULL
     bool resumed; // a continued session: its messages are drawn at start
+    const char *version; // saetta's version, for the header
+    bool engine;          // the model runs in this process (a pack)
+    const char *self_exe; // this program, for `saetta download` from /model
 } CodeUiConfig;
 
 // Runs pi's interactive mode until the user quits. initial: prompts given on the command line.
+// "AgentBusy": the run did not stop after the abort; the caller exits the process at once.
 Err code_ui_run(const CodeUiConfig *cfg, const CodeUiOps *ops, CodeUiHost *host, const char *const *initial, size_t ninitial);
 // An agent event (pi's AgentSessionEvent as JSON, json mode's shape; message_update carries the
 // partial message as "message"), from the agent thread.
 void code_ui_event(const JValue *event);
+// A streamed delta of the assistant message in flight (the per-token path: no allocation, lock or
+// system call; the UI thread rebuilds the partial message). index: the content block; a: the text
+// (for UI_S_TOOL_START the call id, b its name).
+typedef enum { UI_S_TEXT_START, UI_S_TEXT, UI_S_THINK_START, UI_S_THINK, UI_S_TOOL_START, UI_S_TOOL_ARGS } CodeUiStreamKind;
+void code_ui_stream(CodeUiStreamKind kind, int index, Str a, Str b);
+// A model (malloc'd provider and id) or a thinking level the user chose while the run went on,
+// for the agent thread to apply at its next turn boundary; false / NULL when none.
+bool code_ui_take_model(char **provider, char **id);
+char *code_ui_take_thinking(void);
 // A message the user queued while the run goes on (malloc'd), or NULL: a steering message only
 // when steering_only (between tool calls), else a follow-up too (when the run would end).
 char *code_ui_take_queued(bool steering_only);

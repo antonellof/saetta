@@ -8,6 +8,9 @@
 
 #include <ctype.h>
 #include <dirent.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdatomic.h>
 #include <spawn.h>
 #include <stdlib.h>
 #include <sys/stat.h>
@@ -47,7 +50,32 @@ struct Editor {
     bool working;
     int frame;
     char *work_msg;
+    // the "@" lookup (fd) on its own thread, after a debounce, a stale one cancelled
+    int waker;
+    uint64_t req_id, debounce_ns;
+    bool req_pending, req_force;
+    struct AcJob *jobs;
 };
+
+// One "@" lookup: what it searches, and its result once done.
+typedef struct AcJob {
+    struct AcJob *next;
+    pthread_t th;
+    uint64_t id;
+    char *cwd, *fd, *prefix;
+    bool quoted;
+    // the editor's state it was made for (a result for another is dropped)
+    char *snap_text;
+    size_t snap_line, snap_col;
+    SelectList list;
+    _Atomic bool done, cancel;
+    _Atomic int pid;
+    int waker;
+} AcJob;
+
+static void ac_cancel(Editor *e);
+static void job_free(AcJob *j);
+static Str before_cursor(const Editor *e);
 
 static char *dupz(const char *s) {
     size_t n = strlen(s);
@@ -61,7 +89,7 @@ static Str line_at(const Editor *e, size_t i) { return buf_str(&e->lines.ptr[i])
 
 static void editor_comp_render(Comp *c, int width, Lines *out) { editor_render((Editor *)c, width, out); }
 static void editor_comp_destroy(Comp *c) { (void)c; } // owned by the interactive mode
-static const CompVt editor_vt = {editor_comp_render, editor_comp_destroy};
+static const CompVt editor_vt = {editor_comp_render, editor_comp_destroy, true};
 
 Comp *editor_comp(Editor *e) { return &e->base; }
 
@@ -91,6 +119,7 @@ Editor *editor_new(const char *cwd, const char *fd_path) {
     e->cwd = dupz(cwd);
     e->fd = fd_path ? dupz(fd_path) : NULL;
     e->hist_idx = -1;
+    e->waker = -1;
     return e;
 }
 
@@ -103,6 +132,12 @@ static void ac_close(Editor *e) {
 
 void editor_free(Editor *e) {
     if (!e) return;
+    ac_cancel(e);
+    while (e->jobs) {
+        AcJob *j = e->jobs;
+        e->jobs = j->next;
+        job_free(j);
+    }
     ac_close(e);
     for (size_t i = 0; i < e->lines.len; i++) buf_free(&e->lines.ptr[i]);
     vec_free(&e->lines);
@@ -625,8 +660,8 @@ typedef struct {
 typedef VEC(Entry) EntryVec;
 
 // fd as pi runs it (walkDirectoryWithFd): paths relative to base, directories ending in "/".
-static void fd_walk(const char *fd, const char *base, Str query, int max_depth, EntryVec *out) {
-    if (!fd) return;
+static void fd_walk(const char *fd, const char *base, Str query, int max_depth, EntryVec *out, AcJob *job) {
+    if (!fd || (job && atomic_load(&job->cancel))) return;
     char depth[16];
     snprintf(depth, sizeof depth, "%d", max_depth);
     // buildFdPathQuery: a regex of the query, path segments joined by [\\/]
@@ -703,6 +738,10 @@ static void fd_walk(const char *fd, const char *base, Str query, int max_depth, 
     int rc = posix_spawnp(&pid, fd, &fa, NULL, (char *const *)argv, environ);
     posix_spawn_file_actions_destroy(&fa);
     close(pfd[1]);
+    if (rc == 0 && job) {
+        atomic_store(&job->pid, pid);
+        if (atomic_load(&job->cancel)) kill(pid, SIGKILL); // cancelled while it started
+    }
     Buf o = {0};
     if (rc == 0) {
         char chunk[8192];
@@ -712,6 +751,8 @@ static void fd_walk(const char *fd, const char *base, Str query, int max_depth, 
     close(pfd[0]);
     int status = 1;
     if (rc == 0) waitpid(pid, &status, 0);
+    if (job) atomic_store(&job->pid, 0);
+    if (job && atomic_load(&job->cancel)) status = 1;
     if (rc == 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0 && o.len) {
         Str s = str_trim(buf_str(&o));
         for (size_t i = 0; i < s.len;) {
@@ -820,9 +861,9 @@ static void completion_value(Buf *b, Str path, bool at, bool quoted) {
 }
 
 // getFuzzyFileSuggestions: the "@" completion through fd.
-static void fuzzy_files(Editor *e, Str query, bool quoted, SelectList *list) {
+static void fuzzy_files(const char *cwd, const char *fdp, AcJob *job, Str query, bool quoted, SelectList *list) {
     // resolveScopedFuzzyQuery: a query with a "/" searches below its folder
-    char *base = e->cwd;
+    char *base = (char *)cwd;
     char *scoped_base = NULL;
     Str display_base = S("");
     Str fq = query;
@@ -837,7 +878,7 @@ static void fuzzy_files(Editor *e, Str query, bool quoted, SelectList *list) {
             buf_addstr(&bd, str_sub(db, 1, db.len));
         } else if (db.ptr[0] == '/') buf_addstr(&bd, db);
         else {
-            buf_adds(&bd, e->cwd);
+            buf_adds(&bd, cwd);
             buf_addc(&bd, '/');
             buf_addstr(&bd, db);
         }
@@ -849,8 +890,8 @@ static void fuzzy_files(Editor *e, Str query, bool quoted, SelectList *list) {
         } else buf_free(&bd);
     }
     EntryVec all = {0}, rec = {0};
-    fd_walk(e->fd, base, fq, 1, &all);
-    fd_walk(e->fd, base, fq, 0, &rec);
+    fd_walk(fdp, base, fq, 1, &all, job);
+    fd_walk(fdp, base, fq, 0, &rec, job);
     for (size_t i = 0; i < rec.len; i++) {
         bool seen = false;
         for (size_t k = 0; k < all.len && !seen; k++) seen = !strcmp(all.ptr[k].path, rec.ptr[i].path);
@@ -1039,7 +1080,7 @@ static char *suggestions(Editor *e, bool force, SelectList *list) {
             raw = str_sub(ap, 2, ap.len);
             quoted = true;
         } else raw = str_sub(ap, 1, ap.len);
-        fuzzy_files(e, raw, quoted, list);
+        fuzzy_files(e->cwd, e->fd, NULL, raw, quoted, list);
         if (!list->n) return NULL;
         return strndup(ap.ptr, ap.len);
     }
@@ -1095,7 +1136,25 @@ static char *suggestions(Editor *e, bool force, SelectList *list) {
     return strndup(pp.ptr, pp.len);
 }
 
+static void ac_show(Editor *e, SelectList list, char *prefix, bool force);
+
+// The "@" completion (pi's async provider): after ATTACHMENT_AUTOCOMPLETE_DEBOUNCE_MS (20 ms; at
+// once when forced), fd runs on its own thread; a newer request cancels it (its fd is killed).
+static bool request_at(Editor *e, bool force) {
+    Str before = before_cursor(e);
+    Str ap;
+    if (!at_prefix(before, &ap)) return false;
+    ac_cancel(e);
+    e->req_id++;
+    e->req_pending = true;
+    e->req_force = force;
+    e->debounce_ns = now_ns() + (force ? 0 : 20000000ull);
+    return true;
+}
+
 static void request_ac(Editor *e, bool force) {
+    if (request_at(e, force)) return;
+    ac_cancel(e);
     SelectList list;
     bool slash = false;
     {
@@ -1108,6 +1167,10 @@ static void request_ac(Editor *e, bool force) {
     }
     sel_init(&list, 5, slash ? 12 : 32, 32);
     char *prefix = suggestions(e, force, &list);
+    ac_show(e, list, prefix, force);
+}
+
+static void ac_show(Editor *e, SelectList list, char *prefix, bool force) {
     ac_close(e);
     if (!prefix) {
         sel_free(&list);
@@ -1703,7 +1766,94 @@ bool editor_key(Editor *e, const Key *k, char **submitted) {
     }
 }
 
+static void *ac_worker(void *arg) {
+    AcJob *j = arg;
+    sel_init(&j->list, 5, 32, 32);
+    Str ap = str(j->prefix), raw;
+    if (str_starts(ap, S("@\""))) raw = str_sub(ap, 2, ap.len);
+    else raw = str_sub(ap, 1, ap.len);
+    fuzzy_files(j->cwd, j->fd, j, raw, j->quoted, &j->list);
+    atomic_store(&j->done, true);
+    if (j->waker >= 0) (void)!write(j->waker, "a", 1);
+    return NULL;
+}
+
+static void job_free(AcJob *j) {
+    pthread_join(j->th, NULL);
+    sel_free(&j->list);
+    free(j->cwd);
+    free(j->fd);
+    free(j->prefix);
+    free(j->snap_text);
+    free(j);
+}
+
+// Stops the lookups in flight (their results will be dropped) and the debounce.
+static void ac_cancel(Editor *e) {
+    e->req_pending = false;
+    for (AcJob *j = e->jobs; j; j = j->next) {
+        atomic_store(&j->cancel, true);
+        int pid = atomic_load(&j->pid);
+        if (pid > 0) kill(pid, SIGKILL);
+    }
+}
+
+bool editor_busy(const Editor *e) { return e->req_pending || e->jobs; }
+
+void editor_set_waker(Editor *e, int fd) { e->waker = fd; }
+
 bool editor_tick(Editor *e) {
-    (void)e;
-    return false;
+    bool changed = false;
+    if (e->req_pending && now_ns() >= e->debounce_ns) {
+        e->req_pending = false;
+        Str ap;
+        if (at_prefix(before_cursor(e), &ap)) {
+            AcJob *j = xcalloc(1, sizeof *j);
+            j->id = e->req_id;
+            j->cwd = dupz(e->cwd);
+            j->fd = e->fd ? dupz(e->fd) : NULL;
+            j->prefix = strndup(ap.ptr, ap.len);
+            j->quoted = str_starts(ap, S("@\""));
+            Str t = editor_text(e);
+            j->snap_text = strndup(t.ptr, t.len);
+            j->snap_line = e->cl;
+            j->snap_col = e->cc;
+            j->waker = e->waker;
+            if (pthread_create(&j->th, NULL, ac_worker, j)) {
+                free(j->cwd);
+                free(j->fd);
+                free(j->prefix);
+                free(j->snap_text);
+                free(j);
+            } else {
+                j->next = e->jobs;
+                e->jobs = j;
+            }
+        }
+    }
+    for (AcJob **pp = &e->jobs; *pp;) {
+        AcJob *j = *pp;
+        if (!atomic_load(&j->done)) {
+            pp = &j->next;
+            continue;
+        }
+        *pp = j->next;
+        Str now_text = editor_text(e);
+        bool current = !atomic_load(&j->cancel) && j->id == e->req_id && e->cl == j->snap_line && e->cc == j->snap_col &&
+                       str_eqz(now_text, j->snap_text);
+        if (current) {
+            SelectList list = j->list;
+            j->list = (SelectList){0};
+            char *prefix = list.n ? strdup(j->prefix) : NULL;
+            if (e->req_force && list.n == 1) { // Tab with a single match applies it
+                ac_close(e);
+                apply_completion(e, &list.items[0], prefix);
+                sel_free(&list);
+                free(prefix);
+            } else ac_show(e, list, prefix, e->req_force);
+            changed = true;
+        }
+        job_free(j);
+    }
+    return changed;
 }

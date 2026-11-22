@@ -1137,8 +1137,8 @@ Err code_system_message(Arena *a, const CodeEnv *env, const char *const *tools, 
         put_section(a, sections, "preamble", str_n(custom, custom_len));
     } else {
         put_section(a, sections, "preamble",
-                    S("You are a coding assistant running inside pi, a coding agent harness. Help users inspect files, "
-                      "run commands, and modify code."));
+                    S("You are a coding assistant running inside Saetta Code, a coding agent harness. Help users inspect "
+                      "files, run commands, and modify code."));
         size_t listed = 0;
         for (size_t i = 0; i < ntools; i++) {
             const ToolPrompt *tp = tool_prompt(tools[i]);
@@ -1153,29 +1153,7 @@ Err code_system_message(Arena *a, const CodeEnv *env, const char *const *tools, 
         build_rules(&b, tools, ntools);
         put_section(a, sections, "rules", buf_str(&b));
         b.len = 0;
-        if (env->pi_docs) {
-            const char *d = path_resolve(a, cwd, env->pi_docs);
-            buf_printf(&b,
-                       "Pi documentation (read only when the user asks about the harness itself, its SDK, extensions, "
-                       "themes, skills, or TUI):\n"
-                       "- Main documentation: %s\n"
-                       "- Additional docs: %s\n"
-                       "- Examples: %s (extensions, custom tools, SDK)\n",
-                       pjoin(a, d, "README.md"), pjoin(a, d, "docs"), pjoin(a, d, "examples"));
-            buf_adds(&b,
-                     "- When reading pi docs or examples, resolve docs/... under Additional docs and examples/... under "
-                     "Examples, not the current working directory\n"
-                     "- When asked about: extensions (docs/extensions.md, examples/extensions/), themes (docs/themes.md), "
-                     "skills (docs/skills.md), prompt templates (docs/prompt-templates.md), TUI components (docs/tui.md), "
-                     "keybindings (docs/keybindings.md), SDK integrations (docs/sdk.md), custom providers "
-                     "(docs/custom-provider.md), adding models (docs/models.md), packages (docs/packages.md), environment "
-                     "variables (docs/environment-variables.md), MCP servers (docs/mcp.md), codemode scripts and non-LLM "
-                     "models such as classifiers and image models (docs/codemode.md)\n"
-                     "- Before implementing harness changes, read the relevant docs and examples in full, following "
-                     "related cross-references.");
-            put_section(a, sections, "docs", buf_str(&b));
-            b.len = 0;
-        }
+        // no <docs> section: pi's points at pi's own install (Saetta Code is its own product)
     }
     if (append.len) put_section(a, sections, "addendum", buf_str(&append));
     if (ctx.len) {

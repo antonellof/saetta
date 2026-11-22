@@ -5,6 +5,7 @@
 // sliceWithWidth, AnsiCodeTracker), components/text.ts, spacer.ts, select-list.ts, and
 // packages/coding-agent/src/modes/interactive/theme/ (theme.ts, system-theme.ts indexedColors).
 #include "code_tui.h"
+#include "code_tui_theme.h"
 #include "unicode.h"
 
 #include <stdlib.h>
@@ -203,6 +204,30 @@ size_t tui_js_len(Str s) {
         n += cp >= 0x10000 ? 2 : 1;
     }
     return n;
+}
+
+int tui_utf8(char *out, uint32_t cp) {
+    if (cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff)) cp = 0xfffd;
+    if (cp < 0x80) {
+        out[0] = (char)cp;
+        return 1;
+    }
+    if (cp < 0x800) {
+        out[0] = (char)(0xc0 | cp >> 6);
+        out[1] = (char)(0x80 | (cp & 0x3f));
+        return 2;
+    }
+    if (cp < 0x10000) {
+        out[0] = (char)(0xe0 | cp >> 12);
+        out[1] = (char)(0x80 | ((cp >> 6) & 0x3f));
+        out[2] = (char)(0x80 | (cp & 0x3f));
+        return 3;
+    }
+    out[0] = (char)(0xf0 | cp >> 18);
+    out[1] = (char)(0x80 | ((cp >> 12) & 0x3f));
+    out[2] = (char)(0x80 | ((cp >> 6) & 0x3f));
+    out[3] = (char)(0x80 | (cp & 0x3f));
+    return 4;
 }
 
 bool tui_is_space(uint32_t cp) { return unicode_space(cp) || cp == 0xfeff; }
@@ -740,39 +765,69 @@ void tui_slice(Buf *out, Str line, int start, int len, bool strict) {
 
 // ---- theme ----------------------------------------------------------------------------------------
 
-// pi's system theme when the terminal reports no colors (system-theme.ts indexedColors): each
-// token is its family's ANSI palette slot; neutral tokens are the terminal's default color,
-// faint (SGR 2) unless they are body text; panels have no background.
-static const int theme_slot[T_COUNT] = {
-    [T_ACCENT] = 5, [T_BORDER] = 4, [T_BORDER_ACCENT] = 5, [T_BORDER_MUTED] = -1, [T_SUCCESS] = 2, [T_ERROR] = 1,
-    [T_WARNING] = 3, [T_MUTED] = -1, [T_DIM] = -1, [T_TEXT] = 0, [T_THINKING_TEXT] = -1, [T_USER_TEXT] = 0,
-    [T_TOOL_TITLE] = 0, [T_TOOL_OUTPUT] = -1, [T_MD_HEADING] = 3, [T_MD_LINK] = 4, [T_MD_LINK_URL] = -1, [T_MD_CODE] = 5,
-    [T_MD_CODE_BLOCK] = 2, [T_MD_CODE_BLOCK_BORDER] = -1, [T_MD_QUOTE] = -1, [T_MD_QUOTE_BORDER] = -1, [T_MD_HR] = -1,
-    [T_MD_LIST_BULLET] = 5, [T_DIFF_ADDED] = 2, [T_DIFF_REMOVED] = 1, [T_DIFF_CONTEXT] = -1, [T_SYN_COMMENT] = -1,
-    [T_SYN_KEYWORD] = 4, [T_SYN_FUNCTION] = 3, [T_SYN_VARIABLE] = 6, [T_SYN_STRING] = 2, [T_SYN_NUMBER] = 5,
-    [T_SYN_TYPE] = 5, [T_SYN_OPERATOR] = -1, [T_SYN_PUNCTUATION] = -1, [T_THINK_OFF] = -1, [T_THINK_MINIMAL] = 4,
-    [T_THINK_LOW] = 4, [T_THINK_MEDIUM] = 6, [T_THINK_HIGH] = 5, [T_THINK_XHIGH] = 13, [T_THINK_MAX] = 1,
-    [T_BASH_MODE] = 2, [T_CUSTOM_LABEL] = 5, [T_CUSTOM_TEXT] = -1, [T_SCROLL_TRACK] = -1, [T_SCROLL_THUMB] = -1,
-    [T_SEARCH_TEXT] = -1,
+// pi's system theme (code_tui_theme.c): generated from the colors the terminal reports, the
+// indexed palette tier when it reports none; grayscale while the reply is pending.
+static const ThemeFg theme_map[T_COUNT] = {
+    [T_ACCENT] = TH_FG_ACCENT, [T_BORDER] = TH_FG_BORDER, [T_BORDER_ACCENT] = TH_FG_BORDER_ACCENT,
+    [T_BORDER_MUTED] = TH_FG_BORDER_MUTED, [T_SUCCESS] = TH_FG_SUCCESS, [T_ERROR] = TH_FG_ERROR, [T_WARNING] = TH_FG_WARNING,
+    [T_MUTED] = TH_FG_MUTED, [T_DIM] = TH_FG_DIM, [T_TEXT] = TH_FG_TEXT, [T_THINKING_TEXT] = TH_FG_THINKING_TEXT,
+    [T_USER_TEXT] = TH_FG_USER_MESSAGE_TEXT, [T_TOOL_TITLE] = TH_FG_TOOL_TITLE, [T_TOOL_OUTPUT] = TH_FG_TOOL_OUTPUT,
+    [T_MD_HEADING] = TH_FG_MD_HEADING, [T_MD_LINK] = TH_FG_MD_LINK, [T_MD_LINK_URL] = TH_FG_MD_LINK_URL,
+    [T_MD_CODE] = TH_FG_MD_CODE, [T_MD_CODE_BLOCK] = TH_FG_MD_CODE_BLOCK, [T_MD_CODE_BLOCK_BORDER] = TH_FG_MD_CODE_BLOCK_BORDER,
+    [T_MD_QUOTE] = TH_FG_MD_QUOTE, [T_MD_QUOTE_BORDER] = TH_FG_MD_QUOTE_BORDER, [T_MD_HR] = TH_FG_MD_HR,
+    [T_MD_LIST_BULLET] = TH_FG_MD_LIST_BULLET, [T_DIFF_ADDED] = TH_FG_TOOL_DIFF_ADDED, [T_DIFF_REMOVED] = TH_FG_TOOL_DIFF_REMOVED,
+    [T_DIFF_CONTEXT] = TH_FG_TOOL_DIFF_CONTEXT, [T_SYN_COMMENT] = TH_FG_SYNTAX_COMMENT, [T_SYN_KEYWORD] = TH_FG_SYNTAX_KEYWORD,
+    [T_SYN_FUNCTION] = TH_FG_SYNTAX_FUNCTION, [T_SYN_VARIABLE] = TH_FG_SYNTAX_VARIABLE, [T_SYN_STRING] = TH_FG_SYNTAX_STRING,
+    [T_SYN_NUMBER] = TH_FG_SYNTAX_NUMBER, [T_SYN_TYPE] = TH_FG_SYNTAX_TYPE, [T_SYN_OPERATOR] = TH_FG_SYNTAX_OPERATOR,
+    [T_SYN_PUNCTUATION] = TH_FG_SYNTAX_PUNCTUATION, [T_THINK_OFF] = TH_FG_THINKING_OFF, [T_THINK_MINIMAL] = TH_FG_THINKING_MINIMAL,
+    [T_THINK_LOW] = TH_FG_THINKING_LOW, [T_THINK_MEDIUM] = TH_FG_THINKING_MEDIUM, [T_THINK_HIGH] = TH_FG_THINKING_HIGH,
+    [T_THINK_XHIGH] = TH_FG_THINKING_XHIGH, [T_THINK_MAX] = TH_FG_THINKING_MAX, [T_BASH_MODE] = TH_FG_BASH_MODE,
+    [T_CUSTOM_LABEL] = TH_FG_CUSTOM_MESSAGE_LABEL, [T_CUSTOM_TEXT] = TH_FG_CUSTOM_MESSAGE_TEXT,
+    [T_SCROLL_TRACK] = TH_FG_SCROLLBAR_TRACK, [T_SCROLL_THUMB] = TH_FG_SCROLLBAR_THUMB, [T_SEARCH_TEXT] = TH_FG_SEARCH_MATCH_TEXT,
 };
-// slot 0 above marks the body text tokens (terminal default, not faint); -1 the faint neutral ones
 
-static char theme_open_buf[T_COUNT][24];
+static ThemeSgr g_fg[THEME_NFG], g_bg[THEME_NBG];
+static bool g_theme_ready;
+int g_th_appearance; // 0 the terminal reported no colors, 1 dark, 2 light
+
+void theme_set(const TermColors *tc, bool pending) {
+    bool light = false;
+    theme_system_ex(tc, theme_color_mode(), pending, g_fg, g_bg, NULL, NULL, &light);
+    g_theme_ready = true;
+    g_th_appearance = tc && tc->has_bg && !pending ? (light ? 2 : 1) : 0;
+}
+
+static void theme_init(void) {
+    if (!g_theme_ready) theme_set(NULL, false);
+}
+
+int th_appearance(void) { return g_th_appearance; }
 
 const char *th_open(ThemeColor c) {
-    if (!theme_open_buf[c][0]) {
-        int s = theme_slot[c];
-        if (s > 0) snprintf(theme_open_buf[c], sizeof theme_open_buf[c], "\x1b[38;5;%dm", s);
-        else if (s == 0) snprintf(theme_open_buf[c], sizeof theme_open_buf[c], "\x1b[39m");
-        else snprintf(theme_open_buf[c], sizeof theme_open_buf[c], "\x1b[39m\x1b[2m");
-    }
-    return theme_open_buf[c];
+    theme_init();
+    return g_fg[theme_map[c]].open;
 }
 
 void th_fg(Buf *b, ThemeColor c, Str text) {
-    buf_adds(b, th_open(c));
+    theme_init();
+    buf_adds(b, g_fg[theme_map[c]].open);
     buf_addstr(b, text);
-    buf_adds(b, theme_slot[c] < 0 ? "\x1b[22;39m" : "\x1b[39m");
+    buf_adds(b, g_fg[theme_map[c]].close);
+}
+
+void th_bg(Buf *b, ThemeBgToken t, Str text) {
+    theme_init();
+    buf_adds(b, g_bg[t].open);
+    buf_addstr(b, text);
+    buf_adds(b, g_bg[t].close);
+}
+
+void th_bg_line(Buf *out, ThemeBgToken t, Str line, int width) {
+    Buf p = {0};
+    buf_addstr(&p, line);
+    tui_spaces(&p, width - tui_width(line));
+    th_bg(out, t, buf_str(&p));
+    buf_free(&p);
 }
 
 void th_fgz(Buf *b, ThemeColor c, const char *text) { th_fg(b, c, str(text)); }
@@ -820,10 +875,38 @@ ThemeColor th_thinking_color(const char *level) {
 
 // ---- basic components -----------------------------------------------------------------------------
 
-void comp_render(Comp *c, int width, Lines *out) { c->vt->render(c, width, out); }
+const Lines *comp_lines(Comp *c, int width) {
+    if (c->vt->live) {
+        lines_free(&c->cache);
+        c->vt->render(c, width, &c->cache);
+        return &c->cache;
+    }
+    if (!c->cached || c->cache_w != width) {
+        lines_free(&c->cache);
+        c->vt->render(c, width, &c->cache);
+        c->cache_w = width;
+        c->cached = true;
+    }
+    return &c->cache;
+}
+
+void comp_render(Comp *c, int width, Lines *out) {
+    if (c->vt->live) {
+        c->vt->render(c, width, out);
+        return;
+    }
+    const Lines *l = comp_lines(c, width);
+    for (size_t i = 0; i < l->n; i++) lines_addz(out, l->v[i]);
+}
+
+void comp_invalidate(Comp *c) {
+    if (c) c->cached = false;
+}
 
 void comp_free(Comp *c) {
-    if (c) c->vt->destroy(c);
+    if (!c) return;
+    lines_free(&c->cache);
+    c->vt->destroy(c);
 }
 
 typedef struct {
@@ -871,7 +954,7 @@ static void text_destroy(Comp *c) {
     free(c);
 }
 
-static const CompVt text_vt = {text_render, text_destroy};
+static const CompVt text_vt = {text_render, text_destroy, false};
 
 Comp *comp_text(Str text, int pad_x, int pad_y) {
     TextComp *t = xcalloc(1, sizeof *t);
@@ -886,6 +969,7 @@ void comp_text_set(Comp *c, Str text) {
     TextComp *t = (TextComp *)c;
     t->text.len = 0;
     buf_addstr(&t->text, text);
+    comp_invalidate(c);
 }
 
 typedef struct {
@@ -899,7 +983,7 @@ static void spacer_render(Comp *c, int width, Lines *out) {
 
 static void plain_destroy(Comp *c) { free(c); }
 
-static const CompVt spacer_vt = {spacer_render, plain_destroy};
+static const CompVt spacer_vt = {spacer_render, plain_destroy, false};
 
 Comp *comp_spacer(int n) {
     SpacerComp *s = xcalloc(1, sizeof *s);
@@ -924,7 +1008,7 @@ static void container_destroy(Comp *c) {
     free(c);
 }
 
-static const CompVt container_vt = {container_render, container_destroy};
+static const CompVt container_vt = {container_render, container_destroy, true};
 
 Comp *comp_container(void) {
     ContainerComp *k = xcalloc(1, sizeof *k);
@@ -956,7 +1040,7 @@ static void trunc_render(Comp *c, int width, Lines *out) {
     lines_addb(out, &l);
 }
 
-static const CompVt trunc_vt = {trunc_render, text_destroy};
+static const CompVt trunc_vt = {trunc_render, text_destroy, false};
 
 Comp *comp_truncated(Str text, int pad_x) {
     TextComp *t = xcalloc(1, sizeof *t);
@@ -977,7 +1061,7 @@ static void fn_render(Comp *c, int width, Lines *out) {
     f->fn(f->ctx, width, out);
 }
 
-static const CompVt fn_vt = {fn_render, plain_destroy};
+static const CompVt fn_vt = {fn_render, plain_destroy, true};
 
 Comp *comp_fn(void (*render)(void *ctx, int width, Lines *out), void *ctx) {
     FnComp *f = xcalloc(1, sizeof *f);

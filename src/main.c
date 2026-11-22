@@ -764,6 +764,7 @@ static Err run(Arena *arena, int argc, char **argv) {
 static void sigpipe_noop(int sig) { (void)sig; }
 
 int main(int argc, char **argv) {
+    code_version = SAETTA_VERSION;
     // a closed pipe or socket makes write return EPIPE instead of killing the process. A
     // handler, not SIG_IGN: handlers reset on exec, so spawned agents and tools get the
     // default SIGPIPE (Zig's std installs a no-op handler the same way)

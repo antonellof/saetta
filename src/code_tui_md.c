@@ -7,6 +7,9 @@
 // (highlightCode, the highlight.js scopes and their theme colors). The highlighter is a small
 // lexer per language family, not highlight.js: it gives the scopes highlight.js gives for
 // keywords, literals, built-ins, strings, numbers, comments and function signatures.
+// The block and inline rules follow marked (MIT, Copyright (c) 2018+, MarkedJS; Copyright (c)
+// 2011-2018, Christopher Jeffrey). The keyword, literal and built-in lists of the highlighter follow
+// highlight.js 10.7.3's language definitions (BSD-3-Clause, Copyright (c) 2006, Ivan Sagalaev).
 #include "code_tui.h"
 
 #include <ctype.h>
@@ -103,9 +106,21 @@ static uint32_t cp_at(Str s, size_t i) {
 
 static void lex_inline(Arena *a, Str s, InlineVec *out);
 
+// Nesting is bounded (emphasis in links in emphasis..., quotes in lists in quotes...): past these
+// depths the rest is plain text, so deep input cannot exhaust the stack.
+#define MAX_INLINE_DEPTH 24
+#define MAX_BLOCK_DEPTH 32
+static int g_inline_depth, g_block_depth;
+
 static Inline *inline_list(Arena *a, Str s, size_t *n) {
     InlineVec v = {0};
-    lex_inline(a, s, &v);
+    if (g_inline_depth >= MAX_INLINE_DEPTH) {
+        if (s.len) vec_push(&v, ((Inline){.kind = IN_TEXT, .raw = s, .text = s}));
+    } else {
+        g_inline_depth++;
+        lex_inline(a, s, &v);
+        g_inline_depth--;
+    }
     Inline *arr = arena_alloc(a, (v.len + 1) * sizeof *arr);
     memcpy(arr, v.ptr, v.len * sizeof *arr);
     *n = v.len;
@@ -146,8 +161,42 @@ static bool right_flanking(Str s, size_t i, size_t n) {
     return true;
 }
 
+// What one lex_inline call learned about its text, so an unmatched delimiter does not make every
+// later one scan to the end again (the searches below are each linear; with these, the whole lexer
+// stays near linear): the first position from which a search was seen to fail.
+#define MEMO_RUNS 33
+typedef struct {
+    size_t code_fail[MEMO_RUNS]; // a closing backtick run of this length
+    size_t em_fail[2][4];        // a closing '*' / '_' run of this size
+    size_t del_fail;             // a closing "~~"
+    size_t *bracket;             // the matching ']' of each '[' (SIZE_MAX: none)
+} Memo;
+
+static void memo_init(Memo *m) {
+    for (int i = 0; i < MEMO_RUNS; i++) m->code_fail[i] = SIZE_MAX;
+    for (int i = 0; i < 2; i++)
+        for (int k = 0; k < 4; k++) m->em_fail[i][k] = SIZE_MAX;
+    m->del_fail = SIZE_MAX;
+    m->bracket = NULL;
+}
+
+// The closing backtick run of length r for a code span whose content starts at from, or -1.
+static long code_close(Str s, size_t from, size_t r, Memo *m) {
+    if (r < MEMO_RUNS && from >= m->code_fail[r]) return -1;
+    size_t j = from;
+    while (j < s.len) {
+        if (s.ptr[j] == '`') {
+            size_t r2 = run_len(s, j, '`');
+            if (r2 == r) return (long)j;
+            j += r2;
+        } else j++;
+    }
+    if (r < MEMO_RUNS && from < m->code_fail[r]) m->code_fail[r] = from;
+    return -1;
+}
+
 // The closing run for an emphasis opened at i with n delimiters (n = 1 or 2), or -1.
-static long find_close(Str s, size_t from, char c, size_t n) {
+static long find_close(Str s, size_t from, char c, size_t n, Memo *m) {
     size_t i = from;
     while (i < s.len) {
         char ch = s.ptr[i];
@@ -158,20 +207,8 @@ static long find_close(Str s, size_t from, char c, size_t n) {
         if (ch == '`') {
             size_t r = run_len(s, i, '`');
             // skip a code span
-            size_t j = i + r;
-            bool found = false;
-            while (j < s.len) {
-                if (s.ptr[j] == '`') {
-                    size_t r2 = run_len(s, j, '`');
-                    if (r2 == r) {
-                        i = j + r2;
-                        found = true;
-                        break;
-                    }
-                    j += r2;
-                } else j++;
-            }
-            if (!found) i += r;
+            long cl = code_close(s, i + r, r, m);
+            i = cl >= 0 ? (size_t)cl + r : i + r;
             continue;
         }
         if (ch == c) {
@@ -192,8 +229,36 @@ static long find_close(Str s, size_t from, char c, size_t n) {
 
 static bool scheme_char(char c) { return isalnum((unsigned char)c) || c == '+' || c == '.' || c == '-'; }
 
+// The matching ']' of every '[' (escapes and code spans skipped), in one pass.
+static void match_brackets(Arena *a, Str s, Memo *m) {
+    m->bracket = arena_alloc(a, (s.len + 1) * sizeof *m->bracket);
+    VEC(size_t) stack = {0};
+    for (size_t j = 0; j < s.len; j++) {
+        m->bracket[j] = SIZE_MAX;
+        char ch = s.ptr[j];
+        if (ch == '\\') {
+            if (j + 1 < s.len) m->bracket[j + 1] = SIZE_MAX;
+            j++;
+            continue;
+        }
+        if (ch == '`') {
+            size_t r = run_len(s, j, '`');
+            long cl = code_close(s, j + r, r, m);
+            size_t end = cl >= 0 ? (size_t)cl + r : j + r;
+            for (size_t q = j + 1; q < end && q < s.len; q++) m->bracket[q] = SIZE_MAX;
+            j = end - 1;
+            continue;
+        }
+        if (ch == '[') vec_push(&stack, j);
+        else if (ch == ']' && stack.len) m->bracket[stack.ptr[--stack.len]] = j;
+    }
+    vec_free(&stack);
+}
+
 static void lex_inline(Arena *a, Str s, InlineVec *out) {
     size_t i = 0, text_start = 0;
+    Memo memo, *mm = &memo;
+    memo_init(mm);
 #define FLUSH_TEXT()                                                       \
     do {                                                                   \
         if (i > text_start) push_text(a, out, str_sub(s, text_start, i)); \
@@ -228,18 +293,7 @@ static void lex_inline(Arena *a, Str s, InlineVec *out) {
         // code span
         if (c == '`') {
             size_t r = run_len(s, i, '`');
-            size_t j = i + r;
-            long close = -1;
-            while (j < s.len) {
-                if (s.ptr[j] == '`') {
-                    size_t r2 = run_len(s, j, '`');
-                    if (r2 == r) {
-                        close = (long)j;
-                        break;
-                    }
-                    j += r2;
-                } else j++;
-            }
+            long close = code_close(s, i + r, r, mm);
             if (close >= 0) {
                 FLUSH_TEXT();
                 Str inner = str_sub(s, i + r, (size_t)close);
@@ -294,27 +348,8 @@ static void lex_inline(Arena *a, Str s, InlineVec *out) {
         // link and image: [label](href "title")
         if (c == '[' || (c == '!' && i + 1 < s.len && s.ptr[i + 1] == '[')) {
             size_t lb = c == '!' ? i + 1 : i;
-            int depth = 0;
-            size_t j = lb;
-            long rb = -1;
-            for (; j < s.len; j++) {
-                if (s.ptr[j] == '\\') {
-                    j++;
-                    continue;
-                }
-                if (s.ptr[j] == '`') {
-                    size_t r = run_len(s, j, '`');
-                    size_t k = j + r;
-                    while (k < s.len && !(s.ptr[k] == '`' && run_len(s, k, '`') == r)) k++;
-                    if (k < s.len) j = k + r - 1;
-                    continue;
-                }
-                if (s.ptr[j] == '[') depth++;
-                else if (s.ptr[j] == ']' && --depth == 0) {
-                    rb = (long)j;
-                    break;
-                }
-            }
+            if (!mm->bracket) match_brackets(a, s, mm);
+            long rb = mm->bracket[lb] == SIZE_MAX ? -1 : (long)mm->bracket[lb];
             if (rb >= 0 && (size_t)rb + 1 < s.len && s.ptr[rb + 1] == '(') {
                 size_t k = (size_t)rb + 2;
                 while (k < s.len && (s.ptr[k] == ' ' || s.ptr[k] == '\t')) k++;
@@ -395,6 +430,8 @@ static void lex_inline(Arena *a, Str s, InlineVec *out) {
         if (c == '~' && i + 2 < s.len && s.ptr[i + 1] == '~' && s.ptr[i + 2] != '~' && !isspace((unsigned char)s.ptr[i + 2])) {
             size_t j = i + 2;
             long close = -1;
+            if (j >= mm->del_fail) j = s.len; // known: no closing "~~" from here
+            size_t from = j;
             while (j + 1 < s.len) {
                 if (s.ptr[j] == '\\') {
                     j += 2;
@@ -407,6 +444,7 @@ static void lex_inline(Arena *a, Str s, InlineVec *out) {
                 }
                 j++;
             }
+            if (close < 0 && from < mm->del_fail) mm->del_fail = from;
             if (close >= 0) {
                 FLUSH_TEXT();
                 Str inner = str_sub(s, i + 2, (size_t)close);
@@ -431,9 +469,14 @@ static void lex_inline(Arena *a, Str s, InlineVec *out) {
                     long close = -1;
                     // search a closing run of at least `use`
                     size_t j = i + use;
+                    size_t *fail = &mm->em_fail[c == '*' ? 0 : 1][use];
+                    if (j >= *fail) j = s.len;
                     while (j < s.len) {
-                        long cpos = find_close(s, j, c, use == 3 ? 2 : use);
-                        if (cpos < 0) break;
+                        long cpos = find_close(s, j, c, use == 3 ? 2 : use, mm);
+                        if (cpos < 0) {
+                            if (j < *fail) *fail = j;
+                            break;
+                        }
                         size_t cr = run_len(s, (size_t)cpos, c);
                         if (cr >= use) {
                             close = cpos;
@@ -629,6 +672,20 @@ static bool interrupts(Str l) {
 
 static Block mk(BKind k, Str raw) { return (Block){.kind = k, .raw = raw}; }
 
+// The blocks inside a quote or a list item; past MAX_BLOCK_DEPTH one paragraph of the text.
+static void nested_blocks(Arena *a, Str text, BlockVec *kids) {
+    if (g_block_depth >= MAX_BLOCK_DEPTH) {
+        Block b = mk(B_PARAGRAPH, text);
+        b.text = text;
+        b.in = inline_list(a, text, &b.nin);
+        vec_push(kids, b);
+        return;
+    }
+    g_block_depth++;
+    lex_blocks(a, text, kids, false);
+    g_block_depth--;
+}
+
 static void lex_list(Arena *a, Str s, size_t *pos, BlockVec *out) {
     size_t start = *pos;
     bool ordered;
@@ -718,7 +775,7 @@ static void lex_list(Arena *a, Str s, size_t *pos, BlockVec *out) {
             text = str_sub(text, text.len > 3 ? 4 : 3, text.len);
         }
         BlockVec kids = {0};
-        lex_blocks(a, text, &kids, false);
+        nested_blocks(a, text, &kids);
         // a blank line between two blocks of the item makes the list loose
         if (item_blank) {
             for (size_t k = 0; k + 1 < kids.len; k++)
@@ -908,7 +965,7 @@ static void lex_blocks(Arena *a, Str s, BlockVec *out, bool top) {
                 Block b = mk(B_QUOTE, str_sub(s, pos, p));
                 Str text = str_n(arena_strndup(a, body.ptr ? body.ptr : "", body.len), body.len);
                 BlockVec kids = {0};
-                lex_blocks(a, text, &kids, false);
+                nested_blocks(a, text, &kids);
                 b.kids = arena_alloc(a, (kids.len + 1) * sizeof(Block));
                 memcpy(b.kids, kids.ptr, kids.len * sizeof(Block));
                 b.nkids = kids.len;
@@ -1608,6 +1665,7 @@ void md_render(Str text, int pad_x, int pad_y, const MdStyle *style, int width, 
             .indent = "  "};
     Ctx c;
     ctx_init(&c, ST_DEFAULT, style && (style->has_color || style->italic) ? style : NULL);
+    size_t first = out->n;
     for (int k = 0; k < pad_y; k++) {
         Buf e = {0};
         tui_spaces(&e, width);
@@ -1636,6 +1694,14 @@ void md_render(Str text, int pad_x, int pad_y, const MdStyle *style, int width, 
         tui_spaces(&e, width);
         lines_addb(out, &e);
     }
+    // the panel's background (bgColor) on every line, padding rows included
+    if (style && style->has_bg)
+        for (size_t k = first; k < out->n; k++) {
+            Buf l = {0};
+            th_bg_line(&l, style->bg, str(out->v[k]), width);
+            free(out->v[k]);
+            out->v[k] = l.ptr ? l.ptr : strdup("");
+        }
     vec_free(&blocks);
     arena_reset(&a);
     buf_free(&norm);
@@ -1658,7 +1724,7 @@ static void mdc_destroy(Comp *c) {
     free(c);
 }
 
-static const CompVt md_vt = {mdc_render, mdc_destroy};
+static const CompVt md_vt = {mdc_render, mdc_destroy, false};
 
 Comp *comp_markdown(Str text, int pad_x, int pad_y, const MdStyle *style) {
     MdComp *m = xcalloc(1, sizeof *m);

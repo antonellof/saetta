@@ -9,54 +9,110 @@
 // grep, find, ls), core/tools/render-utils.ts, components/diff.ts and visual-truncate.ts,
 // core/compaction/compaction.ts (the context estimate the footer shows).
 #include "code_tui.h"
+#include "code_oai.h"
+#include "download.h"
 
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <math.h>
 #include <poll.h>
+#include <spawn.h>
+#include <sys/wait.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdlib.h>
+#include <time.h>
+#include <sys/mount.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
-// ---- the event queue (agent thread -> UI thread) -----------------------------------------------
+// ---- the event ring (agent thread -> UI thread) ------------------------------------------------
+//
+// One producer (the agent thread) and one consumer (the UI thread). The per-token path (the
+// streamed deltas from the decode thread) copies its text into a preallocated byte ring and writes
+// one fixed-size record: no allocation, no lock, no system call, except the single write that
+// wakes the UI thread when it sleeps (at most once per UI wake-up, never per token). The event
+// JSON is built on the UI thread. The rare events (message start and end, tool events, the end of
+// a run) carry their JSON in a heap string.
 
-typedef struct QItem {
-    char *json;
-    bool update; // a message_update: a newer one replaces it
-    struct QItem *next;
-} QItem;
+typedef enum { R_JSON, R_STREAM } RecKind;
+typedef struct {
+    uint8_t kind;
+    uint8_t skind; // CodeUiStreamKind
+    int32_t index;
+    uint64_t off;  // into the byte ring (monotonic)
+    uint32_t len, len2;
+    char *json;    // R_JSON
+    bool update;
+} Rec;
 
-static pthread_mutex_t g_qlock = PTHREAD_MUTEX_INITIALIZER;
-static QItem *g_qhead, *g_qtail;
+#define RING_RECS 16384u
+#define RING_BYTES (8u << 20)
+static Rec g_recs[RING_RECS];
+static char *g_bytes;
+static _Atomic uint64_t g_rhead, g_rtail, g_bhead, g_btail;
+static _Atomic int g_ui_sleeping;
 static int g_wake[2] = {-1, -1};
+static pthread_t g_ui_thread;
+static bool g_queue_dirty; // the UI thread took a queued message itself
 
-static void q_push(char *json, bool update) {
-    pthread_mutex_lock(&g_qlock);
-    if (update && g_qtail && g_qtail->update) {
-        free(g_qtail->json);
-        g_qtail->json = json;
-    } else {
-        QItem *it = xcalloc(1, sizeof *it);
-        it->json = json;
-        it->update = update;
-        if (g_qtail) g_qtail->next = it;
-        else g_qhead = it;
-        g_qtail = it;
+static void ring_init(void) {
+    if (!g_bytes) g_bytes = xmalloc(RING_BYTES);
+    atomic_store(&g_rhead, 0);
+    atomic_store(&g_rtail, 0);
+    atomic_store(&g_bhead, 0);
+    atomic_store(&g_btail, 0);
+}
+
+static void ring_wake(void) {
+    if (atomic_exchange(&g_ui_sleeping, 0) && g_wake[1] >= 0) (void)!write(g_wake[1], "x", 1);
+}
+
+static void ring_copy_in(uint64_t at, const char *p, size_t n) {
+    size_t o = (size_t)(at % RING_BYTES), first = MIN(n, RING_BYTES - o);
+    memcpy(g_bytes + o, p, first);
+    if (n > first) memcpy(g_bytes, p + first, n - first);
+}
+
+static void ring_copy_out(uint64_t at, size_t n, Buf *out) {
+    size_t o = (size_t)(at % RING_BYTES), first = MIN(n, RING_BYTES - o);
+    buf_add(out, g_bytes + o, first);
+    if (n > first) buf_add(out, g_bytes, n - first);
+}
+
+static void ring_push(Rec r, Str a, Str b) {
+    if (!g_bytes) return;
+    // a single delta never exceeds a quarter of the ring (it is cut, which no real stream reaches)
+    a.len = MIN(a.len, RING_BYTES / 4);
+    b.len = MIN(b.len, RING_BYTES / 4);
+    size_t need = a.len + b.len;
+    // backpressure: the UI thread drains on every wake-up; wait for room (never on the normal path)
+    for (;;) {
+        uint64_t rh = atomic_load_explicit(&g_rhead, memory_order_relaxed), rt = atomic_load_explicit(&g_rtail, memory_order_acquire);
+        uint64_t bh = atomic_load_explicit(&g_bhead, memory_order_relaxed), bt = atomic_load_explicit(&g_btail, memory_order_acquire);
+        if (rh - rt < RING_RECS && bh + need - bt <= RING_BYTES) break;
+        ring_wake();
+        struct timespec ts = {0, 1000000};
+        nanosleep(&ts, NULL);
     }
-    pthread_mutex_unlock(&g_qlock);
-    if (g_wake[1] >= 0) (void)!write(g_wake[1], "x", 1);
+    uint64_t bh = atomic_load_explicit(&g_bhead, memory_order_relaxed);
+    ring_copy_in(bh, a.ptr, a.len);
+    ring_copy_in(bh + a.len, b.ptr, b.len);
+    r.off = bh;
+    r.len = (uint32_t)a.len;
+    r.len2 = (uint32_t)b.len;
+    atomic_store_explicit(&g_bhead, bh + need, memory_order_relaxed);
+    uint64_t rh = atomic_load_explicit(&g_rhead, memory_order_relaxed);
+    g_recs[rh % RING_RECS] = r;
+    atomic_store_explicit(&g_rhead, rh + 1, memory_order_release);
+    ring_wake();
 }
 
-static QItem *q_take_all(void) {
-    pthread_mutex_lock(&g_qlock);
-    QItem *h = g_qhead;
-    g_qhead = g_qtail = NULL;
-    pthread_mutex_unlock(&g_qlock);
-    return h;
-}
+void code_ui_stream(CodeUiStreamKind kind, int index, Str a, Str b) { ring_push((Rec){.kind = R_STREAM, .skind = (uint8_t)kind, .index = index}, a, b); }
+
+static void q_push(char *json, bool update) { ring_push((Rec){.kind = R_JSON, .json = json, .update = update}, S(""), S("")); }
 
 void code_ui_event(const JValue *event) {
     Buf b = {0};
@@ -65,7 +121,49 @@ void code_ui_event(const JValue *event) {
     q_push(b.ptr ? b.ptr : strdup("{}"), t && !strcmp(t, "message_update"));
 }
 
-static void q_post(const char *json) { q_push(strdup(json), false); }
+static void q_post(const char *json) {
+    if (pthread_equal(pthread_self(), g_ui_thread)) g_queue_dirty = true; // the UI thread never produces into the ring
+    else q_push(strdup(json), false);
+}
+
+// Requests the UI makes while a run goes on, which the agent thread applies at its next turn
+// boundary (it alone touches the run's state then): a model or a thinking level.
+static pthread_mutex_t g_req_lock = PTHREAD_MUTEX_INITIALIZER;
+static char *g_req_provider, *g_req_model, *g_req_thinking;
+
+bool code_ui_take_model(char **provider, char **id) {
+    pthread_mutex_lock(&g_req_lock);
+    bool have = g_req_model != NULL;
+    *provider = g_req_provider;
+    *id = g_req_model;
+    g_req_provider = g_req_model = NULL;
+    pthread_mutex_unlock(&g_req_lock);
+    return have;
+}
+
+char *code_ui_take_thinking(void) {
+    pthread_mutex_lock(&g_req_lock);
+    char *t = g_req_thinking;
+    g_req_thinking = NULL;
+    pthread_mutex_unlock(&g_req_lock);
+    return t;
+}
+
+static void request_model(const char *provider, const char *id) {
+    pthread_mutex_lock(&g_req_lock);
+    free(g_req_provider);
+    free(g_req_model);
+    g_req_provider = strdup(provider);
+    g_req_model = strdup(id);
+    pthread_mutex_unlock(&g_req_lock);
+}
+
+static void request_thinking(const char *level) {
+    pthread_mutex_lock(&g_req_lock);
+    free(g_req_thinking);
+    g_req_thinking = strdup(level);
+    pthread_mutex_unlock(&g_req_lock);
+}
 
 // The messages typed while a run goes on (pi's steering and follow-up queues): the agent thread
 // takes them at its turn boundaries (code_ui_take_queued).
@@ -123,11 +221,6 @@ static double jnum(const JValue *v) {
 
 static bool jhas_num(const JValue *v) { return json_is(v, J_INTEGER) || json_is(v, J_FLOAT) || json_is(v, J_NUMBER_STRING); }
 
-static void blank_line(Lines *out, int width) {
-    Buf b = {0};
-    tui_spaces(&b, width);
-    lines_addb(out, &b);
-}
 
 // ---- the state -------------------------------------------------------------------------------------
 
@@ -141,7 +234,7 @@ typedef struct {
 typedef struct ToolView ToolView;
 typedef struct AsstView AsstView;
 
-typedef enum { SEL_NONE, SEL_THINKING, SEL_MODEL, SEL_SETTINGS, SEL_TREE } SelKind;
+typedef enum { SEL_NONE, SEL_THINKING, SEL_MODEL, SEL_SETTINGS, SEL_TREE, SEL_CONFIRM } SelKind;
 
 typedef struct {
     Buf value;
@@ -175,19 +268,26 @@ typedef struct {
     void (*sel_free)(void *);
     // the agent thread
     pthread_t thread;
-    pthread_mutex_t lock;
-    pthread_cond_t cond;
-    char *job;
-    bool thread_quit;
     char *default_thinking;
+    // the prompts from the command line, run one after another
+    char **initial;
+    size_t ninitial, ninitial_next;
+    char *re_provider, *re_id; // a model to start again on (/model)
+    // a pack download (/model)
+    char *dl_name, *dl_title, *dl_models_dir;
+    unsigned dl_disk, dl_free_gb;
+    pid_t dl_pid;
+    int dl_fd;
+    Buf dl_line;
+    bool dl_cancelled;
     // the current model (/model changes it) and the settings the UI uses
     CodeUiModel model;
     bool auto_compact;
     char *default_provider, *default_model;
-    char *pending_thinking; // chosen while a turn ran: applied when it ends
 } Ui;
 
 static Ui *U;
+static uint64_t g_last_spin;
 
 static void request_render(void);
 
@@ -234,9 +334,7 @@ static void show_warning(const char *msg) {
     buf_free(&b);
 }
 
-// ---- header (BuiltInHeader, pi-logo.ts) --------------------------------------------------------------
-
-static const char *const app_version = "1.5.2";
+// ---- header (BuiltInHeader's layout; Saetta Code's own logo and wording) ---------------------------------
 
 static void key_hint(Buf *b, const char *key, const char *desc) {
     th_fgz(b, T_DIM, key);
@@ -246,18 +344,27 @@ static void key_hint(Buf *b, const char *key, const char *desc) {
     buf_free(&d);
 }
 
+
+// The bolt glyph (U+21AF, one cell wide in monospace fonts) in a warm amber, the theme's accent
+// when the terminal reports no colors.
+static void bolt_color(Buf *b) {
+    int ap = th_appearance();
+    if (!ap) buf_adds(b, th_open(T_ACCENT));
+    else if (ap == 2) buf_adds(b, "\x1b[38;2;179;100;0m");
+    else buf_adds(b, "\x1b[38;2;255;176;32m");
+}
+
 static void header_render(void *ctx, int width, Lines *out) {
     (void)ctx;
     Buf t = {0};
-    // the logo: coral, blue and yellow half blocks
-    buf_adds(&t, "\x1b[38;2;228;138;122m\x1b[48;2;79;142;179m\xe2\x96\x80\x1b[0m\x1b[38;2;228;138;122m\xe2\x96\x80\xe2\x96\x88\x1b[0m ");
-    buf_addc(&t, ' ');
+    // the title row: the bolt, the name, the version (pi's logo row)
+    bolt_color(&t);
+    buf_adds(&t, "\x1b[1m\xe2\x86\xaf Saetta Code\x1b[22m\x1b[39m");
     Buf v = {0};
-    buf_printf(&v, "v%s", app_version);
+    buf_printf(&v, " v%s", U->cfg->version ? U->cfg->version : "dev");
     th_fg(&t, T_DIM, buf_str(&v));
     buf_free(&v);
     buf_addc(&t, '\n');
-    buf_adds(&t, "\x1b[38;2;79;142;179m\xe2\x96\x88\xe2\x96\x80\x1b[0m \x1b[38;2;234;182;93m\xe2\x96\x88\x1b[0m ");
     if (!U->header_expanded) {
         Buf sep = {0};
         th_fgz(&sep, T_MUTED, " \xc2\xb7 ");
@@ -267,29 +374,29 @@ static void header_render(void *ctx, int width, Lines *out) {
         buf_addstr(&t, buf_str(&sep));
         key_hint(&t, "/", "commands");
         buf_addstr(&t, buf_str(&sep));
-        key_hint(&t, "!", "bash");
+        key_hint(&t, "@", "files");
         buf_addstr(&t, buf_str(&sep));
         key_hint(&t, "ctrl+o", "more");
         buf_free(&sep);
         buf_addc(&t, '\n');
-        th_fgz(&t, T_DIM, "Press ctrl+o to show full startup help and loaded resources.");
-        buf_adds(&t, "\n\n");
+        th_fgz(&t, T_DIM, "Press ctrl+o to show full startup help.");
     } else {
         static const char *const hints[][2] = {
             {"escape", "to interrupt"}, {"ctrl+c", "to clear"}, {"ctrl+c twice", "to exit"}, {"ctrl+d", "to exit (empty)"},
             {"ctrl+z", "to suspend"}, {"ctrl+k", "to delete to end"}, {"shift+tab", "to cycle thinking level"},
             {"ctrl+p/shift+ctrl+p", "to cycle models"}, {"ctrl+l", "to select model"}, {"ctrl+o", "to expand tools"},
-            {"ctrl+t", "to expand thinking"}, {"ctrl+g", "for external editor"}, {"/", "for commands"}, {"!", "to run bash"},
-            {"!!", "to run bash (no context)"}, {"alt+enter", "to queue follow-up"}, {"alt+up", "to edit all queued messages"},
-            {"ctrl+v", "to paste files on macOS, images, or text"}, {"drop files", "to attach"},
+            {"ctrl+t", "to expand thinking"}, {"ctrl+g", "for external editor"}, {"/", "for commands"},
+            {"@", "to attach files"}, {"shift+enter", "for a new line"}, {"alt+enter", "to queue follow-up"},
+            {"alt+up", "to edit all queued messages"}, {"page up/down, wheel", "to scroll the transcript"},
+            {"ctrl+home/ctrl+end", "to jump to the top / the latest message"},
         };
         for (size_t i = 0; i < COUNT(hints); i++) {
             if (i) buf_addc(&t, '\n');
             key_hint(&t, hints[i][0], hints[i][1]);
         }
-        buf_adds(&t, "\n\n");
     }
-    th_fgz(&t, T_DIM, "Pi can explain its own features and look up its docs. Ask it how to use or extend Pi.");
+    buf_adds(&t, "\n\n");
+    th_fgz(&t, T_DIM, "Ask about your code, or how to use Saetta Code.");
     Comp *c = comp_text(buf_str(&t), 1, 0);
     lines_addz(out, "");
     comp_render(c, width, out);
@@ -302,7 +409,7 @@ static void header_render(void *ctx, int width, Lines *out) {
 
 static const MdStyle md_plain = {0};
 static const MdStyle md_thinking = {.has_color = true, .color = T_THINKING_TEXT, .italic = true};
-static const MdStyle md_user = {.has_color = true, .color = T_USER_TEXT, .user = true};
+static const MdStyle md_user = {.has_color = true, .color = T_USER_TEXT, .user = true, .has_bg = true, .bg = TH_BG_USER_MESSAGE};
 
 struct AsstView {
     Comp base;
@@ -381,11 +488,12 @@ static void asst_destroy(Comp *c) {
     free(c);
 }
 
-static const CompVt asst_vt = {asst_render, asst_destroy};
+static const CompVt asst_vt = {asst_render, asst_destroy, false};
 
 static void asst_set(AsstView *v, const JValue *msg) {
     arena_reset(&v->a);
     v->msg = jcopy(&v->a, msg);
+    comp_invalidate(&v->base);
 }
 
 static AsstView *asst_new(const JValue *msg) {
@@ -395,12 +503,29 @@ static AsstView *asst_new(const JValue *msg) {
     return v;
 }
 
+// Every component rendered again (the theme changed).
+static void invalidate_all(void) {
+    Comp *cs[] = {U->chat, U->pending, U->status};
+    for (size_t k = 0; k < COUNT(cs); k++) {
+        CompVec *kids = comp_children(cs[k]);
+        for (size_t i = 0; i < kids->len; i++) comp_invalidate(kids->ptr[i]);
+    }
+}
+
+// Every component of the chat with this vtable rendered again (a setting they read changed).
+static void invalidate_kind(const CompVt *vt) {
+    CompVec *kids = comp_children(U->chat);
+    for (size_t i = 0; i < kids->len; i++)
+        if (kids->ptr[i]->vt == vt) comp_invalidate(kids->ptr[i]);
+}
+
 // ---- tool views (tool-execution.ts and the built-in renderers) --------------------------------------
 
 struct ToolView {
     Comp base;
     Arena a;
     char *name, *id;
+    char *diff; // the edit's rendered diff (computed once per result)
     JValue *args, *result; // result: {"content":[...],"details":{...}}
     bool has_result, partial, is_error, started, args_complete, expanded;
     bool has_duration;
@@ -433,13 +558,48 @@ static Str text_output(const JValue *result) {
     return buf_str(&b);
 }
 
+// Model-written text shown in a tool view (arguments, diffs): escape sequences dropped and every
+// run of other control characters made one space (pi's replaceControlCharacters), newlines and
+// tabs kept where the view shows several lines. Nothing the model writes reaches the terminal as
+// a sequence.
+static Str clean(Buf *out, Str s, bool multiline) {
+    out->len = 0;
+    Buf t = {0};
+    tui_strip(&t, s);
+    bool run = false;
+    for (size_t i = 0; i < t.len;) {
+        unsigned char c = (unsigned char)t.ptr[i];
+        bool ctl = c < 0x20 || c == 0x7f;
+        size_t n = 1;
+        if (c == 0xc2 && i + 1 < t.len && (unsigned char)t.ptr[i + 1] >= 0x80 && (unsigned char)t.ptr[i + 1] <= 0x9f) {
+            ctl = true; // C1
+            n = 2;
+        }
+        if (ctl && multiline && (c == '\n' || c == '\t')) ctl = false;
+        if (ctl) {
+            if (!run) buf_addc(out, ' ');
+            run = true;
+        } else {
+            buf_add(out, t.ptr + i, n);
+            run = false;
+        }
+        i += n;
+    }
+    buf_free(&t);
+    if (!out->ptr) buf_adds(out, "");
+    return buf_str(out);
+}
+
 static void shorten_path(Buf *b, Str p) {
+    Buf c = {0};
+    p = clean(&c, p, false);
     const char *home = U->cfg->home;
     size_t hl = home ? strlen(home) : 0;
     if (hl && p.len >= hl && !memcmp(p.ptr, home, hl) && (p.len == hl || p.ptr[hl] == '/')) {
         buf_addc(b, '~');
         buf_addstr(b, str_sub(p, hl, p.len));
     } else buf_addstr(b, p);
+    buf_free(&c);
 }
 
 // renderToolPath: the path in the accent color (an invalid argument, an empty one as "...").
@@ -518,7 +678,8 @@ static void text_lines(Str text, int px, int width, Lines *out) {
 static void read_call(ToolView *v, Buf *b) {
     const JValue *path = json_get(v->args, "file_path");
     if (!path) path = json_get(v->args, "path");
-    Str p = json_strs(path);
+    Buf pc = {0};
+    Str p = clean(&pc, json_strs(path), false);
     // compact forms for skills and context files (getCompactReadClassification)
     if (!v->expanded && p.len) {
         Str base = p;
@@ -588,6 +749,7 @@ range:;
         th_fg(b, T_DIM, buf_str(&h));
         buf_free(&h);
     }
+    buf_free(&pc);
 }
 
 static void read_result(ToolView *v, Buf *b) {
@@ -666,7 +828,11 @@ static void bash_render_body(ToolView *v, int width, Lines *out) {
         Buf t = {0};
         buf_adds(&t, "$ ");
         if (cmd && !json_is(cmd, J_STRING) && !json_is(cmd, J_NULL)) th_fgz(&t, T_ERROR, "[invalid arg]");
-        else if (json_strs(cmd).len) buf_addstr(&t, json_strs(cmd));
+        else if (json_strs(cmd).len) {
+            Buf c = {0};
+            buf_addstr(&t, clean(&c, json_strs(cmd), true));
+            buf_free(&c);
+        }
         else th_fgz(&t, T_TOOL_OUTPUT, "...");
         title(&call, t.ptr);
         buf_free(&t);
@@ -787,8 +953,12 @@ static void write_call(ToolView *v, Buf *b) {
         th_fgz(b, T_ERROR, "[invalid content arg - expected string]");
         return;
     }
-    Str c = json_strs(content);
-    if (!c.len) return;
+    Buf cleaned = {0};
+    Str c = clean(&cleaned, json_strs(content), true);
+    if (!c.len) {
+        buf_free(&cleaned);
+        return;
+    }
     const char *lang = json_str(path) ? lang_from_path(json_strs(path)) : NULL;
     Buf norm = {0};
     for (size_t i = 0; i < c.len; i++)
@@ -833,6 +1003,7 @@ static void write_call(ToolView *v, Buf *b) {
     }
     lines_free(&ls);
     buf_free(&norm);
+    buf_free(&cleaned);
 }
 
 // renderDiff (diff.ts): word-level changes in inverse for a single changed line.
@@ -1000,17 +1171,31 @@ static void list_result(ToolView *v, Buf *b, size_t max_collapsed, const char *l
     }
 }
 
-static void box_lines(Lines *kids, int width, int pad_x, int pad_y, Lines *out) {
+// Box(paddingX, paddingY, bg): the lines padded and on the panel's background.
+static void box_lines(Lines *kids, int width, int pad_x, int pad_y, ThemeBgToken bg, Lines *out) {
     if (!kids->n) return;
-    for (int k = 0; k < pad_y; k++) blank_line(out, width);
-    for (size_t i = 0; i < kids->n; i++) {
+    for (int k = 0; k < pad_y; k++) {
         Buf l = {0};
-        tui_spaces(&l, pad_x);
-        buf_adds(&l, kids->v[i]);
-        tui_spaces(&l, width - tui_width(buf_str(&l)));
+        th_bg_line(&l, bg, S(""), width);
         lines_addb(out, &l);
     }
-    for (int k = 0; k < pad_y; k++) blank_line(out, width);
+    for (size_t i = 0; i < kids->n; i++) {
+        Buf p = {0}, l = {0};
+        tui_spaces(&p, pad_x);
+        buf_adds(&p, kids->v[i]);
+        th_bg_line(&l, bg, buf_str(&p), width);
+        lines_addb(out, &l);
+        buf_free(&p);
+    }
+    for (int k = 0; k < pad_y; k++) {
+        Buf l = {0};
+        th_bg_line(&l, bg, S(""), width);
+        lines_addb(out, &l);
+    }
+}
+
+static ThemeBgToken tool_bg(const ToolView *v) {
+    return v->partial || !v->has_result ? TH_BG_TOOL_PENDING : v->is_error ? TH_BG_TOOL_ERROR : TH_BG_TOOL_SUCCESS;
 }
 
 static void tool_render(Comp *c, int width, Lines *out) {
@@ -1028,16 +1213,19 @@ static void tool_render(Comp *c, int width, Lines *out) {
         tool_path(&head, path, NULL);
         text_lines(buf_str(&head), 0, cw, &kids);
         buf_free(&head);
-        const char *diff = v->has_result && !v->is_error ? json_str(json_get(json_get(v->result, "details"), "diff")) : NULL;
-        if (diff) {
+        const JValue *dv = v->has_result && !v->is_error ? json_get(json_get(v->result, "details"), "diff") : NULL;
+        if (json_str(dv)) {
             lines_addz(&kids, "");
-            Buf d = {0};
-            render_diff(str(diff), &d);
-            text_lines(buf_str(&d), 0, cw, &kids);
-            buf_free(&d);
+            if (!v->diff) {
+                Buf d = {0}, c = {0};
+                render_diff(clean(&c, json_strs(dv), true), &d);
+                v->diff = d.ptr ? d.ptr : strdup("");
+                buf_free(&c);
+            }
+            text_lines(str(v->diff), 0, cw, &kids);
         }
         lines_addz(out, "");
-        box_lines(&kids, width, 1, 1, out);
+        box_lines(&kids, width, 1, 1, tool_bg(v), out);
         lines_free(&kids);
         if (v->has_result && v->is_error) {
             Str err = text_output(v->result);
@@ -1056,8 +1244,9 @@ static void tool_render(Comp *c, int width, Lines *out) {
     lines_addz(out, "");
     if (!known) {
         // no renderer: the name, the arguments as JSON, the output (formatToolExecution)
-        Buf t = {0};
-        title(&t, n);
+        Buf t = {0}, cn = {0};
+        title(&t, clean(&cn, str(n), false).ptr);
+        buf_free(&cn);
         if (v->args) {
             buf_adds(&t, "\n\n");
             // JSON.stringify(args, null, 2)
@@ -1073,7 +1262,14 @@ static void tool_render(Comp *c, int width, Lines *out) {
             buf_addstr(&t, o);
         }
         Comp *tc = comp_text(buf_str(&t), 1, 1);
-        comp_render(tc, width, out);
+        Lines tl = {0};
+        comp_render(tc, width, &tl);
+        for (size_t i = 0; i < tl.n; i++) {
+            Buf l = {0};
+            th_bg_line(&l, tool_bg(v), str(tl.v[i]), width);
+            lines_addb(out, &l);
+        }
+        lines_free(&tl);
         comp_free(tc);
         buf_free(&t);
         return;
@@ -1099,8 +1295,10 @@ static void tool_render(Comp *c, int width, Lines *out) {
             buf_addc(&call, ' ');
             if (pat && !json_is(pat, J_STRING)) th_fgz(&call, T_ERROR, "[invalid arg]");
             else {
-                Buf p = {0};
-                buf_printf(&p, "/%.*s/", (int)json_strs(pat).len, json_strs(pat).ptr);
+                Buf p = {0}, cp = {0};
+                Str ps = clean(&cp, json_strs(pat), false);
+                buf_printf(&p, "/%.*s/", (int)ps.len, ps.ptr);
+                buf_free(&cp);
                 th_fg(&call, T_ACCENT, buf_str(&p));
                 buf_free(&p);
             }
@@ -1110,8 +1308,10 @@ static void tool_render(Comp *c, int width, Lines *out) {
             th_fg(&call, T_TOOL_OUTPUT, buf_str(&in));
             buf_free(&in);
             if (json_strs(json_get(v->args, "glob")).len) {
-                Buf g = {0};
-                buf_printf(&g, " (%s)", json_str(json_get(v->args, "glob")));
+                Buf g = {0}, cg = {0};
+                Str gs = clean(&cg, json_strs(json_get(v->args, "glob")), false);
+                buf_printf(&g, " (%.*s)", (int)gs.len, gs.ptr);
+                buf_free(&cg);
                 th_fg(&call, T_TOOL_OUTPUT, buf_str(&g));
                 buf_free(&g);
             }
@@ -1126,7 +1326,9 @@ static void tool_render(Comp *c, int width, Lines *out) {
             const JValue *pat = json_get(v->args, "pattern"), *path = json_get(v->args, "path");
             title(&call, "find");
             buf_addc(&call, ' ');
-            th_fg(&call, T_ACCENT, json_strs(pat));
+            Buf cp = {0};
+            th_fg(&call, T_ACCENT, clean(&cp, json_strs(pat), false));
+            buf_free(&cp);
             Buf in = {0};
             buf_adds(&in, " in ");
             shorten_path(&in, json_strs(path).len ? json_strs(path) : S("."));
@@ -1156,7 +1358,7 @@ static void tool_render(Comp *c, int width, Lines *out) {
         buf_free(&call);
         buf_free(&res);
     }
-    box_lines(&kids, width, 1, 1, out);
+    box_lines(&kids, width, 1, 1, tool_bg(v), out);
     lines_free(&kids);
 }
 
@@ -1165,10 +1367,11 @@ static void tool_destroy(Comp *c) {
     arena_reset(&v->a);
     free(v->name);
     free(v->id);
+    free(v->diff);
     free(v);
 }
 
-static const CompVt tool_vt = {tool_render, tool_destroy};
+static const CompVt tool_vt = {tool_render, tool_destroy, false};
 
 static ToolView *tool_new(const char *name, const char *id, const JValue *args) {
     ToolView *v = xcalloc(1, sizeof *v);
@@ -1189,6 +1392,7 @@ static void tool_set_args(ToolView *v, const JValue *args) {
     v->args = jcopy(&v->a, args);
     v->result = jcopy(&v->a, res);
     arena_reset(&old);
+    comp_invalidate(&v->base);
 }
 
 static void tool_set_result(ToolView *v, const JValue *result, bool is_error, bool partial, const JValue *duration) {
@@ -1203,6 +1407,9 @@ static void tool_set_result(ToolView *v, const JValue *result, bool is_error, bo
     v->partial = partial;
     v->has_duration = duration && jhas_num(duration);
     v->duration_ms = v->has_duration ? jnum(duration) : 0;
+    free(v->diff);
+    v->diff = NULL; // rendered again from the new result
+    comp_invalidate(&v->base);
 }
 
 static ToolView *find_pending(const char *id) {
@@ -1228,6 +1435,55 @@ static void fmt_tokens(Buf *b, double n) {
     else if (n < 1000000) buf_printf(b, "%.0fk", round(n / 1000));
     else if (n < 10000000) buf_printf(b, "%.1fM", n / 1000000);
     else buf_printf(b, "%.0fM", round(n / 1000000));
+}
+
+// The git branch (footer-data-provider.ts): .git found walking up from the working directory, a
+// worktree's .git file followed to its gitdir; HEAD read again at most once a second.
+static const char *git_branch(void) {
+    static char branch[256];
+    static bool have;
+    static uint64_t at;
+    uint64_t now = now_ns();
+    if (at && now - at < 1000000000ull) return have ? branch : NULL;
+    at = now;
+    have = false;
+    char dir[4096], head[4200];
+    snprintf(dir, sizeof dir, "%s", U->cfg->cwd);
+    for (;;) {
+        char gp[4200];
+        snprintf(gp, sizeof gp, "%s/.git", dir);
+        struct stat st;
+        if (stat(gp, &st) == 0) {
+            if (S_ISDIR(st.st_mode)) snprintf(head, sizeof head, "%s/HEAD", gp);
+            else {
+                FILE *f = fopen(gp, "r");
+                char line[4096] = {0};
+                if (!f) return NULL;
+                bool ok = fgets(line, sizeof line, f) != NULL;
+                fclose(f);
+                Str l = str_trim(str(line));
+                if (!ok || !str_starts(l, S("gitdir: "))) return NULL;
+                Str g = str_trim(str_sub(l, 8, l.len));
+                if (g.len && g.ptr[0] == '/') snprintf(head, sizeof head, "%.*s/HEAD", (int)g.len, g.ptr);
+                else snprintf(head, sizeof head, "%s/%.*s/HEAD", dir, (int)g.len, g.ptr);
+            }
+            break;
+        }
+        char *sl = strrchr(dir, '/');
+        if (!sl || sl == dir) return NULL;
+        *sl = 0;
+    }
+    FILE *f = fopen(head, "r");
+    if (!f) return NULL;
+    char line[512];
+    if (fgets(line, sizeof line, f)) {
+        Str l = str_trim(str(line));
+        if (str_starts(l, S("ref: refs/heads/"))) snprintf(branch, sizeof branch, "%.*s", (int)(l.len - 16), l.ptr + 16);
+        else snprintf(branch, sizeof branch, "detached");
+        have = true;
+    }
+    fclose(f);
+    return have ? branch : NULL;
 }
 
 static void footer_render(void *ctx, int width, Lines *out) {
@@ -1265,21 +1521,8 @@ static void footer_render(void *ctx, int width, Lines *out) {
         buf_addc(&pwd, '~');
         buf_adds(&pwd, cfg->cwd + hl);
     } else buf_adds(&pwd, cfg->cwd);
-    // git branch
-    {
-        char head[4096];
-        snprintf(head, sizeof head, "%s/.git/HEAD", cfg->cwd);
-        FILE *f = fopen(head, "r");
-        if (f) {
-            char line[512];
-            if (fgets(line, sizeof line, f)) {
-                Str l = str_trim(str(line));
-                if (str_starts(l, S("ref: refs/heads/"))) buf_printf(&pwd, " (%.*s)", (int)(l.len - 16), l.ptr + 16);
-                else if (l.len >= 7) buf_adds(&pwd, " (detached)");
-            }
-            fclose(f);
-        }
-    }
+    const char *branch = git_branch();
+    if (branch) buf_printf(&pwd, " (%s)", branch);
     Buf stats = {0};
     Buf t = {0};
 #define PART(...)                            \
@@ -1465,24 +1708,10 @@ static void input_render(Input *in, int width, Lines *out) {
 // Edits the search input; true when the value changed.
 static bool input_key(Input *in, const Key *k) {
     Buf *v = &in->value;
-    if (k->kind == K_CHAR) {
-        char enc[5];
-        uint32_t cp = k->ch;
-        int n = cp < 0x80 ? 1 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4;
-        if (n == 1) enc[0] = (char)cp;
-        else if (n == 2) {
-            enc[0] = (char)(0xc0 | cp >> 6);
-            enc[1] = (char)(0x80 | (cp & 0x3f));
-        } else if (n == 3) {
-            enc[0] = (char)(0xe0 | cp >> 12);
-            enc[1] = (char)(0x80 | ((cp >> 6) & 0x3f));
-            enc[2] = (char)(0x80 | (cp & 0x3f));
-        } else {
-            enc[0] = (char)(0xf0 | cp >> 18);
-            enc[1] = (char)(0x80 | ((cp >> 12) & 0x3f));
-            enc[2] = (char)(0x80 | ((cp >> 6) & 0x3f));
-            enc[3] = (char)(0x80 | (cp & 0x3f));
-        }
+    if (!v->ptr) buf_adds(v, ""); // the value is read as a C string: always terminated
+    if (k->kind == K_CHAR && k->ch >= 0x20) {
+        char enc[4];
+        int n = tui_utf8(enc, k->ch);
         buf_reserve(v, (size_t)n);
         memmove(v->ptr + in->cursor + n, v->ptr + in->cursor, v->len - in->cursor + 1);
         memcpy(v->ptr + in->cursor, enc, (size_t)n);
@@ -1588,10 +1817,8 @@ static void set_thinking(const char *level) {
     free(U->thinking);
     U->thinking = dupz(level);
     editor_set_border(U->ed, th_thinking_color(level));
-    if (U->busy) {
-        free(U->pending_thinking);
-        U->pending_thinking = dupz(level);
-    } else if (U->ops->set_thinking) U->ops->set_thinking(U->host, level);
+    if (U->busy) request_thinking(level); // the agent thread applies it at its next turn
+    else if (U->ops->set_thinking) U->ops->set_thinking(U->host, level);
 }
 
 static void open_thinking(void) {
@@ -1733,6 +1960,22 @@ static void model_render(int width, Lines *out) {
         else buf_adds(&l, "  ");
         if (is_current(m)) th_fgz(&l, T_ACCENT, "\xe2\x9c\x93 ");
         else buf_adds(&l, "  ");
+        if (m->pack) {
+            // a model run on this Mac: its name, where it stands
+            const char *nm = m->name ? m->name : m->id;
+            if (m->unavailable && m->too_big) th_fgz(&l, T_DIM, nm);
+            else if (sel) th_fgz(&l, T_ACCENT, nm);
+            else buf_adds(&l, nm);
+            Buf st = {0};
+            if (!m->unavailable) buf_adds(&st, " [on this Mac]");
+            else if (m->too_big) buf_printf(&st, " [needs %u GB memory]", m->min_ram_gb);
+            else buf_printf(&st, " [not downloaded, %u GB]", m->disk_gb);
+            th_fg(&l, m->unavailable && m->too_big ? T_DIM : T_MUTED, buf_str(&st));
+            buf_free(&st);
+            text_lines(buf_str(&l), 0, width, out);
+            buf_free(&l);
+            continue;
+        }
         if (sel) th_fgz(&l, T_ACCENT, m->id);
         else buf_adds(&l, m->id);
         if (name_distinct(m->id, m->name)) {
@@ -1784,17 +2027,226 @@ static void model_render(int width, Lines *out) {
 static void close_selector(void);
 static void show_status(const char *msg);
 
+// ---- downloading a pack from /model (saetta download in a child, its progress in the status) ------------
+
+static uint64_t free_disk_bytes(const char *dir) {
+    struct statfs st;
+    char probe[4096];
+    snprintf(probe, sizeof probe, "%s", dir);
+    // the nearest folder that exists
+    while (statfs(probe, &st) != 0) {
+        char *sl = strrchr(probe, '/');
+        if (!sl || sl == probe) return 0;
+        *sl = 0;
+    }
+    return (uint64_t)st.f_bavail * st.f_bsize;
+}
+
+static void confirm_download(const CodeUiModel *m) {
+    char *mdir = NULL;
+    Arena a = {0};
+    uint64_t freeb = download_models_dir(&a, &mdir) ? 0 : free_disk_bytes(mdir);
+    free(U->dl_name);
+    free(U->dl_title);
+    free(U->dl_models_dir);
+    U->dl_name = strdup(m->id);
+    U->dl_title = strdup(m->name ? m->name : m->id);
+    U->dl_disk = m->disk_gb;
+    U->dl_free_gb = (unsigned)(freeb / 1000000000ull);
+    U->dl_models_dir = dupz(mdir);
+    arena_reset(&a);
+    U->sel = SEL_CONFIRM;
+}
+
+static void confirm_render(int width, Lines *out) {
+    border_line(out, width, T_BORDER);
+    lines_addz(out, "");
+    Buf t = {0};
+    buf_printf(&t, "\x1b[1mDownload %s?\x1b[22m", U->dl_title);
+    text_lines(buf_str(&t), 1, width, out);
+    t.len = 0;
+    lines_addz(out, "");
+    Buf d = {0};
+    buf_printf(&d, "About %u GB into %s (%u GB free). A cancelled download resumes where it stopped.", U->dl_disk,
+               U->dl_models_dir ? U->dl_models_dir : "~/Models", U->dl_free_gb);
+    th_fg(&t, U->dl_free_gb < U->dl_disk ? T_ERROR : T_MUTED, buf_str(&d));
+    text_lines(buf_str(&t), 1, width, out);
+    lines_addz(out, "");
+    t.len = 0;
+    th_fgz(&t, T_DIM, U->dl_free_gb < U->dl_disk ? "Not enough free disk \xc2\xb7 Escape to cancel" : "Enter to download \xc2\xb7 Escape to cancel");
+    text_lines(buf_str(&t), 1, width, out);
+    border_line(out, width, T_BORDER);
+    buf_free(&t);
+    buf_free(&d);
+}
+
+static void start_download(void) {
+    const char *cmd = getenv("SAETTA_CODE_DOWNLOAD"); // a stand-in for the tests
+    int pfd[2];
+    if (pipe(pfd)) {
+        show_error("Could not start the download");
+        return;
+    }
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_addopen(&fa, 0, "/dev/null", O_RDONLY, 0);
+    posix_spawn_file_actions_addopen(&fa, 1, "/dev/null", O_WRONLY, 0);
+    posix_spawn_file_actions_adddup2(&fa, pfd[1], 2);
+    posix_spawn_file_actions_addclose(&fa, pfd[0]);
+    posix_spawn_file_actions_addclose(&fa, pfd[1]);
+    const char *argv[4];
+    if (cmd && *cmd) {
+        argv[0] = cmd;
+        argv[1] = U->dl_name;
+        argv[2] = NULL;
+    } else {
+        argv[0] = U->cfg->self_exe ? U->cfg->self_exe : "saetta";
+        argv[1] = "download";
+        argv[2] = U->dl_name;
+        argv[3] = NULL;
+    }
+    pid_t pid;
+    extern char **environ;
+    int rc = posix_spawnp(&pid, argv[0], &fa, NULL, (char *const *)argv, environ);
+    posix_spawn_file_actions_destroy(&fa);
+    close(pfd[1]);
+    if (rc) {
+        close(pfd[0]);
+        show_error("Could not start the download");
+        return;
+    }
+    fcntl(pfd[0], F_SETFL, O_NONBLOCK);
+    fcntl(pfd[0], F_SETFD, FD_CLOEXEC);
+    U->dl_pid = pid;
+    U->dl_fd = pfd[0];
+    U->dl_line.len = 0;
+    Buf m = {0};
+    buf_printf(&m, "Downloading %s... (escape to cancel)", U->dl_title);
+    editor_set_working(U->ed, m.ptr);
+    if (!U->working) g_last_spin = now_ns();
+    U->working = true;
+    buf_free(&m);
+}
+
+static void restart_model(const char *provider, const char *id);
+
+// The child's progress lines (\r-separated: "  12.3 / 76.0 GB  95 MB/s  3/40 files  ETA 12m03s").
+static void download_poll(void) {
+    if (U->dl_fd < 0) return;
+    char chunk[4096];
+    ssize_t n;
+    while ((n = read(U->dl_fd, chunk, sizeof chunk)) > 0) {
+        for (ssize_t i = 0; i < n; i++) {
+            char c = chunk[i];
+            if (c == '\r' || c == '\n') {
+                Str l = str_trim(buf_str(&U->dl_line));
+                if (l.len && (str_find(l, S(" GB"), 0) >= 0)) {
+                    Buf m = {0}, cl = {0};
+                    tui_strip(&cl, l);
+                    buf_printf(&m, "Downloading %s: %.*s (escape to cancel)", U->dl_title, (int)cl.len, cl.ptr ? cl.ptr : "");
+                    editor_set_working(U->ed, m.ptr);
+                    buf_free(&m);
+                    buf_free(&cl);
+                    request_render();
+                }
+                U->dl_line.len = 0;
+            } else buf_addc(&U->dl_line, c);
+        }
+    }
+    if (n != 0) return; // more to come
+    close(U->dl_fd);
+    U->dl_fd = -1;
+    int st = 0;
+    while (waitpid(U->dl_pid, &st, 0) < 0 && errno == EINTR) {}
+    U->dl_pid = 0;
+    U->working = U->busy;
+    editor_set_working(U->ed, U->busy ? "Working" : NULL);
+    if (WIFEXITED(st) && WEXITSTATUS(st) == 0 && !U->dl_cancelled) {
+        for (size_t i = 0; i < U->cfg->nmodels; i++) {
+            CodeUiModel *mm = (CodeUiModel *)&U->cfg->models[i];
+            if (mm->pack && !strcmp(mm->id, U->dl_name)) mm->unavailable = false;
+        }
+        Buf m = {0};
+        buf_printf(&m, "Downloaded %s", U->dl_title);
+        show_status(m.ptr);
+        buf_free(&m);
+        restart_model("saetta", U->dl_name);
+    } else if (U->dl_cancelled) {
+        show_status("Download stopped; choose the model again to resume it");
+    } else {
+        Buf m = {0};
+        buf_printf(&m, "The download of %s failed; choose it again to resume it (or run saetta download %s)", U->dl_title, U->dl_name);
+        show_error(m.ptr);
+        buf_free(&m);
+    }
+    U->dl_cancelled = false;
+    request_render();
+}
+
+static void cancel_download(void) {
+    if (U->dl_pid > 0) {
+        U->dl_cancelled = true;
+        kill(U->dl_pid, SIGINT);
+    }
+}
+
+// The engine is replaced by starting again on the other model (code_main.c), the session kept.
+static void restart_model(const char *provider, const char *id) {
+    if (!U->ops->restart) {
+        show_error("Could not switch the model");
+        return;
+    }
+    free(U->re_provider);
+    free(U->re_id);
+    U->re_provider = strdup(provider);
+    U->re_id = strdup(id);
+    if (!U->busy) U->quit = true;
+    else show_status("Switching when the current turn ends");
+}
+
 static void choose_model(const CodeUiModel *m, bool persist) {
+    if (m->pack && m->unavailable) {
+        close_selector();
+        if (m->too_big) {
+            Buf b = {0};
+            buf_printf(&b, "%s needs a Mac with %u GB of memory", m->name ? m->name : m->id, m->min_ram_gb);
+            show_status(b.ptr);
+            buf_free(&b);
+        } else if (U->dl_pid > 0) show_status("A download is running already");
+        else confirm_download(m);
+        return;
+    }
+    if (is_current(m)) {
+        close_selector();
+        Buf b = {0};
+        buf_printf(&b, "Model: %s", m->id);
+        show_status(b.ptr);
+        buf_free(&b);
+        return;
+    }
+    if (m->pack || U->cfg->engine) {
+        // another pack, or away from the engine in this process: a restart on it
+        char *prov = strdup(m->provider), *id = strdup(m->id);
+        close_selector();
+        restart_model(prov, id);
+        free(prov);
+        free(id);
+        return;
+    }
     char *prov = strdup(m->provider), *id = strdup(m->id);
     CodeUiModel copy = *m;
     close_selector();
-    if (U->ops->set_model && !U->ops->set_model(U->host, prov, id)) {
+    bool ok = true;
+    if (U->busy) request_model(prov, id); // pi applies it to the next request: the next turn
+    else if (U->ops->set_model) ok = U->ops->set_model(U->host, prov, id);
+    if (!ok) {
         show_error("Could not switch the model");
     } else {
         free((char *)U->model.provider);
         free((char *)U->model.id);
         free((char *)U->model.name);
-        U->model = (CodeUiModel){strdup(prov), strdup(id), dupz(copy.name), copy.reasoning, copy.context_window};
+        U->model = (CodeUiModel){.provider = strdup(prov), .id = strdup(id), .name = dupz(copy.name), .reasoning = copy.reasoning,
+                                 .context_window = copy.context_window};
         if (!copy.reasoning) {
             free(U->thinking);
             U->thinking = strdup("off");
@@ -2054,7 +2506,10 @@ static void settings_render(int width, Lines *out) {
 
 static void setting_changed(const char *id, const char *v) {
     if (!strcmp(id, "autocompact")) U->auto_compact = !strcmp(v, "true");
-    else if (!strcmp(id, "hide-thinking")) U->hide_thinking = !strcmp(v, "true");
+    else if (!strcmp(id, "hide-thinking")) {
+        U->hide_thinking = !strcmp(v, "true");
+        invalidate_kind(&asst_vt);
+    }
 }
 
 static void open_settings(void) {
@@ -2565,19 +3020,8 @@ static void tree_key(const Key *k) {
         t->query.ptr[p] = 0;
         tree_filter(t, true);
     } else if (k->kind == K_CHAR && k->ch >= 0x20) {
-        char enc[5] = {0};
-        size_t i = 0;
-        uint32_t cp = k->ch;
-        if (cp < 0x80) enc[i++] = (char)cp;
-        else if (cp < 0x800) {
-            enc[i++] = (char)(0xc0 | cp >> 6);
-            enc[i++] = (char)(0x80 | (cp & 0x3f));
-        } else {
-            enc[i++] = (char)(0xe0 | cp >> 12);
-            enc[i++] = (char)(0x80 | ((cp >> 6) & 0x3f));
-            enc[i++] = (char)(0x80 | (cp & 0x3f));
-        }
-        buf_add(&t->query, enc, i);
+        char enc[4];
+        buf_add(&t->query, enc, (size_t)tui_utf8(enc, k->ch));
         tree_filter(t, true);
     }
 }
@@ -2645,27 +3089,303 @@ static void render_dock(int width, Lines *out) {
     else if (U->sel == SEL_MODEL) model_render(width, out);
     else if (U->sel == SEL_SETTINGS) settings_render(width, out);
     else if (U->sel == SEL_TREE) tree_render(width, out);
+    else if (U->sel == SEL_CONFIRM) confirm_render(width, out);
     else editor_render(U->ed, width, out);
     footer_render(NULL, width, out);
+}
+
+// ---- the transcript viewport (TuiAltScreen, ScrollView follow "end", layout.ts scrollbar) --------
+
+#define PAGE_SCROLL_OVERLAP 4
+
+typedef struct {
+    int top;          // the first transcript row shown
+    bool follow;      // pinned to the end
+    int total, view;  // content and viewport heights of the last frame
+    uint64_t bar_until; // the auto scrollbar shows until then (1 s after scrolling)
+    // the wheel accelerator (wheel-scroll.ts)
+    uint64_t wheel_last;
+    int wheel_dir;
+    double wheel_gap, wheel_carry;
+    bool wheel_accel;
+    // mouse selection in transcript rows (document coordinates)
+    bool sel_on, sel_drag, sel_press;
+    int sel_r0, sel_c0, sel_r1, sel_c1;
+    int jump_row, jump_col, jump_w; // the jump-to-latest label of the last frame (jump_w 0: none)
+} View;
+static View g_view = {.follow = true};
+
+static void view_scroll(int lines) {
+    View *v = &g_view;
+    int max_top = MAX(0, v->total - v->view);
+    int start = v->follow ? max_top : v->top;
+    int next = MAX(0, MIN(max_top, start + lines));
+    if (next != start) v->bar_until = now_ns() + 1000000000ull;
+    v->top = next;
+    v->follow = next == max_top;
+    request_render();
+}
+
+static void view_top(void) {
+    g_view.top = 0;
+    g_view.follow = g_view.total <= g_view.view;
+    g_view.bar_until = now_ns() + 1000000000ull;
+    request_render();
+}
+
+static void view_end(void) {
+    g_view.follow = true;
+    g_view.bar_until = now_ns() + 1000000000ull;
+    request_render();
+}
+
+// WheelScrollAccelerator("auto"): one line per event where the terminal accelerates (macOS, not
+// over SSH), else faster spins move up to six.
+static int wheel_lines(int dir) {
+    View *v = &g_view;
+    uint64_t now = now_ns();
+    if (!v->wheel_accel) return 1;
+    double gap = v->wheel_last ? (double)(now - v->wheel_last) / 1e6 : 1e9;
+    bool same = dir == v->wheel_dir && gap <= 200;
+    v->wheel_last = now;
+    v->wheel_dir = dir;
+    if (!same) {
+        v->wheel_gap = 0;
+        v->wheel_carry = 0;
+        return 1;
+    }
+    if (gap < 5) return 1;
+    v->wheel_gap = v->wheel_gap == 0 ? gap : (v->wheel_gap + gap) / 2;
+    double lines = MIN(6.0, MAX(1.0, 100.0 / v->wheel_gap)) + v->wheel_carry;
+    int whole = (int)floor(lines);
+    v->wheel_carry = lines - whole;
+    return whole;
+}
+
+// The plain text of a styled row's columns [c0, c1).
+static void plain_cols(Buf *out, const char *line, int c0, int c1) {
+    Buf cut = {0}, plain = {0};
+    tui_slice(&cut, str(line), c0, MAX(0, c1 - c0), true);
+    tui_strip(&plain, buf_str(&cut));
+    buf_addstr(out, buf_str(&plain));
+    buf_free(&cut);
+    buf_free(&plain);
+}
+
+static void sel_bounds(int *r0, int *c0, int *r1, int *c1) {
+    View *v = &g_view;
+    bool fwd = v->sel_r0 < v->sel_r1 || (v->sel_r0 == v->sel_r1 && v->sel_c0 <= v->sel_c1);
+    *r0 = fwd ? v->sel_r0 : v->sel_r1;
+    *c0 = fwd ? v->sel_c0 : v->sel_c1;
+    *r1 = fwd ? v->sel_r1 : v->sel_r0;
+    *c1 = fwd ? v->sel_c1 : v->sel_c0;
+}
+
+// The transcript (header and chat) rows [from, to) into out; returns the total height. The
+// components keep their lines, so a frame only copies the rows it shows.
+static int doc_rows(int width, int from, int to, Lines *out) {
+    int row = 0;
+    const Lines *h = comp_lines(U->header, width);
+    for (size_t i = 0; i < h->n; i++, row++)
+        if (row >= from && row < to) lines_addz(out, h->v[i]);
+    CompVec *kids = comp_children(U->chat);
+    for (size_t k = 0; k < kids->len; k++) {
+        const Lines *l = comp_lines(kids->ptr[k], width);
+        if (row + (int)l->n <= from || row >= to) {
+            row += (int)l->n;
+            continue;
+        }
+        for (size_t i = 0; i < l->n; i++, row++)
+            if (row >= from && row < to) lines_addz(out, l->v[i]);
+    }
+    return row;
+}
+
+static void copy_selection(int width) {
+    int r0, c0, r1, c1;
+    sel_bounds(&r0, &c0, &r1, &c1);
+    Lines rows = {0};
+    doc_rows(width, r0, r1 + 1, &rows);
+    Buf text = {0};
+    for (size_t i = 0; i < rows.n; i++) {
+        int r = r0 + (int)i;
+        Buf l = {0};
+        plain_cols(&l, rows.v[i], r == r0 ? c0 : 0, r == r1 ? c1 : width);
+        while (l.len && l.ptr[l.len - 1] == ' ') l.len--;
+        if (i) buf_addc(&text, '\n');
+        buf_add(&text, l.ptr ? l.ptr : "", l.len);
+        buf_free(&l);
+    }
+    lines_free(&rows);
+    if (text.len) {
+        // pbcopy, else an OSC 52 write
+        bool ok = false;
+        FILE *p = popen("pbcopy 2>/dev/null", "w");
+        if (p) {
+            ok = fwrite(text.ptr, 1, text.len, p) == text.len;
+            ok = pclose(p) == 0 && ok;
+        }
+        if (!ok) {
+            static const char b64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            Buf o = {0};
+            buf_adds(&o, "\x1b]52;c;");
+            for (size_t i = 0; i < text.len; i += 3) {
+                uint32_t v = (uint32_t)(uint8_t)text.ptr[i] << 16;
+                if (i + 1 < text.len) v |= (uint32_t)(uint8_t)text.ptr[i + 1] << 8;
+                if (i + 2 < text.len) v |= (uint8_t)text.ptr[i + 2];
+                buf_addc(&o, b64[v >> 18 & 63]);
+                buf_addc(&o, b64[v >> 12 & 63]);
+                buf_addc(&o, i + 1 < text.len ? b64[v >> 6 & 63] : '=');
+                buf_addc(&o, i + 2 < text.len ? b64[v & 63] : '=');
+            }
+            buf_adds(&o, "\x07");
+            (void)!write(1, o.ptr, o.len);
+            buf_free(&o);
+        }
+    }
+    buf_free(&text);
+}
+
+// A styled row with columns [c0, c1) replaced by repl (layout.ts compositeTuiLine).
+static char *overlay(const char *line, int c0, int c1, Str repl, int width) {
+    Buf b = {0}, x = {0};
+    tui_slice(&x, str(line), 0, c0, true);
+    buf_addstr(&b, buf_str(&x));
+    tui_spaces(&b, c0 - tui_width(buf_str(&x)));
+    buf_adds(&b, "\x1b[0m");
+    buf_addstr(&b, repl);
+    buf_adds(&b, "\x1b[0m");
+    x.len = 0;
+    tui_slice(&x, str(line), c1, MAX(0, width - c1), true);
+    buf_addstr(&b, buf_str(&x));
+    buf_free(&x);
+    return b.ptr ? b.ptr : strdup("");
 }
 
 static void draw(bool force) {
     Screen *s = &U->scr;
     int w = s->cols, h = s->rows;
+    View *v = &g_view;
     editor_set_rows(U->ed, h);
-    Lines dock = {0}, doc = {0}, frame = {0};
+    Lines dock = {0}, frame = {0};
     render_dock(w, &dock);
     int th = MAX(1, h - (int)dock.n);
-    comp_render(U->header, w, &doc);
-    comp_render(U->chat, w, &doc);
-    size_t start = doc.n > (size_t)th ? doc.n - (size_t)th : 0;
-    for (size_t i = start; i < doc.n && frame.n < (size_t)th; i++) lines_addz(&frame, doc.v[i]);
+    // the heights first (cached), then only the rows on screen
+    int total = doc_rows(w, 0, 0, &frame);
+    v->total = total;
+    v->view = th;
+    int max_top = MAX(0, total - th);
+    if (v->follow) v->top = max_top;
+    v->top = MAX(0, MIN(v->top, max_top));
+    if (v->top == max_top) v->follow = true;
+    doc_rows(w, v->top, v->top + th, &frame);
     while (frame.n < (size_t)th) lines_addz(&frame, "");
-    for (size_t i = 0; i < dock.n && frame.n < (size_t)h; i++) lines_addz(&frame, dock.v[i]);
+    // the selection, in inverse
+    if (v->sel_on) {
+        int r0, c0, r1, c1;
+        sel_bounds(&r0, &c0, &r1, &c1);
+        for (int r = MAX(r0, v->top); r <= r1 && r < v->top + th; r++) {
+            int a = r == r0 ? c0 : 0, b = r == r1 ? c1 : w;
+            if (b <= a) continue;
+            char **line = &frame.v[r - v->top];
+            Buf mid = {0}, inv = {0};
+            plain_cols(&mid, *line, a, b);
+            buf_adds(&inv, "\x1b[7m");
+            buf_addstr(&inv, buf_str(&mid));
+            tui_spaces(&inv, (b - a) - tui_width(buf_str(&mid)));
+            buf_adds(&inv, "\x1b[27m");
+            char *nl = overlay(*line, a, b, buf_str(&inv), w);
+            free(*line);
+            *line = nl;
+            buf_free(&mid);
+            buf_free(&inv);
+        }
+    }
+    // the scrollbar ("auto": a moment after scrolling, when the content overflows)
+    uint64_t now = now_ns();
+    if (total > th && now < v->bar_until && w > 1) {
+        int thumb_h = MAX(MIN(2, th), MIN(th, (int)lround((double)th * th / total)));
+        int thumb_top = max_top ? (int)lround((double)v->top / max_top * (th - thumb_h)) : 0;
+        for (int r = 0; r < th; r++) {
+            bool thumb = r >= thumb_top && r < thumb_top + thumb_h;
+            Buf g = {0};
+            th_fgz(&g, thumb ? T_SCROLL_THUMB : T_SCROLL_TRACK, thumb ? "\xe2\x94\x83" : "\xe2\x94\x82");
+            char *nl = overlay(frame.v[r], w - 1, w, buf_str(&g), w);
+            free(frame.v[r]);
+            frame.v[r] = nl;
+            buf_free(&g);
+        }
+    }
+    // scrolled away from the end: the jump-to-latest label on the last transcript row
+    v->jump_w = 0;
+    if (!v->follow) {
+        Buf l = {0}, t = {0};
+        th_fgz(&l, T_TEXT, " \xe2\x86\x93 Jump to latest message \xc2\xb7 ctrl+end ");
+        tui_truncate(&t, buf_str(&l), w, "", false);
+        int lw = tui_width(buf_str(&t));
+        int col = (w - lw) / 2;
+        if (lw > 0) {
+            char *nl = overlay(frame.v[th - 1], col, col + lw, buf_str(&t), w);
+            free(frame.v[th - 1]);
+            frame.v[th - 1] = nl;
+            v->jump_row = th - 1;
+            v->jump_col = col;
+            v->jump_w = lw;
+        }
+        buf_free(&l);
+        buf_free(&t);
+    }
+    for (size_t i = 0; i < dock.n && frame.n < (size_t)h; i++) {
+        lines_push(&frame, dock.v[i]);
+        dock.v[i] = NULL;
+    }
     screen_draw(s, &frame, force);
     lines_free(&dock);
-    lines_free(&doc);
     lines_free(&frame);
+}
+
+// A mouse event: the wheel scrolls the transcript, a drag selects its text (copied on release),
+// a click on the jump label goes to the end.
+static void handle_mouse(const Key *k) {
+    View *v = &g_view;
+    int b = k->button;
+    if (b & 64) { // wheel: 64 up, 65 down; bit 3 is Alt (five times as far)
+        int dir = (b & 3) == 0 ? -1 : (b & 3) == 1 ? 1 : 0;
+        if (!dir) return;
+        int n = wheel_lines(dir);
+        view_scroll(dir * ((b & 8) ? n * 5 : n));
+        return;
+    }
+    bool motion = b & 32;
+    int btn = b & 3;
+    if (k->my >= v->view) { // the dock: no selection there
+        if (!motion && !k->release && v->sel_on) {
+            v->sel_on = false;
+            request_render();
+        }
+        return;
+    }
+    int row = v->top + k->my, col = MAX(0, MIN(U->scr.cols, k->mx));
+    if (!motion && !k->release && btn == 0) {
+        if (v->jump_w && k->my == v->jump_row && k->mx >= v->jump_col && k->mx < v->jump_col + v->jump_w) {
+            view_end();
+            return;
+        }
+        v->sel_press = true;
+        v->sel_drag = false;
+        v->sel_on = false;
+        v->sel_r0 = v->sel_r1 = row;
+        v->sel_c0 = v->sel_c1 = col;
+        request_render();
+    } else if (motion && btn == 0 && v->sel_press) {
+        v->sel_r1 = row;
+        v->sel_c1 = col + 1;
+        v->sel_drag = v->sel_on = true;
+        request_render();
+    } else if (k->release && v->sel_press) {
+        v->sel_press = false;
+        if (v->sel_drag) copy_selection(U->scr.cols);
+    }
 }
 
 static bool g_dirty;
@@ -2673,35 +3393,200 @@ static void request_render(void) { g_dirty = true; }
 
 // ---- the agent thread -------------------------------------------------------------------------------------
 
+// The thread's handoff lives outside the UI's state, so a thread still running after the UI
+// returns (see code_ui_run) touches nothing that was freed.
+static pthread_mutex_t g_tlock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_tcond = PTHREAD_COND_INITIALIZER;
+static char *g_job;
+static bool g_tquit;
+static const CodeUiOps *g_tops;
+static CodeUiHost *g_thost;
+
 static void *agent_main(void *arg) {
     (void)arg;
-    pthread_mutex_lock(&U->lock);
+    const CodeUiOps *ops = g_tops;
+    CodeUiHost *host = g_thost;
+    pthread_mutex_lock(&g_tlock);
     for (;;) {
-        while (!U->job && !U->thread_quit) pthread_cond_wait(&U->cond, &U->lock);
-        if (U->thread_quit) break;
-        char *job = U->job;
-        U->job = NULL;
-        pthread_mutex_unlock(&U->lock);
-        U->ops->prompt(U->host, job);
+        while (!g_job && !g_tquit) pthread_cond_wait(&g_tcond, &g_tlock);
+        if (g_tquit) break;
+        char *job = g_job;
+        g_job = NULL;
+        pthread_mutex_unlock(&g_tlock);
+        ops->prompt(host, job);
         free(job);
         q_post("{\"type\":\"ui_idle\"}");
-        pthread_mutex_lock(&U->lock);
+        pthread_mutex_lock(&g_tlock);
     }
-    pthread_mutex_unlock(&U->lock);
+    pthread_mutex_unlock(&g_tlock);
     return NULL;
 }
 
 static void start_prompt(const char *text) {
     U->busy = true;
-    pthread_mutex_lock(&U->lock);
-    U->job = strdup(text);
-    pthread_cond_signal(&U->cond);
-    pthread_mutex_unlock(&U->lock);
+    pthread_mutex_lock(&g_tlock);
+    free(g_job);
+    g_job = strdup(text);
+    pthread_cond_signal(&g_tcond);
+    pthread_mutex_unlock(&g_tlock);
+}
+
+// ---- the streamed message, rebuilt from the ring's deltas ------------------------------------------------
+
+typedef struct {
+    char type; // 't' text, 'h' thinking, 'c' tool call
+    Buf text;
+    char *id, *name;
+    CodeArgsParser *args;
+} SBlock;
+
+static struct {
+    bool on, dirty, tools_dirty;
+    Arena base_a;
+    JValue *base; // the message as message_start gave it
+    VEC(SBlock) blocks;
+} g_stream;
+
+static void stream_reset(void) {
+    for (size_t i = 0; i < g_stream.blocks.len; i++) {
+        SBlock *b = &g_stream.blocks.ptr[i];
+        buf_free(&b->text);
+        free(b->id);
+        free(b->name);
+        code_args_parser_free(b->args);
+    }
+    vec_free(&g_stream.blocks);
+    arena_reset(&g_stream.base_a);
+    g_stream.base = NULL;
+    g_stream.on = g_stream.dirty = g_stream.tools_dirty = false;
+}
+
+static SBlock *stream_block(int index, char type) {
+    if (index < 0 || index > 100000) return NULL;
+    while (g_stream.blocks.len <= (size_t)index) {
+        SBlock nb = {.type = type};
+        vec_push(&g_stream.blocks, nb);
+    }
+    SBlock *b = &g_stream.blocks.ptr[index];
+    if (!b->type) b->type = type;
+    return b;
+}
+
+static void stream_begin(const JValue *m) {
+    stream_reset();
+    g_stream.on = true;
+    g_stream.base = jcopy(&g_stream.base_a, m);
+    const JValue *c = json_get(m, "content");
+    for (size_t i = 0; json_is(c, J_ARRAY) && i < c->arr.len; i++) {
+        const JValue *bl = c->arr.items[i];
+        Str t = json_strs(json_get(bl, "type"));
+        SBlock *b = stream_block((int)i, str_eqz(t, "thinking") ? 'h' : str_eqz(t, "toolCall") ? 'c' : 't');
+        if (!b) continue;
+        if (b->type == 'c') {
+            b->id = strndup(json_strs(json_get(bl, "id")).ptr, json_strs(json_get(bl, "id")).len);
+            b->name = strndup(json_strs(json_get(bl, "name")).ptr, json_strs(json_get(bl, "name")).len);
+        } else buf_addstr(&b->text, json_strs(json_get(bl, b->type == 'h' ? "thinking" : "text")));
+    }
+}
+
+static void stream_rec(CodeUiStreamKind k, int index, Str a, Str b) {
+    if (!g_stream.on) return;
+    SBlock *bl = NULL;
+    switch (k) {
+    case UI_S_TEXT_START: bl = stream_block(index, 't'); break;
+    case UI_S_THINK_START: bl = stream_block(index, 'h'); break;
+    case UI_S_TEXT:
+    case UI_S_THINK:
+        bl = stream_block(index, k == UI_S_TEXT ? 't' : 'h');
+        if (bl) buf_addstr(&bl->text, a);
+        break;
+    case UI_S_TOOL_START:
+        bl = stream_block(index, 'c');
+        if (bl) {
+            free(bl->id);
+            free(bl->name);
+            bl->id = strndup(a.ptr, a.len);
+            bl->name = strndup(b.ptr, b.len);
+        }
+        g_stream.tools_dirty = true;
+        break;
+    case UI_S_TOOL_ARGS:
+        bl = stream_block(index, 'c');
+        if (bl) {
+            if (!bl->args) bl->args = code_args_parser_new();
+            code_args_parser_feed(bl->args, a);
+        }
+        g_stream.tools_dirty = true;
+        break;
+    }
+    g_stream.dirty = true;
+}
+
+static void sync_tools(const JValue *msg);
+
+// The partial message (pi's message_update "message") from the blocks, handed to the view.
+static void stream_flush(void) {
+    if (!g_stream.on || !g_stream.dirty || !U->streaming) return;
+    g_stream.dirty = false;
+    Arena a = {0};
+    JValue *m = json_new(&a, J_OBJECT);
+    for (size_t i = 0; g_stream.base && json_is(g_stream.base, J_OBJECT) && i < g_stream.base->obj.len; i++)
+        if (!str_eqz(g_stream.base->obj.items[i].key, "content")) json_put(&a, m, g_stream.base->obj.items[i].key, g_stream.base->obj.items[i].val);
+    JValue *content = json_new(&a, J_ARRAY);
+    for (size_t i = 0; i < g_stream.blocks.len; i++) {
+        SBlock *b = &g_stream.blocks.ptr[i];
+        JValue *o = json_new(&a, J_OBJECT);
+        if (b->type == 'c') {
+            json_put(&a, o, S("type"), json_string(&a, S("toolCall")));
+            json_put(&a, o, S("id"), json_string(&a, str(b->id ? b->id : "")));
+            json_put(&a, o, S("name"), json_string(&a, str(b->name ? b->name : "")));
+            json_put(&a, o, S("arguments"), b->args ? (JValue *)code_args_parser_value(b->args) : json_new(&a, J_OBJECT));
+        } else {
+            json_put(&a, o, S("type"), json_string(&a, b->type == 'h' ? S("thinking") : S("text")));
+            json_put(&a, o, b->type == 'h' ? S("thinking") : S("text"), json_string(&a, buf_str(&b->text)));
+        }
+        json_push(&a, content, o);
+    }
+    json_put(&a, m, S("content"), content);
+    asst_set(U->streaming, m);
+    if (g_stream.tools_dirty) sync_tools(m);
+    g_stream.tools_dirty = false;
+    arena_reset(&a);
+}
+
+static void handle_event(const JValue *ev);
+
+// Everything the agent thread produced so far, in order.
+static void ring_drain(bool handle) {
+    static Buf ra, rb;
+    for (;;) {
+        uint64_t rt = atomic_load_explicit(&g_rtail, memory_order_relaxed);
+        uint64_t rh = atomic_load_explicit(&g_rhead, memory_order_acquire);
+        if (rt == rh) break;
+        Rec r = g_recs[rt % RING_RECS];
+        if (r.kind == R_JSON) {
+            if (handle) {
+                stream_flush();
+                Arena a = {0};
+                JValue *ev = NULL;
+                if (!json_parse(&a, str(r.json), true, &ev) && ev) handle_event(ev);
+                arena_reset(&a);
+            } else if (strstr(r.json, "\"ui_idle\"") && U) U->busy = false;
+            free(r.json);
+        } else if (handle) {
+            ra.len = rb.len = 0;
+            ring_copy_out(r.off, r.len, &ra);
+            ring_copy_out(r.off + r.len, r.len2, &rb);
+            stream_rec((CodeUiStreamKind)r.skind, r.index, buf_str(&ra), buf_str(&rb));
+        }
+        atomic_store_explicit(&g_btail, r.off + r.len + r.len2, memory_order_release);
+        atomic_store_explicit(&g_rtail, rt + 1, memory_order_release);
+    }
+    if (handle) stream_flush();
 }
 
 // ---- events (handleEvent) -------------------------------------------------------------------------------------
 
-static uint64_t g_last_spin;
 
 static void set_working(bool on) {
     if (on && !U->working) g_last_spin = now_ns(); // the spinner starts at its first frame
@@ -2739,15 +3624,6 @@ static void sync_tools(const JValue *msg) {
     }
 }
 
-static bool retryable_error(const char *m) {
-    // the transient errors pi retries (a short list: the full one is in code_main.c)
-    if (!m) return false;
-    static const char *const pats[] = {"429", "500", "502", "503", "504", "overloaded", "rate limit", "timeout", "timed out",
-                                       "connection", "network", "fetch failed", "terminated", "socket hang up", "ECONNRESET"};
-    for (size_t i = 0; i < COUNT(pats); i++)
-        if (strcasestr(m, pats[i])) return true;
-    return false;
-}
 
 static void pending_display(void);
 
@@ -2756,10 +3632,26 @@ static void handle_event(const JValue *ev) {
     if (str_eqz(type, "ui_idle")) {
         U->busy = false;
         set_working(false);
-        if (U->pending_thinking) {
-            if (U->ops->set_thinking) U->ops->set_thinking(U->host, U->pending_thinking);
-            free(U->pending_thinking);
-            U->pending_thinking = NULL;
+        // what was chosen while the run went on and its last turn did not take
+        char *rp, *rm;
+        if (code_ui_take_model(&rp, &rm)) {
+            if (U->ops->set_model && !U->ops->set_model(U->host, rp, rm)) show_error("Could not switch the model");
+            free(rp);
+            free(rm);
+        }
+        char *rt = code_ui_take_thinking();
+        if (rt) {
+            if (U->ops->set_thinking) U->ops->set_thinking(U->host, rt);
+            free(rt);
+        }
+        if (U->re_id) {
+            U->quit = true;
+            return;
+        }
+        // the prompts from the command line, one after another (pi awaits each)
+        if (U->ninitial_next < U->ninitial) {
+            start_prompt(U->initial[U->ninitial_next++]);
+            return;
         }
         char *next = code_ui_take_queued(false);
         if (next) {
@@ -2785,6 +3677,7 @@ static void handle_event(const JValue *ev) {
         else if (str_eqz(role, "assistant")) {
             U->streaming = asst_new(m);
             chat_add(&U->streaming->base);
+            stream_begin(m);
         }
     } else if (str_eqz(type, "message_update")) {
         const JValue *m = json_get(ev, "message");
@@ -2817,16 +3710,11 @@ static void handle_event(const JValue *ev) {
                 for (size_t i = 0; i < U->pending_tools.len; i++) tool_set_result(U->pending_tools.ptr[i], res, true, false, NULL);
                 U->pending_tools.len = 0;
                 arena_reset(&ra);
-                // maybeSuggestBugReport
-                if (str_eqz(stop, "error") && !retryable_error(em) && !(em && (strcasestr(em, "abort") || strcasestr(em, "cancel"))) &&
-                    !U->bug_hint_shown) {
-                    U->bug_hint_shown = true;
-                    chat_add(themed(T_MUTED, "If this looks like a pi bug, /bug sends a report to the developers.", 1, 0));
-                }
             } else
                 for (size_t i = 0; i < U->pending_tools.len; i++) U->pending_tools.ptr[i]->args_complete = true;
             arena_reset(&tmp);
             U->streaming = NULL;
+            stream_reset();
         }
     } else if (str_eqz(type, "tool_execution_start")) {
         const char *id = json_str(json_get(ev, "toolCallId"));
@@ -2862,6 +3750,7 @@ static void handle_event(const JValue *ev) {
                 }
             U->streaming = NULL;
         }
+        stream_reset();
         U->pending_tools.len = 0;
     } else if (str_eqz(type, "auto_retry_start")) {
         // RetryStatusIndicator: the retry countdown in the editor's border
@@ -2895,7 +3784,6 @@ static const SlashCmd builtin_cmds[] = {
     {"export", "Export session (HTML default, or specify path: .html/.jsonl)", NULL},
     {"import", "Import a JSONL session, preserving its ID and working directory", NULL},
     {"share", "Share session via a Radius artifact or a GitHub gist", NULL},
-    {"bug", "Report a bug to the Pi developers", "<description>"},
     {"copy", "Copy last agent message to clipboard", NULL},
     {"name", "Set session display name", NULL},
     {"session", "Show session info and stats", NULL},
@@ -2910,7 +3798,7 @@ static const SlashCmd builtin_cmds[] = {
     {"compact", "Manually compact the session context", NULL},
     {"resume", "Resume another session", NULL},
     {"reload", "Reload keybindings, extensions, skills, prompts, themes, and context files", NULL},
-    {"quit", "Quit pi", NULL},
+    {"quit", "Quit Saetta Code", NULL},
     {"llama", "Manage llama.cpp router models", NULL},
     {"mcp", "Manage MCP servers: sign in, reconnect, enable or disable, and change exposure", NULL},
 };
@@ -3077,7 +3965,7 @@ static void submit(char *text) {
             free(s);
             return;
         }
-        static const char *const known[] = {"scoped-models", "export", "import", "share", "bug", "copy",
+        static const char *const known[] = {"scoped-models", "export", "import", "share", "copy",
                                             "name", "session", "changelog", "hotkeys", "fork", "clone", "trust", "login", "logout",
                                             "compact", "resume", "reload", "llama", "mcp"};
         for (size_t i = 0; i < COUNT(known); i++) {
@@ -3104,9 +3992,14 @@ static void toggle_tools(void) {
     U->header_expanded = U->tools_expanded;
     CompVec *kids = comp_children(U->chat);
     for (size_t i = 0; i < kids->len; i++)
-        if (kids->ptr[i]->vt == &tool_vt) ((ToolView *)kids->ptr[i])->expanded = U->tools_expanded;
+        if (kids->ptr[i]->vt == &tool_vt) {
+            ((ToolView *)kids->ptr[i])->expanded = U->tools_expanded;
+            comp_invalidate(kids->ptr[i]);
+        }
     show_status(U->tools_expanded ? "Tool output: expanded" : "Tool output: collapsed");
 }
+
+static void cycle_model(int dir);
 
 static void cycle_thinking(void) {
     if (!U->model.reasoning) {
@@ -3125,6 +4018,13 @@ static void cycle_thinking(void) {
 }
 
 static void selector_key(const Key *k) {
+    if (U->sel == SEL_CONFIRM) {
+        if (k->kind == K_ENTER && U->dl_free_gb >= U->dl_disk) {
+            U->sel = SEL_NONE;
+            start_download();
+        } else if (k->kind == K_ESC || (k->kind == K_CTRL && k->ch == 'c')) U->sel = SEL_NONE;
+        return;
+    }
     if (U->sel == SEL_MODEL) model_key(k);
     else if (U->sel == SEL_SETTINGS) settings_key(k);
     else if (U->sel == SEL_TREE) tree_key(k);
@@ -3163,6 +4063,10 @@ static void handle_key(const Key *k) {
     }
     // app actions (custom-editor.ts)
     if (k->kind == K_ESC && !editor_autocomplete_open(U->ed)) {
+        if (U->dl_pid > 0) {
+            cancel_download();
+            return;
+        }
         if (U->busy) {
             // restoreQueuedMessagesToEditor({abort: true})
             restore_queued();
@@ -3193,6 +4097,12 @@ static void handle_key(const Key *k) {
     }
     if (k->kind == K_CTRL && k->ch == 't') {
         U->hide_thinking = !U->hide_thinking;
+        invalidate_kind(&asst_vt);
+        show_status(U->hide_thinking ? "Thinking blocks: hidden" : "Thinking blocks: visible");
+        return;
+    }
+    if (k->kind == K_CTRL && k->ch == 'p') {
+        cycle_model(k->shift ? -1 : 1);
         return;
     }
     if (k->kind == K_SHIFT_TAB) {
@@ -3238,15 +4148,128 @@ static void on_winch(int sig) {
     g_winch = 1;
 }
 
+// app.editor.external (external-editor.ts): the text in $VISUAL / $EDITOR (settings
+// "externalEditor" first, nano without either), the screen given back meanwhile.
+static void external_editor(void) {
+    const char *cmd = json_str(json_get(U->cfg->settings, "externalEditor"));
+    if (!cmd || !*cmd) cmd = getenv("VISUAL");
+    if (!cmd || !*cmd) cmd = getenv("EDITOR");
+    if (!cmd || !*cmd) cmd = "nano";
+    char dir[] = "/tmp/pi-editor-XXXXXX";
+    if (!mkdtemp(dir)) {
+        show_error("Failed to create a temporary file for the external editor");
+        return;
+    }
+    char path[64];
+    snprintf(path, sizeof path, "%s/prompt.md", dir);
+    Str text = editor_text(U->ed);
+    FILE *f = fopen(path, "w");
+    if (f) {
+        fwrite(text.ptr, 1, text.len, f);
+        fclose(f);
+    }
+    screen_stop(&U->scr);
+    printf("Launching external editor: %s\nSaetta Code will resume when the editor exits.\n", cmd);
+    fflush(stdout);
+    // the command split on spaces, the file last
+    char *copy = strdup(cmd);
+    const char *argv[64];
+    int n = 0;
+    for (char *tok = strtok(copy, " "); tok && n < 62; tok = strtok(NULL, " ")) argv[n++] = tok;
+    argv[n++] = path;
+    argv[n] = NULL;
+    pid_t pid;
+    extern char **environ;
+    int rc = posix_spawnp(&pid, argv[0], NULL, NULL, (char *const *)argv, environ);
+    int st = 0;
+    if (rc == 0)
+        while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+    screen_start(&U->scr);
+    if (rc) {
+        Buf m = {0};
+        buf_printf(&m, "Failed to launch external editor: %s", cmd);
+        show_status(m.ptr);
+        buf_free(&m);
+    } else if (!WIFEXITED(st) || WEXITSTATUS(st)) {
+        Buf m = {0};
+        if (WIFEXITED(st)) buf_printf(&m, "External editor exited with code %d; prompt unchanged", WEXITSTATUS(st));
+        else buf_printf(&m, "External editor exited with %s; prompt unchanged", strsignal(WTERMSIG(st)));
+        show_status(m.ptr);
+        buf_free(&m);
+    } else {
+        Buf b = {0};
+        f = fopen(path, "r");
+        if (f) {
+            char chunk[8192];
+            size_t got;
+            while ((got = fread(chunk, 1, sizeof chunk, f)) > 0) buf_add(&b, chunk, got);
+            fclose(f);
+        }
+        Str t = buf_str(&b);
+        if (str_starts(t, S("\xef\xbb\xbf"))) t = str_sub(t, 3, t.len);
+        if (t.len && t.ptr[t.len - 1] == '\n') t.len--;
+        editor_set_text(U->ed, t);
+        buf_free(&b);
+    }
+    unlink(path);
+    rmdir(dir);
+    free(copy);
+}
+
+// app.model.cycleForward / Backward over the models /model lists that run now (downloaded).
+static void cycle_model(int dir) {
+    size_t n = U->cfg->nmodels, cur = n;
+    size_t runnable = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (!U->cfg->models[i].unavailable) runnable++;
+        if (is_current(&U->cfg->models[i])) cur = i;
+    }
+    if (runnable < 2) {
+        show_status("Only one model available");
+        return;
+    }
+    size_t i = cur == n ? 0 : cur;
+    do i = (i + n + (size_t)(dir > 0 ? 1 : n - 1)) % n;
+    while (U->cfg->models[i].unavailable);
+    const CodeUiModel *m = &U->cfg->models[i];
+    choose_model(m, false);
+    Buf b = {0};
+    const char *lv = U->thinking ? U->thinking : "off";
+    buf_printf(&b, "Switched to %s", m->name && *m->name ? m->name : m->id);
+    if (m->reasoning && strcmp(lv, "off")) buf_printf(&b, " (thinking: %s)", lv);
+    if (!m->pack) show_status(b.ptr);
+    buf_free(&b);
+}
+
+// The keys the fullscreen viewport takes before the editor (tui.altScreen.*).
+static bool viewport_key(const Key *k) {
+    if (U->sel == SEL_TREE && (k->kind == K_PGUP || k->kind == K_PGDN)) return false;
+    View *v = &g_view;
+    switch (k->kind) {
+    case K_PGUP: view_scroll(-MAX(1, v->view - PAGE_SCROLL_OVERLAP)); return true;
+    case K_PGDN: view_scroll(MAX(1, v->view - PAGE_SCROLL_OVERLAP)); return true;
+    case K_CTRL_HOME: view_top(); return true;
+    case K_CTRL_END: view_end(); return true;
+    default: return false;
+    }
+}
+
 Err code_ui_run(const CodeUiConfig *cfg, const CodeUiOps *ops, CodeUiHost *host, const char *const *initial, size_t ninitial) {
     Ui ui = {0};
     U = &ui;
+    g_ui_thread = pthread_self();
+    g_view = (View){.follow = true};
+    {
+        bool local_mac = !getenv("SSH_CONNECTION") && !getenv("SSH_CLIENT") && !getenv("SSH_TTY");
+        g_view.wheel_accel = !local_mac;
+    }
     ui.cfg = cfg;
+    ui.dl_fd = -1;
     ui.ops = ops;
     ui.host = host;
     ui.thinking = dupz(cfg->thinking ? cfg->thinking : "off");
-    ui.model = (CodeUiModel){dupz(cfg->model.provider), dupz(cfg->model.id), dupz(cfg->model.name), cfg->model.reasoning,
-                             cfg->model.context_window};
+    ui.model = (CodeUiModel){.provider = dupz(cfg->model.provider), .id = dupz(cfg->model.id), .name = dupz(cfg->model.name),
+                             .reasoning = cfg->model.reasoning, .context_window = cfg->model.context_window};
     ui.auto_compact = cfg->auto_compact;
     ui.default_provider = dupz(cfg->default_provider);
     ui.default_model = dupz(cfg->default_model);
@@ -3265,29 +4288,53 @@ Err code_ui_run(const CodeUiConfig *cfg, const CodeUiOps *ops, CodeUiHost *host,
     editor_set_arg_completer(ui.ed, arg_items, NULL);
     editor_set_border(ui.ed, th_thinking_color(ui.thinking));
     sel_init(&ui.list, 5, 32, 32);
-    pthread_mutex_init(&ui.lock, NULL);
-    pthread_cond_init(&ui.cond, NULL);
+    ring_init();
     if (pipe(g_wake) == 0) {
         fcntl(g_wake[0], F_SETFL, O_NONBLOCK);
         fcntl(g_wake[1], F_SETFL, O_NONBLOCK);
+        fcntl(g_wake[0], F_SETFD, FD_CLOEXEC);
+        fcntl(g_wake[1], F_SETFD, FD_CLOEXEC);
     }
+    editor_set_waker(ui.ed, g_wake[1]);
+    g_tops = ops;
+    g_thost = host;
+    g_tquit = false;
     pthread_create(&ui.thread, NULL, agent_main, NULL);
     struct sigaction sa = {0};
     sa.sa_handler = on_winch;
     sigaction(SIGWINCH, &sa, NULL);
+    theme_set(NULL, true); // grayscale until the terminal reports its colors
     screen_start(&ui.scr);
     if (cfg->resumed) render_history();
     draw(true);
-    for (size_t i = 0; i < ninitial; i++) submit((char *)initial[i]);
-    char in[65536];
-    size_t inlen = 0;
+    if (ninitial) {
+        ui.initial = xcalloc(ninitial, sizeof *ui.initial);
+        for (size_t i = 0; i < ninitial; i++) ui.initial[i] = strdup(initial[i]);
+        ui.ninitial = ninitial;
+        // the first now, the others as each run ends (pi runs them in turn, none as steering)
+        while (ui.ninitial_next < ui.ninitial && !ui.busy) {
+            char *t = ui.initial[ui.ninitial_next++];
+            submit(t);
+        }
+    }
+    KeyIn kin = {0};
     uint64_t last_draw = 0;
     g_dirty = true;
     while (!ui.quit) {
-        struct pollfd fds[2] = {{0, POLLIN, 0}, {g_wake[0], POLLIN, 0}};
-        int timeout = inlen ? 25 : ui.working ? 80 : 1000;
-        if (g_dirty) timeout = 8;
-        int r = poll(fds, 2, timeout);
+        uint64_t now = now_ns();
+        int timeout = ui.working ? 80 : 1000;
+        int kt = keyin_timeout_ms(&kin, now);
+        if (kt >= 0) timeout = MIN(timeout, kt);
+        if (g_dirty) timeout = MIN(timeout, 8);
+        if (editor_busy(ui.ed)) timeout = MIN(timeout, 10);
+        if (g_view.bar_until > now) timeout = MIN(timeout, (int)((g_view.bar_until - now) / 1000000) + 1);
+        if (ui.scr.color_query) timeout = MIN(timeout, 10);
+        // asleep only with the ring empty (the producer wakes a sleeping consumer once)
+        atomic_store(&g_ui_sleeping, 1);
+        if (atomic_load(&g_rhead) != atomic_load(&g_rtail)) timeout = 0;
+        struct pollfd fds[3] = {{0, POLLIN, 0}, {g_wake[0], POLLIN, 0}, {ui.dl_fd, POLLIN, 0}};
+        int r = poll(fds, ui.dl_fd >= 0 ? 3 : 2, timeout);
+        atomic_store(&g_ui_sleeping, 0);
         if (r < 0 && errno != EINTR) break;
         if (g_winch) {
             g_winch = 0;
@@ -3299,45 +4346,64 @@ Err code_ui_run(const CodeUiConfig *cfg, const CodeUiOps *ops, CodeUiHost *host,
             while (read(g_wake[0], junk, sizeof junk) > 0) {}
         }
         // events from the agent
-        for (QItem *it = q_take_all(); it;) {
-            Arena a = {0};
-            JValue *ev = NULL;
-            if (!json_parse(&a, str(it->json), true, &ev) && ev) handle_event(ev);
-            arena_reset(&a);
-            QItem *next = it->next;
-            free(it->json);
-            free(it);
-            it = next;
-        }
-        // keys
-        bool got = false;
-        if (r > 0 && (fds[0].revents & (POLLIN | POLLHUP))) {
-            ssize_t n = read(0, in + inlen, sizeof in - inlen);
-            if (n <= 0) {
-                if (n == 0) break;
-            } else {
-                inlen += (size_t)n;
-                got = true;
-            }
-        }
-        size_t off = 0;
-        for (;;) {
-            Key k;
-            size_t used = key_parse(in + off, inlen - off, !got, &k);
-            if (!used) break;
-            off += used;
-            if (k.kind != K_NONE) handle_key(&k);
-            free(k.paste);
+        ring_drain(true);
+        if (g_queue_dirty) {
+            g_queue_dirty = false;
+            pending_display();
             request_render();
-            if (ui.quit) break;
         }
-        memmove(in, in + off, inlen - off);
-        inlen -= off;
-        if (inlen == sizeof in) inlen = 0; // a runaway sequence
-        uint64_t now = now_ns();
+        if (editor_tick(ui.ed)) request_render();
+        download_poll();
+        // keys
+        if (r > 0 && (fds[0].revents & (POLLIN | POLLHUP))) {
+            char in[65536];
+            ssize_t n = read(0, in, sizeof in);
+            if (n == 0) break;
+            if (n > 0) keyin_feed(&kin, in, (size_t)n);
+        }
+        Key k;
+        while (!ui.quit && keyin_next(&kin, now_ns(), &k)) {
+            if (k.kind == K_REPLY_KITTY || k.kind == K_REPLY_DA || k.kind == K_REPLY_COLOR) {
+                bool late = !ui.scr.color_query && k.kind == K_REPLY_COLOR;
+                if (late) ui.scr.color_query = true; // a reply after the timeout still applies (onLateReply)
+                screen_reply(&ui.scr, &k);
+                if (late) ui.scr.color_done = true;
+            }
+            else if (k.kind == K_MOUSE) handle_mouse(&k);
+            else if (k.kind != K_NONE) {
+                if (g_view.sel_on) {
+                    g_view.sel_on = false;
+                    request_render();
+                }
+                if (k.kind == K_CTRL && k.ch == 'z' && ui.sel == SEL_NONE) {
+                    screen_suspend(&ui.scr);
+                    screen_size(&ui.scr);
+                    draw(true);
+                } else if (k.kind == K_CTRL && k.ch == 'g' && ui.sel == SEL_NONE) {
+                    external_editor();
+                    draw(true);
+                } else if (!viewport_key(&k)) handle_key(&k);
+                request_render();
+            }
+            free(k.paste);
+        }
+        now = now_ns();
+        // the terminal's colors: the theme once they all came, the DA1 after them, or 100 ms passed
+        // (TERMINAL_QUERY_TIMEOUT_MS)
+        if (ui.scr.color_query && (ui.scr.color_done || now - ui.scr.color_query_ns >= 100000000ull)) {
+            ui.scr.color_query = ui.scr.color_done = false;
+            TermColors tc = ui.scr.colors;
+            theme_set(&tc, false);
+            invalidate_all();
+            g_dirty = true;
+        }
         if (ui.working && now - g_last_spin >= 80000000ull) {
             editor_spin(ui.ed);
             g_last_spin = now;
+            g_dirty = true;
+        }
+        if (g_view.bar_until && now >= g_view.bar_until) {
+            g_view.bar_until = 0;
             g_dirty = true;
         }
         if (g_dirty && now - last_draw >= 8000000ull) {
@@ -3346,37 +4412,48 @@ Err code_ui_run(const CodeUiConfig *cfg, const CodeUiOps *ops, CodeUiHost *host,
             g_dirty = false;
         }
     }
+    keyin_free(&kin);
+    screen_stop(&ui.scr);
+    Err result = OK;
     if (ui.busy) {
-        // the run stops at its next read; wait for it (up to 5 s)
+        // quitting during a run: stop it and wait for it to end (the ring kept drained, so the
+        // agent never blocks on it); nothing it uses is freed before
         ops->abort(host);
         uint64_t until = now_ns() + 5000000000ull;
         while (ui.busy && now_ns() < until) {
             struct pollfd pf = {g_wake[0], POLLIN, 0};
-            poll(&pf, 1, 50);
+            atomic_store(&g_ui_sleeping, 1);
+            if (atomic_load(&g_rhead) == atomic_load(&g_rtail)) poll(&pf, 1, 50);
+            atomic_store(&g_ui_sleeping, 0);
             char junk[256];
             while (read(g_wake[0], junk, sizeof junk) > 0) {}
-            for (QItem *it = q_take_all(); it;) {
-                if (strstr(it->json, "\"ui_idle\"")) ui.busy = false;
-                QItem *next = it->next;
-                free(it->json);
-                free(it);
-                it = next;
-            }
+            ring_drain(false);
         }
     }
-    pthread_mutex_lock(&ui.lock);
-    ui.thread_quit = true;
-    pthread_cond_signal(&ui.cond);
-    pthread_mutex_unlock(&ui.lock);
-    screen_stop(&ui.scr);
-    if (!ui.busy) pthread_join(ui.thread, NULL);
-    // what is still queued is dropped
-    for (QItem *it = q_take_all(); it;) {
-        QItem *next = it->next;
-        free(it->json);
-        free(it);
-        it = next;
+    if (ui.busy) {
+        // still running (a read that ignores the abort): the caller exits the process at once
+        // without freeing what the run uses
+        U = NULL;
+        return "AgentBusy";
     }
+    pthread_mutex_lock(&g_tlock);
+    g_tquit = true;
+    pthread_cond_signal(&g_tcond);
+    pthread_mutex_unlock(&g_tlock);
+    pthread_join(ui.thread, NULL);
+    ring_drain(false);
+    if (ui.re_id && ops->restart) ops->restart(host, ui.re_provider, ui.re_id);
+    if (ui.dl_pid > 0) {
+        kill(ui.dl_pid, SIGINT);
+        waitpid(ui.dl_pid, NULL, 0);
+    }
+    if (ui.dl_fd >= 0) close(ui.dl_fd);
+    free(ui.dl_name);
+    free(ui.dl_title);
+    free(ui.dl_models_dir);
+    buf_free(&ui.dl_line);
+    free(ui.re_provider);
+    stream_reset();
     editor_free(ui.ed);
     comp_free(ui.header);
     comp_free(ui.chat);
@@ -3390,6 +4467,9 @@ Err code_ui_run(const CodeUiConfig *cfg, const CodeUiOps *ops, CodeUiHost *host,
     for (size_t i = 0; i < g_msgq.len; i++) free(g_msgq.ptr[i].text);
     vec_free(&g_msgq);
     pthread_mutex_unlock(&g_mlock);
+    for (size_t i = 0; i < ui.ninitial; i++) free(ui.initial[i]);
+    free(ui.initial);
+    free(ui.re_id);
     free(ui.thinking);
     free(ui.default_thinking);
     free((char *)ui.model.provider);
@@ -3397,8 +4477,11 @@ Err code_ui_run(const CodeUiConfig *cfg, const CodeUiOps *ops, CodeUiHost *host,
     free((char *)ui.model.name);
     free(ui.default_provider);
     free(ui.default_model);
-    free(ui.pending_thinking);
-    free(ui.job);
+    free(g_job);
+    g_job = NULL;
+    close(g_wake[0]);
+    close(g_wake[1]);
+    g_wake[0] = g_wake[1] = -1;
     U = NULL;
-    return OK;
+    return result;
 }

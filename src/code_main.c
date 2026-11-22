@@ -23,6 +23,9 @@
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
+#include <mach-o/dyld.h>
+#include <errno.h>
+#include "fit.h"
 
 static const char *const default_tools[] = {"read", "bash", "edit", "write"};
 
@@ -44,6 +47,11 @@ typedef struct {
     bool ui; // the interactive mode prints the stream as it arrives
     int64_t retry_attempt; // the retries of the current prompt so far (pi's _retryAttempt)
     JValue *new_messages; // this run's messages, for agent_end
+    const char *pack;     // --pack as given (a download name or a folder), NULL over HTTP
+    const char *const *argv; // the command line after "code", for a restart on another model
+    size_t argc;
+    const JValue *call;   // the tool call running (for its partial results)
+    char *restart_provider, *restart_id; // set by the interactive mode: start again on this model
 } Run;
 
 static double wall_ms(void) { return (double)(wall_ns() / 1000000); }
@@ -98,7 +106,7 @@ static Err parse_args(const char *const *v, size_t n, Args *o) {
         else if (!strcmp(x, "--help") || !strcmp(x, "-h")) {
             printf("usage: saetta code [options] [prompt ...]\n"
                    "\n"
-                   "Saetta Code, a minimal coding agent that behaves as pi 1.5.2 does: the same tools (read, bash,\n"
+                   "Saetta Code, a coding agent compatible with pi 1.5.2: the same tools (read, bash,\n"
                    "edit, write; grep, find, ls with --tools), system prompt, AGENTS.md / CLAUDE.md files, skills and\n"
                    "session files, so pi and Saetta Code resume each other's sessions. It talks to saetta or any\n"
                    "OpenAI-compatible chat completions server named in pi's models.json ($PI_CODING_AGENT_DIR, else\n"
@@ -117,7 +125,7 @@ static Err parse_args(const char *const *v, size_t n, Args *o) {
                    "  --ctx N                  with --pack: the context in tokens (default 204800, as saetta start;\n"
                    "                           less when this Mac's memory holds less)\n"
                    "\n"
-                   "Without -p in a terminal it opens pi's interactive screen: Enter sends, Shift+Enter (or a\n"
+                   "Without -p in a terminal it opens the interactive screen: Enter sends, Shift+Enter (or a\n"
                    "trailing \\) starts a new line, \"/\" lists the commands, \"@\" completes file names, Escape stops a\n"
                    "turn, Ctrl-C clears, Ctrl-C twice or Ctrl-D quits.\n");
             exit(0);
@@ -400,6 +408,8 @@ typedef struct {
 
 // ---- the interactive mode's state ------------------------------------------------------------------
 
+const char *code_version = "dev";
+
 static volatile int g_abort;
 
 // pi's message_update, as json mode prints it: usage, and the event without its partial
@@ -415,14 +425,29 @@ static void on_event(void *ctx, const JValue *event, const JValue *partial) {
         return;
     }
     if (str_eqz(type, "done") || str_eqz(type, "error")) return;
-    // the interactive mode gets the partial message too, at most every 15 ms for the deltas (the
-    // final message comes with message_end)
+    // the interactive mode: the deltas go into the UI's ring as they are (no JSON, no allocation:
+    // the per-token path); the UI rebuilds the partial message. The *_end events carry nothing
+    // it shows (the final message comes with message_end).
     if (r->ui) {
-        static uint64_t last;
-        uint64_t now = now_ns();
-        bool delta = str_ends(type, S("_delta"));
-        if (delta && now - last < 15000000ull) return;
-        last = now;
+        const JValue *idx = json_get(event, "contentIndex");
+        long k = -1;
+        if (json_is(idx, J_INTEGER)) k = (long)idx->i;
+        else if (json_is(idx, J_FLOAT)) k = (long)idx->f;
+        else if (json_is(idx, J_NUMBER_STRING)) {
+            k = 0;
+            for (size_t i = 0; i < idx->s.len && idx->s.ptr[i] >= '0' && idx->s.ptr[i] <= '9'; i++) k = k * 10 + (idx->s.ptr[i] - '0');
+        }
+        Str delta = json_strs(json_get(event, "delta"));
+        if (str_eqz(type, "text_start")) code_ui_stream(UI_S_TEXT_START, (int)k, S(""), S(""));
+        else if (str_eqz(type, "text_delta")) code_ui_stream(UI_S_TEXT, (int)k, delta, S(""));
+        else if (str_eqz(type, "thinking_start")) code_ui_stream(UI_S_THINK_START, (int)k, S(""), S(""));
+        else if (str_eqz(type, "thinking_delta")) code_ui_stream(UI_S_THINK, (int)k, delta, S(""));
+        else if (str_eqz(type, "toolcall_start")) {
+            const JValue *content = json_get(partial, "content");
+            const JValue *tc = k >= 0 && json_is(content, J_ARRAY) && (size_t)k < content->arr.len ? content->arr.items[k] : NULL;
+            code_ui_stream(UI_S_TOOL_START, (int)k, json_strs(json_get(tc, "id")), json_strs(json_get(tc, "name")));
+        } else if (str_eqz(type, "toolcall_delta")) code_ui_stream(UI_S_TOOL_ARGS, (int)k, delta, S(""));
+        return;
     }
     JValue *e = ev_new(a, "message_update");
     json_put(a, e, S("usage"), (JValue *)json_get(partial, "usage"));
@@ -439,7 +464,6 @@ static void on_event(void *ctx, const JValue *event, const JValue *partial) {
         json_put(a, ame, S("toolName"), tc ? (JValue *)json_get(tc, "name") : json_string(a, S("")));
     }
     json_put(a, e, S("assistantMessageEvent"), ame);
-    if (r->ui) json_put(a, e, S("message"), (JValue *)partial);
     emit(r, e);
 }
 
@@ -836,12 +860,39 @@ static void finish_agent(Run *r, bool will_retry, const JValue *last) {
 }
 
 // The turns of one agent run (runLoop): *last the final assistant message and its entry id.
+static bool switch_model(Run *r, const char *provider, const char *id);
+static void apply_thinking(Run *r, const char *level);
+
+// What the user chose in the interactive mode while the run went on: applied here, between turns,
+// on this thread (pi's setModel takes effect at the next request).
+static void ui_requests(Run *r) {
+    if (!r->ui) return;
+    char *p, *m;
+    if (code_ui_take_model(&p, &m)) {
+        if (!switch_model(r, p, m)) {
+            Arena t = {0};
+            JValue *ev = ev_new(&t, "ui_error");
+            json_put(&t, ev, S("message"), json_string(&t, str(arena_printf(&t, "Could not switch to %s/%s", p, m))));
+            code_ui_event(ev);
+            arena_reset(&t);
+        }
+        free(p);
+        free(m);
+    }
+    char *lv = code_ui_take_thinking();
+    if (lv) {
+        apply_thinking(r, lv);
+        free(lv);
+    }
+}
+
 static Err run_turns(Run *r, JValue **last_out, const char **last_id) {
     Arena *a = r->a;
     bool turn_started = false;
     for (bool first = true;; first = false) {
         if (!first && !turn_started) emit(r, ev_new(a, "turn_start"));
         turn_started = false;
+        ui_requests(r);
         JValue *msg;
         TRY(stream_assistant(r, &msg));
         *last_out = msg;
@@ -929,8 +980,9 @@ static void host_new_session(CodeUiHost *h) {
     (void)code_session_append(r->session, "thinking_level_change", f);
 }
 
-static void host_set_thinking(CodeUiHost *h, const char *level) {
-    Run *r = h->r;
+static void host_set_thinking(CodeUiHost *h, const char *level) { apply_thinking(h->r, level); }
+
+static void apply_thinking(Run *r, const char *level) {
     Arena *a = r->a;
     if (r->model.thinking && !strcmp(r->model.thinking, level)) return;
     r->model.thinking = arena_strdup(a, level);
@@ -949,8 +1001,9 @@ static const JValue *host_messages(CodeUiHost *h) { return code_session_messages
 
 static void host_set_leaf(CodeUiHost *h, const char *id) { code_session_set_leaf(h->r->session, id); }
 
-static bool host_set_model(CodeUiHost *h, const char *provider, const char *id) {
-    Run *r = h->r;
+static bool host_set_model(CodeUiHost *h, const char *provider, const char *id) { return switch_model(h->r, provider, id); }
+
+static bool switch_model(Run *r, const char *provider, const char *id) {
     if (r->model.engine) return !strcmp(provider, r->model.provider) && !strcmp(id, r->model.id);
     Arena *a = r->a;
     CodeModel keep = r->model;
@@ -972,23 +1025,47 @@ static bool host_set_model(CodeUiHost *h, const char *provider, const char *id) 
     return true;
 }
 
-// The models pi's models.json lists (openai-completions providers), for /model.
-static CodeUiModel *list_models(Arena *a, const Run *r, size_t *n) {
+// What /model lists: the model packs this Mac can run in process (downloaded or not; the ones that
+// need more memory than it has marked), then the openai-completions models of pi's models.json.
+static bool pack_is_current(Arena *a, const Run *r, const DownloadPack *p) {
+    if (!r->pack) return false;
+    if (!strcmp(r->pack, p->name)) return true;
+    char *dir;
+    return !download_pack_dir(a, p, &dir) && !strcmp(dir, r->pack);
+}
+
+static CodeUiModel *list_models(Arena *a, const Run *r, size_t *n, CodeUiModel *current) {
     *n = 0;
-    if (r->model.engine) {
-        CodeUiModel *m = arena_alloc(a, sizeof *m);
-        *m = (CodeUiModel){r->model.provider, r->model.id, r->model.name, r->model.reasoning, r->model.context_window};
-        *n = 1;
-        return m;
-    }
     JValue *models = read_json(a, path_join(a, r->env.agent_dir, "models.json"));
     const JValue *providers = json_get(models, "providers");
-    size_t cap = 0;
+    size_t cap = DOWNLOAD_NPACKS + 1;
     for (size_t i = 0; providers && json_is(providers, J_OBJECT) && i < providers->obj.len; i++) {
         const JValue *list = json_get(providers->obj.items[i].val, "models");
         cap += json_is(list, J_ARRAY) ? list->arr.len : 0;
     }
     CodeUiModel *out = arena_alloc(a, (cap + 1) * sizeof *out);
+    const uint64_t ram = fit_ram_bytes();
+    for (size_t i = 0; i < DOWNLOAD_NPACKS; i++) {
+        const DownloadPack *p = &download_packs[i];
+        if (!p->min_ram_gb) continue; // adapters are not models
+        char *dir;
+        bool have = !download_pack_dir(a, p, &dir) && file_exists(path_join(a, dir, "config.json"));
+        CodeUiModel m = {.provider = "saetta", .id = p->name, .name = p->title ? p->title : p->name, .reasoning = true,
+                         .context_window = 204800, .pack = true, .unavailable = !have,
+                         .too_big = ((uint64_t)p->min_ram_gb << 30) > ram, .disk_gb = p->disk_gb, .min_ram_gb = p->min_ram_gb};
+        if (pack_is_current(a, r, p)) {
+            m.unavailable = false;
+            m.context_window = r->model.context_window;
+            *current = m;
+        }
+        out[(*n)++] = m;
+    }
+    if (r->pack && !current->id) { // a pack folder that is not a known download
+        CodeUiModel m = {.provider = "saetta", .id = r->pack, .name = r->model.id, .reasoning = true,
+                         .context_window = r->model.context_window, .pack = true};
+        *current = m;
+        out[(*n)++] = m;
+    }
     for (size_t i = 0; providers && json_is(providers, J_OBJECT) && i < providers->obj.len; i++) {
         const JMember *p = &providers->obj.items[i];
         const JValue *list = json_get(p->val, "models");
@@ -996,11 +1073,65 @@ static CodeUiModel *list_models(Arena *a, const Run *r, size_t *n) {
             const JValue *m = list->arr.items[k];
             const char *api = json_str(json_get(m, "api")) ? json_str(json_get(m, "api")) : json_str(json_get(p->val, "api"));
             if (!api || strcmp(api, "openai-completions") || !json_str(json_get(m, "id"))) continue;
-            out[(*n)++] = (CodeUiModel){str_z(a, p->key), json_str(json_get(m, "id")), json_str(json_get(m, "name")),
-                                        jbool(json_get(m, "reasoning"), false), juint(json_get(m, "contextWindow"), 128000)};
+            out[(*n)++] = (CodeUiModel){.provider = str_z(a, p->key), .id = json_str(json_get(m, "id")), .name = json_str(json_get(m, "name")),
+                                        .reasoning = jbool(json_get(m, "reasoning"), false),
+                                        .context_window = juint(json_get(m, "contextWindow"), 128000)};
         }
     }
     return out;
+}
+
+// The interactive mode chose a model this process cannot switch to in place (another pack, or
+// away from the engine): saetta code starts again on it once the UI has ended, the session
+// continued (-c), the other options kept.
+static void host_restart(CodeUiHost *h, const char *provider, const char *id) {
+    Run *r = h->r;
+    free(r->restart_provider);
+    free(r->restart_id);
+    r->restart_provider = strdup(provider);
+    r->restart_id = strdup(id);
+}
+
+static void restart_on(Run *r) {
+    Arena *a = r->a;
+    char self[PATH_MAX];
+    uint32_t sz = sizeof self;
+    if (_NSGetExecutablePath(self, &sz) != 0) return;
+    VEC(const char *) v = {0};
+    vec_push(&v, self);
+    vec_push(&v, "code");
+    for (size_t i = 0; i < r->argc; i++) {
+        const char *x = r->argv[i];
+        bool more = i + 1 < r->argc;
+        bool takes = !strcmp(x, "--provider") || !strcmp(x, "--model") || !strcmp(x, "--pack") || !strcmp(x, "--thinking") ||
+                     !strcmp(x, "--mode") || !strcmp(x, "--system-prompt") || !strcmp(x, "--append-system-prompt") ||
+                     !strcmp(x, "--tools") || !strcmp(x, "--ctx");
+        if (takes && more) {
+            if (strcmp(x, "--provider") && strcmp(x, "--model") && strcmp(x, "--pack")) {
+                vec_push(&v, x);
+                vec_push(&v, r->argv[i + 1]);
+            }
+            i++;
+        } else if (x[0] == '-' && strcmp(x, "-c") && strcmp(x, "--continue")) vec_push(&v, x);
+        // prompts are not run again
+    }
+    if (!strcmp(r->restart_provider, "saetta")) {
+        vec_push(&v, "--pack");
+        vec_push(&v, r->restart_id);
+    } else {
+        vec_push(&v, "--provider");
+        vec_push(&v, r->restart_provider);
+        vec_push(&v, "--model");
+        vec_push(&v, r->restart_id);
+    }
+    vec_push(&v, "-c");
+    vec_push(&v, NULL);
+    code_tools_kill_detached();
+    fflush(NULL);
+    execv(self, (char *const *)v.ptr);
+    fprintf(stderr, "saetta code: cannot start again on %s/%s: %s\n", r->restart_provider, r->restart_id, strerror(errno));
+    (void)a;
+    vec_free(&v);
 }
 
 static void host_abort(CodeUiHost *h) {
@@ -1022,6 +1153,12 @@ static const char *find_fd(Arena *a, const char *agent_dir) {
     return access(managed, X_OK) == 0 ? managed : NULL;
 }
 
+static const char *self_exe(Arena *a) {
+    char self[PATH_MAX];
+    uint32_t sz = sizeof self;
+    return _NSGetExecutablePath(self, &sz) == 0 ? arena_strdup(a, self) : NULL;
+}
+
 static Err interactive(Run *r, const Args *o, const JValue *settings) {
     Arena *a = r->a;
     r->ui = true;
@@ -1032,12 +1169,15 @@ static Err interactive(Run *r, const Args *o, const JValue *settings) {
     signal(SIGINT, SIG_IGN); // Ctrl-C is a key in raw mode
     const JValue *compaction = json_get(settings, "compaction");
     size_t nmodels;
-    CodeUiModel *models = list_models(a, r, &nmodels);
+    CodeUiModel cur = {0};
+    CodeUiModel *models = list_models(a, r, &nmodels, &cur);
     CodeUiConfig cfg = {
         .cwd = r->env.cwd,
         .home = r->env.home,
         .agent_dir = r->env.agent_dir,
-        .model = {r->model.provider, r->model.id, r->model.name, r->model.reasoning, r->model.context_window},
+        .model = cur.id ? cur
+                        : (CodeUiModel){.provider = r->model.provider, .id = r->model.id, .name = r->model.name, .reasoning = r->model.reasoning,
+                                        .context_window = r->model.context_window},
         .thinking = r->model.thinking,
         .auto_compact = jbool(json_get(compaction, "enabled"), true),
         .fd_path = find_fd(a, r->env.agent_dir),
@@ -1047,12 +1187,21 @@ static Err interactive(Run *r, const Args *o, const JValue *settings) {
         .default_model = json_str(json_get(settings, "defaultModel")),
         .settings = settings,
         .resumed = o->cont && code_session_messages(r->session)->arr.len > 0,
+        .version = code_version,
     };
+    cfg.engine = r->model.engine != NULL;
+    cfg.self_exe = self_exe(a);
     CodeUiOps ops = {host_prompt, host_new_session, host_set_thinking, host_entries, host_messages,
-                     host_set_leaf, host_set_model, host_abort};
+                     host_set_leaf, host_set_model, host_abort, host_restart};
     CodeUiHost host = {r};
     Err e = code_ui_run(&cfg, &ops, &host, o->prompts.ptr, o->prompts.len);
     g_tty_saved = 0;
+    if (e && !strcmp(e, "AgentBusy")) {
+        // the run ignored the abort: leave without touching what it uses
+        code_tools_kill_detached();
+        _exit(0);
+    }
+    if (!e && r->restart_id) restart_on(r);
     return e;
 }
 
@@ -1186,7 +1335,7 @@ Err code_run(const char *const *args, size_t n, int *code) {
     Args o = {0};
     Err e = parse_args(args, n, &o);
     if (e) goto done;
-    Run r = {.a = a, .json = o.mode && !strcmp(o.mode, "json")};
+    Run r = {.a = a, .json = o.mode && !strcmp(o.mode, "json"), .pack = o.pack, .argv = args, .argc = n};
     char cwd[PATH_MAX];
     if (!getcwd(cwd, sizeof cwd)) {
         e = "NoCwd";

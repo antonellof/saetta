@@ -22,6 +22,7 @@ typedef struct {
     const char *repo;
     const char *rev;
     const char *note;
+    const char *title; // the model's name as Saetta Code lists it
     const char *dir; // local folder under the models folder (default: repo)
     const char *const *only; // names relative to subdir
     const char *subdir;      // a folder of repo, or NULL for its root

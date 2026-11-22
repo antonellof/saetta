@@ -36,4 +36,12 @@ JValue *code_oai_js_parse(Arena *a, Str text, char **err);
 // JSON.stringify of a tree from code_oai_js_parse or json_parse.
 void code_oai_js_write(Buf *out, const JValue *v);
 
+// pi's StreamingJsonParser for tool-call arguments, fed one delta at a time; the value is the
+// partial arguments object ({} until there is one), valid until the next feed.
+typedef struct CodeArgsParser CodeArgsParser;
+CodeArgsParser *code_args_parser_new(void);
+void code_args_parser_feed(CodeArgsParser *p, Str text);
+const JValue *code_args_parser_value(CodeArgsParser *p);
+void code_args_parser_free(CodeArgsParser *p);
+
 #endif

@@ -40,6 +40,9 @@ typedef struct {
     struct Engine *engine;
 } CodeModel;
 
+// saetta's version (main.c sets it), for Saetta Code's header.
+extern const char *code_version;
+
 // Where the agent runs.
 typedef struct {
     const char *cwd;       // process working directory, as pi's process.cwd()

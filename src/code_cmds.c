@@ -12,6 +12,7 @@
 // default keys), utils/clipboard.ts and clipboard-command.ts (copyToClipboard on macOS),
 // packages/tui/src/fuzzy.ts (fuzzyFilter), components/loader.ts, input.ts.
 #include "code_cmds.h"
+#include "code_cfg.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -1380,98 +1381,40 @@ void cmds_header_notice(int width, Lines *out) {
 // ---- settings.json (SettingsManager.setEnabledModels: the file read again under its lock, the field
 // set or dropped, written whole as JSON.stringify(settings, null, 2)) -------------------------------------
 
-static void json_pretty(Buf *b, const JValue *v, int depth) {
-    if (json_is(v, J_OBJECT) && v->obj.len) {
-        buf_adds(b, "{\n");
-        for (size_t i = 0; i < v->obj.len; i++) {
-            tui_spaces(b, (depth + 1) * 2);
-            json_write_string(b, v->obj.items[i].key);
-            buf_adds(b, ": ");
-            json_pretty(b, v->obj.items[i].val, depth + 1);
-            buf_adds(b, i + 1 < v->obj.len ? ",\n" : "\n");
-        }
-        tui_spaces(b, depth * 2);
-        buf_addc(b, '}');
-    } else if (json_is(v, J_ARRAY) && v->arr.len) {
-        buf_adds(b, "[\n");
-        for (size_t i = 0; i < v->arr.len; i++) {
-            tui_spaces(b, (depth + 1) * 2);
-            json_pretty(b, v->arr.items[i], depth + 1);
-            buf_adds(b, i + 1 < v->arr.len ? ",\n" : "\n");
-        }
-        tui_spaces(b, depth * 2);
-        buf_addc(b, ']');
-    } else json_write(b, v);
+typedef struct {
+    char *const *ids;
+    size_t n;
+    bool drop;
+} EnabledModels;
+
+// enabledModels dropped, then (unless dropping) set again at the end
+static bool put_enabled_models(Arena *a, JValue *root, void *ctx) {
+    const EnabledModels *e = ctx;
+    JValue *out = json_new(a, J_OBJECT);
+    for (size_t i = 0; i < root->obj.len; i++)
+        if (!e->drop || !str_eqz(root->obj.items[i].key, "enabledModels")) json_put(a, out, root->obj.items[i].key, root->obj.items[i].val);
+    if (!e->drop) {
+        JValue *arr = json_new(a, J_ARRAY);
+        for (size_t i = 0; i < e->n; i++) json_push(a, arr, json_string(a, str(e->ids[i])));
+        json_put(a, out, S("enabledModels"), arr);
+    }
+    *root = *out;
+    return true;
 }
 
 static void save_enabled_models(char *const *ids, size_t n, bool drop) {
-    Arena a = {0};
-    Buf path = {0}, lock = {0}, tmp = {0}, text = {0};
+    Buf path = {0}, why = {0};
     buf_printf(&path, "%s/settings.json", G.cfg->agent_dir);
-    buf_printf(&lock, "%s.lock", path.ptr);
-    buf_printf(&tmp, "%s.tmp-%d", path.ptr, (int)getpid());
-    mkdir(G.cfg->agent_dir, 0755);
-    bool locked = false;
-    for (int i = 0; i < 20 && !locked; i++) {
-        if (mkdir(lock.ptr, 0755) == 0) locked = true;
-        else if (errno == EEXIST) {
-            struct stat st;
-            if (stat(lock.ptr, &st) == 0 && time(NULL) - st.st_mtime > 10) rmdir(lock.ptr); // stale
-            else {
-                struct timespec ts = {0, 25000000};
-                nanosleep(&ts, NULL);
-            }
-        } else break;
-    }
-    const char *problem = NULL;
-    if (!locked) problem = "settings.json is locked by another program; the model selection is not saved";
-    else {
-        char *data = NULL;
-        size_t len = 0;
-        JValue *root = NULL;
-        Err re = read_file(path.ptr, 1 << 24, &data, &len);
-        if (re && access(path.ptr, F_OK) == 0) problem = "settings.json could not be read; the model selection is not saved";
-        else if (!re) {
-            Str t = str_n(data ? data : "", len);
-            if (str_starts(t, S("\xef\xbb\xbf"))) t = str_sub(t, 3, t.len);
-            if (str_trim(t).len && (json_parse(&a, t, true, &root) || !json_is(root, J_OBJECT)))
-                problem = "settings.json does not parse; the model selection is not saved";
-        }
-        free(data);
-        if (!problem) {
-            JValue *out = json_new(&a, J_OBJECT);
-            for (size_t i = 0; json_is(root, J_OBJECT) && i < root->obj.len; i++)
-                if (!drop || !str_eqz(root->obj.items[i].key, "enabledModels")) json_put(&a, out, root->obj.items[i].key, root->obj.items[i].val);
-            if (!drop) {
-                JValue *arr = json_new(&a, J_ARRAY);
-                for (size_t i = 0; i < n; i++) json_push(&a, arr, json_string(&a, str(ids[i])));
-                json_put(&a, out, S("enabledModels"), arr);
-            }
-            json_pretty(&text, out, 0);
-            int fd = open(tmp.ptr, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-            bool ok = fd >= 0;
-            for (size_t off = 0; ok && off < text.len;) {
-                ssize_t w = write(fd, text.ptr + off, text.len - off);
-                if (w < 0 && errno == EINTR) continue;
-                if (w <= 0) ok = false;
-                else off += (size_t)w;
-            }
-            if (ok && fsync(fd)) ok = false;
-            if (fd >= 0 && close(fd)) ok = false;
-            if (ok && rename(tmp.ptr, path.ptr)) ok = false;
-            if (!ok) {
-                unlink(tmp.ptr);
-                problem = "Could not save the model selection in settings.json";
-            }
-        }
-        rmdir(lock.ptr);
-    }
-    if (problem) G.show_error(problem);
+    EnabledModels e = {ids, n, drop};
+    CfgUpdateOpts o = {.parse_numbers = true,
+                       .lock_tries = 20,
+                       .locked = "settings.json is locked by another program; the model selection is not saved",
+                       .unreadable = "settings.json could not be read; the model selection is not saved",
+                       .unparsable = "settings.json does not parse; the model selection is not saved",
+                       .unwritable = "Could not save the model selection in settings.json"};
+    if (!cfg_json_update_ex(path.ptr, &o, put_enabled_models, &e, &why)) G.show_error(why.ptr ? why.ptr : "");
     buf_free(&path);
-    buf_free(&lock);
-    buf_free(&tmp);
-    buf_free(&text);
-    arena_reset(&a);
+    buf_free(&why);
 }
 
 // ---- /scoped-models (showModelsSelector, ScopedModelsSelectorComponent) -----------------------------------

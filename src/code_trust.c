@@ -16,17 +16,48 @@
 // Not ported: extensions' project_trust event (Saetta Code has no extensions).
 #include "code_res.h"
 #include "code_res_ui.h"
+#include "code_cfg.h"
 
 #include <errno.h>
 #include <poll.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
 static int g_override = -1; // --approve / --no-approve
-static int g_trusted = -1;  // the session's decision, once resolved
 static char *g_auto_cwd;    // autoTrustOnReloadCwd
+
+// main.ts projectTrustByCwd: the decisions resolved (asked, or read from the store) for a folder
+// with project resources, one per cwd, for this process. The current runtime's trust
+// (settingsManager.isProjectTrusted) is g_trusted for g_cur_cwd; a new cwd (a resumed or imported
+// session's folder) resolves its own, never inherits it.
+typedef struct {
+    char *cwd;
+    bool trusted;
+} CwdTrust;
+static pthread_mutex_t g_tmu = PTHREAD_MUTEX_INITIALIZER;
+static VEC(CwdTrust) g_by_cwd;
+static char *g_cur_cwd;
+static int g_trusted = -1;
+
+// projectTrustByCwd.get: -1 for none (g_tmu held)
+static int cached_l(const char *cwd) {
+    for (size_t i = 0; i < g_by_cwd.len; i++)
+        if (!strcmp(g_by_cwd.ptr[i].cwd, cwd)) return g_by_cwd.ptr[i].trusted;
+    return -1;
+}
+
+// projectTrustByCwd.set (g_tmu held)
+static void cache_l(const char *cwd, bool trusted) {
+    for (size_t i = 0; i < g_by_cwd.len; i++)
+        if (!strcmp(g_by_cwd.ptr[i].cwd, cwd)) {
+            g_by_cwd.ptr[i].trusted = trusted;
+            return;
+        }
+    vec_push(&g_by_cwd, ((CwdTrust){strdup(cwd), trusted}));
+}
 
 void code_trust_override(int trusted) { g_override = trusted; }
 
@@ -80,24 +111,14 @@ static const char *read_trust(Arena *a, const char *path, JValue **out) {
 // proper-lockfile's lockSync on the folder, lockfilePath "<path>.lock": 10 tries, 20 ms apart;
 // a lock older than 10 s is stale.
 static bool trust_lock(Arena *a, const char *path) {
-    const char *lock = arena_printf(a, "%s.lock", path);
-    char *dir = code_path_dirname(a, path);
-    mkdir(dir, 0755);
-    for (int i = 0; i < 10; i++) {
-        if (mkdir(lock, 0755) == 0) return true;
-        if (errno != EEXIST) return false;
-        struct stat st;
-        if (stat(lock, &st) == 0 && time(NULL) - st.st_mtime > 10) {
-            rmdir(lock);
-            continue;
-        }
-        struct timespec ts = {0, 20000000};
-        nanosleep(&ts, NULL);
-    }
-    return false;
+    mkdir(code_path_dirname(a, path), 0755);
+    return cfg_lock(path, 10, 20); // code_cfg.c
 }
 
-static void trust_unlock(Arena *a, const char *path) { rmdir(arena_printf(a, "%s.lock", path)); }
+static void trust_unlock(Arena *a, const char *path) {
+    (void)a;
+    cfg_unlock(path);
+}
 
 // findNearestTrustEntry: the nearest entry with a decision, at or above the real cwd.
 static bool nearest_entry(Arena *a, const JValue *data, const char *cwd, const char **path, bool *decision) {
@@ -179,15 +200,8 @@ static const char *store_set_many(Arena *a, const char *agent_dir, const TrustUp
             json_write(&b, v);
         }
         buf_adds(&b, shown ? "\n}\n" : "}\n");
-        const char *tmp = arena_printf(a, "%s.tmp-%d", tp, (int)getpid());
-        FILE *f = fopen(tmp, "w");
-        bool ok = f && fwrite(b.ptr, 1, b.len, f) == b.len;
-        if (f && fclose(f)) ok = false;
-        if (ok && rename(tmp, tp)) ok = false;
-        if (!ok) {
-            unlink(tmp);
-            err = arena_printf(a, "Could not write %s", tp);
-        }
+        // the shared writer (code_cfg.c): fsync'd, through a symlink, the file's mode kept
+        if (!cfg_write_file(tp, b.ptr, b.len, NULL)) err = arena_printf(a, "Could not write %s", tp);
         buf_free(&b);
     }
     trust_unlock(a, tp);
@@ -416,28 +430,29 @@ static int run_prompt(Prompt *p, const char *theme) {
 
 // ---- the session's trust (main.ts createRuntime, project-trust.ts resolveProjectTrusted) -------------
 
-static bool resolve(Arena *a, const CodeEnv *env, bool interactive) {
-    const char *cwd = code_path_resolve(a, "/", env->cwd);
+static const char *trust_title(Arena *a, const char *cwd) {
+    // formatProjectTrustPrompt
+    return arena_printf(a,
+                        "Trust project folder?\n%s\n\nThis allows Saetta Code to load .pi settings and resources, install "
+                        "missing project packages, and execute project extensions.",
+                        cwd);
+}
+
+// resolveProjectTrusted for a cwd with project resources and no override: the store, then
+// defaultProjectTrust, then the prompt when interactive (selectProjectTrustOption). *ask (when
+// given) is set when it comes to the prompt.
+static bool resolve(Arena *a, const CodeEnv *env, const char *cwd, bool interactive, bool *ask) {
     const char *agent_dir = code_path_resolve(a, cwd, env->agent_dir);
-    bool has = code_trust_has_project_resources(a, cwd, env->home);
-    if (g_override < 0 && !has) {
-        free(g_auto_cwd);
-        g_auto_cwd = strdup(cwd);
-    }
-    if (g_override >= 0) return g_override;
     int stored = store_get(a, agent_dir, cwd);
-    if (!has) return stored != 0;
     if (stored >= 0) return stored;
     JValue *settings = code_read_json_object(a, code_path_join(a, agent_dir, "settings.json"));
     const char *def = json_str(json_get(settings, "defaultProjectTrust"));
     if (def && !strcmp(def, "always")) return true;
     if (def && !strcmp(def, "never")) return false;
+    if (ask) *ask = true;
     if (!interactive) return false; // no UI to ask
     // selectProjectTrustOption
-    Prompt p = {.title = arena_printf(a,
-                                      "Trust project folder?\n%s\n\nThis allows Saetta Code to load .pi settings and resources, install "
-                                      "missing project packages, and execute project extensions.",
-                                      cwd)};
+    Prompt p = {.title = trust_title(a, cwd)};
     p.n = trust_options(a, cwd, true, p.opts);
     int sel = run_prompt(&p, json_str(json_get(settings, "theme")));
     if (sel < 0) return false;
@@ -448,15 +463,201 @@ static bool resolve(Arena *a, const CodeEnv *env, bool interactive) {
     return p.opts[sel].trusted;
 }
 
-void code_trust_resolve(const CodeEnv *env, bool interactive) {
+// createRuntime's projectTrusted for cwd: projectTrustByCwd's decision, else --approve /
+// --no-approve, else (project resources) resolveProjectTrusted, remembered for the cwd; else the
+// store, else trusted.
+static bool runtime_trust(Arena *a, const CodeEnv *env, const char *cwd, bool interactive) {
+    bool has = code_trust_has_project_resources(a, cwd, env->home);
+    pthread_mutex_lock(&g_tmu);
+    int cached = cached_l(cwd);
+    pthread_mutex_unlock(&g_tmu);
+    if (cached >= 0) return cached;
+    if (g_override >= 0) return g_override;
+    if (!has) {
+        int stored = store_get(a, code_path_resolve(a, cwd, env->agent_dir), cwd);
+        return stored >= 0 ? stored : true;
+    }
+    bool trusted = resolve(a, env, cwd, interactive, NULL);
+    pthread_mutex_lock(&g_tmu);
+    cache_l(cwd, trusted);
+    pthread_mutex_unlock(&g_tmu);
+    return trusted;
+}
+
+static void set_current(const char *cwd, bool trusted) {
+    pthread_mutex_lock(&g_tmu);
+    free(g_cur_cwd);
+    g_cur_cwd = strdup(cwd);
+    g_trusted = trusted;
+    pthread_mutex_unlock(&g_tmu);
+}
+
+// The hand-off of a restart on another model (code_main.c restart_on): the current folder's
+// decision, for that folder only ("<0|1>:<path>"), taken out of the environment at once so no tool
+// inherits it. --approve would trust every folder of the next process.
+#define TRUST_ENV "SAETTA_CODE_PROJECT_TRUST"
+
+void code_trust_export_restart(const CodeEnv *env) {
     Arena a = {0};
-    g_trusted = resolve(&a, env, interactive);
+    bool t = code_trust_trusted(env);
+    const char *cwd = code_path_resolve(&a, "/", env->cwd);
+    setenv(TRUST_ENV, arena_printf(&a, "%d:%s", t, cwd), 1);
+    arena_reset(&a);
+}
+
+void code_trust_resolve(const CodeEnv *env, bool interactive) {
+    const char *handed = getenv(TRUST_ENV);
+    if (handed && (handed[0] == '0' || handed[0] == '1') && handed[1] == ':' && handed[2] == '/') {
+        pthread_mutex_lock(&g_tmu);
+        cache_l(handed + 2, handed[0] == '1');
+        pthread_mutex_unlock(&g_tmu);
+    }
+    unsetenv(TRUST_ENV);
+    Arena a = {0};
+    const char *cwd = code_path_resolve(&a, "/", env->cwd);
+    // autoTrustOnReloadCwd: the session's first folder, when it has no project resources
+    if (g_override < 0 && !code_trust_has_project_resources(&a, cwd, env->home)) {
+        free(g_auto_cwd);
+        g_auto_cwd = strdup(cwd);
+    }
+    set_current(cwd, runtime_trust(&a, env, cwd, interactive));
     arena_reset(&a);
 }
 
 bool code_trust_trusted(const CodeEnv *env) {
-    if (g_trusted < 0) code_trust_resolve(env, false);
-    return g_trusted;
+    Arena a = {0};
+    const char *cwd = code_path_resolve(&a, "/", env->cwd);
+    pthread_mutex_lock(&g_tmu);
+    int t = g_cur_cwd && !strcmp(g_cur_cwd, cwd) ? g_trusted : -1;
+    pthread_mutex_unlock(&g_tmu);
+    if (t < 0) {
+        // a runtime in another folder (a resumed or imported session's): its own trust, with no UI
+        // here (the interactive mode asked first: code_trust_switch_ask); never the previous folder's
+        t = runtime_trust(&a, env, cwd, false);
+        set_current(cwd, t);
+    }
+    arena_reset(&a);
+    return t;
+}
+
+// The current runtime's folder (the last one resolved), else the configuration's.
+static const char *current_cwd(Arena *a) {
+    pthread_mutex_lock(&g_tmu);
+    const char *c = g_cur_cwd ? arena_strdup(a, g_cur_cwd) : NULL;
+    pthread_mutex_unlock(&g_tmu);
+    return c ? c : code_path_resolve(a, "/", code_ui_config()->cwd);
+}
+
+static bool current_trusted(void) {
+    pthread_mutex_lock(&g_tmu);
+    bool t = g_trusted > 0;
+    pthread_mutex_unlock(&g_tmu);
+    return t;
+}
+
+bool code_trust_folder(const char *cwd) {
+    const CodeUiConfig *cfg = code_ui_config();
+    Arena a = {0};
+    const char *c = code_path_resolve(&a, "/", cwd);
+    pthread_mutex_lock(&g_tmu);
+    int t = g_cur_cwd && !strcmp(g_cur_cwd, c) ? g_trusted : cached_l(c);
+    pthread_mutex_unlock(&g_tmu);
+    if (t < 0) {
+        // what createRuntime would decide there, without asking and without remembering it
+        CodeEnv env = {.cwd = c, .agent_dir = cfg->agent_dir, .home = cfg->home};
+        if (g_override >= 0) t = g_override;
+        else if (!code_trust_has_project_resources(&a, c, cfg->home)) {
+            int stored = store_get(&a, code_path_resolve(&a, c, cfg->agent_dir), c);
+            t = stored >= 0 ? stored : 1;
+        } else t = resolve(&a, &env, c, false, NULL);
+    }
+    arena_reset(&a);
+    return t > 0;
+}
+
+// ---- the question on a session switch (AgentSessionRuntime.switchSession with
+// projectTrustContextFactory: interactive-mode.ts createProjectTrustContext, showExtensionSelector) --
+
+bool code_trust_switch_asks(const char *cwd) {
+    const CodeUiConfig *cfg = code_ui_config();
+    Arena a = {0};
+    const char *c = code_path_resolve(&a, "/", cwd);
+    pthread_mutex_lock(&g_tmu);
+    int cached = cached_l(c);
+    pthread_mutex_unlock(&g_tmu);
+    bool ask = false;
+    if (g_override < 0 && cached < 0 && code_trust_has_project_resources(&a, c, cfg->home)) {
+        CodeEnv env = {.cwd = c, .agent_dir = cfg->agent_dir, .home = cfg->home};
+        (void)resolve(&a, &env, c, false, &ask);
+    }
+    arena_reset(&a);
+    return ask;
+}
+
+typedef struct {
+    Arena a;
+    Prompt p;
+    const char *cwd, *agent_dir;
+    void (*done)(void *);
+    void *ctx;
+} SwitchAsk;
+
+static void ask_render(void *ctx, int width, Lines *out) {
+    SwitchAsk *s = ctx;
+    prompt_render(&s->p, width, out);
+}
+
+static void ask_destroy(void *ctx) {
+    SwitchAsk *s = ctx;
+    prompt_free(&s->p);
+    arena_reset(&s->a);
+    free(s);
+}
+
+static void ask_key(void *ctx, const Key *k) {
+    SwitchAsk *s = ctx;
+    Prompt *p = &s->p;
+    if (key_up(k)) {
+        if (p->selected > 0) p->selected--;
+        prompt_list(p);
+    } else if (key_down(k)) {
+        if (p->selected + 1 < p->n) p->selected++;
+        prompt_list(p);
+    } else if (k->kind == K_ENTER || (k->kind == K_CHAR && k->ch == '\n') || key_cancel(k)) {
+        // resolveProjectTrusted's end: the choice saved (saveProjectTrustPromptResult), cancel is
+        // untrusted; projectTrustByCwd.set either way
+        bool trusted = false;
+        const char *err = NULL;
+        if (!key_cancel(k)) {
+            const TrustOption *o = &p->opts[p->selected];
+            trusted = o->trusted;
+            if (o->nupdates) err = store_set_many(&s->a, s->agent_dir, o->updates, o->nupdates);
+        }
+        pthread_mutex_lock(&g_tmu);
+        cache_l(s->cwd, trusted);
+        pthread_mutex_unlock(&g_tmu);
+        char *errc = err ? strdup(err) : NULL;
+        void (*done)(void *) = s->done;
+        void *dctx = s->ctx;
+        code_ui_panel_close(); // frees s
+        if (errc) code_ui_warning(errc);
+        free(errc);
+        done(dctx);
+    }
+}
+
+void code_trust_switch_ask(const char *cwd, void (*done)(void *), void *ctx) {
+    const CodeUiConfig *cfg = code_ui_config();
+    SwitchAsk *s = xcalloc(1, sizeof *s);
+    Arena *a = &s->a;
+    s->cwd = code_path_resolve(a, "/", cwd);
+    s->agent_dir = code_path_resolve(a, s->cwd, cfg->agent_dir);
+    s->done = done;
+    s->ctx = ctx;
+    s->p.title = trust_title(a, s->cwd);
+    s->p.n = trust_options(a, s->cwd, true, s->p.opts);
+    prompt_build(&s->p);
+    code_ui_panel_open((CodeUiPanel){ask_render, ask_key, ask_destroy, s});
 }
 
 // ---- /trust (showTrustSelector, TrustSelectorComponent) ------------------------------------------
@@ -499,7 +700,7 @@ static void trust_render(void *ctx, int width, Lines *out) {
     th_fgz(&b, T_MUTED, arena_printf(a, "Saved decision: %s", decision));
     text_into(buf_str(&b), 1, width, out);
     b.len = 0;
-    th_fgz(&b, T_MUTED, arena_printf(a, "Current session: %s", g_trusted > 0 ? "trusted" : "untrusted"));
+    th_fgz(&b, T_MUTED, arena_printf(a, "Current session: %s", current_trusted() ? "trusted" : "untrusted"));
     text_into(buf_str(&b), 1, width, out);
     lines_addz(out, "");
     for (size_t i = 0; i < t->n; i++) {
@@ -550,7 +751,7 @@ void code_trust_command(void) {
     const CodeUiConfig *cfg = code_ui_config();
     TrustSel *t = xcalloc(1, sizeof *t);
     Arena *a = &t->a;
-    t->cwd = code_path_resolve(a, "/", cfg->cwd);
+    t->cwd = current_cwd(a); // sessionManager.getCwd()
     t->agent_dir = code_path_resolve(a, t->cwd, cfg->agent_dir);
     const char *err;
     t->has_saved = store_entry(a, t->agent_dir, t->cwd, &t->saved_path, &t->saved_decision, &err);
@@ -585,9 +786,9 @@ static void warning_render(void *ctx, int width, Lines *out) {
 void code_trust_warning(void) {
     const CodeUiConfig *cfg = code_ui_config();
     Arena a = {0};
-    bool has = code_trust_has_project_resources(&a, code_path_resolve(&a, "/", cfg->cwd), cfg->home);
+    bool has = code_trust_has_project_resources(&a, current_cwd(&a), cfg->home);
     arena_reset(&a);
-    if (g_trusted > 0 || !has) return;
+    if (current_trusted() || !has) return;
     if (code_ui_chat_len()) code_ui_chat_add(comp_spacer(1));
     code_ui_chat_add(comp_fn(warning_render, NULL));
 }
@@ -596,7 +797,7 @@ bool code_trust_after_reload(const CodeEnv *env) {
     Arena a = {0};
     const char *cwd = code_path_resolve(&a, "/", env->cwd);
     bool saved = false;
-    if (g_auto_cwd && !strcmp(g_auto_cwd, cwd) && g_trusted > 0 && code_trust_has_project_resources(&a, cwd, env->home)) {
+    if (g_auto_cwd && !strcmp(g_auto_cwd, cwd) && code_trust_trusted(env) && code_trust_has_project_resources(&a, cwd, env->home)) {
         const char *agent_dir = code_path_resolve(&a, cwd, env->agent_dir);
         if (store_get(&a, agent_dir, cwd) < 0) {
             TrustUpdate u = {cwd, 1};

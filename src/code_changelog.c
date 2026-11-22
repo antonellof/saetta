@@ -11,6 +11,7 @@
 // ported: it points relative links at pi's repository, and this changelog has none.
 #include "code_res.h"
 #include "code_res_ui.h"
+#include "code_cfg.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -112,87 +113,20 @@ static bool new_entries(const VecEntry *all, const char *last, VecEntry *out) {
 
 // ---- settings.json (settings-manager.ts: the global file, written whole under its lock) ------------
 
-static void json_pretty(Buf *b, const JValue *v, int depth) {
-    if (json_is(v, J_OBJECT) && v->obj.len) {
-        buf_adds(b, "{\n");
-        for (size_t i = 0; i < v->obj.len; i++) {
-            tui_spaces(b, (depth + 1) * 2);
-            json_write_string(b, v->obj.items[i].key);
-            buf_adds(b, ": ");
-            json_pretty(b, v->obj.items[i].val, depth + 1);
-            buf_adds(b, i + 1 < v->obj.len ? ",\n" : "\n");
-        }
-        tui_spaces(b, depth * 2);
-        buf_addc(b, '}');
-    } else if (json_is(v, J_ARRAY) && v->arr.len) {
-        buf_adds(b, "[\n");
-        for (size_t i = 0; i < v->arr.len; i++) {
-            tui_spaces(b, (depth + 1) * 2);
-            json_pretty(b, v->arr.items[i], depth + 1);
-            buf_adds(b, i + 1 < v->arr.len ? ",\n" : "\n");
-        }
-        tui_spaces(b, depth * 2);
-        buf_addc(b, ']');
-    } else
-        json_write(b, v);
+static bool put_last_version(Arena *a, JValue *root, void *ctx) {
+    json_put(a, root, S("saettaLastChangelogVersion"), json_string(a, str((const char *)ctx)));
+    return true;
 }
 
-// setLastChangelogVersion and the flush: under proper-lockfile's lock ("settings.json.lock", stale
-// after 10 s), the file read again, the field set, written whole (through a temporary file and a
-// rename). A file that does not parse is left alone.
+// setLastChangelogVersion and the flush: under proper-lockfile's lock, the file read again, the
+// field set, written whole (code_cfg.c cfg_json_update_ex). A file that does not parse is left
+// alone, silently.
 static void save_last_version(const char *agent_dir, const char *version) {
-    Arena a = {0};
-    const char *path = arena_printf(&a, "%s/settings.json", agent_dir);
-    const char *lock = arena_printf(&a, "%s.lock", path);
-    const char *tmp = arena_printf(&a, "%s.tmp-%d", path, (int)getpid());
-    mkdir(agent_dir, 0755);
-    bool locked = false;
-    for (int i = 0; i < 20 && !locked; i++) {
-        if (mkdir(lock, 0755) == 0) locked = true;
-        else if (errno == EEXIST) {
-            struct stat st;
-            if (stat(lock, &st) == 0 && time(NULL) - st.st_mtime > 10) rmdir(lock);
-            else {
-                struct timespec ts = {0, 25000000};
-                nanosleep(&ts, NULL);
-            }
-        } else
-            break;
-    }
-    if (locked) {
-        char *data = NULL;
-        size_t n = 0;
-        JValue *root = NULL;
-        bool ok = true;
-        Err re = read_file(path, 1 << 24, &data, &n);
-        if (re && access(path, F_OK) == 0) ok = false;
-        else if (!re) {
-            Str t = str_n(data ? data : "", n);
-            if (str_starts(t, S("\xef\xbb\xbf"))) t = str_sub(t, 3, t.len);
-            if (str_trim(t).len && (json_parse(&a, t, true, &root) || !json_is(root, J_OBJECT))) ok = false;
-        }
-        free(data);
-        if (ok) {
-            if (!json_is(root, J_OBJECT)) root = json_new(&a, J_OBJECT);
-            json_put(&a, root, S("saettaLastChangelogVersion"), json_string(&a, str(version)));
-            Buf text = {0};
-            json_pretty(&text, root, 0);
-            int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-            bool w = fd >= 0;
-            for (size_t off = 0; w && off < text.len;) {
-                ssize_t k = write(fd, text.ptr + off, text.len - off);
-                if (k < 0 && errno == EINTR) continue;
-                if (k <= 0) w = false;
-                else off += (size_t)k;
-            }
-            if (fd >= 0 && close(fd)) w = false;
-            if (w && rename(tmp, path)) w = false;
-            if (!w) unlink(tmp);
-            buf_free(&text);
-        }
-        rmdir(lock);
-    }
-    arena_reset(&a);
+    Buf path = {0};
+    buf_printf(&path, "%s/settings.json", agent_dir);
+    CfgUpdateOpts o = {.parse_numbers = true, .lock_tries = 20};
+    (void)cfg_json_update_ex(path.ptr, &o, put_last_version, (void *)version, NULL);
+    buf_free(&path);
 }
 
 // ---- the views --------------------------------------------------------------------------------------

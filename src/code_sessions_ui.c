@@ -12,6 +12,7 @@
 // (the status /session shows), packages/tui/src/fuzzy.ts and components/input.ts.
 #include "code_sessions.h"
 #include "code_ui_ext.h"
+#include "code_res_ui.h"
 
 #include <errno.h>
 #include <math.h>
@@ -764,6 +765,7 @@ static void after_switch(void) {
     if (level) uix_show_thinking(level);
     sess_ui_reset();
     uix_render_history();
+    code_trust_warning(); // renderInitialMessages' renderProjectTrustWarningIfNeeded (code_trust.c)
 }
 
 static void fork_at(const char *entry_id) {
@@ -1639,7 +1641,7 @@ static void toggle_scope(ResumeSel *r) {
 }
 
 // The session at path made current, then the status.
-static void switch_to(const char *path, bool stay, const char *status) {
+static void switch_now(const char *path, bool stay, const char *status) {
     const char *err = uix_ops()->resume(uix_host(), path, stay);
     if (err) {
         uix_show_error(err);
@@ -1647,6 +1649,43 @@ static void switch_to(const char *path, bool stay, const char *status) {
     }
     after_switch();
     uix_show_status(status);
+}
+
+typedef struct {
+    char *path, *status;
+    bool stay;
+} PendingSwitch;
+
+static void switch_trusted(void *p) {
+    PendingSwitch *w = p;
+    switch_now(w->path, w->stay, w->status);
+    free(w->path);
+    free(w->status);
+    free(w);
+}
+
+// switchSession with projectTrustContextFactory: the new folder's project trust asked first when
+// it needs a decision (code_trust.c), never the previous folder's carried over.
+static void switch_to(const char *path, bool stay, const char *status) {
+    Arena a = {0};
+    CodeSession *s;
+    const char *cwd = NULL;
+    if (stay) {
+        char *here = getcwd(NULL, 0);
+        if (here) cwd = arena_strdup(&a, here);
+        free(here);
+    } else if (!code_session_open_path(&a, path, &s))
+        cwd = json_str(json_get(code_session_header(s), "cwd"));
+    bool ask = cwd && *cwd && code_trust_switch_asks(cwd);
+    if (ask) {
+        PendingSwitch *w = xcalloc(1, sizeof *w);
+        w->path = strdup(path);
+        w->status = strdup(status);
+        w->stay = stay;
+        code_trust_switch_ask(cwd, switch_trusted, w);
+    }
+    arena_reset(&a);
+    if (!ask) switch_now(path, stay, status);
 }
 
 // promptForMissingSessionCwd: an ExtensionSelectorComponent with getMissingSessionCwdOptions.

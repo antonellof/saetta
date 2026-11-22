@@ -286,6 +286,18 @@ TEST(code_oai_body_golden) {
             JValue *msgs = json_get(req, "messages"), *first = msgs->arr.len ? msgs->arr.items[0] : NULL;
             g_system_text = first && str_eqz(json_strs(json_get(first, "role")), "system") ? json_strs(json_get(first, "content")) : S("");
             CodeModel m = mock_model(&a, "http://127.0.0.1:1/v1", turns[k].thinking);
+            // the scenario's context window (run_scenario.py writes it into models.json): it caps max_tokens
+            {
+                char *t;
+                size_t tl;
+                JValue *sc = NULL;
+                if (!read_file(arena_printf(&a, "%s/../scenarios/%s.json", golden, names[s]), 1 << 24, &t, &tl)) {
+                    if (json_parse(&a, str_n(t, tl), true, &sc)) sc = NULL;
+                    free(t);
+                }
+                const JValue *cw = json_get(sc, "context_window");
+                if (json_is(cw, J_INTEGER)) m.context_window = (uint32_t)cw->i;
+            }
             for (int pass = 0; pass < 2; pass++) {
                 // pass 0: the golden tools array; pass 1: NULL, the tools from the system message's toolsAdded
                 Buf body = {0};

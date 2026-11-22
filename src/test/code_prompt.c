@@ -5,6 +5,7 @@
 // sections and the prompt text are compared byte for byte (after the same normalization) with
 // the golden session's system message and the golden first request's messages[0].content.
 #include "../code.h"
+#include "../code_res.h"
 #include "../test.h"
 
 #include <dirent.h>
@@ -175,6 +176,9 @@ static int check_scenario(const char *golden, const char *name, const char *inst
     }
 
     JValue *msg;
+    // the scenario's trust and resources, loaded as `saetta code` does at startup (code_main.c)
+    code_trust_resolve(&env, false);
+    code_resources_reload(&env);
     if (code_system_message(&a, &env, tools, ntools, &msg)) goto out;
     Buf got = {0}, want = {0}, gtext = {0};
     json_write(&got, json_get(msg, "sections"));

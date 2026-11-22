@@ -1234,3 +1234,10 @@ void code_prompt_context_paths(Arena *a, const CodeEnv *env, bool trusted, CodeP
     for (size_t i = 0; i < ctx.len; i++) vec_push(out, (char *)ctx.ptr[i].path);
     vec_free(&ctx);
 }
+
+// The project trust (code_trust.c), for the MCP configuration (code_mcp.c reads <cwd>/.pi/mcp.json
+// only for a trusted project, as pi's loadMcpConfig does).
+bool code_project_trusted(Arena *a, const CodeEnv *env) {
+    (void)a;
+    return code_trust_trusted(env);
+}

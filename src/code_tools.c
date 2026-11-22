@@ -15,6 +15,7 @@
 // character lines) count UTF-16 units. Decoding follows TextDecoder (invalid bytes become
 // U+FFFD), so byte counts match Buffer.byteLength of pi's decoded text.
 #include "code.h"
+#include "code_mcp.h"
 #include "metal/shim.h"
 
 #include <dirent.h>
@@ -1205,6 +1206,7 @@ void code_tools_kill_detached(void) {
         pid_t p = atomic_exchange(&tracked_groups[i], 0);
         if (p > 0) kill_tree(p);
     }
+    code_mcp_kill_signal_safe(); // the MCP servers' process groups too (stdio.ts's exit hook)
 }
 
 static double ms_since(uint64_t t0) { return (double)(now_ns() - t0) / 1e6; }
@@ -2641,10 +2643,11 @@ static ptrdiff_t tool_index(Str name) {
 }
 
 JValue *code_tool_schemas(Arena *a, const char *const *tools, size_t ntools) {
-    JValue *arr = json_new(a, J_ARRAY);
+    JValue *arr = json_new(a, J_ARRAY), *mcp;
     for (size_t i = 0; i < ntools; i++) {
         ptrdiff_t k = tool_index(str(tools[i]));
         if (k >= 0) json_push(a, arr, tool_schema(a, (size_t)k));
+        else if ((mcp = code_mcp_tool_schema(a, str(tools[i])))) json_push(a, arr, mcp); // an MCP tool (code_mcp.c)
     }
     return arr;
 }
@@ -2953,19 +2956,21 @@ Err code_tool_run(Arena *a, const CodeEnv *env, const JValue *call, JValue **res
     bool executed = false;
     double duration = 0;
     ptrdiff_t k = tool_index(name);
-    if (k < 0) o.thrown = arena_printf(a, "Tool %.*s not found", (int)name.len, name.ptr);
+    JValue *mcp_params = k < 0 ? code_mcp_tool_parameters(a, name) : NULL; // an MCP tool (code_mcp.c)
+    if (k < 0 && !mcp_params) o.thrown = arena_printf(a, "Tool %.*s not found", (int)name.len, name.ptr);
     else {
-        const char *tname = TOOLS[k].name;
+        const char *tname = k >= 0 ? TOOLS[k].name : str_z(a, name);
         JValue *prepared = !strcmp(tname, "edit") ? prepare_edit(a, args) : args;
         const JValue *ae = json_get(call, "argumentsError");
         JValue *valid = NULL;
         if (json_is(ae, J_STRING)) o.thrown = arena_printf(a, "Invalid arguments for tool \"%s\": %.*s", tname, (int)ae->s.len, ae->s.ptr);
-        else valid = validate(a, tname, json_get(json_get(tool_schema(a, (size_t)k), "function"), "parameters"), prepared, &o.thrown);
+        else valid = validate(a, tname, k < 0 ? mcp_params : json_get(json_get(tool_schema(a, (size_t)k), "function"), "parameters"), prepared, &o.thrown);
         if (valid && env->abort && *env->abort) o.thrown = "Operation aborted"; // prepareToolCall's signal check
         else if (valid) {
             executed = true;
             uint64_t t0 = now_ns();
-            TOOLS[k].run(a, env, valid, &o);
+            if (k >= 0) TOOLS[k].run(a, env, valid, &o);
+            else code_mcp_tool_call(a, env, name, valid, &o.content, &o.details, &o.structured, &o.is_error, &o.thrown);
             duration = round(ms_since(t0));
         }
     }

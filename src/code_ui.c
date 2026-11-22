@@ -10,6 +10,7 @@
 // core/compaction/compaction.ts (the context estimate the footer shows).
 #include "code_tui.h"
 #include "code_cfg.h"
+#include "code_mcp_ui.h"
 #include "code_oai.h"
 #include "code_monitor.h"
 #include "code_res_ui.h"
@@ -1264,6 +1265,13 @@ static void tool_render(Comp *c, int width, Lines *out) {
                 buf_free(&e);
             }
         }
+        return;
+    }
+    if (!strncmp(n, "mcp__", 5)) { // an MCP tool (code_mcp_ui.c)
+        lines_addz(out, "");
+        code_mcp_ui_render_tool(n, v->args, v->result, text_output(v->result), v->has_result, v->is_error, v->expanded, cw, &kids);
+        box_lines(&kids, width, 1, 1, tool_bg(v), out);
+        lines_free(&kids);
         return;
     }
     bool known = !strcmp(n, "read") || !strcmp(n, "bash") || !strcmp(n, "write") || !strcmp(n, "grep") || !strcmp(n, "find") ||
@@ -3913,6 +3921,7 @@ static void render_dock(int width, Lines *out) {
     else if (U->sel == SEL_PANEL) g_panel.render(g_panel.ctx, width, out);
     else if (cmds_dock_active()) cmds_dock_render(width, out);
     else if (U->sel == SEL_EXT) g_ext_render(width, out);
+    else if (code_mcp_ui_open()) code_mcp_ui_render(width, out); // /mcp (code_mcp_ui.c)
     else editor_render(U->ed, width, out);
     footer_render(NULL, width, out);
 }
@@ -4688,6 +4697,7 @@ static const SlashCmd builtin_cmds[] = {
 
 static bool arg_items(void *ctx, const char *cmd, SelectList *all, Lines *search) {
     (void)ctx;
+    if (!strcmp(cmd, "mcp")) return code_mcp_ui_arg_items(all, search); // code_mcp_ui.c
     if (!strcmp(cmd, "thinking")) {
         for (size_t i = 0; i < available_levels(); i++) {
             sel_add(all, level_names[i], level_names[i], NULL);
@@ -4731,11 +4741,16 @@ static void new_session(void) {
     chat_add(themed(T_ACCENT, "\xe2\x9c\x93 New session started", 1, 1));
 }
 
-static void unsupported(const char *cmd) {
-    Buf b = {0};
-    buf_printf(&b, "/%s is not available in Saetta Code yet.", cmd);
-    show_warning(b.ptr);
-    buf_free(&b);
+// MCP (code_mcp.c): its notices as pi's ctx.ui.notify shows them, and the wake-up when they or the
+// /mcp manager's state change
+static void mcp_notice(int kind, const char *msg) {
+    if (kind == 2) show_error(msg);
+    else if (kind == 1) show_warning(msg);
+    else show_status(msg);
+}
+
+static void mcp_wake(void) {
+    if (g_wake[1] >= 0) (void)!write(g_wake[1], "x", 1);
 }
 
 static bool g_follow_up; // the text being submitted is a follow-up (Alt+Enter), not a steering message
@@ -4890,14 +4905,10 @@ static void submit(char *text) {
             free(s);
             return;
         }
-        static const char *const known[] = {"mcp"};
-        for (size_t i = 0; i < COUNT(known); i++) {
-            size_t kl = strlen(known[i]);
-            if (!strncmp(c, known[i], kl) && (c[kl] == 0 || c[kl] == ' ')) {
-                unsupported(known[i]);
-                free(s);
-                return;
-            }
+        if (!strcmp(c, "mcp") || !strncmp(c, "mcp ", 4)) {
+            code_mcp_ui_command(c + 3); // code_mcp_ui.c
+            free(s);
+            return;
         }
     }
     editor_add_history(U->ed, str(s));
@@ -5006,6 +5017,10 @@ static void selector_key(const Key *k) {
 static void handle_key(const Key *k) {
     if (U->sel != SEL_NONE) {
         selector_key(k);
+        return;
+    }
+    if (code_mcp_ui_open()) { // /mcp takes the keys (code_mcp_ui.c)
+        code_mcp_ui_key(k);
         return;
     }
     if (cmds_dock_active()) {
@@ -5265,6 +5280,7 @@ Err code_ui_run(const CodeUiConfig *cfg, const CodeUiOps *ops, CodeUiHost *host,
         fcntl(g_wake[1], F_SETFD, FD_CLOEXEC);
     }
     editor_set_waker(ui.ed, g_wake[1]);
+    code_mcp_set_waker(mcp_wake);
     git_refresh();
     g_tops = ops;
     g_thost = host;
@@ -5347,6 +5363,8 @@ Err code_ui_run(const CodeUiConfig *cfg, const CodeUiOps *ops, CodeUiHost *host,
         }
         if (editor_tick(ui.ed)) request_render();
         if (code_monitor_tick()) request_render();
+        // MCP notices and state (code_mcp.c), once the theme is known (the terminal's colors came)
+        if (!ui.scr.color_query && code_mcp_ui_tick(mcp_notice)) request_render();
         if (atomic_exchange(&g_git_changed, false)) request_render();
         if (code_update_check_poll()) request_render();
         download_poll();
@@ -5494,6 +5512,7 @@ Err code_ui_run(const CodeUiConfig *cfg, const CodeUiOps *ops, CodeUiHost *host,
     g_git_started = false;
     atomic_store(&g_git_wake, -1);
     code_update_check_stop();
+    code_mcp_set_waker(NULL);
     close(g_wake[0]);
     close(g_wake[1]);
     g_wake[0] = g_wake[1] = -1;

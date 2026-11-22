@@ -10,6 +10,7 @@
 // (getCurrentSystemMessage, getToolStateChanges), utils/retry.ts (the retryable patterns).
 #include "code.h"
 #include "code_cfg.h"
+#include "code_mcp.h"
 #include "code_oai.h"
 #include "code_res.h"
 #include "code_sessions.h"
@@ -41,7 +42,7 @@ static const char *const default_tools[] = {"read", "bash", "edit", "write"};
 
 typedef struct {
     const char *provider, *model, *thinking, *mode, *system_prompt, *tools, *pack, *ctx, *session;
-    bool print, cont, no_session, no_tools, no_skills;
+    bool print, cont, no_session, no_tools, no_skills, no_mcp;
     int approve; // --approve 1, --no-approve 0, else -1
     VEC(const char *) skills;
     VEC(const char *) prompts;
@@ -55,6 +56,8 @@ typedef struct {
     CodeSession *session;
     const char **tools;
     size_t ntools;
+    const char **base_tools; // the built-in ones (--tools); tools adds the MCP tools (code_mcp.c)
+    size_t nbase_tools;
     bool json;
     bool ui; // the interactive mode prints the stream as it arrives
     int64_t retry_attempt; // the retries of the current prompt so far (pi's _retryAttempt)
@@ -120,6 +123,7 @@ static Err parse_args(const char *const *v, size_t n, Args *o) {
         else if (!strcmp(x, "--no-skills") || !strcmp(x, "-ns")) o->no_skills = true;
         else if (!strcmp(x, "--approve") || !strcmp(x, "-a")) o->approve = 1;
         else if (!strcmp(x, "--no-approve") || !strcmp(x, "-na")) o->approve = 0;
+        else if (!strcmp(x, "--no-mcp")) o->no_mcp = true;
         else if (!strcmp(x, "--help") || !strcmp(x, "-h")) {
             printf("usage: saetta code [options] [prompt ...]\n"
                    "\n"
@@ -137,6 +141,7 @@ static Err parse_args(const char *const *v, size_t n, Args *o) {
                    "  --provider P --model M   the model (M may be provider/id and end in :thinking)\n"
                    "  --thinking LEVEL         off, minimal, low, medium, high, xhigh, max\n"
                    "  --tools a,b,c | --no-tools   the tool set\n"
+                   "  --no-mcp                 no MCP servers (pi's mcp.json) and no MCP tools\n"
                    "  --system-prompt T, --append-system-prompt T   text or a file\n"
                    "  --skill PATH             load a skill file or folder (can be repeated)\n"
                    "  --no-skills, -ns         no skill discovery (--skill paths still load)\n"
@@ -800,9 +805,23 @@ static JValue *user_message(Arena *a, const char *text) {
     return user;
 }
 
+// The tools of this prompt: the built-in ones, then the MCP tools declared now (the first prompt
+// waits for their servers first, pi's before_agent_start).
+static void mcp_tools(Run *r) {
+    code_mcp_before_prompt();
+    const char **m;
+    size_t nm = code_mcp_declared(r->a, &m);
+    const char **all = arena_alloc(r->a, (r->nbase_tools + nm + 1) * sizeof *all);
+    for (size_t i = 0; i < r->nbase_tools; i++) all[i] = r->base_tools[i];
+    for (size_t i = 0; i < nm; i++) all[r->nbase_tools + i] = m[i];
+    r->tools = all;
+    r->ntools = r->nbase_tools + nm;
+}
+
 // One prompt: agent_start, the turns, agent_end (agentLoop + AgentSession.prompt).
 static Err prompt(Run *r, const char *text) {
     Arena *a = r->a;
+    mcp_tools(r);
     r->new_messages = json_new(a, J_ARRAY);
     emit(r, ev_new(a, "agent_start"));
     emit(r, ev_new(a, "turn_start"));
@@ -1814,6 +1833,9 @@ Err code_run(const char *const *args, size_t n, int *code) {
     code_trust_override(o.approve);
     code_trust_resolve(&r.env, tty);
     (void)code_resources(&r.env);
+    r.base_tools = r.tools;
+    r.nbase_tools = r.ntools;
+    code_mcp_start(&r.env, !o.no_mcp, r.tools, r.ntools, o.tools || o.no_tools);
     if (!o.print && !piped && !r.json && isatty(0) && isatty(1)) {
         e = interactive(&r, &o, settings);
         if (!e) *code = 0;
@@ -1848,6 +1870,7 @@ Err code_run(const char *const *args, size_t n, int *code) {
         }
     }
 done:
+    code_mcp_shutdown();
     code_tools_kill_detached();
     vec_free(&o.prompts);
     vec_free(&o.append);

@@ -19,13 +19,13 @@
 
 Saetta runs Qwen3.8 coding models on any Apple Silicon Mac with 32 GB of memory or more, with every kernel written for coding agents: long shared-prefix prompts (20K to 200K tokens), short answers, tool calls, through OpenAI- and Anthropic-compatible APIs. It picks the model that fits your Mac. It is tuned and measured on an M5 Max with 128 GB, whose neural accelerators read prompts fastest; M1 to M4 run the same kernels on their GPU cores (not yet tested on those chips: reports welcome).
 
-**One command instead of four moving parts.** Running a coding agent locally usually means a model file, an inference server, an agent harness on Node.js or Python, and the glue between them (base URLs, API keys, context sizes, chat templates, tool-call formats), each its own install with its own runtime. With Saetta, `saetta start code` picks the model that fits your Mac, downloads it and opens Saetta Code with the model running inside it: one binary under 2 MB, no Node.js, no Python, no server, nothing to wire.
+Running a coding agent locally usually takes four pieces: a model, an inference server, an agent on Node.js or Python, and the settings that connect them (base URLs, API keys, context sizes, chat templates, tool-call formats). With Saetta, `saetta start code` picks the model that fits your Mac, downloads it and opens Saetta Code, which runs the model in its own process. It is one binary under 2 MB, with no Node.js, Python or separate server.
 
-- **Fast:** on an M5 Max, Flash-Next reads prompts at 1,600 to 1,950 tokens/s and answers at 66 to 85 tokens/s, with speculative decoding.
-- **Follow-up turns read only what is new:** a second turn on a 16K conversation answers in 0.2 s.
-- **One command to code:** `saetta` picks the model and the agent for you; `saetta start code` for the built-in agent, or `saetta start claude` (`pi`, `opencode`) when you know.
-- **LoRA adapters** on Qwen3.8-27B, per request.
-- **Checked** layer by layer against numpy references; one binary, no Python.
+- On an M5 Max, Flash-Next reads prompts at 1,600 to 1,950 tokens/s and answers at 66 to 85 tokens/s, with speculative decoding.
+- Follow-up turns read only what is new: a second turn on a 16K conversation answers in 0.2 s.
+- `saetta` picks the model and the agent for you; `saetta start code` opens the built-in agent, `saetta start claude` (`pi`, `opencode`) another one.
+- LoRA adapters on Qwen3.8-27B, per request.
+- Every layer is checked against numpy references.
 
 ## Install
 
@@ -98,7 +98,7 @@ saetta start claude -- -p "fix the failing test"   # anything after -- goes to t
 
 <p align="center">
   <img src="docs/assets/demo.gif" width="900" alt="saetta start claude: Claude Code on Saetta writes a snake game in Python, checks it, and the game runs">
-  <br><sub><code>saetta start claude</code>: Claude Code on the local model writes a snake game and checks it. Real time, no cloud.</sub>
+  <br><sub><code>saetta start claude</code>: Claude Code on the local model writes a snake game and checks it, recorded in real time.</sub>
 </p>
 
 `saetta start` joins the server on this machine or starts one, waits for the model and runs the agent pointed at it, without touching your agent configuration; the server it started stops with the last session. Several sessions share one server (up to 4 conversations, `SAETTA_CONVERSATIONS`).
@@ -117,7 +117,7 @@ saetta start claude -- -p "fix the failing test"   # anything after -- goes to t
 
 ### Saetta Code
 
-A minimal coding agent inside the `saetta` binary, in C, nothing to install: a port of [pi](https://pi.dev) 1.5.2 that behaves as pi does. The same tools (read, bash, edit, write; grep, find and ls with `--tools`), system prompt, `AGENTS.md` / `CLAUDE.md` files, skills, prompt files and session files, so pi and Saetta Code continue each other's sessions (compacted ones too). The model runs inside it, with no server and no HTTP in between (`--pack`); or it talks to a Saetta server or any OpenAI-compatible server listed in pi's `models.json`. pi's TypeScript extensions are not supported.
+The coding agent built into `saetta`, written in C: a port of [pi](https://pi.dev) 1.5.2 that behaves as pi does. The same tools (read, bash, edit, write; grep, find and ls with `--tools`), system prompt, `AGENTS.md` / `CLAUDE.md` files, skills, prompt files and session files, so pi and Saetta Code continue each other's sessions (compacted ones too). The model runs inside it, with no server and no HTTP in between (`--pack`); or it talks to a Saetta server or any OpenAI-compatible server listed in pi's `models.json`. pi's TypeScript extensions are not supported.
 
 ```sh
 saetta start code                             # the model inside Saetta Code (or the running server, if one is up)
@@ -184,4 +184,4 @@ make verify GOLDEN=<dir>/golden         # development: against reference outputs
 
 ## License
 
-[MIT](LICENSE). Parts are adapted from the MIT-licensed projects sushi, qwental, Strata, ds4 and llama.cpp; each adapted file names its source, and their notices are in [LICENSE](LICENSE).
+[MIT](LICENSE). Parts are adapted from sushi, qwental, Strata, ds4, llama.cpp and pi (MIT), jsdiff (BSD-3-Clause), TypeBox (MIT) and openai-node (Apache-2.0); each adapted file names its source, and their notices are in [LICENSE](LICENSE).

@@ -133,7 +133,7 @@
       <div class="wrap">
         <a class="pill" href="#quickstart">One command. Every Apple Silicon Mac. <span aria-hidden="true">&rarr;</span></a>
         <h1>Local coding models at lightning speed.</h1>
-        <p class="lede">Saetta runs a local LLM for coding on Apple Silicon, with its own coding agent built in: an inference engine in C and hand-written Metal for Qwen3.8 models, and Saetta Code, an agent with the model running inside it, no server and no API in between. It picks the model that fits your Mac. Use Saetta Code, or Claude Code, pi and opencode as with a cloud API: offline, with your code never leaving the machine.</p>
+        <p class="lede">Saetta is an inference engine in C and hand-written Metal for Qwen3.8 coding models on Apple Silicon, with a coding agent built in: Saetta Code runs the model in its own process. It picks the model that fits your Mac, and Claude Code, pi and opencode can use the same engine as a local API. It all runs offline, and your code stays on the machine.</p>
         <div class="actions">
           <a class="btn primary" href="#quickstart">Get started <span aria-hidden="true">&rarr;</span></a>
           <a class="btn" href="https://github.com/antonellof/saetta">GitHub</a>
@@ -169,20 +169,20 @@
       <div class="wrap">
         <span class="eyebrow">Why Saetta</span>
         <h2>One command instead of four moving parts</h2>
-        <p class="lede-sm">A local coding agent usually means assembling a stack: download a model, run an inference server for it, install an agent that runs on Node.js or Python, then wire them together with base URLs, API keys, context sizes, chat templates and tool-call formats. Each piece is its own install with its own runtime, and each one can drift out of step with the others.</p>
+        <p class="lede-sm">Running a coding agent locally usually takes four pieces: a model, an inference server, an agent on Node.js or Python, and the settings that connect them (base URLs, API keys, context sizes, chat templates, tool-call formats). Each is installed and updated separately, and they can fall out of step.</p>
         <div class="cells cells-3">
-          <div class="cell"><div class="k">The usual stack</div><div class="v">a model file + an inference server + an agent harness + the glue between them, each installed, updated and configured on its own</div></div>
-          <div class="cell"><div class="k">Saetta</div><div class="v"><code>saetta start code</code> picks the model that fits your Mac, downloads it and opens the agent: one binary under 2 MB, no Node.js, no Python, no server to keep running</div></div>
-          <div class="cell"><div class="k">The model inside the agent</div><div class="v">Saetta Code runs the inference engine in its own process: no HTTP between agent and model, nothing to wire</div></div>
+          <div class="cell"><div class="k">The usual stack</div><div class="v">a model file, an inference server, an agent harness and the settings between them, each installed and updated on its own</div></div>
+          <div class="cell"><div class="k">Saetta</div><div class="v"><code>saetta start code</code> picks the model that fits your Mac, downloads it and opens the agent. One binary under 2 MB, with no Node.js, Python or separate server.</div></div>
+          <div class="cell"><div class="k">The model inside the agent</div><div class="v">Saetta Code runs the inference engine in its own process, so the agent talks to the model directly instead of over HTTP.</div></div>
         </div>
-        <p class="note">Prefer your own agent? Claude Code, pi and opencode run on the same engine with <code>saetta start claude</code>, <code>pi</code> or <code>opencode</code>.</p>
+        <p class="note">Claude Code, pi and opencode run on the same engine: <code>saetta start claude</code>, <code>pi</code> or <code>opencode</code>.</p>
       </div>
     </section>
 
     <section class="block" id="benchmarks">
       <div class="wrap">
         <span class="eyebrow">Benchmarks</span>
-        <h2>Measured, not claimed</h2>
+        <h2>Speed on an M5 Max</h2>
         <p class="sub">On an M5 Max with 128 GB, through the same HTTP API your agent uses: cold prompts of 4K to 64K tokens, follow-up turns and a tool-call edit. Every number has a log in the repository.</p>
         <div class="charts">
           <figure class="chart">
@@ -366,10 +366,10 @@ saetta start code</pre>
           <div class="agent"><div class="k">pi</div><code>saetta start pi</code></div>
           <div class="agent"><div class="k">opencode</div><code>saetta start opencode</code></div>
         </div>
-        <p class="note"><b>Saetta Code</b> is a minimal coding agent built into the <code>saetta</code> binary, in C, with the model running inside it: no server, no HTTP in between. A port of pi that behaves as pi does, with the same tools, prompt, skills and session files (pi and Saetta Code continue each other's sessions). Nothing else to install.</p>
+        <p class="note"><b>Saetta Code</b> is the coding agent built into <code>saetta</code>, written in C. It runs the model in its own process and behaves like pi, with the same tools, prompt, skills and session files, so pi and Saetta Code can continue each other's sessions.</p>
         <figure class="demo">
           <img src="/assets/demo.gif" alt="Claude Code running on Saetta writes a snake game in Python, checks it, and the game runs" loading="lazy" width="1200" height="675">
-          <figcaption>Claude Code on the local model writes a snake game and checks it. Real time, no cloud.</figcaption>
+          <figcaption>Claude Code on the local model writes a snake game and checks it, recorded in real time.</figcaption>
         </figure>
         <p class="note">Any Apple Silicon Mac, M1 or later, with 32 GB of memory or more and macOS 27.2. Tuned and measured on an M5 Max; M1 to M4 are not yet tested on hardware.</p>
       </div>

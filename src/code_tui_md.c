@@ -842,6 +842,70 @@ static void lex_list(Arena *a, Str s, size_t *pos, BlockVec *out) {
     vec_push(out, b);
 }
 
+// marked's block.html start: 1 (script, pre, style, textarea: to its closing tag), 2 (a comment: to
+// "-->"), 6 (a block-level tag) and 7 (a line that is only an open or a closing tag): to a blank line.
+// 0: not an HTML block.
+static int html_block(Str l) {
+    size_t i = indent_of(l);
+    if (i > 3 || i >= l.len || l.ptr[i] != '<') return 0;
+    Str r = str_sub(l, i + 1, l.len);
+    if (str_starts(r, S("!--"))) return 2;
+    static const char *const raw_tags[] = {"script", "pre", "style", "textarea"};
+    for (size_t k = 0; k < sizeof raw_tags / sizeof *raw_tags; k++) {
+        size_t n = strlen(raw_tags[k]);
+        if (r.len >= n && !strncasecmp(r.ptr, raw_tags[k], n) && (r.len == n || isspace((unsigned char)r.ptr[n]) || r.ptr[n] == '>')) return 1;
+    }
+    bool closing = r.len && r.ptr[0] == '/';
+    size_t j = closing ? 1 : 0;
+    size_t ns = j;
+    if (j >= r.len || !isalpha((unsigned char)r.ptr[j])) return 0;
+    while (j < r.len && (isalnum((unsigned char)r.ptr[j]) || r.ptr[j] == '-' || r.ptr[j] == '_')) j++;
+    Str name = str_sub(r, ns, j);
+    static const char *const block_tags[] = {
+        "address", "article", "aside", "base", "basefont", "blockquote", "body", "caption", "center", "col", "colgroup", "dd",
+        "details", "dialog", "dir", "div", "dl", "dt", "fieldset", "figcaption", "figure", "footer", "form", "frame", "frameset",
+        "h1", "h2", "h3", "h4", "h5", "h6", "head", "header", "hr", "html", "iframe", "legend", "li", "link", "main", "menu",
+        "menuitem", "meta", "nav", "noframes", "ol", "optgroup", "option", "p", "param", "search", "section", "summary", "table",
+        "tbody", "td", "tfoot", "th", "thead", "title", "tr", "track", "ul"};
+    for (size_t k = 0; k < sizeof block_tags / sizeof *block_tags; k++)
+        if (name.len == strlen(block_tags[k]) && !strncasecmp(name.ptr, block_tags[k], name.len)) {
+            if (j == r.len || r.ptr[j] == ' ' || r.ptr[j] == '>' || (r.ptr[j] == '/' && j + 1 < r.len && r.ptr[j + 1] == '>')) return 6;
+            break;
+        }
+    // 7: attributes (an open tag), then "/>" or ">", then only blanks
+    if (!closing)
+        while (j < r.len && (r.ptr[j] == ' ' || r.ptr[j] == '\t')) {
+            size_t a0 = j;
+            while (j < r.len && (r.ptr[j] == ' ' || r.ptr[j] == '\t')) j++;
+            if (j >= r.len || !(isalpha((unsigned char)r.ptr[j]) || r.ptr[j] == '_' || r.ptr[j] == ':')) {
+                j = a0;
+                break;
+            }
+            while (j < r.len && (isalnum((unsigned char)r.ptr[j]) || strchr("_.:-", r.ptr[j]))) j++;
+            size_t e = j;
+            while (e < r.len && r.ptr[e] == ' ') e++;
+            if (e < r.len && r.ptr[e] == '=') {
+                e++;
+                while (e < r.len && r.ptr[e] == ' ') e++;
+                if (e < r.len && (r.ptr[e] == '"' || r.ptr[e] == '\'')) {
+                    char q = r.ptr[e++];
+                    while (e < r.len && r.ptr[e] != q) e++;
+                    if (e >= r.len) return 0;
+                    e++;
+                } else {
+                    size_t v0 = e;
+                    while (e < r.len && !isspace((unsigned char)r.ptr[e]) && !strchr("\"'=<>`", r.ptr[e])) e++;
+                    if (e == v0) return 0;
+                }
+                j = e;
+            }
+        }
+    while (j < r.len && r.ptr[j] == ' ') j++;
+    if (!closing && j < r.len && r.ptr[j] == '/') j++;
+    if (j >= r.len || r.ptr[j] != '>') return 0;
+    return blank(str_sub(r, j + 1, r.len)) ? 7 : 0;
+}
+
 static void lex_blocks(Arena *a, Str s, BlockVec *out, bool top) {
     size_t pos = 0;
     while (pos < s.len) {
@@ -1009,6 +1073,25 @@ static void lex_blocks(Arena *a, Str s, BlockVec *out, bool top) {
                 lex_list(a, s, &pos, out);
                 continue;
             }
+        }
+        // an HTML block, drawn as its text (the blank lines after it are a space)
+        int hb = html_block(l);
+        if (hb) {
+            size_t p = pos, end = pos;
+            while (p < s.len) {
+                size_t pn;
+                Str hl2 = line_at(s, p, &pn);
+                if ((hb == 6 || hb == 7) && blank(hl2)) break;
+                end = p + hl2.len;
+                p = pn;
+                if (hb == 2 && str_find(hl2, S("-->"), 0) >= 0) break;
+                if (hb == 1 && (strcasestr(str_z(a, hl2), "</script>") || strcasestr(str_z(a, hl2), "</pre>") ||
+                                strcasestr(str_z(a, hl2), "</style>") || strcasestr(str_z(a, hl2), "</textarea>")))
+                    break;
+            }
+            vec_push(out, mk(B_HTML, str_sub(s, pos, end)));
+            pos = end;
+            continue;
         }
         // table: a header row and a delimiter row
         if (nx < s.len) {

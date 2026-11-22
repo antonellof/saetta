@@ -10,6 +10,7 @@
 // core/compaction/compaction.ts (the context estimate the footer shows).
 #include "code_tui.h"
 #include "code_oai.h"
+#include "code_ui_ext.h"
 #include "download.h"
 
 #include <ctype.h>
@@ -234,7 +235,7 @@ typedef struct {
 typedef struct ToolView ToolView;
 typedef struct AsstView AsstView;
 
-typedef enum { SEL_NONE, SEL_THINKING, SEL_MODEL, SEL_SETTINGS, SEL_TREE, SEL_CONFIRM, SEL_THEME } SelKind;
+typedef enum { SEL_NONE, SEL_THINKING, SEL_MODEL, SEL_SETTINGS, SEL_TREE, SEL_CONFIRM, SEL_THEME, SEL_EXT } SelKind;
 
 typedef struct {
     Buf value;
@@ -1637,6 +1638,7 @@ static void prompt_line(Buf *out) {
         }
         buf_free(&st);
     }
+    sess_ui_footer_name(out);
     if (g_last_turn_s >= 2) {
         Buf d = {0};
         fmt_took(&d, g_last_turn_s);
@@ -1680,8 +1682,10 @@ static void footer_render(void *ctx, int width, Lines *out) {
         tokens = s->total ? s->total : s->input + s->output + s->cache_read + s->cache_write;
         for (size_t i = (size_t)last_valid + 1; i < U->stats.len; i++) tokens += (double)U->stats.ptr[i].est;
     }
+    bool ctx_unknown = false;
+    sess_ui_footer(&in, &outp, &cr, &cwr, &cost, &ctx_unknown);
     double window = (double)U->model.context_window;
-    double pct = window > 0 ? tokens / window * 100 : 0;
+    double pct = window > 0 && !ctx_unknown ? tokens / window * 100 : 0;
     (void)cfg;
     Buf pwd = {0};
     prompt_line(&pwd);
@@ -1717,7 +1721,8 @@ static void footer_render(void *ctx, int width, Lines *out) {
     t.len = 0;
     fmt_tokens(&t, window);
     Buf ctxs = {0};
-    buf_printf(&ctxs, "%.1f%%/%s%s", pct, t.ptr, U->auto_compact ? " (auto)" : "");
+    if (ctx_unknown) buf_printf(&ctxs, "?/%s%s", t.ptr, U->auto_compact ? " (auto)" : "");
+    else buf_printf(&ctxs, "%.1f%%/%s%s", pct, t.ptr, U->auto_compact ? " (auto)" : "");
     if (stats.len) buf_addc(&stats, ' ');
     if (pct > 90) th_fg(&stats, T_ERROR, buf_str(&ctxs));
     else if (pct > 70) th_fg(&stats, T_WARNING, buf_str(&ctxs));
@@ -3406,13 +3411,15 @@ static void render_history(void) {
     U->stats.len = 0;
     U->last_status_text = U->last_status_spacer = NULL;
     U->pending_tools.len = 0;
-    const JValue *msgs = U->ops->messages ? U->ops->messages(U->host) : NULL;
+    Arena ha = {0};
+    const JValue *msgs = sess_ui_history(&ha);
     VEC(ToolView *) open = {0};
     for (size_t i = 0; msgs && json_is(msgs, J_ARRAY) && i < msgs->arr.len; i++) {
         const JValue *m = msgs->arr.items[i];
         account(m);
         Str role = json_strs(json_get(m, "role"));
         if (str_eqz(role, "user")) add_user(m);
+        else if (str_eqz(role, "compactionSummary")) sess_ui_add_compaction(m);
         else if (str_eqz(role, "assistant")) {
             AsstView *v = asst_new(m);
             chat_add(&v->base);
@@ -3450,9 +3457,14 @@ static void render_history(void) {
         }
     }
     vec_free(&open);
+    arena_reset(&ha);
+    sess_ui_history_done();
 }
 
 // ---- layout and drawing --------------------------------------------------------------------------------
+
+static void (*g_ext_render)(int width, Lines *out); // SEL_EXT: a selector kept in its own file
+static void (*g_ext_key)(const Key *k);
 
 static void render_dock(int width, Lines *out) {
     comp_render(U->pending, width, out);
@@ -3464,6 +3476,7 @@ static void render_dock(int width, Lines *out) {
     else if (U->sel == SEL_TREE) tree_render(width, out);
     else if (U->sel == SEL_CONFIRM) confirm_render(width, out);
     else if (U->sel == SEL_THEME) theme_render(width, out);
+    else if (U->sel == SEL_EXT) g_ext_render(width, out);
     else editor_render(U->ed, width, out);
     footer_render(NULL, width, out);
 }
@@ -3783,7 +3796,8 @@ static void *agent_main(void *arg) {
         char *job = g_job;
         g_job = NULL;
         pthread_mutex_unlock(&g_tlock);
-        ops->prompt(host, job);
+        if (job[0] == '\x01' && ops->compact) ops->compact(host, job + 1); // /compact (uix_start_compact)
+        else ops->prompt(host, job);
         free(job);
         q_post("{\"type\":\"ui_idle\"}");
         pthread_mutex_lock(&g_tlock);
@@ -4040,6 +4054,7 @@ static void sync_tools(const JValue *msg) {
 static void pending_display(void);
 
 static void handle_event(const JValue *ev) {
+    sess_ui_event(ev);
     Str type = json_strs(json_get(ev, "type"));
     if (str_eqz(type, "ui_idle")) {
         U->busy = false;
@@ -4058,6 +4073,7 @@ static void handle_event(const JValue *ev) {
             if (U->ops->set_thinking) U->ops->set_thinking(U->host, rt);
             free(rt);
         }
+        if (sess_ui_idle()) return;
         if (U->re_id) {
             U->quit = true;
             return;
@@ -4248,6 +4264,7 @@ static bool arg_items(void *ctx, const char *cmd, SelectList *all, Lines *search
 static void new_session(void) {
     if (U->busy) return;
     if (U->ops->new_session) U->ops->new_session(U->host);
+    sess_ui_reset();
     comp_clear(U->chat);
     U->stats.len = 0;
     U->bug_hint_shown = false;
@@ -4387,9 +4404,13 @@ static void submit(char *text) {
             free(s);
             return;
         }
+        if (sess_ui_command(c)) {
+            free(s);
+            return;
+        }
         static const char *const known[] = {"scoped-models", "export", "import", "share", "copy",
-                                            "name", "session", "changelog", "hotkeys", "fork", "clone", "trust", "login", "logout",
-                                            "compact", "resume", "reload", "llama", "mcp"};
+                                            "changelog", "hotkeys", "trust", "login", "logout",
+                                            "reload", "llama", "mcp"};
         for (size_t i = 0; i < COUNT(known); i++) {
             size_t kl = strlen(known[i]);
             if (!strncmp(c, known[i], kl) && (c[kl] == 0 || c[kl] == ' ')) {
@@ -4418,6 +4439,7 @@ static void toggle_tools(void) {
             ((ToolView *)kids->ptr[i])->expanded = U->tools_expanded;
             comp_invalidate(kids->ptr[i]);
         }
+    sess_ui_set_expanded(U->tools_expanded);
     show_status(U->tools_expanded ? "Tool output: expanded" : "Tool output: collapsed");
 }
 
@@ -4460,6 +4482,10 @@ static void selector_key(const Key *k) {
     }
     if (U->sel == SEL_THEME) {
         theme_key(k);
+        return;
+    }
+    if (U->sel == SEL_EXT) {
+        g_ext_key(k);
         return;
     }
     if (U->sel == SEL_MODEL) model_key(k);
@@ -4683,7 +4709,7 @@ static void cycle_model(int dir) {
 
 // The keys the fullscreen viewport takes before the editor (tui.altScreen.*).
 static bool viewport_key(const Key *k) {
-    if (U->sel == SEL_TREE && (k->kind == K_PGUP || k->kind == K_PGDN)) return false;
+    if ((U->sel == SEL_TREE || U->sel == SEL_EXT) && (k->kind == K_PGUP || k->kind == K_PGDN)) return false;
     View *v = &g_view;
     switch (k->kind) {
     case K_PGUP: view_scroll(-MAX(1, v->view - PAGE_SCROLL_OVERLAP)); return true;
@@ -4781,6 +4807,8 @@ Err code_ui_run(const CodeUiConfig *cfg, const CodeUiOps *ops, CodeUiHost *host,
         if (g_dirty) timeout = MIN(timeout, 8);
         if (editor_busy(ui.ed)) timeout = MIN(timeout, 10);
         if (g_view.bar_until > now) timeout = MIN(timeout, (int)((g_view.bar_until - now) / 1000000) + 1);
+        int sess_ms = sess_ui_tick(now);
+        if (sess_ms >= 0) timeout = MIN(timeout, sess_ms);
         if (ui.scr.color_query) timeout = MIN(timeout, 10);
         // asleep only with the ring empty (the producer wakes a sleeping consumer once)
         atomic_store(&g_ui_sleeping, 1);
@@ -4952,4 +4980,65 @@ Err code_ui_run(const CodeUiConfig *cfg, const CodeUiOps *ops, CodeUiHost *host,
     g_wake[0] = g_wake[1] = -1;
     U = NULL;
     return result;
+}
+
+// ---- for the features kept in their own files (code_ui_ext.h) --------------------------------------------
+
+const CodeUiConfig *uix_cfg(void) { return U->cfg; }
+const CodeUiOps *uix_ops(void) { return U->ops; }
+CodeUiHost *uix_host(void) { return U->host; }
+Comp *uix_chat(void) { return U->chat; }
+Editor *uix_editor(void) { return U->ed; }
+bool uix_busy(void) { return U->busy; }
+bool uix_tools_expanded(void) { return U->tools_expanded; }
+void uix_show_status(const char *msg) { show_status(msg); }
+void uix_show_error(const char *msg) { show_error(msg); }
+void uix_show_warning(const char *msg) { show_warning(msg); }
+void uix_render_history(void) { render_history(); }
+void uix_request_render(void) { request_render(); }
+
+void uix_open_selector(void (*render)(int width, Lines *out), void (*key)(const Key *k), void (*free_data)(void *), void *data) {
+    close_selector();
+    g_ext_render = render;
+    g_ext_key = key;
+    U->sel = SEL_EXT;
+    U->sel_data = data;
+    U->sel_free = free_data;
+}
+
+void *uix_selector_data(void) { return U->sel == SEL_EXT ? U->sel_data : NULL; }
+
+void uix_close_selector(void) { close_selector(); }
+
+void uix_show_thinking(const char *level) {
+    free(U->thinking);
+    U->thinking = dupz(level);
+    editor_set_border(U->ed, th_thinking_color(level));
+}
+
+void uix_start_compact(const char *instructions) {
+    U->busy = true;
+    pthread_mutex_lock(&g_tlock);
+    free(g_job);
+    Buf b = {0};
+    buf_addc(&b, '\x01');
+    buf_adds(&b, instructions ? instructions : "");
+    g_job = strdup(b.ptr);
+    buf_free(&b);
+    pthread_cond_signal(&g_tcond);
+    pthread_mutex_unlock(&g_tlock);
+}
+
+void uix_working(const char *message) {
+    if (!message) {
+        set_working(false);
+        return;
+    }
+    editor_set_working(U->ed, message);
+    if (!U->working) g_last_spin = now_ns();
+    U->working = true;
+}
+
+void uix_abort(void) {
+    if (U->busy) U->ops->abort(U->host);
 }

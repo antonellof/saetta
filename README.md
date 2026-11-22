@@ -115,17 +115,17 @@ saetta start claude -- -p "fix the failing test"   # anything after -- goes to t
 
 ### Saetta Code
 
-A minimal coding agent inside the `saetta` binary, in C, nothing to install: a port of [pi](https://pi.dev) 1.5.2 that behaves as pi does. The same tools (read, bash, edit, write; grep, find and ls with `--tools`), system prompt, `AGENTS.md` / `CLAUDE.md` files, skills, prompt files and session files, so pi and Saetta Code continue each other's sessions. It talks to Saetta or any OpenAI-compatible server listed in pi's `models.json`; pi's TypeScript extensions are not supported.
+A minimal coding agent inside the `saetta` binary, in C, nothing to install: a port of [pi](https://pi.dev) 1.5.2 that behaves as pi does. The same tools (read, bash, edit, write; grep, find and ls with `--tools`), system prompt, `AGENTS.md` / `CLAUDE.md` files, skills, prompt files and session files, so pi and Saetta Code continue each other's sessions (compacted ones too). The model runs inside it, with no server and no HTTP in between (`--pack`); or it talks to a Saetta server or any OpenAI-compatible server listed in pi's `models.json`. pi's TypeScript extensions are not supported.
 
 ```sh
-saetta start code                             # the server and Saetta Code together
-saetta code                                   # against a running server: a prompt, Ctrl-C stops a turn
-saetta code -p "fix the failing test"         # print mode, as pi -p
+saetta start code                             # the model inside Saetta Code (or the running server, if one is up)
+saetta code --pack coder                      # the same, by hand: a prompt, Ctrl-C stops a turn
+saetta code -p "fix the failing test"         # print mode against pi's models.json, as pi -p
 saetta code --mode json -p "..."              # pi's JSON event stream
 saetta code -c                                # continue this folder's last session (also pi's)
 ```
 
-Its requests, session files and output match pi's byte for byte on 41 recorded scenarios (tool errors, edits, truncation, sessions, skills, JSON events). The interactive view is a simple prompt for now, not pi's full terminal UI. Next: the inference engine in the same process (sessions kept on disk, prompts read ahead of each request).
+Its requests, session files and output match pi's byte for byte on 47 recorded scenarios (tool errors, edits, truncation, sessions, compaction, retries, skills, JSON events), and on three coding tasks it solves what pi solves with less time of its own per turn. The interactive view is a simple prompt for now, not pi's full terminal UI. Next: sessions kept on disk with the engine's state, and prompts read while tools run.
 
 Without `saetta start`, point any agent at `http://127.0.0.1:8080/v1` (OpenAI) or `http://127.0.0.1:8080` (Anthropic), any API key: configs in [`config/`](config) ([Claude Code](docs/claude-code.md), [opencode](docs/opencode.md)).
 

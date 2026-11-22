@@ -1373,6 +1373,21 @@ static Err engine_open(Arena *arena, const char *dir, const char *const *loras, 
 }
 
 Err server_engine_open(Arena *arena, const char *dir, const char *kwargs_default, Engine **out) {
+    // one engine per machine: not beside a server or another in-process engine
+    Server srv;
+    if (instance_running(&srv)) {
+        dbg("saetta: a server is running (pid %d, port %u); one model runs at a time: use it (saetta code without "
+            "--pack, or saetta start code), or stop it first\n", srv.pid, srv.port);
+        return "EngineBusy";
+    }
+    int lock_fd;
+    Err le = instance_inproc_acquire(&lock_fd);
+    if (le) {
+        int pid = 0;
+        instance_inproc_running(&pid);
+        dbg("saetta: another Saetta Code (pid %d) is running the model in its process; one model runs at a time\n", pid);
+        return le;
+    }
     JValue *kwd = NULL;
     if (kwargs_default && (json_parse(arena, str(kwargs_default), true, &kwd) || kwd->kind != J_OBJECT)) return "BadKwargs";
     return engine_open(arena, dir, NULL, 0, kwd, 0, out);
@@ -1418,6 +1433,13 @@ Err server_serve(Arena *arena, const char *dir, uint16_t port, const char *const
             dbg("saetta: --default-chat-template-kwargs wants a JSON object, got %s\n", kwargs_default);
             return "BadKwargs";
         }
+    }
+    // one engine per machine: not beside a Saetta Code that runs the model in its process
+    int ipid = 0;
+    if (instance_inproc_running(&ipid)) {
+        dbg("saetta: Saetta Code (pid %d) is running the model in its own process; one model runs at a time.\n"
+            "Close it, or start it after the server (saetta start code joins a running server).\n", ipid);
+        return "EngineBusy";
     }
     // one server per machine (src/instance.h); the lock is held until this process ends
     int lock_fd;

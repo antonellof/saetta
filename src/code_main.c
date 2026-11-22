@@ -11,6 +11,7 @@
 #include "code.h"
 #include "code_oai.h"
 #include "download.h"
+#include "instance.h"
 #include "server.h"
 
 #include <ctype.h>
@@ -25,7 +26,7 @@
 static const char *const default_tools[] = {"read", "bash", "edit", "write"};
 
 typedef struct {
-    const char *provider, *model, *thinking, *mode, *system_prompt, *tools, *pack;
+    const char *provider, *model, *thinking, *mode, *system_prompt, *tools, *pack, *ctx;
     bool print, cont, no_session, no_tools;
     VEC(const char *) prompts;
     VEC(const char *) append;
@@ -87,6 +88,7 @@ static Err parse_args(const char *const *v, size_t n, Args *o) {
         else if (!strcmp(x, "--append-system-prompt") && more) vec_push(&o->append, v[++i]);
         else if (!strcmp(x, "--tools") && more) o->tools = v[++i];
         else if (!strcmp(x, "--pack") && more) o->pack = v[++i];
+        else if (!strcmp(x, "--ctx") && more) o->ctx = v[++i];
         else if (!strcmp(x, "--no-tools") || !strcmp(x, "-nt")) o->no_tools = true;
         else if (!strcmp(x, "--help") || !strcmp(x, "-h")) {
             printf("usage: saetta code [options] [prompt ...]\n"
@@ -107,6 +109,8 @@ static Err parse_args(const char *const *v, size_t n, Args *o) {
                    "  --system-prompt T, --append-system-prompt T   text or a file\n"
                    "  --pack P                 run the model in this process (a download name such as coder, or a\n"
                    "                           folder): no server, no HTTP; the requests are the same\n"
+                   "  --ctx N                  with --pack: the context in tokens (default 204800, as saetta start;\n"
+                   "                           less when this Mac's memory holds less)\n"
                    "\n"
                    "Without -p in a terminal it opens a prompt: Enter sends, a trailing \\ continues on a new line,\n"
                    "Ctrl-C stops a turn, /new starts a session, /exit quits.\n");
@@ -1217,7 +1221,7 @@ static const char *find_pi_docs(Arena *a) {
 // --pack: the engine in this process, described as `saetta start pi` describes the server to pi
 // (launch.c pi_setup), so the requests stay byte for byte the same. The engine's own log lines
 // go to ~/.saetta/code.log.
-static Err open_engine(Arena *a, Run *r, const char *arg) {
+static Err open_engine(Arena *a, Run *r, const char *arg, const char *ctx) {
     const DownloadPack *pk = download_find(arg);
     char *dir = (char *)arg;
     if (pk) TRY(download_pack_dir(a, pk, &dir));
@@ -1232,11 +1236,26 @@ static Err open_engine(Arena *a, Run *r, const char *arg) {
         setvbuf(log, NULL, _IOLBF, 0);
         dbg_out = log;
     }
+    // the context saetta start gives a server (204800 tokens), unless --ctx or SAETTA_CTX says
+    // otherwise; the engine lowers it to what this Mac's memory holds
+    if (ctx) setenv("SAETTA_CTX", ctx, 1);
+    else if (!getenv("SAETTA_CTX")) setenv("SAETTA_CTX", "204800", 1);
     uint64_t t0 = now_ns();
     if (isatty(2)) fprintf(stderr, "saetta code: loading %s ...\r", pk ? arg : dir);
     Engine *e;
     Err err = server_engine_open(a, dir, NULL, &e);
     if (isatty(2)) fprintf(stderr, "\x1b[K");
+    if (err && !strcmp(err, "EngineBusy")) {
+        Server srv;
+        int pid = 0;
+        if (instance_running(&srv))
+            fprintf(stderr, "saetta code: a saetta server is running (pid %d, port %u); one model runs at a time.\n"
+                            "Use it: saetta start code (or saetta code without --pack), or stop it first (saetta stop).\n",
+                    srv.pid, srv.port);
+        else if (instance_inproc_running(&pid))
+            fprintf(stderr, "saetta code: another Saetta Code (pid %d) is running the model; one model runs at a time.\n", pid);
+        return err;
+    }
     if (err) {
         fprintf(stderr, "saetta code: cannot load %s: %s (log: ~/.saetta/code.log)\n", dir, err);
         return err;
@@ -1343,7 +1362,7 @@ Err code_run(const char *const *args, size_t n, int *code) {
         buf_free(&in);
     }
     if (o.pack) {
-        e = open_engine(a, &r, o.pack);
+        e = open_engine(a, &r, o.pack, o.ctx);
         if (e) goto done;
         if (o.thinking) r.model.thinking = o.thinking;
     } else e = find_model(&r, &o, settings);

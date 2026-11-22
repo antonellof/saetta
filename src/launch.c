@@ -405,7 +405,7 @@ static Err pi_setup(Arena *a, Env *env, Argv *argv, const char *base, uint32_t c
     return OK;
 }
 
-static Err code_in_process(Arena *a, const char *dir, const char *const *extra, size_t n_extra, int *code);
+static Err code_in_process(Arena *a, const char *dir, uint32_t ctx, const char *const *extra, size_t n_extra, int *code);
 
 // Saetta Code (`saetta code`, this binary): pi's configuration, so the two share settings,
 // models and sessions under ~/.saetta/pi.
@@ -423,7 +423,7 @@ static Err code_setup(Arena *a, Env *env, Argv *argv, const char *base, uint32_t
 }
 
 // saetta code --pack <dir> [extra], the engine in its own process, waited for.
-static Err code_in_process(Arena *a, const char *dir, const char *const *extra, size_t n_extra, int *code) {
+static Err code_in_process(Arena *a, const char *dir, uint32_t ctx, const char *const *extra, size_t n_extra, int *code) {
     const char *home = getenv("HOME");
     if (!home) return "NoHome";
     char *cfg = path_join(a, path_join(a, home, ".saetta"), "pi");
@@ -439,6 +439,8 @@ static Err code_in_process(Arena *a, const char *dir, const char *const *extra, 
     vec_push(&argv, "code");
     vec_push(&argv, "--pack");
     vec_push(&argv, dir);
+    vec_push(&argv, "--ctx");
+    vec_push(&argv, arena_printf(a, "%u", ctx));
     for (size_t k = 0; k < n_extra; k++) vec_push(&argv, extra[k]);
     vec_push(&argv, NULL);
     pid_t child;
@@ -531,6 +533,13 @@ static Err session(Arena *a, Session *ss, Agent agent, const char *pack_arg, uin
         }
     }
     if (!joined) {
+        int ipid = 0;
+        if (instance_inproc_running(&ipid)) {
+            dbg("saetta: Saetta Code (pid %d) is running the model in its own process; one model runs at a time. Close it "
+                "first, or run it against a server (start the server first, then saetta start code joins it).\n", ipid);
+            *code = 1;
+            return OK;
+        }
         const char *dir;
         TRY(pack_for(a, pack_arg, &dir));
         if (!dir) {
@@ -539,7 +548,8 @@ static Err session(Arena *a, Session *ss, Agent agent, const char *pack_arg, uin
         }
         // Saetta Code without a server: the model runs inside it (saetta code --pack), with the
         // configuration and sessions `saetta start pi` uses
-        if (agent == AGENT_CODE) return code_in_process(a, dir, extra, n_extra, code);
+        // (an adapter needs the server: it serves the adapter under its own name)
+        if (agent == AGENT_CODE && !lora_arg) return code_in_process(a, dir, ctx, extra, n_extra, code);
         // another program on the port: the default moves to the next free one, a chosen one is an error
         if (!port_free(port)) {
             if (port_set) {

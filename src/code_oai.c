@@ -2457,7 +2457,9 @@ static Err complete_in_process(Arena *a, const CodeModel *m, CodeOaiStream *s, c
     HttpCtx hc = {.s = s, .abort = env ? env->abort : NULL};
     TRY(server_engine_chat(m->engine, body, on_engine, &hc));
     if (s->failed) *assistant = code_oai_stream_end(s, NULL);
-    else if (!hc.seen && hc.abort && *hc.abort) *assistant = code_oai_stream_end(s, "Request was aborted");
+    // Ctrl-C: the error path, as over HTTP (a cancelled transfer) and in pi's catch: open blocks
+    // are not finished and partial tool arguments are not parsed
+    else if (hc.abort && *hc.abort) *assistant = code_oai_stream_end(s, "Request was aborted");
     else if (!hc.ok_status) *assistant = code_oai_stream_end(s, code_oai_http_error(a, hc.status ? hc.status : 500, code_utf8_clean(a, buf_str(&hc.errbody))));
     else {
         code_oai_stream_start(s);

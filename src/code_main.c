@@ -10,6 +10,7 @@
 // (getCurrentSystemMessage, getToolStateChanges), utils/retry.ts (the retryable patterns).
 #include "code.h"
 #include "code_oai.h"
+#include "code_tui.h"
 #include "download.h"
 #include "instance.h"
 #include "server.h"
@@ -50,6 +51,10 @@ static double wall_ms(void) { return (double)(wall_ns() / 1000000); }
 // ---- output --------------------------------------------------------------------------------------
 
 static void emit(Run *r, JValue *ev) {
+    if (r->ui) {
+        code_ui_event(ev);
+        return;
+    }
     if (!r->json) return;
     Buf b = {0};
     json_write(&b, ev);
@@ -112,8 +117,9 @@ static Err parse_args(const char *const *v, size_t n, Args *o) {
                    "  --ctx N                  with --pack: the context in tokens (default 204800, as saetta start;\n"
                    "                           less when this Mac's memory holds less)\n"
                    "\n"
-                   "Without -p in a terminal it opens a prompt: Enter sends, a trailing \\ continues on a new line,\n"
-                   "Ctrl-C stops a turn, /new starts a session, /exit quits.\n");
+                   "Without -p in a terminal it opens pi's interactive screen: Enter sends, Shift+Enter (or a\n"
+                   "trailing \\) starts a new line, \"/\" lists the commands, \"@\" completes file names, Escape stops a\n"
+                   "turn, Ctrl-C clears, Ctrl-C twice or Ctrl-D quits.\n");
             exit(0);
         } else if (x[0] == '-' && x[1]) {
             dbg("saetta code: unknown option %s\n", x);
@@ -392,116 +398,9 @@ typedef struct {
     bool started;
 } Stream;
 
-// ---- the interactive display (a minimal stand-in for pi's TUI) ------------------------------------
+// ---- the interactive mode's state ------------------------------------------------------------------
 
 static volatile int g_abort;
-static const char *g_cwd;
-static int g_ui_state; // 0 nothing, 1 thinking, 2 text
-
-#define DIM "\x1b[2m"
-#define BOLD "\x1b[1m"
-#define CYAN "\x1b[36m"
-#define RED "\x1b[31m"
-#define RESET "\x1b[0m"
-
-// Text from the model or a tool, shown without terminal control: escape sequences (CSI and the
-// rest) and other C0 controls but newline and tab are dropped.
-static void ui_write(Str t) {
-    size_t i = 0, run = 0;
-    while (i < t.len) {
-        unsigned char c = (unsigned char)t.ptr[i];
-        if (c >= 0x20 && c != 0x7f) {
-            i++;
-            continue;
-        }
-        if (c == '\n' || c == '\t') {
-            i++;
-            continue;
-        }
-        fwrite(t.ptr + run, 1, i - run, stdout);
-        if (c == 0x1b && i + 1 < t.len && t.ptr[i + 1] == '[') { // CSI: to its final byte
-            i += 2;
-            while (i < t.len && !((unsigned char)t.ptr[i] >= 0x40 && (unsigned char)t.ptr[i] <= 0x7e)) i++;
-            if (i < t.len) i++;
-        } else if (c == 0x1b && i + 1 < t.len && t.ptr[i + 1] == ']') { // OSC: to BEL or ST
-            i += 2;
-            while (i < t.len && t.ptr[i] != 0x07 && !(t.ptr[i] == 0x1b && i + 1 < t.len && t.ptr[i + 1] == '\\')) i++;
-            i += i < t.len && t.ptr[i] == 0x07 ? 1 : 2;
-            if (i > t.len) i = t.len;
-        } else i++;
-        run = i;
-    }
-    fwrite(t.ptr + run, 1, i - run, stdout);
-}
-
-static void ui_event(Str type, const JValue *event) {
-    Str delta = json_strs(json_get(event, "delta"));
-    if (str_eqz(type, "thinking_start")) {
-        printf("%s%s", g_ui_state ? "\n" : "", DIM);
-        g_ui_state = 1;
-    } else if (str_eqz(type, "thinking_delta")) {
-        ui_write(delta);
-    } else if (str_eqz(type, "thinking_end")) {
-        printf("%s\n", RESET);
-        g_ui_state = 0;
-    } else if (str_eqz(type, "text_start")) {
-        if (g_ui_state == 1) printf("%s\n", RESET);
-        g_ui_state = 2;
-    } else if (str_eqz(type, "text_delta")) {
-        ui_write(delta);
-    } else if (str_eqz(type, "text_end")) {
-        printf("\n");
-        g_ui_state = 0;
-    }
-    fflush(stdout);
-}
-
-// "read calc.py", "bash ls -la", "edit stats.py": the call's main argument, one line
-static void ui_tool_start(const JValue *call) {
-    const JValue *args = json_get(call, "arguments");
-    Str name = json_strs(json_get(call, "name"));
-    Str arg = json_strs(json_get(args, "path"));
-    if (!arg.len) arg = json_strs(json_get(args, "command"));
-    if (!arg.len) arg = json_strs(json_get(args, "pattern"));
-    // paths under the working directory are shown relative to it
-    Str cwd = str(g_cwd);
-    if (cwd.len && arg.len > cwd.len + 1 && str_starts(arg, cwd) && arg.ptr[cwd.len] == '/') arg = str_sub(arg, cwd.len + 1, arg.len);
-    size_t nl = 0;
-    while (nl < arg.len && arg.ptr[nl] != '\n') nl++;
-    if (g_ui_state) printf("%s\n", RESET);
-    g_ui_state = 0;
-    printf("%s%s\xe2\x97\x8f ", CYAN, BOLD);
-    ui_write(name);
-    printf("%s ", RESET);
-    ui_write(str_n(arg.ptr, nl > 120 ? 120 : nl));
-    printf("%s%s\n", nl < arg.len || nl > 120 ? " ..." : "", RESET);
-    fflush(stdout);
-}
-
-// the first lines of the result, dimmed (red when it failed)
-static void ui_tool_end(const JValue *msg) {
-    bool err = json_is(json_get(msg, "isError"), J_BOOL) && json_get(msg, "isError")->b;
-    const JValue *c = json_get(msg, "content");
-    Str t = c && c->arr.len ? json_strs(json_get(c->arr.items[0], "text")) : S("");
-    size_t lines = 0, i = 0;
-    printf("%s", err ? RED : DIM);
-    while (i < t.len && lines < 6) {
-        size_t j = i;
-        while (j < t.len && t.ptr[j] != '\n') j++;
-        printf("  ");
-        ui_write(str_n(t.ptr + i, j - i > 200 ? 200 : j - i));
-        printf("\n");
-        lines++;
-        i = j + 1;
-    }
-    if (i < t.len) {
-        size_t more = 0;
-        for (size_t k = i; k < t.len; k++) more += t.ptr[k] == '\n';
-        printf("  ... %zu more lines\n", more + 1);
-    }
-    printf("%s", RESET);
-    fflush(stdout);
-}
 
 // pi's message_update, as json mode prints it: usage, and the event without its partial
 // (toolcall_start gains the call's id and name).
@@ -516,7 +415,15 @@ static void on_event(void *ctx, const JValue *event, const JValue *partial) {
         return;
     }
     if (str_eqz(type, "done") || str_eqz(type, "error")) return;
-    if (r->ui) ui_event(type, event);
+    // the interactive mode gets the partial message too, at most every 15 ms for the deltas (the
+    // final message comes with message_end)
+    if (r->ui) {
+        static uint64_t last;
+        uint64_t now = now_ns();
+        bool delta = str_ends(type, S("_delta"));
+        if (delta && now - last < 15000000ull) return;
+        last = now;
+    }
     JValue *e = ev_new(a, "message_update");
     json_put(a, e, S("usage"), (JValue *)json_get(partial, "usage"));
     JValue *ame = json_new(a, J_OBJECT);
@@ -532,6 +439,7 @@ static void on_event(void *ctx, const JValue *event, const JValue *partial) {
         json_put(a, ame, S("toolName"), tc ? (JValue *)json_get(tc, "name") : json_string(a, S("")));
     }
     json_put(a, e, S("assistantMessageEvent"), ame);
+    if (r->ui) json_put(a, e, S("message"), (JValue *)partial);
     emit(r, e);
 }
 
@@ -659,7 +567,6 @@ static Err fail_truncated(Run *r, const JValue *assistant, JValue *results) {
                                   (int)name.len, name.ptr),
                      &msg, &raw);
         emit_tool_end(r, call, msg, raw);
-        if (r->ui) ui_tool_end(msg);
         TRY(add_message(r, msg));
         json_push(a, results, msg);
     }
@@ -692,7 +599,6 @@ static Err run_tools(Run *r, const JValue *assistant, JValue *results) {
         if (g_abort && i > 0) break;
         started = i + 1;
         emit_tool_start(r, calls.ptr[i]);
-        if (r->ui) ui_tool_start(calls.ptr[i]);
         r->env.now_ms = wall_ms();
         Str name = json_strs(json_get(calls.ptr[i], "name"));
         if (!declared(r, name)) {
@@ -714,7 +620,6 @@ static Err run_tools(Run *r, const JValue *assistant, JValue *results) {
             if (failed == (pass == 0)) emit_tool_end(r, calls.ptr[i], msgs[i], raws[i]);
         }
     for (size_t i = 0; i < calls.len && !err; i++) {
-        if (r->ui) ui_tool_end(msgs[i]);
         err = add_message(r, msgs[i]);
         json_push(a, results, msgs[i]);
     }
@@ -873,7 +778,6 @@ static Err run_agent(Run *r, bool started) {
             json_put(a, e, S("delayMs"), json_int(a, delay));
             const char *em = json_str(json_get(last, "errorMessage"));
             json_put(a, e, S("errorMessage"), json_string(a, str(em ? em : "Unknown error")));
-            if (r->ui) printf("%sretrying in %lld s (%lld of %lld)%s\n", DIM, (long long)(delay / 1000), (long long)attempt, (long long)g_retry.max_retries, RESET);
             // agent_end (willRetry) is emitted before the retry starts
             finish_agent(r, true, NULL);
             emit(r, e);
@@ -936,13 +840,6 @@ static Err run_turns(Run *r, JValue **last_out, const char **last_id) {
         *last_out = msg;
         *last_id = code_session_leaf(r->session);
         Str stop = json_strs(json_get(msg, "stopReason"));
-        if (r->ui && (str_eqz(stop, "error") || str_eqz(stop, "aborted"))) {
-            printf("%s%s", g_ui_state ? "\n" : "", RED);
-            const char *em = json_str(json_get(msg, "errorMessage"));
-            ui_write(str(em ? em : "error"));
-            printf("%s\n", RESET);
-            g_ui_state = 0;
-        }
         JValue *results = json_new(a, J_ARRAY);
         bool more = false;
         if (!str_eqz(stop, "error") && !str_eqz(stop, "aborted")) {
@@ -960,32 +857,9 @@ static Err run_turns(Run *r, JValue **last_out, const char **last_id) {
     return OK;
 }
 
-// ---- interactive mode: a prompt loop with a small line editor -------------------------------------
-
-static void on_sigint(int sig) {
-    (void)sig;
-    g_abort = 1;
-}
+// ---- interactive mode (code_ui.c draws pi's screen; this is the agent's side) ----------------------
 
 static struct termios g_cooked;
-
-static void raw_on(void) {
-    struct termios t = g_cooked;
-    t.c_lflag &= ~(tcflag_t)(ICANON | ECHO | ISIG);
-    t.c_iflag &= ~(tcflag_t)(IXON | ICRNL);
-    t.c_cc[VMIN] = 1;
-    t.c_cc[VTIME] = 0;
-    tcsetattr(0, TCSANOW, &t); // keep what was typed or pasted ahead
-    fputs("\x1b[?2004h", stdout); // bracketed paste: a pasted newline does not send
-    fflush(stdout);
-}
-
-static void raw_off(void) {
-    fputs("\x1b[?2004l", stdout);
-    fflush(stdout);
-    tcsetattr(0, TCSANOW, &g_cooked);
-}
-
 static volatile sig_atomic_t g_tty_saved;
 
 // SIGTERM / SIGHUP: the terminal back as it was, the running bash commands stopped, then the exit
@@ -995,7 +869,7 @@ static volatile sig_atomic_t g_interactive;
 
 static void on_term(int sig) {
     if (g_tty_saved) {
-        static const char off[] = "\x1b[?2004l\x1b[0m\r\n";
+        static const char off[] = "\x1b[?2004l\x1b[0m\x1b[?7h\x1b[?25h\x1b[?1049l";
         (void)!write(1, off, sizeof off - 1);
         tcsetattr(0, TCSANOW, &g_cooked);
     }
@@ -1003,185 +877,97 @@ static void on_term(int sig) {
     _exit(g_interactive ? 0 : sig == SIGHUP ? 129 : 143);
 }
 
-// Code points in s (the cursor moves by those; wide characters are not measured).
-static size_t cps(const char *s, size_t n) {
-    size_t c = 0;
-    for (size_t i = 0; i < n; i++) c += ((unsigned char)s[i] & 0xC0) != 0x80;
-    return c;
-}
+struct CodeUiHost {
+    Run *r;
+};
 
-static void redraw(const char *prompt, const Buf *line, size_t cur) {
-    printf("\r\x1b[K%s%.*s", prompt, (int)line->len, line->ptr ? line->ptr : "");
-    size_t back = cps(line->ptr + cur, line->len - cur);
-    if (back) printf("\x1b[%zuD", back);
-    fflush(stdout);
-}
-
-// One prompt from the user: Enter sends, a trailing backslash continues on a new line, arrows
-// move and walk the history, Ctrl-A / Ctrl-E jump, Ctrl-U clears, Ctrl-C clears (or quits on an
-// empty line), Ctrl-D quits on an empty line. Returns false to quit.
-static bool read_prompt(Arena *a, VecStr *history, char **out) {
-    Buf text = {0}, line = {0};
-    size_t cur = 0, hist = history->len;
-    bool pasting = false;
-    const char *prompt = BOLD "> " RESET;
-    raw_on();
-    redraw(prompt, &line, cur);
-    bool ok = true;
-    for (;;) {
-        unsigned char c;
-        if (read(0, &c, 1) != 1) {
-            ok = false;
-            break;
-        }
-        if ((c == '\r' || c == '\n') && pasting) { // a pasted line break: keep going
-            buf_addstr(&text, buf_str(&line));
-            buf_addc(&text, '\n');
-            line.len = cur = 0;
-            printf("\r\n");
-            prompt = "  ";
-            redraw(prompt, &line, cur);
-            continue;
-        }
-        if (c == '\r' || c == '\n') {
-            if (line.len && line.ptr[line.len - 1] == '\\') { // continue
-                line.len--;
-                buf_addstr(&text, buf_str(&line));
-                buf_addc(&text, '\n');
-                line.len = cur = 0;
-                printf("\r\n");
-                prompt = "  ";
-                redraw(prompt, &line, cur);
-                continue;
-            }
-            buf_addstr(&text, buf_str(&line));
-            printf("\r\n");
-            break;
-        }
-        if (c == 3) { // Ctrl-C
-            if (!line.len && !text.len) {
-                ok = false;
-                printf("\r\n");
-                break;
-            }
-            line.len = cur = text.len = 0;
-            prompt = BOLD "> " RESET;
-        } else if (c == 4) { // Ctrl-D
-            if (!line.len && !text.len) {
-                ok = false;
-                printf("\r\n");
-                break;
-            }
-        } else if (c == 127 || c == 8) {
-            if (cur > 0) {
-                size_t k = cur - 1;
-                while (k > 0 && ((unsigned char)line.ptr[k] & 0xC0) == 0x80) k--;
-                memmove(line.ptr + k, line.ptr + cur, line.len - cur);
-                line.len -= cur - k;
-                cur = k;
-            }
-        } else if (c == 1) cur = 0;
-        else if (c == 5) cur = line.len;
-        else if (c == 21) line.len = cur = 0;
-        else if (c == 27) {
-            // an escape sequence, read to its final byte (CSI parameters, then 0x40..0x7e)
-            unsigned char seq[2] = {0, 0}, params[16];
-            size_t np = 0;
-            if (read(0, &seq[0], 1) != 1) continue;
-            if (seq[0] != '[' && seq[0] != 'O') continue; // Alt+key and the like: ignored
-            for (;;) {
-                unsigned char x;
-                if (read(0, &x, 1) != 1) break;
-                if (x >= 0x40 && x <= 0x7e) {
-                    seq[1] = x;
-                    break;
-                }
-                if (np < sizeof params) params[np++] = x;
-            }
-            if (seq[1] == '~' && np == 3 && !memcmp(params, "200", 3)) pasting = true;
-            else if (seq[1] == '~' && np == 3 && !memcmp(params, "201", 3)) pasting = false;
-            else if (np) {
-                // other parameterized keys (Home, End, Delete, modified arrows): ignored
-            } else if (seq[1] == 'D' && cur > 0) {
-                cur--;
-                while (cur > 0 && ((unsigned char)line.ptr[cur] & 0xC0) == 0x80) cur--;
-            } else if (seq[1] == 'C' && cur < line.len) {
-                cur++;
-                while (cur < line.len && ((unsigned char)line.ptr[cur] & 0xC0) == 0x80) cur++;
-            } else if ((seq[1] == 'A' && hist > 0) || (seq[1] == 'B' && hist < history->len)) {
-                hist += seq[1] == 'A' ? (size_t)-1 : 1;
-                line.len = 0;
-                if (hist < history->len) buf_addstr(&line, history->ptr[hist]);
-                cur = line.len;
-            }
-        } else if (c >= 32 || c == '\t') {
-            buf_reserve(&line, 1);
-            memmove(line.ptr + cur + 1, line.ptr + cur, line.len - cur);
-            line.ptr[cur++] = (char)c;
-            line.len++;
-        }
-        redraw(prompt, &line, cur);
+static void host_prompt(CodeUiHost *h, const char *text) {
+    Run *r = h->r;
+    g_abort = 0;
+    Err e = prompt(r, text);
+    if (e) {
+        Arena a = {0};
+        JValue *ev = ev_new(&a, "ui_error");
+        json_put(&a, ev, S("message"), json_string(&a, str(arena_printf(&a, "saetta code: %s", e))));
+        code_ui_event(ev);
+        arena_reset(&a);
     }
-    raw_off();
-    *out = ok ? str_z(a, buf_str(&text)) : NULL;
-    if (ok && text.len) vec_push(history, str(*out));
-    buf_free(&text);
-    buf_free(&line);
-    return ok;
 }
 
-static Err interactive(Run *r, const Args *o) {
+static void host_new_session(CodeUiHost *h) {
+    Run *r = h->r;
+    Arena *a = r->a;
+    if (code_session_open(a, &r->env, false, false, &r->session)) return;
+    r->env.session_id = json_str(json_get(code_session_header(r->session), "id"));
+    r->env.session_file = code_session_path(r->session);
+    JValue *f = json_new(a, J_OBJECT);
+    json_put(a, f, S("provider"), json_string(a, str(r->model.provider)));
+    json_put(a, f, S("modelId"), json_string(a, str(r->model.id)));
+    (void)code_session_append(r->session, "model_change", f);
+    f = json_new(a, J_OBJECT);
+    json_put(a, f, S("thinkingLevel"), json_string(a, str(r->model.thinking)));
+    (void)code_session_append(r->session, "thinking_level_change", f);
+}
+
+static void host_set_thinking(CodeUiHost *h, const char *level) {
+    Run *r = h->r;
+    Arena *a = r->a;
+    if (r->model.thinking && !strcmp(r->model.thinking, level)) return;
+    r->model.thinking = arena_strdup(a, level);
+    r->env.thinking = r->model.thinking;
+    JValue *f = json_new(a, J_OBJECT);
+    json_put(a, f, S("thinkingLevel"), json_string(a, str(level)));
+    (void)code_session_append(r->session, "thinking_level_change", f);
+}
+
+static const JValue *host_entries(CodeUiHost *h) { return code_session_messages(h->r->session); }
+
+static void host_abort(CodeUiHost *h) {
+    (void)h;
+    g_abort = 1;
+}
+
+// fd for the "@" completion: on PATH, else pi's managed copy in the agent folder
+static const char *find_fd(Arena *a, const char *agent_dir) {
+    const char *path = getenv("PATH");
+    for (Str rest = str(path ? path : ""); rest.len;) {
+        ptrdiff_t c = str_find_char(rest, ':', 0);
+        Str dir = c >= 0 ? str_sub(rest, 0, (size_t)c) : rest;
+        rest = c >= 0 ? str_sub(rest, (size_t)c + 1, rest.len) : S("");
+        char *cand = path_join(a, str_z(a, dir), "fd");
+        if (access(cand, X_OK) == 0) return cand;
+    }
+    char *managed = path_join(a, path_join(a, agent_dir, "bin"), "fd");
+    return access(managed, X_OK) == 0 ? managed : NULL;
+}
+
+static Err interactive(Run *r, const Args *o, const JValue *settings) {
     Arena *a = r->a;
     r->ui = true;
-    g_cwd = r->env.cwd;
     tcgetattr(0, &g_cooked);
     g_tty_saved = 1;
     g_interactive = 1;
-    struct sigaction sa = {0};
-    sa.sa_handler = on_sigint;
-    sigaction(SIGINT, &sa, NULL);
     r->env.abort = &g_abort;
-    printf("%sSaetta Code%s %s%s/%s, thinking %s%s\n", BOLD, RESET, DIM, r->model.provider, r->model.id, r->model.thinking, RESET);
-    printf("%s%s  (Enter sends, \\ then Enter for a new line, Ctrl-C stops a turn, /help)%s\n\n", DIM, r->env.cwd, RESET);
-    VecStr history = {0};
-    for (size_t i = 0; i < o->prompts.len; i++) {
-        g_abort = 0;
-        TRY(prompt(r, o->prompts.ptr[i]));
-    }
-    for (;;) {
-        char *text;
-        if (!read_prompt(a, &history, &text)) break;
-        Str t = str_trim(str(text));
-        if (!t.len) continue;
-        if (str_eqz(t, "/exit") || str_eqz(t, "/quit")) break;
-        if (str_eqz(t, "/help")) {
-            printf("%s/new      a new session\n/exit     quit (also Ctrl-D)\nSessions are pi's (~/.pi/agent/sessions or "
-                   "$PI_CODING_AGENT_DIR): saetta code -c continues the last one, and so does pi -c.%s\n\n",
-                   DIM, RESET);
-            continue;
-        }
-        if (str_eqz(t, "/new")) {
-            TRY(code_session_open(a, &r->env, false, false, &r->session));
-            r->env.session_id = json_str(json_get(code_session_header(r->session), "id"));
-            r->env.session_file = code_session_path(r->session);
-            JValue *f = json_new(a, J_OBJECT);
-            json_put(a, f, S("provider"), json_string(a, str(r->model.provider)));
-            json_put(a, f, S("modelId"), json_string(a, str(r->model.id)));
-            TRY(code_session_append(r->session, "model_change", f));
-            f = json_new(a, J_OBJECT);
-            json_put(a, f, S("thinkingLevel"), json_string(a, str(r->model.thinking)));
-            TRY(code_session_append(r->session, "thinking_level_change", f));
-            printf("%snew session%s\n\n", DIM, RESET);
-            continue;
-        }
-        g_abort = 0;
-        uint64_t t0 = now_ns();
-        Err e = prompt(r, text);
-        if (e) printf("%ssaetta code: %s%s\n", RED, e, RESET);
-        printf("%s%.1f s%s\n\n", DIM, (double)(now_ns() - t0) / 1e9, RESET);
-    }
-    vec_free(&history);
-    return OK;
+    signal(SIGINT, SIG_IGN); // Ctrl-C is a key in raw mode
+    const JValue *compaction = json_get(settings, "compaction");
+    CodeUiConfig cfg = {
+        .cwd = r->env.cwd,
+        .home = r->env.home,
+        .agent_dir = r->env.agent_dir,
+        .provider = r->model.provider,
+        .model_id = r->model.id,
+        .model_name = r->model.name,
+        .thinking = r->model.thinking,
+        .reasoning = r->model.reasoning,
+        .context_window = r->model.context_window,
+        .auto_compact = jbool(json_get(compaction, "enabled"), true),
+        .fd_path = find_fd(a, r->env.agent_dir),
+    };
+    CodeUiOps ops = {host_prompt, host_new_session, host_set_thinking, host_entries, host_abort};
+    CodeUiHost host = {r};
+    Err e = code_ui_run(&cfg, &ops, &host, o->prompts.ptr, o->prompts.len);
+    g_tty_saved = 0;
+    return e;
 }
 
 // ---- entry ---------------------------------------------------------------------------------------
@@ -1401,7 +1187,7 @@ Err code_run(const char *const *args, size_t n, int *code) {
     r.env.model = r.model.id;
     r.env.thinking = level;
     if (!o.print && !piped && !r.json && isatty(0) && isatty(1)) {
-        e = interactive(&r, &o);
+        e = interactive(&r, &o, settings);
         if (!e) *code = 0;
         goto done;
     }

@@ -119,13 +119,13 @@ A minimal coding agent inside the `saetta` binary, in C, nothing to install: a p
 
 ```sh
 saetta start code                             # the model inside Saetta Code (or the running server, if one is up)
-saetta code --pack coder                      # the same, by hand: a prompt, Ctrl-C stops a turn
+saetta code --pack coder                      # the same, by hand: pi's screen, Escape stops a turn
 saetta code -p "fix the failing test"         # print mode against pi's models.json, as pi -p
 saetta code --mode json -p "..."              # pi's JSON event stream
 saetta code -c                                # continue this folder's last session (also pi's)
 ```
 
-Its requests, session files and output match pi's byte for byte on 47 recorded scenarios (tool errors, edits, truncation, sessions, compaction, retries, skills, JSON events), and on three coding tasks it solves what pi solves with less time of its own per turn. The interactive view is a simple prompt for now, not pi's full terminal UI. Next: sessions kept on disk with the engine's state, and prompts read while tools run.
+Its requests, session files and output match pi's byte for byte on 47 recorded scenarios (tool errors, edits, truncation, sessions, compaction, retries, skills, JSON events), and on three coding tasks it solves what pi solves with less time of its own per turn. The interactive view is pi's terminal UI ported to C: the same screens as pi on 8 of 11 recorded scenarios (editor, "/" commands with completion, "@" file completion, markdown with highlighted code, tool views, errors, aborts); its selectors (model, settings, session tree) are not ported yet. Next: sessions kept on disk with the engine's state, and prompts read while tools run.
 
 Without `saetta start`, point any agent at `http://127.0.0.1:8080/v1` (OpenAI) or `http://127.0.0.1:8080` (Anthropic), any API key: configs in [`config/`](config) ([Claude Code](docs/claude-code.md), [opencode](docs/opencode.md)).
 

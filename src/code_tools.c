@@ -24,6 +24,7 @@
 #include <poll.h>
 #include <signal.h>
 #include <spawn.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <sys/event.h>
 #include <sys/stat.h>
@@ -214,14 +215,27 @@ static Str u8_text(Arena *a, const void *p, size_t n, bool ignore_bom) {
     return take(a, &b);
 }
 
-static uint32_t u8_next(Str s, size_t *i) { // s is valid UTF-8
+// The code point at s[*i], advancing *i. Bounded by s.len: an invalid or truncated sequence is
+// U+FFFD and consumes its maximal valid prefix (at least one byte), as TextDecoder does.
+static uint32_t u8_next(Str s, size_t *i) {
     const uint8_t *p = (const uint8_t *)s.ptr;
-    uint8_t b = p[*i];
-    if (b < 0x80) { (*i)++; return b; }
-    int n = b >= 0xf0 ? 3 : b >= 0xe0 ? 2 : 1;
+    size_t at = *i;
+    uint8_t b = p[at];
+    if (b < 0x80) { *i = at + 1; return b; }
+    int n;
+    uint8_t lo = 0x80, hi = 0xbf;
+    if (b >= 0xc2 && b <= 0xdf) n = 1;
+    else if (b >= 0xe0 && b <= 0xef) { n = 2; if (b == 0xe0) lo = 0xa0; else if (b == 0xed) hi = 0x9f; }
+    else if (b >= 0xf0 && b <= 0xf4) { n = 3; if (b == 0xf0) lo = 0x90; else if (b == 0xf4) hi = 0x8f; }
+    else { *i = at + 1; return 0xfffd; }
     uint32_t cp = b & (0x3f >> n);
-    for (int k = 1; k <= n && *i + (size_t)k < s.len; k++) cp = (cp << 6) | (p[*i + (size_t)k] & 0x3f);
-    *i += (size_t)n + 1;
+    for (int k = 1; k <= n; k++) {
+        size_t q = at + (size_t)k;
+        if (q >= s.len || p[q] < lo || p[q] > hi) { *i = q; return 0xfffd; }
+        cp = (cp << 6) | (p[q] & 0x3f);
+        lo = 0x80, hi = 0xbf;
+    }
+    *i = at + (size_t)n + 1;
     return cp;
 }
 
@@ -733,10 +747,11 @@ typedef struct {
     bool exited_code; // false: killed by a signal (Node's code null)
     int code;
     bool killed;
+    int wait_err; // errno of a failed poll: the child was killed and reaped, its output is partial
 } Proc;
 
 // Runs argv (PATH lookup) in cwd (NULL: ours) with stdin /dev/null; stdout lines to on_line,
-// stderr collected. Returns errno of a failed spawn, else 0.
+// stderr collected. Returns errno of a failed spawn, else 0 (check pr->wait_err).
 static int run_proc(const char *const *argv, const char *cwd, Proc *pr) {
     int out[2], err[2];
     if (pipe(out)) return errno;
@@ -770,6 +785,12 @@ static int run_proc(const char *const *argv, const char *cwd, Proc *pr) {
     while (open > 0) {
         if (poll(fds, 2, -1) < 0) {
             if (errno == EINTR) continue;
+            pr->wait_err = errno;
+            kill(pid, SIGKILL);
+            for (int k = 0; k < 2; k++)
+                if (fds[k].fd >= 0) { close(fds[k].fd); fds[k].fd = -1; }
+            open = 0;
+            stop = true;
             break;
         }
         for (int k = 0; k < 2; k++) {
@@ -806,8 +827,10 @@ static int run_proc(const char *const *argv, const char *cwd, Proc *pr) {
         pr->on_line(pr->ctx, l);
     }
     buf_free(&line);
-    int st;
-    while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+    int st = 0;
+    pid_t w;
+    while ((w = waitpid(pid, &st, 0)) < 0 && errno == EINTR) {}
+    if (w < 0 && !pr->wait_err) pr->wait_err = errno;
     pr->exited_code = WIFEXITED(st);
     pr->code = WIFEXITED(st) ? WEXITSTATUS(st) : 0;
     return 0;
@@ -1140,6 +1163,42 @@ static void kill_tree(pid_t pid) {
     if (kill(-pid, SIGKILL)) kill(pid, SIGKILL);
 }
 
+// How often the bash wait loop looks at env->abort when nothing else wakes it.
+#define ABORT_POLL_MS 50.0
+
+static bool reap(pid_t pid, int *st) {
+    pid_t w;
+    while ((w = waitpid(pid, st, 0)) < 0 && errno == EINTR) {}
+    return w == pid;
+}
+
+// pi's trackedDetachedChildPids (utils/shell.ts): the bash process groups while their command
+// runs (tracked at spawn, untracked once the wait is over), killed by code_tools_kill_detached.
+// Lock-free atomics, so a signal handler may call it.
+#define TRACK_MAX 32
+static _Atomic pid_t tracked_groups[TRACK_MAX];
+
+static void track_group(pid_t pid) {
+    for (size_t i = 0; i < TRACK_MAX; i++) {
+        pid_t z = 0;
+        if (atomic_compare_exchange_strong(&tracked_groups[i], &z, pid)) return;
+    }
+}
+
+static void untrack_group(pid_t pid) {
+    for (size_t i = 0; i < TRACK_MAX; i++) {
+        pid_t p = pid;
+        if (atomic_compare_exchange_strong(&tracked_groups[i], &p, 0)) return;
+    }
+}
+
+void code_tools_kill_detached(void) {
+    for (size_t i = 0; i < TRACK_MAX; i++) {
+        pid_t p = atomic_exchange(&tracked_groups[i], 0);
+        if (p > 0) kill_tree(p);
+    }
+}
+
 static double ms_since(uint64_t t0) { return (double)(now_ns() - t0) / 1e6; }
 
 static char **shell_env(Arena *a, const CodeEnv *env) {
@@ -1191,7 +1250,8 @@ static void tool_bash(Arena *a, const CodeEnv *env, const JValue *args, ToolOut 
     Acc acc = {.tail_at_line = true, .tmp_fd = -1, .a = a};
     uint64_t started = now_ns();
     const char *thrown = NULL;
-    bool timed_out = false;
+    bool timed_out = false, aborted = false;
+    volatile int *ab = env->abort;
     double shell_exit_before = -1; // ms after start when the shell exited, if before the deadline
     int exit_code = 0;
     double timeout_ms = 0;
@@ -1226,34 +1286,46 @@ static void tool_bash(Arena *a, const CodeEnv *env, const JValue *args, ToolOut 
             rc = posix_spawnp(&pid, sh, &fa, &at, (char *const *)argv, shell_env(a, env));
             posix_spawn_file_actions_destroy(&fa);
             posix_spawnattr_destroy(&at);
-            close(out[1]);
-            close(err[1]);
         }
+        if (out[1] >= 0) close(out[1]);
+        if (err[1] >= 0) close(err[1]);
         if (rc) {
             if (out[0] >= 0) close(out[0]);
             if (err[0] >= 0) close(err[0]);
             thrown = arena_printf(a, "spawn %s %s", shell_path(), errno_code(rc));
         } else {
-            int kq = kqueue();
-            struct kevent ch[3];
-            EV_SET(&ch[0], out[0], EVFILT_READ, EV_ADD, 0, 0, NULL);
-            EV_SET(&ch[1], err[0], EVFILT_READ, EV_ADD, 0, 0, NULL);
-            EV_SET(&ch[2], pid, EVFILT_PROC, EV_ADD | EV_ONESHOT, NOTE_EXIT, 0, NULL);
-            kevent(kq, ch, 2, NULL, 0, NULL);
+            track_group(pid);
+            const char *werr = NULL; // waiting failed: the group is killed and reaped, no result
             bool exited = false;
             int st = 0;
-            if (kevent(kq, &ch[2], 1, NULL, 0, NULL) < 0) { // already gone
-                waitpid(pid, &st, 0);
-                exited = true;
+            int kq = kqueue();
+            if (kq < 0) werr = arena_printf(a, "kqueue %s", errno_code(errno));
+            else {
+                struct kevent ch[3];
+                EV_SET(&ch[0], out[0], EVFILT_READ, EV_ADD, 0, 0, NULL);
+                EV_SET(&ch[1], err[0], EVFILT_READ, EV_ADD, 0, 0, NULL);
+                EV_SET(&ch[2], pid, EVFILT_PROC, EV_ADD | EV_ONESHOT, NOTE_EXIT, 0, NULL);
+                if (kevent(kq, ch, 2, NULL, 0, NULL) < 0) werr = arena_printf(a, "kevent %s", errno_code(errno));
+                else if (kevent(kq, &ch[2], 1, NULL, 0, NULL) < 0) {
+                    if (errno != ESRCH) werr = arena_printf(a, "kevent %s", errno_code(errno));
+                    else { // already gone
+                        if (!reap(pid, &st)) werr = arena_printf(a, "waitpid %s", errno_code(errno));
+                        exited = true;
+                    }
+                }
             }
             int fds[2] = {out[0], err[0]};
             int nopen = 2;
             uint64_t t0 = now_ns();
             double exited_at = exited ? 0 : -1, idle_until = exited ? 100 : -1;
             char buf[65536];
-            for (;;) {
+            while (!werr) {
                 if (exited && nopen == 0) break;
                 double now = ms_since(t0);
+                if (ab && *ab && !aborted) { // pi's onAbort: kill the whole tree, keep waiting for it
+                    aborted = true;
+                    kill_tree(pid);
+                }
                 if (has_to && !timed_out && now >= timeout_ms) {
                     timed_out = true;
                     shell_exit_before = exited ? exited_at : -1;
@@ -1263,6 +1335,7 @@ static void tool_bash(Arena *a, const CodeEnv *env, const JValue *args, ToolOut 
                 double wait = -1;
                 if (has_to && !timed_out) wait = timeout_ms - now;
                 if (exited && (wait < 0 || idle_until - now < wait)) wait = idle_until - now;
+                if (ab && !aborted && (wait < 0 || wait > ABORT_POLL_MS)) wait = ABORT_POLL_MS;
                 struct timespec ts, *tsp = NULL;
                 if (wait >= 0) {
                     ts.tv_sec = (time_t)(wait / 1000);
@@ -1271,10 +1344,13 @@ static void tool_bash(Arena *a, const CodeEnv *env, const JValue *args, ToolOut 
                 }
                 struct kevent ev[4];
                 int n = kevent(kq, NULL, 0, ev, 4, tsp);
-                if (n < 0 && errno != EINTR) break;
+                if (n < 0) {
+                    if (errno != EINTR) werr = arena_printf(a, "kevent %s", errno_code(errno));
+                    continue;
+                }
                 for (int i = 0; i < n; i++) {
                     if (ev[i].filter == EVFILT_PROC) {
-                        while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+                        if (!reap(pid, &st)) werr = arena_printf(a, "waitpid %s", errno_code(errno));
                         exited = true;
                         exited_at = ms_since(t0);
                         idle_until = exited_at + 100;
@@ -1282,7 +1358,7 @@ static void tool_bash(Arena *a, const CodeEnv *env, const JValue *args, ToolOut 
                     }
                     int fd = (int)ev[i].ident;
                     ssize_t r = read(fd, buf, sizeof buf);
-                    if (r < 0 && errno == EINTR) continue;
+                    if (r < 0 && (errno == EINTR || errno == EAGAIN)) continue;
                     if (r <= 0) {
                         struct kevent del;
                         EV_SET(&del, fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
@@ -1297,9 +1373,16 @@ static void tool_bash(Arena *a, const CodeEnv *env, const JValue *args, ToolOut 
                     if (exited) idle_until = ms_since(t0) + 100;
                 }
             }
+            if (!exited) { // the wait failed: never leave the group running or a zombie behind
+                kill_tree(pid);
+                if (!reap(pid, &st) && !werr) werr = arena_printf(a, "waitpid %s", errno_code(errno));
+            }
             for (int k = 0; k < 2; k++)
                 if (fds[k] >= 0) close(fds[k]);
-            close(kq);
+            if (kq >= 0) close(kq);
+            untrack_group(pid);
+            if (ab && *ab) aborted = true; // pi checks signal.aborted once the wait is over
+            if (werr && !aborted) thrown = arena_printf(a, "Failed to wait for %s: %s", shell_path(), werr);
             exit_code = WIFEXITED(st) ? WEXITSTATUS(st) : WIFSIGNALED(st) ? 128 + WTERMSIG(st) : 1;
         }
     }
@@ -1307,7 +1390,7 @@ static void tool_bash(Arena *a, const CodeEnv *env, const JValue *args, ToolOut 
     acc_finish(&acc);
     Trunc t = acc_snapshot(a, &acc);
     if (acc.tmp_fd >= 0) { close(acc.tmp_fd); acc.tmp_fd = -1; }
-    bool thrown_path = thrown || timed_out;
+    bool thrown_path = thrown || timed_out || aborted;
     Str text = t.content.len ? t.content : thrown_path ? (Str){"", 0} : S("(no output)");
     JValue *details = NULL;
     if (t.truncated) {
@@ -1326,7 +1409,8 @@ static void tool_bash(Arena *a, const CodeEnv *env, const JValue *args, ToolOut 
                         js_num(a, el), js_num(a, t.total_lines), format_size(a, MAX_BYTES), acc.tmp_path);
     }
     if (thrown_path) {
-        if (timed_out) {
+        if (aborted) thrown = text.len ? arena_printf(a, "%.*s\n\nCommand aborted", (int)text.len, text.ptr) : "Command aborted";
+        else if (timed_out) {
             Str status = sfmt(a, "Command timed out after %s seconds", js_num(a, timeout));
             if (shell_exit_before >= 0)
                 status = sfmt(a, "%.*s. The shell exited with code %d after %s seconds, but background processes it started kept writing output until the timeout.",
@@ -2250,6 +2334,7 @@ static void tool_grep(Arena *a, const CodeEnv *env, const JValue *args, ToolOut 
     Proc pr = {.on_line = grep_line, .ctx = &g};
     int rc = run_proc(argv, is_dir ? search : NULL, &pr);
     if (rc) { o->thrown = arena_printf(a, "Failed to run ripgrep: spawn %s %s", rg, errno_code(rc)); goto out; }
+    if (pr.wait_err) { o->thrown = arena_printf(a, "Failed to run ripgrep: %s", errno_code(pr.wait_err)); goto out; }
     if (!pr.killed && !(pr.exited_code && (pr.code == 0 || pr.code == 1))) {
         Str e = str_trim(u8_text(a, pr.err.ptr, pr.err.len, false));
         o->thrown = e.len ? str_z(a, e) : pr.exited_code ? arena_printf(a, "ripgrep exited with code %d", pr.code) : "ripgrep exited with code null";
@@ -2358,6 +2443,7 @@ static void tool_find(Arena *a, const CodeEnv *env, const JValue *args, ToolOut 
     Proc pr = {.on_line = find_line, .ctx = &f};
     int rc = run_proc(argv, NULL, &pr);
     if (rc) { o->thrown = arena_printf(a, "Failed to run fd: spawn %s %s", fd, errno_code(rc)); goto out; }
+    if (pr.wait_err) { o->thrown = arena_printf(a, "Failed to run fd: %s", errno_code(pr.wait_err)); goto out; }
     if (!(pr.exited_code && pr.code == 0) && f.count == 0) {
         Str e = str_trim(u8_text(a, pr.err.ptr, pr.err.len, false));
         o->thrown = e.len ? str_z(a, e) : pr.exited_code ? arena_printf(a, "fd exited with code %d", pr.code) : "fd exited with code null";
@@ -2403,6 +2489,20 @@ static int name_cmp(const void *x, const void *y) {
     return c ? c : (a->len < b->len ? -1 : a->len > b->len);
 }
 
+// Stable merge sort by sx_locale_compare_lower, O(n log n) comparisons; runs already in order
+// cost one comparison to merge.
+static void locale_merge_sort(Str *v, Str *tmp, size_t n) {
+    if (n < 2) return;
+    size_t h = n / 2;
+    locale_merge_sort(v, tmp, h);
+    locale_merge_sort(v + h, tmp, n - h);
+    if (sx_locale_compare_lower(v[h - 1].ptr, v[h - 1].len, v[h].ptr, v[h].len) <= 0) return;
+    memcpy(tmp, v, h * sizeof *v);
+    size_t i = 0, j = h, k = 0;
+    while (i < h && j < n) v[k++] = sx_locale_compare_lower(tmp[i].ptr, tmp[i].len, v[j].ptr, v[j].len) <= 0 ? tmp[i++] : v[j++];
+    while (i < h) v[k++] = tmp[i++];
+}
+
 static void tool_ls(Arena *a, const CodeEnv *env, const JValue *args, ToolOut *o) {
     Str p = json_strs(json_get(args, "path"));
     double limit = 500;
@@ -2422,15 +2522,10 @@ static void tool_ls(Arena *a, const CodeEnv *env, const JValue *args, ToolOut *o
     }
     closedir(d);
     qsort(names.ptr, names.len, sizeof(Str), name_cmp); // libuv scandir order
-    // stable insertion sort by the locale order (Array.prototype.sort is stable)
-    for (size_t i = 1; i < names.len; i++) {
-        Str k = names.ptr[i];
-        size_t j = i;
-        while (j > 0 && sx_locale_compare_lower(names.ptr[j - 1].ptr, names.ptr[j - 1].len, k.ptr, k.len) > 0) {
-            names.ptr[j] = names.ptr[j - 1];
-            j--;
-        }
-        names.ptr[j] = k;
+    // stable by the locale order (Array.prototype.sort is stable): a merge sort
+    if (names.len > 1) {
+        Str *tmp = ARENA_ARRAY(a, Str, names.len);
+        locale_merge_sort(names.ptr, tmp, names.len);
     }
     Buf out = {0};
     size_t count = 0;
@@ -2815,7 +2910,8 @@ Err code_tool_run(Arena *a, const CodeEnv *env, const JValue *call, JValue **res
         JValue *valid = NULL;
         if (json_is(ae, J_STRING)) o.thrown = arena_printf(a, "Invalid arguments for tool \"%s\": %.*s", tname, (int)ae->s.len, ae->s.ptr);
         else valid = validate(a, tname, json_get(json_get(tool_schema(a, (size_t)k), "function"), "parameters"), prepared, &o.thrown);
-        if (valid) {
+        if (valid && env->abort && *env->abort) o.thrown = "Operation aborted"; // prepareToolCall's signal check
+        else if (valid) {
             executed = true;
             uint64_t t0 = now_ns();
             TOOLS[k].run(a, env, valid, &o);

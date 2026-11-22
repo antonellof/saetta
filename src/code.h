@@ -51,7 +51,9 @@ typedef struct {
     // PI_MODEL and PI_REASONING_LEVEL (bash.ts resolveSpawnContext); NULL leaves one unset.
     const char *session_id, *session_file, *provider, *model, *thinking;
     // Set (by a signal handler) to abort the request in flight: the client stops reading and
-    // records the answer as pi does, stopReason "aborted". NULL when nothing aborts.
+    // records the answer as pi does, stopReason "aborted"; a tool call not yet run returns
+    // "Operation aborted" and a running bash command has its process group killed ("Command
+    // aborted"). NULL when nothing aborts.
     volatile int *abort;
 } CodeEnv;
 
@@ -78,6 +80,10 @@ JValue *code_tool_schemas(Arena *a, const char *const *tools, size_t ntools);
 // tool name is a result too). raw (may be NULL) gets the tool's own return value as json
 // mode's tool_execution_end prints it ({"content","details","structuredContent",...}).
 Err code_tool_run(Arena *a, const CodeEnv *env, const JValue *call, JValue **result, JValue **raw);
+// pi's killTrackedDetachedChildren (utils/shell.ts): SIGKILLs the process group of every bash
+// command still running (pi tracks a group from spawn until its wait ends). Async-signal-safe,
+// for exit and the SIGTERM / SIGHUP handlers.
+void code_tools_kill_detached(void);
 
 // Kills the process groups of bash jobs still running in the background (pi's
 // killTrackedDetachedChildren), at exit and on SIGTERM / SIGHUP. Async-signal-safe.

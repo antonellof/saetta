@@ -1,4 +1,30 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
   <url><loc>https://saetta.dev/</loc><lastmod>2026-11-22</lastmod></url>
+  <url><loc>https://saetta.dev/docs/</loc></url>
+  <url><loc>https://saetta.dev/docs/install/</loc></url>
+  <url><loc>https://saetta.dev/docs/quickstart/</loc></url>
+  <url><loc>https://saetta.dev/docs/choosing-a-model/</loc></url>
+  <url><loc>https://saetta.dev/docs/saetta-code/</loc></url>
+  <url><loc>https://saetta.dev/docs/interactive-mode/</loc></url>
+  <url><loc>https://saetta.dev/docs/sessions/</loc></url>
+  <url><loc>https://saetta.dev/docs/models-and-providers/</loc></url>
+  <url><loc>https://saetta.dev/docs/context-and-skills/</loc></url>
+  <url><loc>https://saetta.dev/docs/mcp/</loc></url>
+  <url><loc>https://saetta.dev/docs/print-json-rpc/</loc></url>
+  <url><loc>https://saetta.dev/docs/themes-and-settings/</loc></url>
+  <url><loc>https://saetta.dev/docs/monitor/</loc></url>
+  <url><loc>https://saetta.dev/docs/claude-code/</loc></url>
+  <url><loc>https://saetta.dev/docs/pi/</loc></url>
+  <url><loc>https://saetta.dev/docs/opencode/</loc></url>
+  <url><loc>https://saetta.dev/docs/http-api/</loc></url>
+  <url><loc>https://saetta.dev/docs/server/</loc></url>
+  <url><loc>https://saetta.dev/docs/gguf-import/</loc></url>
+  <url><loc>https://saetta.dev/docs/lora/</loc></url>
+  <url><loc>https://saetta.dev/docs/performance/</loc></url>
+  <url><loc>https://saetta.dev/docs/build-from-source/</loc></url>
+  <url><loc>https://saetta.dev/docs/commands/</loc></url>
+  <url><loc>https://saetta.dev/docs/environment/</loc></url>
+  <url><loc>https://saetta.dev/docs/faq/</loc></url>
+  <url><loc>https://saetta.dev/docs/changelog/</loc></url>
 </urlset>

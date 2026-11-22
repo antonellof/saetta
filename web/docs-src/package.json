@@ -1,0 +1,11 @@
+{
+  "name": "saetta-docs-generator",
+  "private": true,
+  "description": "Renders docs/*.md and docs/nav.json into web/docs. Run: node web/docs-src/build.mjs [--check]",
+  "type": "module",
+  "dependencies": {
+    "github-slugger": "2.0.0",
+    "highlight.js": "11.11.1",
+    "marked": "17.0.1"
+  }
+}

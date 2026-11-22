@@ -1,0 +1,55 @@
+{
+  "sections": [
+    {
+      "title": "Get started",
+      "pages": [
+        { "slug": "index", "title": "Introduction" },
+        { "slug": "install", "title": "Install" },
+        { "slug": "quickstart", "title": "Quickstart" },
+        { "slug": "choosing-a-model", "title": "Choosing a model" }
+      ]
+    },
+    {
+      "title": "The agent",
+      "pages": [
+        { "slug": "saetta-code", "title": "Overview" },
+        { "slug": "interactive-mode", "title": "Interactive mode" },
+        { "slug": "sessions", "title": "Sessions" },
+        { "slug": "models-and-providers", "title": "Models and providers" },
+        { "slug": "context-and-skills", "title": "Context and skills" },
+        { "slug": "mcp", "title": "MCP" },
+        { "slug": "print-json-rpc", "title": "Print, JSON and RPC modes" },
+        { "slug": "themes-and-settings", "title": "Themes and settings" },
+        { "slug": "monitor", "title": "/monitor" }
+      ]
+    },
+    {
+      "title": "Other agents",
+      "pages": [
+        { "slug": "claude-code", "title": "Claude Code" },
+        { "slug": "pi", "title": "pi" },
+        { "slug": "opencode", "title": "opencode" }
+      ]
+    },
+    {
+      "title": "Engine and server",
+      "pages": [
+        { "slug": "http-api", "title": "HTTP API" },
+        { "slug": "server", "title": "monitor, status, stop" },
+        { "slug": "gguf-import", "title": "GGUF import" },
+        { "slug": "lora", "title": "LoRA adapters" },
+        { "slug": "performance", "title": "Performance" },
+        { "slug": "build-from-source", "title": "Build from source" }
+      ]
+    },
+    {
+      "title": "Reference",
+      "pages": [
+        { "slug": "commands", "title": "Commands" },
+        { "slug": "environment", "title": "Environment variables" },
+        { "slug": "faq", "title": "FAQ" },
+        { "slug": "changelog", "title": "Changelog", "file": "../CHANGELOG.md" }
+      ]
+    }
+  ]
+}

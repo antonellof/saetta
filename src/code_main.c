@@ -12,9 +12,10 @@
 static const char *const default_tools[] = {"read", "bash", "edit", "write"};
 
 typedef struct {
-    const char *provider, *model, *thinking, *mode;
-    bool print, cont, no_session;
+    const char *provider, *model, *thinking, *mode, *system_prompt, *tools;
+    bool print, cont, no_session, no_tools;
     VEC(const char *) prompts;
+    VEC(const char *) append;
 } Args;
 
 typedef struct {
@@ -22,6 +23,8 @@ typedef struct {
     CodeEnv env;
     CodeModel model;
     CodeSession *session;
+    const char **tools;
+    size_t ntools;
     bool json;
     JValue *new_messages; // this run's messages, for agent_end
 } Run;
@@ -65,6 +68,10 @@ static Err parse_args(const char *const *v, size_t n, Args *o) {
         else if (!strcmp(x, "--print") || !strcmp(x, "-p")) o->print = true;
         else if (!strcmp(x, "--continue") || !strcmp(x, "-c")) o->cont = true;
         else if (!strcmp(x, "--no-session")) o->no_session = true;
+        else if (!strcmp(x, "--system-prompt") && more) o->system_prompt = v[++i];
+        else if (!strcmp(x, "--append-system-prompt") && more) vec_push(&o->append, v[++i]);
+        else if (!strcmp(x, "--tools") && more) o->tools = v[++i];
+        else if (!strcmp(x, "--no-tools") || !strcmp(x, "-nt")) o->no_tools = true;
         else if (x[0] == '-' && x[1]) {
             dbg("saetta code: unknown option %s\n", x);
             return "UnknownOption";
@@ -249,7 +256,7 @@ static Err pending_system(Run *r, const JValue *messages, JValue **out) {
     Arena *a = r->a;
     *out = NULL;
     JValue *want;
-    TRY(code_system_message(a, &r->env, default_tools, COUNT(default_tools), &want));
+    TRY(code_system_message(a, &r->env, r->tools, r->ntools, &want));
     const JValue *cur = current_system(a, messages);
     const JValue *prev = cur ? json_get(cur, "sections") : NULL;
     const JValue *now = json_get(want, "sections");
@@ -262,7 +269,7 @@ static Err pending_system(Run *r, const JValue *messages, JValue **out) {
     for (size_t i = 0; prev && i < prev->obj.len; i++)
         if (!now || !json_get(now, str_z(a, prev->obj.items[i].key))) json_put(a, patch, prev->obj.items[i].key, json_new(a, J_NULL));
     // tools: the declarations not yet in the transcript
-    JValue *schemas = code_tool_schemas(a, default_tools, COUNT(default_tools));
+    JValue *schemas = code_tool_schemas(a, r->tools, r->ntools);
     const JValue *have = cur ? json_get(cur, "toolsAdded") : NULL;
     JValue *added = json_new(a, J_ARRAY);
     for (size_t i = 0; i < schemas->arr.len; i++) {
@@ -461,6 +468,61 @@ static Err prompt(Run *r, const char *text) {
 
 // ---- entry ---------------------------------------------------------------------------------------
 
+// pi's package folder for the <docs> section: $SAETTA_CODE_PI_DOCS, else the managed install the
+// `pi` on PATH belongs to (<agent>/bin/pi, <agent>/install/current-version), else none.
+static const char *find_pi_docs(Arena *a) {
+    const char *e = getenv("SAETTA_CODE_PI_DOCS");
+    if (e) return e[0] ? e : NULL;
+    const char *path = getenv("PATH");
+    if (!path) return NULL;
+    for (Str rest = str(path); rest.len;) {
+        ptrdiff_t c = str_find_char(rest, ':', 0);
+        Str dir = c >= 0 ? str_sub(rest, 0, (size_t)c) : rest;
+        rest = c >= 0 ? str_sub(rest, (size_t)c + 1, rest.len) : S("");
+        char *cand = path_join(a, str_z(a, dir), "pi");
+        char real[PATH_MAX];
+        if (!realpath(cand, real)) continue;
+        char *bin = strrchr(real, '/');
+        if (!bin || strcmp(bin, "/pi")) return NULL;
+        *bin = 0;
+        char *agent = strrchr(real, '/');
+        if (!agent || strcmp(agent, "/bin")) return NULL;
+        *agent = 0;
+        char *install = path_join(a, real, "install");
+        char *ver;
+        size_t len;
+        if (read_file(path_join(a, install, "current-version"), 256, &ver, &len)) return NULL;
+        Str v = str_trim(str_n(ver, len));
+        char *docs = arena_printf(a, "%s/releases/%.*s/node_modules/@earendil-works/pi-coding-agent", install, (int)v.len, v.ptr);
+        free(ver);
+        return file_exists(path_join(a, docs, "README.md")) ? docs : NULL;
+    }
+    return NULL;
+}
+
+// --tools a,b,c (pi's order as given), --no-tools, else the defaults
+static void pick_tools(Arena *a, const Args *o, Run *r) {
+    if (o->no_tools) {
+        r->tools = NULL;
+        r->ntools = 0;
+        return;
+    }
+    if (!o->tools) {
+        r->tools = (const char **)default_tools;
+        r->ntools = COUNT(default_tools);
+        return;
+    }
+    size_t cap = 1;
+    for (const char *p = o->tools; *p; p++) cap += *p == ',';
+    r->tools = arena_alloc(a, cap * sizeof *r->tools);
+    for (Str rest = str(o->tools); rest.len;) {
+        ptrdiff_t c = str_find_char(rest, ',', 0);
+        Str t = str_trim(c >= 0 ? str_sub(rest, 0, (size_t)c) : rest);
+        rest = c >= 0 ? str_sub(rest, (size_t)c + 1, rest.len) : S("");
+        if (t.len) r->tools[r->ntools++] = str_z(a, t);
+    }
+}
+
 Err code_run(const char *const *args, size_t n, int *code) {
     *code = 1;
     Arena arena = {0};
@@ -480,6 +542,11 @@ Err code_run(const char *const *args, size_t n, int *code) {
     if (ad && ad[0] == '~') ad = arena_printf(a, "%s%s", r.env.home, ad + 1);
     r.env.agent_dir = ad && ad[0] ? ad : path_join(a, path_join(a, r.env.home, ".pi"), "agent");
     r.env.now_ms = wall_ms();
+    r.env.pi_docs = find_pi_docs(a);
+    r.env.system_prompt = o.system_prompt;
+    r.env.append_system_prompt = o.append.ptr;
+    r.env.nappend_system_prompt = o.append.len;
+    pick_tools(a, &o, &r);
     JValue *settings = read_json(a, path_join(a, r.env.agent_dir, "settings.json"));
     e = find_model(&r, &o, settings);
     if (e) {
@@ -541,6 +608,7 @@ Err code_run(const char *const *args, size_t n, int *code) {
     }
 done:
     vec_free(&o.prompts);
+    vec_free(&o.append);
     arena_reset(a);
     return e;
 }

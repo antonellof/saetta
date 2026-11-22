@@ -28,7 +28,7 @@
     "description": "An open-source inference engine in C and hand-written Metal that runs Qwen3.8 coding models locally on Apple Silicon Macs, for coding agents such as Claude Code, pi and opencode.",
     "applicationCategory": "DeveloperApplication",
     "operatingSystem": "macOS 27.2 or later, Apple Silicon (M1 or later), 32 GB of memory or more",
-    "softwareVersion": "0.13.2",
+    "softwareVersion": "0.14.0",
     "license": "https://opensource.org/licenses/MIT",
     "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
     "downloadUrl": "https://github.com/antonellof/saetta/releases/latest",
@@ -61,7 +61,7 @@
    "name": "Which Mac do I need to run a coding LLM locally?",
    "acceptedAnswer": {
     "@type": "Answer",
-    "text": "Any Apple Silicon Mac (M1 or later) with 32 GB of memory or more and macOS 27.2. 32 GB runs Qwen3.8-27B in 4-bit, 36 GB the 27B TURBO fine-tune, 96 GB Qwen3.8-Flash-Next Coder and 128 GB the full Flash-Next. Saetta picks the one that fits."
+    "text": "Any Apple Silicon Mac (M1 or later) with 32 GB of memory or more and macOS 27.2. 32 GB runs Qwen3.8-27B in 4-bit, 36 GB the 27B TURBO or Fable-5 coding fine-tunes, 48 GB the Coder390 fine-tune, 96 GB Qwen3.8-Flash-Next Coder and 128 GB the full Flash-Next. Saetta picks the one that fits."
    }
   },
   {
@@ -77,7 +77,7 @@
    "name": "Is Saetta free?",
    "acceptedAnswer": {
     "@type": "Answer",
-    "text": "Yes. Saetta is open source under the MIT license. The models keep their own licenses: Qwen3.8-27B and the TURBO fine-tune are Apache-2.0, Qwen3.8-Flash-Next uses the Qwen Community License."
+    "text": "Yes. Saetta is open source under the MIT license. The models keep their own licenses: Qwen3.8-27B and its TURBO, Coder390 and Fable-5 fine-tunes are Apache-2.0, Qwen3.8-Flash-Next uses the Qwen Community License."
    }
   },
   {
@@ -93,7 +93,7 @@
    "name": "Which models does it run?",
    "acceptedAnswer": {
     "@type": "Answer",
-    "text": "Qwen3.8-Flash-Next (the pruned Coder variant and the full model) and Qwen3.8-27B in 4-bit and 8-bit, with LoRA adapters and the TURBO fine-tune. Any Qwen3.8-27B GGUF can be converted with saetta import."
+    "text": "Qwen3.8-Flash-Next (the pruned Coder variant and the full model) and Qwen3.8-27B in 4-bit and 8-bit, with LoRA adapters and the TURBO, Coder390 and Fable-5 coding fine-tunes. Any Qwen3.8-27B GGUF can be converted with saetta import."
    }
   }
  ]
@@ -109,7 +109,7 @@
     <div class="wrap">
       <a class="brand" href="#top">
         <svg viewBox="0 0 32 32" width="20" height="20" aria-hidden="true"><path d="M18.5 3 7 18h7.5L12 29l13-16h-7.8z" fill="currentColor"/></svg>
-        Saetta <span class="ver">v0.13.2</span>
+        Saetta <span class="ver">v0.14.0</span>
       </a>
       <nav class="links">
         <a href="#quickstart">Quickstart</a>
@@ -316,6 +316,8 @@ logits       max rel err 6.7e-7</pre>
               <tr><td><code>coder</code></td><td>Qwen3.8-Flash-Next, 256 experts pruned for code, the fastest for agents</td><td class="num">76 GB</td><td><span class="tagm">96 GB</span></td></tr>
               <tr><td><code>full</code></td><td>Qwen3.8-Flash-Next, all 512 experts</td><td class="num">105 GB</td><td><span class="tagm">128 GB</span></td></tr>
               <tr><td><code>27b-turbo</code></td><td>Qwen3.8-27B TURBO fine-tune, shorter thinking, with its draft head</td><td class="num">20 GB</td><td><span class="tagm">36 GB</span></td></tr>
+              <tr><td><code>27b-fable5</code></td><td>Qwen3.8-27B Fable-5 coding distill, with its draft head</td><td class="num">20 GB</td><td><span class="tagm">36 GB</span></td></tr>
+              <tr><td><code>27b-coder390</code></td><td>Qwen3.8-27B Coder390, SFT and RL on code, with its draft head</td><td class="num">23 GB</td><td><span class="tagm">48 GB</span></td></tr>
               <tr><td><code>27b-8bit</code></td><td>Qwen3.8-27B, 8-bit, takes LoRA adapters</td><td class="num">29 GB</td><td><span class="tagm">48 GB</span></td></tr>
               <tr><td><code>27b-4bit</code></td><td>Qwen3.8-27B, 4-bit, the smallest</td><td class="num">16 GB</td><td><span class="tagm">32 GB</span></td></tr>
             </tbody>
@@ -361,11 +363,11 @@ saetta start claude</pre>
         <h2>Local coding models on a Mac</h2>
         <div class="faq">
           <details class="qa"><summary>Can I use Claude Code with a local model?</summary><p>Yes. <code>saetta start claude</code> runs Claude Code against Saetta's Anthropic-compatible API on your own Mac, without editing your Claude Code configuration. pi and opencode work the same way with <code>saetta start pi</code> and <code>saetta start opencode</code>.</p></details>
-          <details class="qa"><summary>Which Mac do I need to run a coding LLM locally?</summary><p>Any Apple Silicon Mac (M1 or later) with 32 GB of memory or more and macOS 27.2. 32 GB runs Qwen3.8-27B in 4-bit, 36 GB the 27B TURBO fine-tune, 96 GB Qwen3.8-Flash-Next Coder and 128 GB the full Flash-Next. Saetta picks the one that fits.</p></details>
+          <details class="qa"><summary>Which Mac do I need to run a coding LLM locally?</summary><p>Any Apple Silicon Mac (M1 or later) with 32 GB of memory or more and macOS 27.2. 32 GB runs Qwen3.8-27B in 4-bit, 36 GB the 27B TURBO or Fable-5 coding fine-tunes, 48 GB the Coder390 fine-tune, 96 GB Qwen3.8-Flash-Next Coder and 128 GB the full Flash-Next. Saetta picks the one that fits.</p></details>
           <details class="qa"><summary>Does my code leave my machine?</summary><p>No. The model runs on your Mac and the server listens only on 127.0.0.1, so prompts and code stay local. The only network use is downloading the model weights once from Hugging Face.</p></details>
-          <details class="qa"><summary>Is Saetta free?</summary><p>Yes. Saetta is open source under the MIT license. The models keep their own licenses: Qwen3.8-27B and the TURBO fine-tune are Apache-2.0, Qwen3.8-Flash-Next uses the Qwen Community License.</p></details>
+          <details class="qa"><summary>Is Saetta free?</summary><p>Yes. Saetta is open source under the MIT license. The models keep their own licenses: Qwen3.8-27B and its TURBO, Coder390 and Fable-5 fine-tunes are Apache-2.0, Qwen3.8-Flash-Next uses the Qwen Community License.</p></details>
           <details class="qa"><summary>How fast is it?</summary><p>On an M5 Max with 128 GB, Qwen3.8-Flash-Next reads prompts at 1,600 to 1,950 tokens per second and answers at 66 to 85. Earlier chips run the same kernels on their GPU cores and are slower; they are not yet measured.</p></details>
-          <details class="qa"><summary>Which models does it run?</summary><p>Qwen3.8-Flash-Next (the pruned Coder variant and the full model) and Qwen3.8-27B in 4-bit and 8-bit, with LoRA adapters and the TURBO fine-tune. Any Qwen3.8-27B GGUF can be converted with <code>saetta import</code>.</p></details>
+          <details class="qa"><summary>Which models does it run?</summary><p>Qwen3.8-Flash-Next (the pruned Coder variant and the full model) and Qwen3.8-27B in 4-bit and 8-bit, with LoRA adapters and the TURBO, Coder390 and Fable-5 coding fine-tunes. Any Qwen3.8-27B GGUF can be converted with <code>saetta import</code>.</p></details>
         </div>
       </div>
     </section>

@@ -169,11 +169,11 @@
       <div class="wrap">
         <span class="eyebrow">Why Saetta</span>
         <h2>One command instead of four moving parts</h2>
-        <p class="lede-sm">A local coding agent usually means assembling a stack: download a model, run an inference server for it, install an agent that runs on Node.js or Python, then wire them together with base URLs, API keys, context sizes, chat templates and tool-call formats. Each piece is its own process with its own runtime and its own memory, and each one can drift out of step with the others.</p>
+        <p class="lede-sm">A local coding agent usually means assembling a stack: download a model, run an inference server for it, install an agent that runs on Node.js or Python, then wire them together with base URLs, API keys, context sizes, chat templates and tool-call formats. Each piece is its own install with its own runtime, and each one can drift out of step with the others.</p>
         <div class="cells cells-3">
           <div class="cell"><div class="k">The usual stack</div><div class="v">a model file + an inference server + an agent harness + the glue between them, each installed, updated and configured on its own</div></div>
           <div class="cell"><div class="k">Saetta</div><div class="v"><code>saetta start code</code> picks the model that fits your Mac, downloads it and opens the agent: one binary under 2 MB, no Node.js, no Python, no server to keep running</div></div>
-          <div class="cell"><div class="k">The model inside the agent</div><div class="v">Saetta Code runs the inference engine in its own process: no HTTP between agent and model, nothing to wire, the memory goes to the model, not to runtimes</div></div>
+          <div class="cell"><div class="k">The model inside the agent</div><div class="v">Saetta Code runs the inference engine in its own process: no HTTP between agent and model, nothing to wire</div></div>
         </div>
         <p class="note">Prefer your own agent? Claude Code, pi and opencode run on the same engine with <code>saetta start claude</code>, <code>pi</code> or <code>opencode</code>.</p>
       </div>

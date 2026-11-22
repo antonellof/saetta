@@ -35,6 +35,9 @@ typedef struct {
     const char *thinking_format;  // "qwen-chat-template", ...
     const JValue *compat;         // the whole compat object, for the fields not listed
     const char *thinking;         // "off", "minimal", "low", "medium", "high", "xhigh"
+    // The in-process engine (server.h server_engine_open), or NULL to call base_url over HTTP.
+    // The request body and the answer are the same either way.
+    struct Engine *engine;
 } CodeModel;
 
 // Where the agent runs.

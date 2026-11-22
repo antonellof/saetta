@@ -114,8 +114,8 @@ static bool read_text(Arena *a, const char *p, Str *out) {
     size_t len;
     if (read_file(p, (size_t)1 << 30, &data, &len)) return false;
     size_t off = len >= 3 && memcmp(data, "\xEF\xBB\xBF", 3) == 0 ? 3 : 0;
-    out->ptr = arena_strndup(a, data + off, len - off);
-    out->len = len - off;
+    // readFileSync(..., "utf8"): ill-formed UTF-8 becomes U+FFFD
+    *out = code_utf8_clean(a, str_n(arena_strndup(a, data + off, len - off), len - off));
     free(data);
     return true;
 }
@@ -1104,6 +1104,11 @@ Err code_system_message(Arena *a, const CodeEnv *env, const char *const *tools, 
     }
     size_t custom_len = 0;
     const char *custom = prompt_input(a, cwd, sys_src, &custom_len);
+    if (custom) { // argv text and files reach pi decoded: ill-formed UTF-8 as U+FFFD
+        Str c = code_utf8_clean(a, str_n(custom, custom_len));
+        custom = c.ptr;
+        custom_len = c.len;
+    }
 
     // the addendum: each --append-system-prompt, else .pi/APPEND_SYSTEM.md (trusted) or the agent dir's
     Buf append = {0};
@@ -1121,8 +1126,9 @@ Err code_system_message(Arena *a, const CodeEnv *env, const char *const *tools, 
         size_t len;
         const char *t = prompt_input(a, cwd, srcs[i], &len);
         if (!t) continue;
+        Str c = code_utf8_clean(a, str_n(t, len));
         if (parts++) buf_adds(&append, "\n\n");
-        buf_add(&append, t, len);
+        buf_add(&append, c.ptr, c.len);
     }
 
     JValue *sections = json_new(a, J_OBJECT);

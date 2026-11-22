@@ -52,7 +52,7 @@ static const char *fx(double x, int prec) {
     return b;
 }
 
-typedef struct {
+typedef struct Engine {
     Gpu *g;
     Model *m;
     Session *s;
@@ -81,6 +81,7 @@ typedef struct {
     int conv_lora[MAX_CONV];
     // --default-chat-template-kwargs: an object whose keys fill in what a request leaves out
     JValue *kwargs_default;
+    uint64_t opened_ns; // when engine_open began (the load time the server reports)
 } Engine;
 
 // Makes conversation i the active one.
@@ -497,6 +498,11 @@ typedef struct {
 
 // Sends the pending body bytes as one chunk and flushes the connection.
 static Err out_flush(Out *o) {
+    if (o->ev.len > 0 && o->c->sink) { // in process: the event bytes, no chunk framing
+        Err err = conn_write(o->c, o->ev.ptr, o->ev.len);
+        o->ev.len = 0;
+        TRY(err);
+    }
     if (o->ev.len > 0) {
         char hd[32];
         int n = snprintf(hd, sizeof hd, "%zx\r\n", o->ev.len);
@@ -514,6 +520,7 @@ static Err out_flush(Out *o) {
 // BodyWriter.end: the rest of the body and the last chunk.
 static Err out_end(Out *o) {
     TRY(out_flush(o));
+    if (o->c->sink) return conn_flush(o->c);
     TRY(conn_writes(o->c, "0\r\n\r\n"));
     return conn_flush(o->c);
 }
@@ -697,9 +704,12 @@ static Err generate_reply(Engine *e, Arena *a, Conn *c, Req *h, Work *w, JValue 
     (void)r;
     Out *out = NULL;
     if (stream) {
-        TRY(http_write_expect_continue(c, h));
-        TRY(conn_writes(c, "HTTP/1.1 200 OK\r\nconnection: close\r\ntransfer-encoding: chunked\r\ncontent-type: "
-                           "text/event-stream\r\ncache-control: no-cache\r\n\r\n"));
+        if (c->sink) c->status = 200; // in process: no head
+        else {
+            TRY(http_write_expect_continue(c, h));
+            TRY(conn_writes(c, "HTTP/1.1 200 OK\r\nconnection: close\r\ntransfer-encoding: chunked\r\ncontent-type: "
+                               "text/event-stream\r\ncache-control: no-cache\r\n\r\n"));
+        }
         w->out = (Out){.a = a, .fmt = fmt, .c = c, .id = id, .created = created, .model = model_name, .last = now_ns()};
         w->streaming = true;
         out = &w->out;
@@ -1236,33 +1246,11 @@ static const char *basename_of(Arena *a, const char *dir) {
     return arena_strndup(a, dir + b, n - b);
 }
 
-Err server_serve(Arena *arena, const char *dir, uint16_t port, const char *const *loras, size_t nloras,
-                 const char *kwargs_default) {
-    JValue *kwd = NULL;
-    if (kwargs_default) {
-        if (json_parse(arena, str(kwargs_default), true, &kwd) || kwd->kind != J_OBJECT) {
-            dbg("saetta: --default-chat-template-kwargs wants a JSON object, got %s\n", kwargs_default);
-            return "BadKwargs";
-        }
-    }
-    // one server per machine (src/instance.h); the lock is held until this process ends
-    int lock_fd;
-    TRY(instance_acquire(port, &lock_fd));
-    // the port is bound before the load, so a port in use fails at once instead of after
-    // loading the weights; listen comes after the load, so until then connections are refused
-    int ls = socket(AF_INET, SOCK_STREAM, 0);
-    if (ls < 0) return err_errno(errno);
-    int one = 1;
-    setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
-    struct sockaddr_in sa = {0};
-    sa.sin_family = AF_INET;
-    sa.sin_port = htons(port);
-    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    if (bind(ls, (struct sockaddr *)&sa, sizeof sa) != 0) {
-        Err err = err_errno(errno);
-        close(ls);
-        return err;
-    }
+// The engine of a server (see server.h): the pack, the model, its LoRA adapters, the tokenizer,
+// the conversations sized to this Mac's memory, sampling state. Shared by server_serve and the
+// in-process callers (Saetta Code).
+static Err engine_open(Arena *arena, const char *dir, const char *const *loras, size_t nloras, JValue *kwd, uint16_t port,
+                       Engine **out) {
     uint64_t t0 = now_ns();
     Pack *pack = ARENA_NEW(arena, Pack);
     TRY(pack_open(arena, dir, pack));
@@ -1270,7 +1258,6 @@ Err server_serve(Arena *arena, const char *dir, uint16_t port, const char *const
         const ModelInfo *mi = model_info_for(arena, pack);
         if (mi && mi->no_serve) {
             dbg("serve: %s cannot be served yet (no tokenizer and chat template for it); use saetta generate\n", mi->name);
-            close(ls);
             return "NotServable";
         }
     }
@@ -1380,7 +1367,84 @@ Err server_serve(Arena *arena, const char *dir, uint16_t port, const char *const
     for (size_t i = 0; i < MAX_CONV; i++) e->conv_lora[i] = -1;
     e->kwargs_default = kwd;
     st->ctx = e->s->max_cap;
-    TRY(stats_spawn(st));
+    e->opened_ns = t0;
+    *out = e;
+    return OK;
+}
+
+Err server_engine_open(Arena *arena, const char *dir, const char *kwargs_default, Engine **out) {
+    JValue *kwd = NULL;
+    if (kwargs_default && (json_parse(arena, str(kwargs_default), true, &kwd) || kwd->kind != J_OBJECT)) return "BadKwargs";
+    return engine_open(arena, dir, NULL, 0, kwd, 0, out);
+}
+
+const char *server_engine_model(const Engine *e) { return base_id; }
+
+size_t server_engine_context(const Engine *e) { return e->s->max_cap; }
+
+Err server_engine_chat(Engine *e, Str body, int (*sink)(void *ctx, int status, const void *p, size_t n), void *ctx) {
+    Conn *c = xcalloc(1, sizeof(Conn));
+    conn_init(c, -1);
+    c->sink = sink;
+    c->sink_ctx = ctx;
+    c->status = 200;
+    Req h = {.method = M_POST, .target = S("/v1/chat/completions")};
+    Arena a = {0};
+    Str bs = str_n(arena_dup(&a, body.ptr ? body.ptr : "", body.len + 1), body.len);
+    Work w = {.status = 400};
+    Err err = handle(e, &a, c, &h, bs, FMT_OPENAI, &w);
+    Err ret = OK;
+    if (err) {
+        dbg("request failed: %s\n", err);
+        // the caller that left gets nothing; a started stream ends with an error event
+        if (!strcmp(err, "WriteFailed") || !strcmp(err, "ClientGone")) ret = OK;
+        else if (w.streaming) (void)out_error(&w.out, w.status, err);
+        else (void)respond_error(c, &h, w.status, FMT_OPENAI, err);
+    }
+    vec_free(&w.ids);
+    lookup_free(&w.lk);
+    buf_free(&w.split.text);
+    buf_free(&w.out.ev);
+    arena_reset(&a);
+    free(c);
+    return ret;
+}
+
+Err server_serve(Arena *arena, const char *dir, uint16_t port, const char *const *loras, size_t nloras,
+                 const char *kwargs_default) {
+    JValue *kwd = NULL;
+    if (kwargs_default) {
+        if (json_parse(arena, str(kwargs_default), true, &kwd) || kwd->kind != J_OBJECT) {
+            dbg("saetta: --default-chat-template-kwargs wants a JSON object, got %s\n", kwargs_default);
+            return "BadKwargs";
+        }
+    }
+    // one server per machine (src/instance.h); the lock is held until this process ends
+    int lock_fd;
+    TRY(instance_acquire(port, &lock_fd));
+    // the port is bound before the load, so a port in use fails at once instead of after
+    // loading the weights; listen comes after the load, so until then connections are refused
+    int ls = socket(AF_INET, SOCK_STREAM, 0);
+    if (ls < 0) return err_errno(errno);
+    int one = 1;
+    setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    struct sockaddr_in sa = {0};
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(port);
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (bind(ls, (struct sockaddr *)&sa, sizeof sa) != 0) {
+        Err err = err_errno(errno);
+        close(ls);
+        return err;
+    }
+    Engine *e;
+    Err oe = engine_open(arena, dir, loras, nloras, kwd, port, &e);
+    if (oe) {
+        close(ls);
+        return oe;
+    }
+    uint64_t t0 = e->opened_ns;
+    TRY(stats_spawn(e->st));
     TRY(http_guard_spawn());
     if (listen(ls, 128) != 0) {
         Err err = err_errno(errno);

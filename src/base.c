@@ -59,10 +59,12 @@ Err err_errno(int e) {
     }
 }
 
+FILE *dbg_out;
+
 void dbg(const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
-    vfprintf(stderr, fmt, ap);
+    vfprintf(dbg_out ? dbg_out : stderr, fmt, ap);
     va_end(ap);
 }
 

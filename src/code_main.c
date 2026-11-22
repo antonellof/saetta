@@ -1,9 +1,17 @@
-// `saetta code` (see code.h): the command line, print and json modes, and the agent loop.
-// Adapted from pi (MIT, Copyright (c) 2025 Mario Zechner; github.com/earendil-works/pi v1.5.2:
-// packages/agent/src/agent-loop.ts, packages/coding-agent/src/main.ts, cli/args.ts,
-// core/agent-session.ts, modes/print-mode.ts, modes/json-event.ts, packages/ai/src/utils/transcript.ts).
+// `saetta code` (see code.h): the command line, print and json modes, the interactive prompt,
+// the agent loop and its retries, and the in-process engine (--pack).
+// Adapted from pi (MIT, Copyright (c) 2025 Mario Zechner; github.com/earendil-works/pi v1.5.2,
+// b4afddd): packages/agent/src/agent-loop.ts (runLoop, streamAssistantResponse,
+// executeToolCalls*, failToolCallsFromTruncatedMessage, declareToolChanges),
+// packages/coding-agent/src/main.ts (readPipedStdin, the app mode), cli/args.ts,
+// cli/initial-message.ts, core/agent-session.ts (the system prompt delta, _prepareRetry,
+// _handlePostAgentRun, _omitRecoveryAttempt), modes/print-mode.ts (signals), modes/json-event.ts,
+// utils/shell.ts (killTrackedDetachedChildren), packages/ai/src/utils/transcript.ts
+// (getCurrentSystemMessage, getToolStateChanges), utils/retry.ts (the retryable patterns).
 #include "code.h"
 #include "code_oai.h"
+#include "download.h"
+#include "server.h"
 
 #include <ctype.h>
 #include <limits.h>
@@ -17,7 +25,7 @@
 static const char *const default_tools[] = {"read", "bash", "edit", "write"};
 
 typedef struct {
-    const char *provider, *model, *thinking, *mode, *system_prompt, *tools;
+    const char *provider, *model, *thinking, *mode, *system_prompt, *tools, *pack;
     bool print, cont, no_session, no_tools;
     VEC(const char *) prompts;
     VEC(const char *) append;
@@ -78,6 +86,7 @@ static Err parse_args(const char *const *v, size_t n, Args *o) {
         else if (!strcmp(x, "--system-prompt") && more) o->system_prompt = v[++i];
         else if (!strcmp(x, "--append-system-prompt") && more) vec_push(&o->append, v[++i]);
         else if (!strcmp(x, "--tools") && more) o->tools = v[++i];
+        else if (!strcmp(x, "--pack") && more) o->pack = v[++i];
         else if (!strcmp(x, "--no-tools") || !strcmp(x, "-nt")) o->no_tools = true;
         else if (!strcmp(x, "--help") || !strcmp(x, "-h")) {
             printf("usage: saetta code [options] [prompt ...]\n"
@@ -96,6 +105,8 @@ static Err parse_args(const char *const *v, size_t n, Args *o) {
                    "  --thinking LEVEL         off, minimal, low, medium, high, xhigh, max\n"
                    "  --tools a,b,c | --no-tools   the tool set\n"
                    "  --system-prompt T, --append-system-prompt T   text or a file\n"
+                   "  --pack P                 run the model in this process (a download name such as coder, or a\n"
+                   "                           folder): no server, no HTTP; the requests are the same\n"
                    "\n"
                    "Without -p in a terminal it opens a prompt: Enter sends, a trailing \\ continues on a new line,\n"
                    "Ctrl-C stops a turn, /new starts a session, /exit quits.\n");
@@ -301,31 +312,51 @@ static Err pending_system(Run *r, const JValue *messages, JValue **out) {
     }
     for (size_t i = 0; prev && i < prev->obj.len; i++)
         if (!now || !json_get(now, str_z(a, prev->obj.items[i].key))) json_put(a, patch, prev->obj.items[i].key, json_new(a, J_NULL));
-    // tools: the declarations not yet in the transcript
+    // tools (getToolStateChanges): the run's declarations the transcript lacks or holds
+    // differently are added; the transcript's tools this run lacks or declares differently are
+    // removed, by name
     JValue *schemas = code_tool_schemas(a, r->tools, r->ntools);
     const JValue *have = cur ? json_get(cur, "toolsAdded") : NULL;
-    JValue *added = json_new(a, J_ARRAY);
+    JValue *added = json_new(a, J_ARRAY), *removed = json_new(a, J_ARRAY);
+    JValue **want_d = arena_alloc(a, (schemas->arr.len + 1) * sizeof *want_d);
+    for (size_t i = 0; i < schemas->arr.len; i++) want_d[i] = declaration(a, schemas->arr.items[i]);
+    Buf x = {0}, y = {0};
     for (size_t i = 0; i < schemas->arr.len; i++) {
-        JValue *d = declaration(a, schemas->arr.items[i]);
-        Buf x = {0}, y = {0};
-        json_write(&x, d);
+        x.len = 0;
+        json_write(&x, want_d[i]);
         bool same = false;
         for (size_t k = 0; have && k < have->arr.len && !same; k++) {
             y.len = 0;
             json_write(&y, have->arr.items[k]);
             same = str_eq(buf_str(&x), buf_str(&y));
         }
-        buf_free(&x);
-        buf_free(&y);
-        if (!same) json_push(a, added, d);
+        if (!same) json_push(a, added, want_d[i]);
     }
-    if (patch->obj.len == 0 && added->arr.len == 0) return OK;
+    for (size_t k = 0; have && k < have->arr.len; k++) {
+        y.len = 0;
+        json_write(&y, have->arr.items[k]);
+        bool same = false;
+        for (size_t i = 0; i < schemas->arr.len && !same; i++) {
+            x.len = 0;
+            json_write(&x, want_d[i]);
+            same = str_eq(buf_str(&x), buf_str(&y));
+        }
+        if (!same) {
+            JValue *n = json_new(a, J_OBJECT);
+            json_put(a, n, S("name"), (JValue *)json_get(have->arr.items[k], "name"));
+            json_push(a, removed, n);
+        }
+    }
+    buf_free(&x);
+    buf_free(&y);
+    if (patch->obj.len == 0 && added->arr.len == 0 && removed->arr.len == 0) return OK;
     JValue *s = json_new(a, J_OBJECT);
     json_put(a, s, S("role"), json_string(a, S("system")));
     json_put(a, s, S("content"), json_string(a, S("")));
     if (patch->obj.len) json_put(a, s, S("sections"), patch);
     json_put(a, s, S("timestamp"), json_int(a, (int64_t)wall_ms()));
     if (added->arr.len) json_put(a, s, S("toolsAdded"), added);
+    if (removed->arr.len) json_put(a, s, S("toolsRemoved"), removed);
     *out = s;
     return OK;
 }
@@ -631,13 +662,11 @@ static Err fail_truncated(Run *r, const JValue *assistant, JValue *results) {
     return OK;
 }
 
-// The tools the transcript declares (pi runs only the tools in the context: a call to any
-// other is "Tool <name> not found", whatever the tools module knows).
-static bool declared(Arena *a, const JValue *system, Str name) {
-    const JValue *decl = system ? json_get(system, "toolsAdded") : NULL;
-    for (size_t i = 0; decl && json_is(decl, J_ARRAY) && i < decl->arr.len; i++)
-        if (str_eq(json_strs(json_get(decl->arr.items[i], "name")), name)) return true;
-    (void)a;
+// The run's tool set (pi looks a call up in context.tools: a call to any other is "Tool <name>
+// not found", whatever the tools module knows or an older part of the transcript declared).
+static bool declared(const Run *r, Str name) {
+    for (size_t i = 0; i < r->ntools; i++)
+        if (str_eqz(name, r->tools[i])) return true;
     return false;
 }
 
@@ -652,14 +681,17 @@ static Err run_tools(Run *r, const JValue *assistant, JValue *results) {
         if (str_eqz(json_strs(json_get(content->arr.items[i], "type")), "toolCall")) vec_push(&calls, content->arr.items[i]);
     JValue **msgs = arena_alloc(a, (calls.len + 1) * sizeof *msgs);
     JValue **raws = arena_alloc(a, (calls.len + 1) * sizeof *raws);
-    const JValue *system = current_system(a, code_session_messages(r->session));
     Err err = OK;
+    size_t started = 0;
     for (size_t i = 0; i < calls.len && !err; i++) {
+        // aborted: no further call starts (executeToolCallsParallel breaks out of its loop)
+        if (g_abort && i > 0) break;
+        started = i + 1;
         emit_tool_start(r, calls.ptr[i]);
         if (r->ui) ui_tool_start(calls.ptr[i]);
         r->env.now_ms = wall_ms();
         Str name = json_strs(json_get(calls.ptr[i], "name"));
-        if (!declared(a, system, name)) {
+        if (!declared(r, name)) {
             error_result(a, calls.ptr[i], arena_printf(a, "Tool %.*s not found", (int)name.len, name.ptr), &msgs[i], &raws[i]);
             emit_tool_end(r, calls.ptr[i], msgs[i], raws[i]);
             continue;
@@ -670,6 +702,7 @@ static Err run_tools(Run *r, const JValue *assistant, JValue *results) {
     }
     // pi runs the executed calls concurrently and ends each as it settles; a call that throws
     // (a missing file, say) settles before one that completes its I/O, so errors end first
+    calls.len = started;
     for (int pass = 0; pass < 2; pass++)
         for (size_t i = 0; i < calls.len && !err; i++) {
             if (!json_get(msgs[i], "durationMs")) continue;
@@ -727,6 +760,16 @@ static bool retryable(const JValue *msg) {
                                         "subscription_sharing_workplace_individual_usage_limit_exceeded"};
     for (size_t k = 0; k < COUNT(never); k++)
         if (pm(m, never[k])) return false;
+    // '"code"\s*:\s*"?1308(?![0-9])'
+    for (const char *p = strcasestr(m, "\"code\""); p; p = strcasestr(p + 1, "\"code\"")) {
+        const char *t = p + 6;
+        while (isspace((unsigned char)*t)) t++;
+        if (*t != ':') continue;
+        t++;
+        while (isspace((unsigned char)*t)) t++;
+        if (*t == '"') t++;
+        if (!strncmp(t, "1308", 4) && !isdigit((unsigned char)t[4])) return false;
+    }
     if (status_code(m)) return true;
     static const char *const yes[] = {
         "overloaded", "server_busy", "servers are currently busy", "currently experiencing high demand", "model is at capacity",
@@ -816,7 +859,9 @@ static Err run_agent(Run *r, bool started) {
         bool again = false;
         if (last && retryable(last) && g_retry.enabled && !g_abort && r->retry_attempt < g_retry.max_retries) {
             int64_t attempt = ++r->retry_attempt;
-            int64_t delay = g_retry.base_ms << (attempt - 1);
+            // baseDelayMs * 2^(attempt-1), capped (and never shifted past the cap)
+            int64_t delay = g_retry.base_ms;
+            for (int64_t k = 1; k < attempt && delay < g_retry.cap_ms; k++) delay = delay > INT64_MAX / 2 ? INT64_MAX : delay * 2;
             if (delay > g_retry.cap_ms) delay = g_retry.cap_ms;
             JValue *e = ev_new(a, "auto_retry_start");
             json_put(a, e, S("attempt"), json_int(a, attempt));
@@ -843,6 +888,9 @@ static Err run_agent(Run *r, bool started) {
                 json_put(a, end, S("attempt"), json_int(a, r->retry_attempt));
                 json_put(a, end, S("finalError"), json_string(a, S("Retry cancelled")));
                 emit(r, end);
+                JValue *settled = ev_new(a, "agent_settled");
+                json_put(a, settled, S("aborted"), json_bool(a, true));
+                emit(r, settled);
                 return OK;
             }
             continue;
@@ -885,7 +933,10 @@ static Err run_turns(Run *r, JValue **last_out, const char **last_id) {
         *last_id = code_session_leaf(r->session);
         Str stop = json_strs(json_get(msg, "stopReason"));
         if (r->ui && (str_eqz(stop, "error") || str_eqz(stop, "aborted"))) {
-            printf("%s%s%s%s\n", g_ui_state ? "\n" : "", RED, json_str(json_get(msg, "errorMessage")) ? json_str(json_get(msg, "errorMessage")) : "error", RESET);
+            printf("%s%s", g_ui_state ? "\n" : "", RED);
+            const char *em = json_str(json_get(msg, "errorMessage"));
+            ui_write(str(em ? em : "error"));
+            printf("%s\n", RESET);
             g_ui_state = 0;
         }
         JValue *results = json_new(a, J_ARRAY);
@@ -933,7 +984,11 @@ static void raw_off(void) {
 
 static volatile sig_atomic_t g_tty_saved;
 
-// SIGTERM / SIGHUP: the terminal back as it was, the bash jobs stopped, exit as pi does (143, 129)
+// SIGTERM / SIGHUP: the terminal back as it was, the running bash commands stopped, then the exit
+// pi makes: 0 from the interactive mode (interactive-mode.ts), 143 / 129 from print and json
+// mode (print-mode.ts)
+static volatile sig_atomic_t g_interactive;
+
 static void on_term(int sig) {
     if (g_tty_saved) {
         static const char off[] = "\x1b[?2004l\x1b[0m\r\n";
@@ -941,7 +996,7 @@ static void on_term(int sig) {
         tcsetattr(0, TCSANOW, &g_cooked);
     }
     code_tools_kill_detached();
-    _exit(sig == SIGHUP ? 129 : 143);
+    _exit(g_interactive ? 0 : sig == SIGHUP ? 129 : 143);
 }
 
 // Code points in s (the cursor moves by those; wide characters are not measured).
@@ -1026,7 +1081,7 @@ static bool read_prompt(Arena *a, VecStr *history, char **out) {
         else if (c == 21) line.len = cur = 0;
         else if (c == 27) {
             // an escape sequence, read to its final byte (CSI parameters, then 0x40..0x7e)
-            unsigned char seq[2], params[16];
+            unsigned char seq[2] = {0, 0}, params[16];
             size_t np = 0;
             if (read(0, &seq[0], 1) != 1) continue;
             if (seq[0] != '[' && seq[0] != 'O') continue; // Alt+key and the like: ignored
@@ -1077,10 +1132,7 @@ static Err interactive(Run *r, const Args *o) {
     g_cwd = r->env.cwd;
     tcgetattr(0, &g_cooked);
     g_tty_saved = 1;
-    struct sigaction st = {0};
-    st.sa_handler = on_term;
-    sigaction(SIGTERM, &st, NULL);
-    sigaction(SIGHUP, &st, NULL);
+    g_interactive = 1;
     struct sigaction sa = {0};
     sa.sa_handler = on_sigint;
     sigaction(SIGINT, &sa, NULL);
@@ -1162,6 +1214,57 @@ static const char *find_pi_docs(Arena *a) {
     return NULL;
 }
 
+// --pack: the engine in this process, described as `saetta start pi` describes the server to pi
+// (launch.c pi_setup), so the requests stay byte for byte the same. The engine's own log lines
+// go to ~/.saetta/code.log.
+static Err open_engine(Arena *a, Run *r, const char *arg) {
+    const DownloadPack *pk = download_find(arg);
+    char *dir = (char *)arg;
+    if (pk) TRY(download_pack_dir(a, pk, &dir));
+    if (!file_exists(path_join(a, dir, "config.json"))) {
+        dbg("saetta code: no model at %s%s%s\n", dir, pk ? "; download it with: saetta download " : "", pk ? arg : "");
+        return "NoModel";
+    }
+    char *logdir = path_join(a, r->env.home, ".saetta");
+    mkdir_p(logdir);
+    FILE *log = fopen(path_join(a, logdir, "code.log"), "a");
+    if (log) {
+        setvbuf(log, NULL, _IOLBF, 0);
+        dbg_out = log;
+    }
+    uint64_t t0 = now_ns();
+    if (isatty(2)) fprintf(stderr, "saetta code: loading %s ...\r", pk ? arg : dir);
+    Engine *e;
+    Err err = server_engine_open(a, dir, NULL, &e);
+    if (isatty(2)) fprintf(stderr, "\x1b[K");
+    if (err) {
+        fprintf(stderr, "saetta code: cannot load %s: %s (log: ~/.saetta/code.log)\n", dir, err);
+        return err;
+    }
+    dbg("saetta code: %s loaded in process in %llu ms\n", dir, (unsigned long long)((now_ns() - t0) / 1000000));
+    CodeModel *m = &r->model;
+    m->engine = e;
+    m->provider = "saetta";
+    m->id = server_engine_model(e);
+    m->name = m->id;
+    m->base_url = "in-process";
+    m->api_key = "saetta";
+    m->reasoning = true;
+    m->context_window = server_engine_context(e);
+    m->max_tokens = 32768;
+    m->supports_developer_role = m->supports_store = m->supports_reasoning_effort = false;
+    m->max_tokens_field = "max_tokens";
+    m->thinking_format = "qwen-chat-template";
+    JValue *compat = json_new(a, J_OBJECT);
+    json_put(a, compat, S("supportsDeveloperRole"), json_bool(a, false));
+    json_put(a, compat, S("supportsStore"), json_bool(a, false));
+    json_put(a, compat, S("supportsReasoningEffort"), json_bool(a, false));
+    json_put(a, compat, S("maxTokensField"), json_string(a, S("max_tokens")));
+    json_put(a, compat, S("thinkingFormat"), json_string(a, S("qwen-chat-template")));
+    m->compat = compat;
+    return OK;
+}
+
 // --tools a,b,c (pi's order as given), --no-tools, else the defaults
 static void pick_tools(Arena *a, const Args *o, Run *r) {
     if (o->no_tools) {
@@ -1204,6 +1307,12 @@ Err code_run(const char *const *args, size_t n, int *code) {
     if (ad && ad[0] == '~') ad = arena_printf(a, "%s%s", r.env.home, ad + 1);
     r.env.agent_dir = ad && ad[0] ? ad : path_join(a, path_join(a, r.env.home, ".pi"), "agent");
     r.env.now_ms = wall_ms();
+    {
+        struct sigaction st = {0};
+        st.sa_handler = on_term;
+        sigaction(SIGTERM, &st, NULL);
+        sigaction(SIGHUP, &st, NULL);
+    }
     r.env.pi_docs = find_pi_docs(a);
     r.env.system_prompt = o.system_prompt;
     r.env.append_system_prompt = o.append.ptr;
@@ -1233,8 +1342,12 @@ Err code_run(const char *const *args, size_t n, int *code) {
         }
         buf_free(&in);
     }
-    e = find_model(&r, &o, settings);
-    if (e) {
+    if (o.pack) {
+        e = open_engine(a, &r, o.pack);
+        if (e) goto done;
+        if (o.thinking) r.model.thinking = o.thinking;
+    } else e = find_model(&r, &o, settings);
+    if (e && !o.pack) {
         dbg("saetta code: no model %s%s%s in %s/models.json (Saetta Code runs openai-completions providers)\n",
             o.provider ? o.provider : "", o.provider ? "/" : "", o.model ? o.model : "", r.env.agent_dir);
         goto done;

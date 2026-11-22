@@ -748,6 +748,8 @@ typedef struct {
     int code;
     bool killed;
     int wait_err; // errno of a failed poll: the child was killed and reaped, its output is partial
+    volatile int *abort; // CodeEnv.abort: when set, the child is killed and aborted is true
+    bool aborted;
 } Proc;
 
 // Runs argv (PATH lookup) in cwd (NULL: ours) with stdin /dev/null; stdout lines to on_line,
@@ -783,7 +785,13 @@ static int run_proc(const char *const *argv, const char *cwd, Proc *pr) {
     int open = 2;
     char buf[65536];
     while (open > 0) {
-        if (poll(fds, 2, -1) < 0) {
+        if (pr->abort && *pr->abort && !pr->aborted) { // grep.ts / find.ts: the signal kills the child
+            pr->aborted = true;
+            kill(pid, SIGKILL);
+        }
+        int ready = poll(fds, 2, pr->abort ? 50 : -1);
+        if (ready == 0) continue;
+        if (ready < 0) {
             if (errno == EINTR) continue;
             pr->wait_err = errno;
             kill(pid, SIGKILL);
@@ -2331,8 +2339,9 @@ static void tool_grep(Arena *a, const CodeEnv *env, const JValue *args, ToolOut 
     argv[n++] = is_dir ? "." : search;
     argv[n] = NULL;
     Grep g = {.a = a, .search = search, .is_dir = is_dir, .ctx = ctx, .limit = eff};
-    Proc pr = {.on_line = grep_line, .ctx = &g};
+    Proc pr = {.on_line = grep_line, .ctx = &g, .abort = env->abort};
     int rc = run_proc(argv, is_dir ? search : NULL, &pr);
+    if (pr.aborted) { o->thrown = "Operation aborted"; goto out; }
     if (rc) { o->thrown = arena_printf(a, "Failed to run ripgrep: spawn %s %s", rg, errno_code(rc)); goto out; }
     if (pr.wait_err) { o->thrown = arena_printf(a, "Failed to run ripgrep: %s", errno_code(pr.wait_err)); goto out; }
     if (!pr.killed && !(pr.exited_code && (pr.code == 0 || pr.code == 1))) {
@@ -2440,8 +2449,9 @@ static void tool_find(Arena *a, const CodeEnv *env, const JValue *args, ToolOut 
     argv[n++] = search;
     argv[n] = NULL;
     Find f = {.a = a, .search = search, .limit = eff};
-    Proc pr = {.on_line = find_line, .ctx = &f};
+    Proc pr = {.on_line = find_line, .ctx = &f, .abort = env->abort};
     int rc = run_proc(argv, NULL, &pr);
+    if (pr.aborted) { o->thrown = "Operation aborted"; goto out; }
     if (rc) { o->thrown = arena_printf(a, "Failed to run fd: spawn %s %s", fd, errno_code(rc)); goto out; }
     if (pr.wait_err) { o->thrown = arena_printf(a, "Failed to run fd: %s", errno_code(pr.wait_err)); goto out; }
     if (!(pr.exited_code && pr.code == 0) && f.count == 0) {

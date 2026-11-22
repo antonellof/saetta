@@ -17,6 +17,7 @@
 // saetta), model cost rates (cost is 0), OpenRouter reported cost, session affinity headers.
 #include "code_oai.h"
 #include "metal/shim.h"
+#include "server.h"
 
 #include <math.h>
 #include <stdlib.h>
@@ -2426,6 +2427,7 @@ char *code_oai_http_error(Arena *a, int status, Str body) {
 typedef struct {
     CodeOaiStream *s;
     bool ok_status, seen;
+    int status; // the last status seen (the error answer's)
     Buf errbody;
     volatile int *abort; // CodeEnv.abort
 } HttpCtx;
@@ -2433,6 +2435,7 @@ typedef struct {
 static int on_http(void *ctx, int status, const void *p, size_t n) {
     HttpCtx *h = ctx;
     h->seen = true;
+    h->status = status;
     if (status < 200 || status >= 300) {
         if (h->errbody.len < (1u << 20)) buf_add(&h->errbody, p, n);
         return 0;
@@ -2442,8 +2445,35 @@ static int on_http(void *ctx, int status, const void *p, size_t n) {
     return code_oai_stream_feed(h->s, p, n) ? 0 : 1;
 }
 
+// The in-process transport: the server's request path (server_engine_chat) writes the response
+// body straight into on_http, as the socket would; p NULL asks whether the caller has left.
+static int on_engine(void *ctx, int status, const void *p, size_t n) {
+    HttpCtx *h = ctx;
+    if (!p) return h->abort && *h->abort;
+    return on_http(ctx, status, p, n);
+}
+
+static Err complete_in_process(Arena *a, const CodeModel *m, CodeOaiStream *s, const CodeEnv *env, Str body, JValue **assistant) {
+    HttpCtx hc = {.s = s, .abort = env ? env->abort : NULL};
+    TRY(server_engine_chat(m->engine, body, on_engine, &hc));
+    if (s->failed) *assistant = code_oai_stream_end(s, NULL);
+    else if (!hc.seen && hc.abort && *hc.abort) *assistant = code_oai_stream_end(s, "Request was aborted");
+    else if (!hc.ok_status) *assistant = code_oai_stream_end(s, code_oai_http_error(a, hc.status ? hc.status : 500, code_utf8_clean(a, buf_str(&hc.errbody))));
+    else {
+        code_oai_stream_start(s);
+        *assistant = code_oai_stream_end(s, NULL);
+    }
+    buf_free(&hc.errbody);
+    if (hc.abort && *hc.abort) {
+        json_put(a, *assistant, S("stopReason"), json_string(a, S("aborted")));
+        json_put(a, *assistant, S("errorMessage"), json_string(a, S("Request was aborted")));
+    }
+    return OK;
+}
+
 Err code_oai_complete(Arena *a, const CodeModel *m, const CodeEnv *env, Str body, const CodeSink *sink, JValue **assistant) {
     CodeOaiStream *s = code_oai_stream_new(a, m, env, sink);
+    if (m->engine) return complete_in_process(a, m, s, env, body, assistant);
     if (!m->api_key || !*m->api_key) {
         *assistant = code_oai_stream_end(s, arena_printf(a, "No API key for provider: %s", m->provider ? m->provider : ""));
         return OK;
@@ -2460,8 +2490,8 @@ Err code_oai_complete(Arena *a, const CodeModel *m, const CodeEnv *env, Str body
     HttpCtx hc = {.s = s, .abort = env ? env->abort : NULL};
     int status = 0;
     char err[512] = "";
-    // 600 s without a byte, the OpenAI SDK's default timeout pi uses
-    int rc = sx_http_cancellable("POST", url, h, nh, body.ptr, body.len, 600, on_http, &hc, &status, err, sizeof err, hc.abort);
+    // 300 s without a byte: pi's timeout (http-dispatcher.ts, passed as the SDK timeout in sdk.ts)
+    int rc = sx_http_cancellable("POST", url, h, nh, body.ptr, body.len, 300, on_http, &hc, &status, err, sizeof err, hc.abort);
     if (s->failed) {
         *assistant = code_oai_stream_end(s, NULL);
     } else if (rc != 0) {
@@ -2471,7 +2501,7 @@ Err code_oai_complete(Arena *a, const CodeModel *m, const CodeEnv *env, Str body
         else msg = arena_printf(a, "Connection error.: %s", err);
         *assistant = code_oai_stream_end(s, msg);
     } else if (status < 200 || status >= 300) {
-        *assistant = code_oai_stream_end(s, code_oai_http_error(a, status, buf_str(&hc.errbody)));
+        *assistant = code_oai_stream_end(s, code_oai_http_error(a, status, code_utf8_clean(a, buf_str(&hc.errbody))));
     } else {
         code_oai_stream_start(s);
         *assistant = code_oai_stream_end(s, NULL);

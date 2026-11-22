@@ -24,6 +24,23 @@
 Err server_serve(Arena *arena, const char *dir, uint16_t port, const char *const *loras, size_t nloras,
                  const char *kwargs_default);
 
+// ---- in process (Saetta Code): the server's engine and request path without a socket --------
+
+typedef struct Engine Engine;
+// Loads the pack in dir as server_serve does (model, tokenizer, conversations sized to this
+// Mac's memory), without a socket, the instance lock or the stats thread. kwargs_default as for
+// server_serve.
+Err server_engine_open(Arena *arena, const char *dir, const char *kwargs_default, Engine **out);
+// The model id the engine answers as, and its context in tokens.
+const char *server_engine_model(const Engine *e);
+size_t server_engine_context(const Engine *e);
+// One POST /v1/chat/completions with this body, on the caller's thread: the response body
+// bytes (the SSE stream, or the JSON answer or error) go to sink as they are produced, with the
+// response status; sink returns nonzero to stop (the request ends as when a client leaves), and
+// is also called with p NULL, n 0 to ask whether the caller is gone. Errors: harness failures
+// only (a failed request is an error answer through sink).
+Err server_engine_chat(Engine *e, Str body, int (*sink)(void *ctx, int status, const void *p, size_t n), void *ctx);
+
 // The error object a failed request is answered with (also the data of a stream's error
 // event): 4xx is the client's (invalid_request_error; Anthropic request_too_large for 413),
 // 5xx the server's (OpenAI server_error, Anthropic api_error).

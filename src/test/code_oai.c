@@ -188,7 +188,26 @@ static size_t session_turns(Arena *a, const char *path, const size_t *runs, size
         JValue *m = json_get(e, "message");
         const char *role = json_str(json_get(m, "role"));
         if (role && !strcmp(role, "system")) {
-            system = m;
+            // the replayed system message (getCurrentSystemMessage): later messages remove and
+            // add tools by name, so the tools are the replay, not the last message's
+            JValue *tools = json_new(a, J_ARRAY);
+            const JValue *prev = system ? json_get(system, "toolsAdded") : NULL;
+            const JValue *rm = json_get(m, "toolsRemoved"), *add = json_get(m, "toolsAdded");
+            for (size_t k = 0; prev && k < prev->arr.len; k++) {
+                bool gone = false;
+                for (size_t j = 0; rm && j < rm->arr.len && !gone; j++)
+                    gone = str_eq(json_strs(json_get(rm->arr.items[j], "name")), json_strs(json_get(prev->arr.items[k], "name")));
+                for (size_t j = 0; add && j < add->arr.len && !gone; j++)
+                    gone = str_eq(json_strs(json_get(add->arr.items[j], "name")), json_strs(json_get(prev->arr.items[k], "name")));
+                if (!gone) json_push(a, tools, prev->arr.items[k]);
+            }
+            for (size_t j = 0; add && j < add->arr.len; j++) json_push(a, tools, add->arr.items[j]);
+            JValue *copy = json_new(a, J_OBJECT);
+            for (size_t k = 0; k < m->obj.len; k++)
+                if (!str_eqz(m->obj.items[k].key, "toolsAdded") && !str_eqz(m->obj.items[k].key, "toolsRemoved"))
+                    json_put(a, copy, m->obj.items[k].key, m->obj.items[k].val);
+            if (tools->arr.len) json_put(a, copy, S("toolsAdded"), tools);
+            system = copy;
             continue;
         }
         if (role && !strcmp(role, "assistant")) {

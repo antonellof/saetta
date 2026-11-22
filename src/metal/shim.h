@@ -139,7 +139,8 @@ int sx_http(const char *method, const char *url, const sx_header *headers, size_
             const void *body, size_t body_len, double timeout_s, sx_http_sink on_data, void *ctx,
             int *status, char *err, size_t err_cap);
 // sx_http that also stops when *cancel becomes nonzero (checked every 100 ms, also while no byte
-// arrives): the task is cancelled and the call returns 1 with err "cancelled".
+// arrives): the task is cancelled and the call returns 1 (err holds the system's description of
+// the cancellation; callers tell it from other failures by their own flag).
 int sx_http_cancellable(const char *method, const char *url, const sx_header *headers, size_t nheaders,
                         const void *body, size_t body_len, double timeout_s, sx_http_sink on_data, void *ctx,
                         int *status, char *err, size_t err_cap, volatile int *cancel);

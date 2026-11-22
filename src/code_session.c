@@ -1,6 +1,8 @@
 // Saetta Code sessions (see code.h): pi's session files, version 3, one JSON entry per line.
 // Adapted from pi (MIT, Copyright (c) 2025 Mario Zechner; github.com/earendil-works/pi v1.5.2,
-// packages/coding-agent/src/core/session-manager.ts).
+// b4afddd: packages/coding-agent/src/core/session-manager.ts (the file format, buildContextEntries,
+// sessionEntryToContextMessages, projectContextEntry, findMostRecentSession), core/messages.ts
+// (convertToLlm for summaries, custom and bash messages)).
 //
 // The file is created only once the session holds a user or assistant message (pi's
 // _hasConversation); before that, entries stay in memory. Entries form a tree by parentId; the

@@ -25,6 +25,13 @@ typedef struct {
     bool wfail;
     uint64_t deadline_ns; // now_ns() by which reads must be done; 0: none
     bool timed_out;       // a read passed deadline_ns
+    // An in-process connection (server_engine_chat): no socket. Flushed bytes go to sink
+    // with the response status, the status line, headers and chunk framing are not written,
+    // and a nonzero return (or sink(ctx, status, NULL, 0) != 0 when asked whether the peer is
+    // gone) means the caller has left.
+    int (*sink)(void *ctx, int status, const void *p, size_t n);
+    void *sink_ctx;
+    int status;
 } Conn;
 
 typedef struct {

@@ -405,6 +405,8 @@ static Err pi_setup(Arena *a, Env *env, Argv *argv, const char *base, uint32_t c
     return OK;
 }
 
+static Err code_in_process(Arena *a, const char *dir, const char *const *extra, size_t n_extra, int *code);
+
 // Saetta Code (`saetta code`, this binary): pi's configuration, so the two share settings,
 // models and sessions under ~/.saetta/pi.
 static Err code_setup(Arena *a, Env *env, Argv *argv, const char *base, uint32_t ctx) {
@@ -417,6 +419,39 @@ static Err code_setup(Arena *a, Env *env, Argv *argv, const char *base, uint32_t
     vec_push(argv, NULL);
     memmove(&argv->ptr[2], &argv->ptr[1], (argv->len - 2) * sizeof argv->ptr[0]);
     argv->ptr[1] = "code";
+    return OK;
+}
+
+// saetta code --pack <dir> [extra], the engine in its own process, waited for.
+static Err code_in_process(Arena *a, const char *dir, const char *const *extra, size_t n_extra, int *code) {
+    const char *home = getenv("HOME");
+    if (!home) return "NoHome";
+    char *cfg = path_join(a, path_join(a, home, ".saetta"), "pi");
+    TRY(mkdir_p(cfg));
+    char self[PATH_MAX];
+    uint32_t len = sizeof self;
+    if (_NSGetExecutablePath(self, &len) != 0) return "NoExecutablePath";
+    Env env;
+    env_clone(&env, a);
+    env_put(&env, "PI_CODING_AGENT_DIR", cfg);
+    Argv argv = {0};
+    vec_push(&argv, arena_strdup(a, self));
+    vec_push(&argv, "code");
+    vec_push(&argv, "--pack");
+    vec_push(&argv, dir);
+    for (size_t k = 0; k < n_extra; k++) vec_push(&argv, extra[k]);
+    vec_push(&argv, NULL);
+    pid_t child;
+    int rc = posix_spawn(&child, argv.ptr[0], NULL, NULL, (char *const *)argv.ptr, env_block(&env));
+    if (rc != 0) {
+        vec_free(&argv);
+        return err_errno(rc);
+    }
+    ignore_interrupt(); // Ctrl-C belongs to Saetta Code now
+    int st = wait_child(child);
+    vec_free(&argv);
+    if (st < 0) return err_errno(errno);
+    *code = WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st);
     return OK;
 }
 
@@ -502,6 +537,9 @@ static Err session(Arena *a, Session *ss, Agent agent, const char *pack_arg, uin
             *code = 1;
             return OK;
         }
+        // Saetta Code without a server: the model runs inside it (saetta code --pack), with the
+        // configuration and sessions `saetta start pi` uses
+        if (agent == AGENT_CODE) return code_in_process(a, dir, extra, n_extra, code);
         // another program on the port: the default moves to the next free one, a chosen one is an error
         if (!port_free(port)) {
             if (port_set) {

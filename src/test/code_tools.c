@@ -33,7 +33,7 @@ static Str replace_all(Arena *a, Str s, Str from, Str to) {
 
 static bool is_hex(char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); }
 
-// "key":<digits> -> "key":0, and pi-bash-<16 hex> -> pi-bash-X (a random temp file name)
+// "key":<digits> -> "key":0, and pi-bash-<16 hex> -> pi-bash-$RANDOM (a random temp file name, as run_scenario.py writes it)
 static Str normalize(Arena *a, Str s, const char *ws, const char *ws_real, const char *home, const char *home_real) {
     // the longer (real) path first: it contains the other
     s = replace_all(a, s, str(ws_real), S("$WS"));
@@ -52,7 +52,7 @@ static Str normalize(Arena *a, Str s, const char *ws, const char *ws_real, const
             bool hex = true;
             for (size_t k = 8; k < 24; k++) hex = hex && is_hex(s.ptr[i + k]);
             if (hex) {
-                buf_adds(&b, "pi-bash-X");
+                buf_adds(&b, "pi-bash-$RANDOM");
                 i += 24;
                 continue;
             }

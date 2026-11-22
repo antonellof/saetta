@@ -3,6 +3,7 @@
 // packages/agent/src/agent-loop.ts, packages/coding-agent/src/main.ts, cli/args.ts,
 // core/agent-session.ts, modes/print-mode.ts, modes/json-event.ts, packages/ai/src/utils/transcript.ts).
 #include "code.h"
+#include "code_oai.h"
 
 #include <limits.h>
 #include <stdio.h>
@@ -236,17 +237,22 @@ static JValue *current_system(Arena *a, const JValue *messages) {
 }
 
 // pi's tool declaration from an OpenAI tools entry: name, description, parameters,
-// constrainedSampling (the built-in tools prefer JSON-schema constrained sampling).
+// constrainedSampling for the tools that declare it.
 static JValue *declaration(Arena *a, const JValue *oai) {
     const JValue *f = json_get(oai, "function");
     JValue *d = json_new(a, J_OBJECT);
     json_put(a, d, S("name"), (JValue *)json_get(f, "name"));
     json_put(a, d, S("description"), (JValue *)json_get(f, "description"));
     json_put(a, d, S("parameters"), (JValue *)json_get(f, "parameters"));
-    JValue *cs = json_new(a, J_OBJECT);
-    json_put(a, cs, S("type"), json_string(a, S("json_schema")));
-    json_put(a, cs, S("strict"), json_string(a, S("prefer")));
-    json_put(a, d, S("constrainedSampling"), cs);
+    // read, bash, edit and write prefer JSON-schema constrained sampling (their definitions in
+    // core/tools/*.ts); grep, find and ls declare none
+    Str name = json_strs(json_get(f, "name"));
+    if (str_eqz(name, "read") || str_eqz(name, "bash") || str_eqz(name, "edit") || str_eqz(name, "write")) {
+        JValue *cs = json_new(a, J_OBJECT);
+        json_put(a, cs, S("type"), json_string(a, S("json_schema")));
+        json_put(a, cs, S("strict"), json_string(a, S("prefer")));
+        json_put(a, d, S("constrainedSampling"), cs);
+    }
     return d;
 }
 
@@ -345,7 +351,9 @@ static void on_event(void *ctx, const JValue *event, const JValue *partial) {
     if (str_eqz(type, "toolcall_start")) {
         const JValue *idx = json_get(event, "contentIndex");
         const JValue *content = json_get(partial, "content");
-        const JValue *tc = json_is(idx, J_INTEGER) && content && (size_t)idx->i < content->arr.len ? content->arr.items[idx->i] : NULL;
+        // the client writes numbers as JavaScript does (J_NUMBER_STRING)
+        long k = json_is(idx, J_INTEGER) ? (long)idx->i : json_is(idx, J_NUMBER_STRING) ? strtol(str_z(a, idx->s), NULL, 10) : -1;
+        const JValue *tc = k >= 0 && content && (size_t)k < content->arr.len ? content->arr.items[k] : NULL;
         json_put(a, ame, S("id"), tc ? (JValue *)json_get(tc, "id") : json_string(a, S("")));
         json_put(a, ame, S("toolName"), tc ? (JValue *)json_get(tc, "name") : json_string(a, S("")));
     }
@@ -382,35 +390,78 @@ static Err stream_assistant(Run *r, JValue **out) {
     return OK;
 }
 
+// The part of the edit tool's prepareArguments (edit.ts prepareEditArguments) that rewrites the
+// call's own arguments object in place: edits sent as a JSON string, or a single edit object,
+// become an array. pi's session line was written before, so the file keeps the original while
+// later requests of this process send the rewritten call; a resumed session sends the original.
+static bool single_edit(const JValue *v) {
+    return json_is(v, J_OBJECT) && json_is(json_get(v, "oldText"), J_STRING) && json_is(json_get(v, "newText"), J_STRING);
+}
+
+static void prepare_edit_in_place(Arena *a, const JValue *call) {
+    if (!str_eqz(json_strs(json_get(call, "name")), "edit")) return;
+    JValue *args = (JValue *)json_get(call, "arguments");
+    if (!json_is(args, J_OBJECT)) return;
+    JValue *edits = (JValue *)json_get(args, "edits");
+    JValue *repl = NULL;
+    if (json_is(edits, J_STRING)) {
+        char *err = NULL;
+        JValue *parsed = code_oai_js_parse(a, edits->s, &err);
+        if (parsed && json_is(parsed, J_ARRAY)) repl = parsed;
+        else if (parsed && single_edit(parsed)) {
+            repl = json_new(a, J_ARRAY);
+            json_push(a, repl, parsed);
+        }
+    } else if (single_edit(edits)) {
+        repl = json_new(a, J_ARRAY);
+        json_push(a, repl, edits);
+    }
+    if (repl) json_put(a, args, S("edits"), repl);
+}
+
+static void emit_tool_end(Run *r, const JValue *call, JValue *msg, JValue *raw) {
+    Arena *a = r->a;
+    JValue *e = ev_new(a, "tool_execution_end");
+    json_put(a, e, S("toolCallId"), (JValue *)json_get(call, "id"));
+    json_put(a, e, S("toolName"), (JValue *)json_get(call, "name"));
+    json_put(a, e, S("result"), raw ? raw : json_new(a, J_OBJECT));
+    json_put(a, e, S("isError"), (JValue *)json_get(msg, "isError"));
+    const JValue *d = json_get(msg, "durationMs");
+    if (d) json_put(a, e, S("durationMs"), (JValue *)d);
+    emit(r, e);
+}
+
+// executeToolCallsParallel: each call's tool_execution_start in order; a call that fails before
+// running (unknown tool, bad arguments: its result has no durationMs) ends at once, the executed
+// ones end after every start (failures first); then the results, in call order.
 static Err run_tools(Run *r, const JValue *assistant, JValue *results) {
     Arena *a = r->a;
     const JValue *content = json_get(assistant, "content");
     VEC(const JValue *) calls = {0};
     for (size_t i = 0; content && i < content->arr.len; i++)
         if (str_eqz(json_strs(json_get(content->arr.items[i], "type")), "toolCall")) vec_push(&calls, content->arr.items[i]);
-    for (size_t i = 0; i < calls.len; i++) {
+    JValue **msgs = arena_alloc(a, (calls.len + 1) * sizeof *msgs);
+    JValue **raws = arena_alloc(a, (calls.len + 1) * sizeof *raws);
+    Err err = OK;
+    for (size_t i = 0; i < calls.len && !err; i++) {
         JValue *e = ev_new(a, "tool_execution_start");
         json_put(a, e, S("toolCallId"), (JValue *)json_get(calls.ptr[i], "id"));
         json_put(a, e, S("toolName"), (JValue *)json_get(calls.ptr[i], "name"));
         json_put(a, e, S("args"), (JValue *)json_get(calls.ptr[i], "arguments"));
         emit(r, e);
-    }
-    JValue **msgs = arena_alloc(a, (calls.len + 1) * sizeof *msgs);
-    Err err = OK;
-    for (size_t i = 0; i < calls.len && !err; i++) {
         r->env.now_ms = wall_ms();
-        JValue *raw = NULL;
-        err = code_tool_run(a, &r->env, calls.ptr[i], &msgs[i], &raw);
-        if (err) break;
-        JValue *e = ev_new(a, "tool_execution_end");
-        json_put(a, e, S("toolCallId"), (JValue *)json_get(calls.ptr[i], "id"));
-        json_put(a, e, S("toolName"), (JValue *)json_get(calls.ptr[i], "name"));
-        json_put(a, e, S("result"), raw ? raw : json_new(a, J_OBJECT));
-        json_put(a, e, S("isError"), (JValue *)json_get(msgs[i], "isError"));
-        const JValue *d = json_get(msgs[i], "durationMs");
-        if (d) json_put(a, e, S("durationMs"), (JValue *)d);
-        emit(r, e);
+        prepare_edit_in_place(a, calls.ptr[i]);
+        err = code_tool_run(a, &r->env, calls.ptr[i], &msgs[i], &raws[i]);
+        if (!err && !json_get(msgs[i], "durationMs")) emit_tool_end(r, calls.ptr[i], msgs[i], raws[i]);
     }
+    // pi runs the executed calls concurrently and ends each as it settles; a call that throws
+    // (a missing file, say) settles before one that completes its I/O, so errors end first
+    for (int pass = 0; pass < 2; pass++)
+        for (size_t i = 0; i < calls.len && !err; i++) {
+            if (!json_get(msgs[i], "durationMs")) continue;
+            bool failed = jbool(json_get(msgs[i], "isError"), false);
+            if (failed == (pass == 0)) emit_tool_end(r, calls.ptr[i], msgs[i], raws[i]);
+        }
     for (size_t i = 0; i < calls.len && !err; i++) {
         err = add_message(r, msgs[i]);
         json_push(a, results, msgs[i]);

@@ -417,7 +417,8 @@ static int raw_sink(void *ctx, int status, const void *p, size_t n) {
 }
 
 // Strips the "usage" of message_update lines: in pi it depends on timing (which events its
-// consumer copied before the usage chunk was parsed), so the live HTTP check leaves it out.
+// consumer copied before the usage chunk was parsed), so the goldens hold "$USAGE" there
+// (tools/code/run_scenario.py) and no check compares it.
 static Str no_usage(Arena *a, Str l) {
     ptrdiff_t u = str_find(l, S(",\"usage\":"), 0), e = str_find(l, S(",\"assistantMessageEvent\":"), 0);
     if (u < 0 || e < 0) return l;
@@ -474,7 +475,7 @@ static bool check_answer(Arena *a, const char *name, size_t k, const Turn *turn,
     if (!str_eq(got, turn->answer)) {
         report_diff(arena_printf(a, "%s answer %zu (parser)", name, k), got, turn->answer);
         ok = false;
-    } else if (gold && !same_lines(a, gold, &rec, true)) {
+    } else if (gold && !same_lines(a, gold, &rec, false)) {
         dbg("%s answer %zu: json-mode events differ\n", name, k);
         ok = false;
     }

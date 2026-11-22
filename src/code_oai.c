@@ -2474,7 +2474,7 @@ Err code_oai_complete(Arena *a, const CodeModel *m, const CodeEnv *env, Str body
     h[nh++] = (sx_header){"Accept", "application/json"};
     h[nh++] = (sx_header){"Content-Type", "application/json"};
     h[nh++] = (sx_header){"Authorization", arena_printf(a, "Bearer %s", m->api_key)};
-    h[nh++] = (sx_header){"User-Agent", "pi/1.5.2 (darwin; saetta; arm64)"};
+    h[nh++] = (sx_header){"User-Agent", "saetta-code (darwin; arm64)"};
     nh += attribution(a, m, h + nh);
     HttpCtx hc = {.s = s};
     int status = 0;

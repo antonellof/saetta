@@ -21,7 +21,7 @@ Saetta runs Qwen3.8 coding models on any Apple Silicon Mac with 32 GB of memory 
 
 - **Fast:** on an M5 Max, Flash-Next reads prompts at 1,600 to 1,950 tokens/s and answers at 66 to 85 tokens/s, with speculative decoding.
 - **Follow-up turns read only what is new:** a second turn on a 16K conversation answers in 0.2 s.
-- **One command to code:** `saetta` picks the model and the agent for you; `saetta start claude` (or `pi`, `opencode`, or the built-in `code`) when you know.
+- **One command to code:** `saetta` picks the model and the agent for you; `saetta start code` for the built-in agent, or `saetta start claude` (`pi`, `opencode`) when you know.
 - **LoRA adapters** on Qwen3.8-27B, per request.
 - **Checked** layer by layer against numpy references; one binary, no Python.
 
@@ -36,7 +36,7 @@ saetta                   # guided: pick a model and a coding agent, then it down
 
 ```sh
 saetta download          # the model that fits this Mac, into ~/Models, resumable, hash-checked
-saetta start claude      # or: saetta start pi, saetta start opencode
+saetta start code        # the built-in agent; or: saetta start claude, pi, opencode
 ```
 
 `saetta download` picks by memory: `coder` (Flash-Next, 76 GB) with 96 GB or more, `27b-turbo` (Qwen3.8-27B fine-tune, 20 GB, converted from its GGUF: about 40 GB free disk while it runs) with 36 GB, `27b-4bit` (16 GB) with 32 GB. Any pack can be named instead (table below); one that cannot run on this Mac is refused, and the context shrinks to what memory holds.
@@ -87,10 +87,10 @@ A request whose `model` is the adapter's name runs with it, any other with the b
 ## Coding agents
 
 ```sh
+saetta start code        # Saetta Code, built in: the model inside the agent (below)
 saetta start claude      # Claude Code
 saetta start pi          # pi
 saetta start opencode    # opencode
-saetta start code        # Saetta Code, built in (below)
 saetta start claude -- -p "fix the failing test"   # anything after -- goes to the agent
 ```
 

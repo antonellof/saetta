@@ -12,6 +12,7 @@
 #include "code_cfg.h"
 #include "code_oai.h"
 #include "code_res.h"
+#include "code_sessions.h"
 #include "code_tui.h"
 #include "code_monitor.h"
 #include "download.h"
@@ -34,6 +35,7 @@
 #include <poll.h>
 #include <sys/mount.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 
 static const char *const default_tools[] = {"read", "bash", "edit", "write"};
 
@@ -1034,6 +1036,99 @@ static void host_set_leaf(CodeUiHost *h, const char *id) { code_session_set_leaf
 
 static bool host_set_model(CodeUiHost *h, const char *provider, const char *id) { return switch_model(h->r, provider, id); }
 
+// ---- the session commands' side (code_sessions_ui.c draws them; code_sessions.c does the work) ----
+
+static CodeSession *host_session(CodeUiHost *h) { return h->r->session; }
+
+// createAgentSession for a session made current (/fork, /clone, /resume): its thinking level
+// restored from the branch (or recorded when the branch has none), the model and thinking level
+// recorded in a session without messages.
+static void use_session(Run *r, CodeSession *s) {
+    Arena *a = r->a;
+    r->session = s;
+    r->env.session_id = json_str(json_get(code_session_header(s), "id"));
+    r->env.session_file = code_session_path(s);
+    bool existing = code_session_messages(s)->arr.len > 0;
+    const char *recorded = json_str(code_session_last(s, "thinking_level_change", "thinkingLevel"));
+    const char *level = r->model.thinking ? r->model.thinking : "medium";
+    if (existing && recorded) level = recorded;
+    else if (existing) {
+        JValue *settings = read_json(a, path_join(a, r->env.agent_dir, "settings.json"));
+        const char *d = json_str(json_get(settings, "defaultThinkingLevel"));
+        level = d ? d : "medium";
+    }
+    if (!r->model.reasoning) level = "off";
+    level = arena_strdup(a, level);
+    if (!existing) {
+        JValue *f = json_new(a, J_OBJECT);
+        json_put(a, f, S("provider"), json_string(a, str(r->model.provider)));
+        json_put(a, f, S("modelId"), json_string(a, str(r->model.id)));
+        (void)code_session_append(s, "model_change", f);
+    }
+    if (!existing || !recorded) {
+        JValue *f = json_new(a, J_OBJECT);
+        json_put(a, f, S("thinkingLevel"), json_string(a, str(level)));
+        (void)code_session_append(s, "thinking_level_change", f);
+    }
+    r->model.thinking = level;
+    r->env.thinking = level;
+}
+
+static const char *host_fork(CodeUiHost *h, const char *entry_id, bool at, char **selected) {
+    Run *r = h->r;
+    CodeSession *s;
+    const char *err = code_sessions_fork(r->a, r->session, json_str(json_get(code_session_header(r->session), "cwd")), entry_id, at, &s, selected);
+    if (!err) use_session(r, s);
+    return err;
+}
+
+// AgentSessionRuntime.switchSession: the session file opened; the process moves to its folder, as
+// pi's runtime does, unless it stays here (cwdOverride: the session's folder is gone).
+static const char *host_resume(CodeUiHost *h, const char *path, bool stay) {
+    Run *r = h->r;
+    CodeSession *s;
+    Err e = code_session_open_path(r->a, path, &s);
+    if (e) return arena_printf(r->a, "Failed to resume session: %s", e);
+    const char *cwd = json_str(json_get(code_session_header(s), "cwd"));
+    if (!stay && cwd && *cwd && strcmp(cwd, r->env.cwd)) {
+        if (chdir(cwd) != 0) return arena_printf(r->a, "Failed to resume session: %s", strerror(errno));
+        r->env.cwd = arena_strdup(r->a, cwd);
+    }
+    use_session(r, s);
+    return NULL;
+}
+
+// AgentSession.compact (manual), on the agent thread: compaction_start, then compaction_end with
+// the result, the error or the abort, as pi emits them.
+static void host_compact(CodeUiHost *h, const char *instructions) {
+    Run *r = h->r;
+    Arena *a = r->a;
+    g_abort = 0;
+    JValue *ev = ev_new(a, "compaction_start");
+    json_put(a, ev, S("reason"), json_string(a, S("manual")));
+    code_ui_event(ev);
+    JValue *settings = read_json(a, path_join(a, r->env.agent_dir, "settings.json"));
+    int64_t keep = (int64_t)juint(json_get(json_get(settings, "compaction"), "keepRecentTokens"), 20000);
+    const JValue *entry = NULL;
+    const char *err = code_sessions_compact(a, r->session, &r->model, &r->env, instructions && *instructions ? instructions : NULL, keep, &entry);
+    bool aborted = g_abort || (err && !strcmp(err, "aborted"));
+    JValue *end = ev_new(a, "compaction_end");
+    json_put(a, end, S("reason"), json_string(a, S("manual")));
+    if (!err && entry) {
+        JValue *res = json_new(a, J_OBJECT);
+        json_put(a, res, S("summary"), json_get(entry, "summary"));
+        json_put(a, res, S("firstKeptEntryId"), json_get(entry, "firstKeptEntryId"));
+        json_put(a, res, S("tokensBefore"), json_get(entry, "tokensBefore"));
+        if (json_get(entry, "usage")) json_put(a, res, S("usage"), json_get(entry, "usage"));
+        json_put(a, res, S("details"), json_get(entry, "details"));
+        json_put(a, end, S("result"), res);
+    }
+    json_put(a, end, S("aborted"), json_bool(a, !entry && aborted));
+    json_put(a, end, S("willRetry"), json_bool(a, false));
+    if (err && !aborted) json_put(a, end, S("errorMessage"), json_string(a, str(arena_printf(a, "Compaction failed: %s", err))));
+    code_ui_event(end);
+}
+
 static bool switch_model(Run *r, const char *provider, const char *id) {
     if (r->model.engine) return !strcmp(provider, r->model.provider) && !strcmp(id, r->model.id);
     Arena *a = r->a;
@@ -1319,7 +1414,8 @@ static Err interactive(Run *r, const Args *o, const JValue *settings) {
     CodeUiOps ops = {host_prompt, host_new_session, host_set_thinking, host_entries, host_messages,
                      host_set_leaf, host_set_model, host_abort, host_restart, host_reload_models,
                      .session_file = host_session_file, .session_dir = host_session_dir, .session_cwd = host_session_cwd,
-                     .system_prompt = host_system_prompt, .tool_decls = host_tool_decls, .open_session = host_open_session};
+                     .system_prompt = host_system_prompt, .tool_decls = host_tool_decls, .open_session = host_open_session,
+                     .session = host_session, .fork = host_fork, .resume = host_resume, .compact = host_compact};
     CodeUiHost host = {r};
     // a stand-in for a slow model load, for the loader's test scenario: SAETTA_CODE_LOAD_DEMO_MS
     const char *demo = getenv("SAETTA_CODE_LOAD_DEMO_MS");
@@ -1759,3 +1855,6 @@ done:
     arena_reset(a);
     return e;
 }
+
+// getCurrentSystemMessage for code_sessions.c (compaction's system message and estimates).
+JValue *code_current_system(Arena *a, const JValue *messages) { return current_system(a, messages); }

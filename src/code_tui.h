@@ -361,6 +361,15 @@ typedef struct {
     const char *(*system_prompt)(CodeUiHost *h);
     const JValue *(*tool_decls)(CodeUiHost *h);
     Err (*open_session)(CodeUiHost *h, const char *path, const char *cwd);
+    // The session commands (code_sessions_ui.c), from the UI thread with the agent idle: the
+    // session; a fork of it made current (/fork before a user message, /clone at an entry: pi's
+    // runtime fork, *selected the message's text); another session file made current (/resume),
+    // in its own folder or (stay, its folder gone) in this one. NULL, or pi's error text.
+    struct CodeSession *(*session)(CodeUiHost *h);
+    const char *(*fork)(CodeUiHost *h, const char *entry_id, bool at, char **selected);
+    const char *(*resume)(CodeUiHost *h, const char *path, bool stay);
+    // /compact, run on the agent thread; compaction_start and compaction_end arrive as events.
+    void (*compact)(CodeUiHost *h, const char *instructions);
 } CodeUiOps;
 typedef struct {
     const char *cwd, *home, *agent_dir;

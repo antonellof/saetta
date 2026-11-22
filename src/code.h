@@ -43,13 +43,20 @@ typedef struct {
     const char *home;      // $HOME
     const char *agent_dir; // $PI_CODING_AGENT_DIR, else ~/.pi/agent
     double now_ms;         // wall clock in ms since the epoch (pi's Date.now()), for timestamps
+    const char *pi_docs; // the pi-coding-agent package folder for the <docs> section, or NULL to omit it
+    const char *system_prompt;                // --system-prompt (text, or a file to read), or NULL
+    const char *const *append_system_prompt;  // each --append-system-prompt (text or file), in order
+    size_t nappend_system_prompt;
 } CodeEnv;
 
 // ---- system prompt (code_prompt.c; pi: core/system-prompt.js, resource-loader.js, skills.js)
 
 // pi's system message for these tools (names in pi's order: read, bash, edit, write, ...):
-// sections, context files (AGENTS.md / CLAUDE.md lookup), skills, cwd. *out is the object
-// pi stores as the session's system message.
+// {"role":"system","content":"","sections":{...}}, the sections of pi's
+// buildSystemPromptSections (preamble, tools, rules, docs, addendum, project_context, skills,
+// cwd) from the context files (AGENTS.md / CLAUDE.md lookup), skills, SYSTEM.md and
+// APPEND_SYSTEM.md, with pi's project trust in print mode. The agent loop adds "timestamp"
+// and "toolsAdded".
 Err code_system_message(Arena *a, const CodeEnv *env, const char *const *tools, size_t ntools, JValue **out);
 // The prompt text the model gets, from a system message (pi-ai getSystemMessageText).
 Str code_system_text(Arena *a, const JValue *system);

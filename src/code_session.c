@@ -490,6 +490,10 @@ const JValue *code_session_last(const CodeSession *s, const char *type, const ch
 
 const char *code_session_path(const CodeSession *s) { return s->path; }
 
+const JValue *code_session_entries(const CodeSession *s) { return s->entries; }
+
+void code_session_set_leaf(CodeSession *s, const char *id) { s->leaf = id ? arena_strdup(s->a, id) : NULL; }
+
 const char *code_session_leaf(const CodeSession *s) { return s->leaf; }
 
 const JValue *code_session_entry_last(const CodeSession *s) { return s->entries->arr.items[s->entries->arr.len - 1]; }

@@ -205,27 +205,38 @@ void screen_draw(Screen *s, Lines *frame, bool force);
 // The agent's side, run on its own thread: code_main.c provides these.
 typedef struct CodeUiHost CodeUiHost;
 typedef struct {
+    const char *provider, *id, *name;
+    bool reasoning;
+    uint64_t context_window;
+} CodeUiModel;
+typedef struct {
     // Runs one prompt to its end (on the agent thread); events arrive through code_ui_event.
     void (*prompt)(CodeUiHost *h, const char *text);
-    // A new session (called from the UI thread while the agent is idle).
+    // The calls below come from the UI thread while the agent is idle.
     void (*new_session)(CodeUiHost *h);
-    // The thinking level changed (UI thread, agent idle).
     void (*set_thinking)(CodeUiHost *h, const char *level);
-    // The session's entries on the current branch, as {"type":"message",...} objects (UI thread,
-    // agent idle), for /tree.
-    const JValue *(*entries)(CodeUiHost *h);
+    // Every session entry, the header first (pi's session file, for /tree), and the leaf's id.
+    const JValue *(*entries)(CodeUiHost *h, const char **leaf);
+    // The messages of the current branch, in order (for drawing the transcript).
+    const JValue *(*messages)(CodeUiHost *h);
+    // Moves the session's leaf (/tree): the next message is appended under it.
+    void (*set_leaf)(CodeUiHost *h, const char *id);
+    // Switches the model (/model); false when it cannot.
+    bool (*set_model)(CodeUiHost *h, const char *provider, const char *id);
     // Abort the run in flight (any thread).
     void (*abort)(CodeUiHost *h);
 } CodeUiOps;
 typedef struct {
     const char *cwd, *home, *agent_dir;
-    const char *provider, *model_id, *model_name, *thinking;
-    bool reasoning;
-    uint64_t context_window;
+    CodeUiModel model;
+    const char *thinking;
     bool auto_compact;
     const char *fd_path; // fd for "@" completion, or NULL
-    const char *const *models; // "provider/id" of every model in models.json
+    const CodeUiModel *models; // every model of models.json
     size_t nmodels;
+    const char *default_provider, *default_model; // settings.json
+    const JValue *settings; // settings.json, or NULL
+    bool resumed; // a continued session: its messages are drawn at start
 } CodeUiConfig;
 
 // Runs pi's interactive mode until the user quits. initial: prompts given on the command line.

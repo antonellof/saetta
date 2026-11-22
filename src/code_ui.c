@@ -148,6 +148,7 @@ typedef struct {
     SelectList list;
     Input search;
     void *sel_data;
+    void (*sel_free)(void *);
     // the agent thread
     pthread_t thread;
     pthread_mutex_t lock;
@@ -156,6 +157,11 @@ typedef struct {
     bool thread_quit;
     VEC(char *) queued; // prompts typed while a turn runs
     char *default_thinking;
+    // the current model (/model changes it) and the settings the UI uses
+    CodeUiModel model;
+    bool auto_compact;
+    char *default_provider, *default_model;
+    char *pending_thinking; // chosen while a turn ran: applied when it ends
 } Ui;
 
 static Ui *U;
@@ -1321,7 +1327,7 @@ static void footer_render(void *ctx, int width, Lines *out) {
         tokens = s->total ? s->total : s->input + s->output + s->cache_read + s->cache_write;
         for (size_t i = (size_t)last_valid + 1; i < U->stats.len; i++) tokens += (double)U->stats.ptr[i].est;
     }
-    double window = (double)cfg->context_window;
+    double window = (double)U->model.context_window;
     double pct = window > 0 ? tokens / window * 100 : 0;
     // the working directory, ~ for the home folder
     Buf pwd = {0};
@@ -1377,7 +1383,7 @@ static void footer_render(void *ctx, int width, Lines *out) {
     t.len = 0;
     fmt_tokens(&t, window);
     Buf ctxs = {0};
-    buf_printf(&ctxs, "%.1f%%/%s%s", pct, t.ptr, cfg->auto_compact ? " (auto)" : "");
+    buf_printf(&ctxs, "%.1f%%/%s%s", pct, t.ptr, U->auto_compact ? " (auto)" : "");
     if (stats.len) buf_addc(&stats, ' ');
     if (pct > 90) th_fg(&stats, T_ERROR, buf_str(&ctxs));
     else if (pct > 70) th_fg(&stats, T_WARNING, buf_str(&ctxs));
@@ -1392,8 +1398,8 @@ static void footer_render(void *ctx, int width, Lines *out) {
         sw = tui_width(buf_str(&stats));
     }
     Buf right = {0};
-    const char *model = cfg->model_id ? cfg->model_id : "no-model";
-    if (cfg->reasoning) {
+    const char *model = U->model.id ? U->model.id : "no-model";
+    if (U->model.reasoning) {
         const char *lv = U->thinking ? U->thinking : "off";
         if (!strcmp(lv, "off")) buf_printf(&right, "%s \xe2\x80\xa2 thinking off", model);
         else buf_printf(&right, "%s \xe2\x80\xa2 %s", model, lv);
@@ -1583,7 +1589,7 @@ static const char *const level_desc[] = {"No reasoning", "Very brief reasoning (
                                          "Moderate reasoning (~8k tokens)", "Deep reasoning (~16k tokens)",
                                          "Extra-high reasoning (~32k tokens)", "Maximum reasoning"};
 
-static size_t available_levels(void) { return U->cfg->reasoning ? 5 : 1; }
+static size_t available_levels(void) { return U->model.reasoning ? 5 : 1; }
 
 static void thinking_build(const char *filter, const char *keep) {
     sel_free(&U->list);
@@ -1640,6 +1646,9 @@ static void thinking_render(int width, Lines *out) {
 }
 
 static void close_selector(void) {
+    if (U->sel_data && U->sel_free) U->sel_free(U->sel_data);
+    U->sel_data = NULL;
+    U->sel_free = NULL;
     U->sel = SEL_NONE;
     sel_free(&U->list);
     buf_free(&U->search.value);
@@ -1650,13 +1659,1051 @@ static void set_thinking(const char *level) {
     free(U->thinking);
     U->thinking = dupz(level);
     editor_set_border(U->ed, th_thinking_color(level));
-    if (U->ops->set_thinking) U->ops->set_thinking(U->host, level);
+    if (U->busy) {
+        free(U->pending_thinking);
+        U->pending_thinking = dupz(level);
+    } else if (U->ops->set_thinking) U->ops->set_thinking(U->host, level);
 }
 
 static void open_thinking(void) {
     close_selector();
     U->sel = SEL_THINKING;
     thinking_build(NULL, NULL);
+}
+
+// ---- the model selector (model-selector.ts) ---------------------------------------------------------
+
+typedef struct {
+    size_t *idx; // indexes into cfg->models, sorted (current, default, then by provider)
+    size_t n, all;
+    size_t selected;
+} ModelSel;
+
+static bool is_current(const CodeUiModel *m) {
+    return U->model.provider && U->model.id && !strcmp(m->provider, U->model.provider) && !strcmp(m->id, U->model.id);
+}
+
+static bool is_default_model(const CodeUiModel *m) {
+    return U->default_provider && U->default_model && !strcmp(m->provider, U->default_provider) && !strcmp(m->id, U->default_model);
+}
+
+static const CodeUiModel *g_sort_models;
+static int model_cmp(const void *a, const void *b) {
+    const CodeUiModel *x = &g_sort_models[*(const size_t *)a], *y = &g_sort_models[*(const size_t *)b];
+    bool xc = is_current(x), yc = is_current(y);
+    if (xc != yc) return xc ? -1 : 1;
+    bool xd = is_default_model(x), yd = is_default_model(y);
+    if (xd != yd) return xd ? -1 : 1;
+    int c = strcasecmp(x->provider, y->provider);
+    if (c) return c;
+    return *(const size_t *)a < *(const size_t *)b ? -1 : 1;
+}
+
+// getDistinctModelName: the name when it has words the id does not.
+static bool name_distinct(const char *id, const char *name) {
+    if (!name || !*name) return false;
+    Buf words = {0};
+    for (const char *p = id; *p; p++) buf_addc(&words, isalnum((unsigned char)*p) ? (char)tolower((unsigned char)*p) : ' ');
+    Buf compact = {0};
+    for (const char *p = id; *p; p++)
+        if (isalnum((unsigned char)*p)) buf_addc(&compact, (char)tolower((unsigned char)*p));
+    bool all = true;
+    for (const char *p = name; *p && all;) {
+        while (*p && !isalnum((unsigned char)*p)) p++;
+        const char *e = p;
+        while (*e && isalnum((unsigned char)*e)) e++;
+        if (e > p) {
+            char w[128];
+            size_t n = MIN((size_t)(e - p), sizeof w - 1);
+            for (size_t k = 0; k < n; k++) w[k] = (char)tolower((unsigned char)p[k]);
+            w[n] = 0;
+            // a whole id token, or (longer than one character) inside the compact id
+            bool tok = false;
+            for (const char *q = words.ptr ? words.ptr : ""; *q && !tok;) {
+                while (*q == ' ') q++;
+                const char *qe = q;
+                while (*qe && *qe != ' ') qe++;
+                if ((size_t)(qe - q) == n && !strncmp(q, w, n)) tok = true;
+                q = qe;
+            }
+            if (!tok && !(n > 1 && compact.ptr && strstr(compact.ptr, w))) all = false;
+        }
+        p = e;
+    }
+    buf_free(&words);
+    buf_free(&compact);
+    return !all;
+}
+
+static void model_sel_free(void *p) {
+    free(((ModelSel *)p)->idx);
+    free(p);
+}
+
+static void model_filter(ModelSel *ms, const char *query) {
+    const CodeUiModel *ms_all = U->cfg->models;
+    size_t n = U->cfg->nmodels;
+    size_t *order = xmalloc((n + 1) * sizeof *order);
+    for (size_t i = 0; i < n; i++) order[i] = i;
+    g_sort_models = ms_all;
+    qsort(order, n, sizeof *order, model_cmp);
+    free(ms->idx);
+    ms->idx = xmalloc((n + 1) * sizeof *ms->idx);
+    ms->n = 0;
+    for (size_t k = 0; k < n; k++) {
+        const CodeUiModel *m = &ms_all[order[k]];
+        bool ok = true;
+        if (query && *query) {
+            Buf hay = {0};
+            buf_printf(&hay, "%s %s/%s %s %s%s%s%s", m->provider, m->provider, m->id, m->provider, m->id, m->name ? " " : "",
+                       m->name ? m->name : "", is_default_model(m) ? " default" : "");
+            for (const char *q = query; *q && ok;) {
+                while (*q == ' ') q++;
+                const char *e = q;
+                while (*e && *e != ' ') e++;
+                const char *h = hay.ptr;
+                for (const char *c = q; c < e && ok; c++) {
+                    while (*h && tolower((unsigned char)*h) != tolower((unsigned char)*c)) h++;
+                    if (!*h) ok = false;
+                    else h++;
+                }
+                q = e;
+            }
+            buf_free(&hay);
+        }
+        if (ok) ms->idx[ms->n++] = order[k];
+    }
+    free(order);
+    ms->selected = 0;
+    if (!query || !*query)
+        for (size_t i = 0; i < ms->n; i++)
+            if (is_current(&ms_all[ms->idx[i]])) ms->selected = i;
+}
+
+static void model_render(int width, Lines *out) {
+    ModelSel *ms = U->sel_data;
+    border_line(out, width, T_BORDER);
+    lines_addz(out, "");
+    Buf w = {0};
+    th_fgz(&w, T_WARNING, "Only showing models from configured providers. Use /login to add providers.");
+    text_lines(buf_str(&w), 0, width, out);
+    buf_free(&w);
+    lines_addz(out, "");
+    input_render(&U->search, width, out);
+    lines_addz(out, "");
+    const int maxv = 10;
+    long start = (long)ms->selected - maxv / 2;
+    if (start > (long)ms->n - maxv) start = (long)ms->n - maxv;
+    if (start < 0) start = 0;
+    size_t end = MIN((size_t)start + maxv, ms->n);
+    for (size_t i = (size_t)start; i < end; i++) {
+        const CodeUiModel *m = &U->cfg->models[ms->idx[i]];
+        bool sel = i == ms->selected;
+        Buf l = {0};
+        if (sel) th_fgz(&l, T_ACCENT, "\xe2\x86\x92 ");
+        else buf_adds(&l, "  ");
+        if (is_current(m)) th_fgz(&l, T_ACCENT, "\xe2\x9c\x93 ");
+        else buf_adds(&l, "  ");
+        if (sel) th_fgz(&l, T_ACCENT, m->id);
+        else buf_adds(&l, m->id);
+        if (name_distinct(m->id, m->name)) {
+            Buf nm = {0};
+            buf_printf(&nm, " (%s)", m->name);
+            th_fg(&l, T_MUTED, buf_str(&nm));
+            buf_free(&nm);
+        }
+        buf_addc(&l, ' ');
+        Buf pb = {0};
+        buf_printf(&pb, "[%s]", m->provider);
+        th_fg(&l, T_MUTED, buf_str(&pb));
+        buf_free(&pb);
+        if (is_default_model(m)) th_fgz(&l, T_MUTED, " \xc2\xb7 default");
+        text_lines(buf_str(&l), 0, width, out);
+        buf_free(&l);
+    }
+    if (start > 0 || end < ms->n) {
+        Buf si = {0}, t = {0};
+        buf_printf(&si, "  (%zu/%zu)", ms->selected + 1, ms->n);
+        th_fg(&t, T_MUTED, buf_str(&si));
+        text_lines(buf_str(&t), 0, width, out);
+        buf_free(&si);
+        buf_free(&t);
+    }
+    Buf t = {0};
+    if (!ms->n) th_fgz(&t, T_MUTED, "  No matching models");
+    else {
+        lines_addz(out, "");
+        Buf nm = {0};
+        const CodeUiModel *m = &U->cfg->models[ms->idx[ms->selected]];
+        buf_printf(&nm, "  Model Name: %s", m->name ? m->name : m->id);
+        th_fg(&t, T_MUTED, buf_str(&nm));
+        buf_free(&nm);
+    }
+    text_lines(buf_str(&t), 0, width, out);
+    buf_free(&t);
+    lines_addz(out, "");
+    th_fgz(&t, T_SUCCESS, "  Model catalogs refreshed.");
+    text_lines(buf_str(&t), 0, width, out);
+    buf_free(&t);
+    lines_addz(out, "");
+    th_fgz(&t, T_DIM, "  Enter to select \xc2\xb7 Ctrl+S to set as default \xc2\xb7 Escape/Ctrl+C to cancel");
+    text_lines(buf_str(&t), 0, width, out);
+    buf_free(&t);
+    border_line(out, width, T_BORDER);
+}
+
+static void close_selector(void);
+static void show_status(const char *msg);
+
+static void choose_model(const CodeUiModel *m, bool persist) {
+    char *prov = strdup(m->provider), *id = strdup(m->id);
+    CodeUiModel copy = *m;
+    close_selector();
+    if (U->ops->set_model && !U->ops->set_model(U->host, prov, id)) {
+        show_error("Could not switch the model");
+    } else {
+        free((char *)U->model.provider);
+        free((char *)U->model.id);
+        free((char *)U->model.name);
+        U->model = (CodeUiModel){strdup(prov), strdup(id), dupz(copy.name), copy.reasoning, copy.context_window};
+        if (!copy.reasoning) {
+            free(U->thinking);
+            U->thinking = strdup("off");
+        }
+        editor_set_border(U->ed, th_thinking_color(U->thinking));
+        Buf b = {0};
+        if (persist) {
+            free(U->default_provider);
+            free(U->default_model);
+            U->default_provider = strdup(prov);
+            U->default_model = strdup(id);
+            buf_printf(&b, "Default model: %s/%s", prov, id);
+        } else buf_printf(&b, "Model: %s", id);
+        show_status(b.ptr);
+        buf_free(&b);
+    }
+    free(prov);
+    free(id);
+}
+
+static void open_model(const char *search) {
+    close_selector();
+    U->sel = SEL_MODEL;
+    ModelSel *ms = xcalloc(1, sizeof *ms);
+    U->sel_data = ms;
+    U->sel_free = model_sel_free;
+    if (search) {
+        buf_adds(&U->search.value, search);
+        U->search.cursor = U->search.value.len;
+    }
+    model_filter(ms, search);
+}
+
+static void model_key(const Key *k) {
+    ModelSel *ms = U->sel_data;
+    if (k->kind == K_UP && ms->n) ms->selected = ms->selected ? ms->selected - 1 : ms->n - 1;
+    else if (k->kind == K_DOWN && ms->n) ms->selected = ms->selected + 1 >= ms->n ? 0 : ms->selected + 1;
+    else if (k->kind == K_ENTER) {
+        if (ms->n) choose_model(&U->cfg->models[ms->idx[ms->selected]], false);
+    } else if (k->kind == K_ESC || (k->kind == K_CTRL && k->ch == 'c')) close_selector();
+    else if (k->kind == K_CTRL && k->ch == 's') {
+        if (ms->n) choose_model(&U->cfg->models[ms->idx[ms->selected]], true);
+    } else if (k->kind == K_TAB) {
+    } else if (input_key(&U->search, k)) model_filter(ms, U->search.value.ptr ? U->search.value.ptr : "");
+}
+
+// ---- the settings selector (settings-selector.ts, settings-list.ts) ---------------------------------------
+
+typedef struct {
+    const char *id, *label, *desc;
+    const char *values[8];
+    char cur[64];
+} SetItem;
+
+typedef struct {
+    SetItem items[40];
+    size_t n;
+    size_t *shown; // the filtered items
+    size_t nshown;
+    size_t selected;
+} SetSel;
+
+static const char *setting_str(const char *key, const char *dflt) {
+    const JValue *v = json_get(U->cfg->settings, key);
+    return json_str(v) ? json_str(v) : dflt;
+}
+
+static const char *setting_bool(const char *key, bool dflt) {
+    const JValue *v = json_get(U->cfg->settings, key);
+    return (json_is(v, J_BOOL) ? v->b : dflt) ? "true" : "false";
+}
+
+static void setting_num(char *out, size_t cap, const char *key, int dflt) {
+    const JValue *v = json_get(U->cfg->settings, key);
+    snprintf(out, cap, "%d", json_is(v, J_INTEGER) ? (int)v->i : dflt);
+}
+
+static void set_add(SetSel *s, const char *id, const char *label, const char *desc, const char *cur, const char *const *values) {
+    SetItem *it = &s->items[s->n++];
+    it->id = id;
+    it->label = label;
+    it->desc = desc;
+    snprintf(it->cur, sizeof it->cur, "%s", cur);
+    for (size_t k = 0; values && values[k] && k < 7; k++) it->values[k] = values[k];
+}
+
+static void settings_build(SetSel *s) {
+    static const char *const tf[] = {"true", "false", NULL};
+    static const char *const mode[] = {"one-at-a-time", "all", NULL};
+    char num[16];
+    set_add(s, "autocompact", "Auto-compact", "Automatically compact context when it gets too large", U->auto_compact ? "true" : "false", tf);
+    set_add(s, "auto-resize-images", "Auto-resize images", "Resize large images to 2000x2000 max for better model compatibility",
+            setting_bool("autoResizeImages", true), tf);
+    set_add(s, "block-images", "Block images", "Prevent images from being sent to LLM providers", setting_bool("blockImages", false), tf);
+    set_add(s, "skill-commands", "Skill commands", "Register skills as /skill:name commands", setting_bool("enableSkillCommands", true), tf);
+    set_add(s, "show-hardware-cursor", "Show hardware cursor", "Use the terminal cursor instead of Pi's drawn cursor",
+            setting_bool("showHardwareCursor", false), tf);
+    setting_num(num, sizeof num, "editorPaddingX", 0);
+    set_add(s, "editor-padding", "Editor padding", "Horizontal padding for input editor (0-3)", num, (const char *const[]){"0", "1", "2", "3", NULL});
+    setting_num(num, sizeof num, "outputPad", 1);
+    set_add(s, "output-padding", "Output padding", "Horizontal padding for messages, tool output, and command output", num,
+            (const char *const[]){"0", "1", NULL});
+    setting_num(num, sizeof num, "autocompleteMaxVisible", 5);
+    set_add(s, "autocomplete-max-visible", "Autocomplete max items", "Max visible items in autocomplete dropdown (3-20)", num,
+            (const char *const[]){"3", "5", "7", "10", "15", "20", NULL});
+    set_add(s, "clear-on-shrink", "Clear on shrink", "Clear empty rows when content shrinks (may cause flicker)",
+            setting_bool("clearOnShrink", false), tf);
+    set_add(s, "terminal-progress", "Terminal progress", "Show OSC 9;4 progress indicators in the terminal tab bar",
+            setting_bool("showTerminalProgress", false), tf);
+    set_add(s, "steering-mode", "Steering mode",
+            "Enter while streaming queues steering messages. 'one-at-a-time': deliver one, wait for response. 'all': deliver all at once.",
+            setting_str("steeringMode", "one-at-a-time"), mode);
+    set_add(s, "follow-up-mode", "Follow-up mode",
+            "Option+Enter queues follow-up messages until agent stops. 'one-at-a-time': deliver one, wait for response. 'all': deliver all at once.",
+            setting_str("followUpMode", "one-at-a-time"), mode);
+    set_add(s, "transport", "Transport", "Preferred transport for providers that support multiple transports", setting_str("transport", "auto"),
+            (const char *const[]){"sse", "websocket", "websocket-cached", "auto", NULL});
+    set_add(s, "share-destination", "Session share destination",
+            "Where to upload sessions with /share (auto prefers Radius when authenticated, otherwise GitHub Gist)",
+            setting_str("sessionShareDestination", "auto"), (const char *const[]){"auto", "gist", "radius", NULL});
+    set_add(s, "http-idle-timeout", "HTTP idle timeout",
+            "Maximum idle gap while waiting for HTTP headers or body chunks. Disable for local models that pause longer than five minutes.",
+            "5 min", (const char *const[]){"30 sec", "1 min", "2 min", "5 min", "disabled", NULL});
+    set_add(s, "cache-warming-mode", "Cache warming",
+            "off; streaming while the agent runs; idle also between runs while continuation stays profitable",
+            setting_str("cacheWarmingMode", "idle"), (const char *const[]){"off", "streaming", "idle", NULL});
+    set_add(s, "hide-thinking", "Hide thinking", "Hide thinking blocks in assistant responses", U->hide_thinking ? "true" : "false", tf);
+    set_add(s, "mermaid-rendering", "Mermaid diagrams", "Render Mermaid code blocks as Unicode diagrams",
+            setting_str("mermaidRendering", "streaming"), (const char *const[]){"off", "final", "streaming", NULL});
+    set_add(s, "cache-miss-notices", "Cache miss notices", "Show transcript notices for cache costs and provider recovery diagnostics",
+            setting_bool("showCacheMissNotices", false), tf);
+    set_add(s, "collapse-changelog", "Collapse changelog", "Show condensed changelog after updates", setting_bool("collapseChangelog", false), tf);
+    set_add(s, "quiet-startup", "Quiet startup", "Disable verbose printing at startup (header: keep only the startup header)",
+            setting_bool("quietStartup", false), (const char *const[]){"true", "header", "false", NULL});
+    set_add(s, "install-telemetry", "Install telemetry", "Send an anonymous version/update ping after changelog-detected updates",
+            setting_bool("enableInstallTelemetry", true), tf);
+    set_add(s, "default-project-trust", "Default project trust",
+            "Fallback behavior when no extension or saved trust decision decides project trust", "Ask",
+            (const char *const[]){"Ask", "Always trust", "Never trust", NULL});
+    set_add(s, "double-escape-action", "Double-escape action", "Action when pressing Escape twice with empty editor",
+            setting_str("doubleEscapeAction", "tree"), (const char *const[]){"tree", "fork", "none", NULL});
+    set_add(s, "tree-filter-mode", "Tree filter mode", "Default filter when opening /tree", setting_str("treeFilterMode", "default"),
+            (const char *const[]){"default", "no-tools", "user-only", "labeled-only", "all", NULL});
+    set_add(s, "warnings", "Warnings", "Enable or disable individual warnings", "configure", NULL);
+    set_add(s, "model-thinking", "Default thinking level per model",
+            "Override the default thinking level for specific models. Shift+Tab cycles in-session.", "none", NULL);
+    set_add(s, "tui-mode", "TUI mode", "Interface layout; regular mode uses the terminal's normal scrollback", "fullscreen",
+            (const char *const[]){"regular", "fullscreen", NULL});
+    set_add(s, "fullscreen-exit-output", "Fullscreen exit output",
+            "Print the transcript or only a session resume hint when exiting fullscreen mode", setting_str("fullscreenExitOutput", "transcript"),
+            (const char *const[]){"transcript", "resume-hint", NULL});
+    set_add(s, "fullscreen-scrollbar", "Fullscreen scrollbar", "Scrollbar behavior in fullscreen mode; has no effect in regular mode",
+            setting_str("fullscreenScrollbar", "auto"), (const char *const[]){"auto", "always", "hidden", NULL});
+    set_add(s, "fullscreen-copy-on-select", "Fullscreen copy on select",
+            "Automatically copy selected text in fullscreen mode; disable to copy selections with Ctrl+X",
+            setting_bool("fullscreenCopyOnSelect", true), tf);
+    set_add(s, "fullscreen-wheel-scroll-lines", "Fullscreen wheel scrolling",
+            "Lines per mouse-wheel event in fullscreen mode; 'auto' speeds up fast wheel spins where the terminal does not", "auto",
+            (const char *const[]){"auto", "1", "2", "3", "5", "10", NULL});
+    set_add(s, "theme", "Theme", "Color theme for the interface", setting_str("theme", "system"), NULL);
+}
+
+static void set_sel_free(void *p) {
+    free(((SetSel *)p)->shown);
+    free(p);
+}
+
+static void settings_filter(SetSel *s, const char *query) {
+    free(s->shown);
+    s->shown = xmalloc((s->n + 1) * sizeof *s->shown);
+    s->nshown = 0;
+    for (size_t i = 0; i < s->n; i++) {
+        bool ok = true;
+        const char *h = s->items[i].label;
+        for (const char *q = query ? query : ""; *q && ok; q++) {
+            if (*q == ' ') continue;
+            while (*h && tolower((unsigned char)*h) != tolower((unsigned char)*q)) h++;
+            if (!*h) ok = false;
+            else h++;
+        }
+        if (ok) s->shown[s->nshown++] = i;
+    }
+    s->selected = 0;
+}
+
+static void settings_render(int width, Lines *out) {
+    SetSel *s = U->sel_data;
+    border_line(out, width, T_BORDER);
+    input_render(&U->search, width, out);
+    lines_addz(out, "");
+    if (!s->nshown) {
+        Buf t = {0}, c = {0};
+        th_fgz(&t, T_DIM, "  No matching settings");
+        tui_truncate(&c, buf_str(&t), width, "...", false);
+        lines_addb(out, &c);
+        buf_free(&t);
+    } else {
+        int maxlabel = 0;
+        for (size_t i = 0; i < s->n; i++) maxlabel = MAX(maxlabel, tui_width(str(s->items[i].label)));
+        maxlabel = MIN(36, maxlabel);
+        const int maxv = 10;
+        long start = (long)s->selected - maxv / 2;
+        if (start > (long)s->nshown - maxv) start = (long)s->nshown - maxv;
+        if (start < 0) start = 0;
+        size_t end = MIN((size_t)start + maxv, s->nshown);
+        for (size_t i = (size_t)start; i < end; i++) {
+            const SetItem *it = &s->items[s->shown[i]];
+            bool sel = i == s->selected;
+            Buf l = {0}, lab = {0}, val = {0}, cut = {0};
+            if (sel) th_fgz(&l, T_ACCENT, "\xe2\x86\x92 ");
+            else buf_adds(&l, "  ");
+            buf_adds(&lab, it->label);
+            tui_spaces(&lab, maxlabel - tui_width(str(it->label)));
+            if (sel) th_fg(&l, T_ACCENT, buf_str(&lab));
+            else buf_addstr(&l, buf_str(&lab));
+            buf_adds(&l, "  ");
+            tui_truncate(&val, str(it->cur), width - (2 + maxlabel + 2) - 2, "", false);
+            th_fg(&l, sel ? T_ACCENT : T_MUTED, buf_str(&val));
+            tui_truncate(&cut, buf_str(&l), width, "...", false);
+            lines_addb(out, &cut);
+            buf_free(&l);
+            buf_free(&lab);
+            buf_free(&val);
+        }
+        if (start > 0 || end < s->nshown) {
+            char info[64];
+            snprintf(info, sizeof info, "  (%zu/%zu)", s->selected + 1, s->nshown);
+            Buf t = {0}, c = {0};
+            tui_truncate(&c, str(info), width - 2, "", false);
+            th_fg(&t, T_DIM, buf_str(&c));
+            lines_addb(out, &t);
+            buf_free(&c);
+        }
+        const SetItem *cur = &s->items[s->shown[s->selected]];
+        if (cur->desc) {
+            lines_addz(out, "");
+            Lines w = {0};
+            tui_wrap(str(cur->desc), width - 4, &w);
+            for (size_t k = 0; k < w.n; k++) {
+                Buf t = {0}, d = {0};
+                buf_printf(&d, "  %s", w.v[k]);
+                th_fg(&t, T_DIM, buf_str(&d));
+                lines_addb(out, &t);
+                buf_free(&d);
+            }
+            lines_free(&w);
+        }
+    }
+    lines_addz(out, "");
+    Buf h = {0}, c = {0};
+    th_fgz(&h, T_DIM, "  Type to search \xc2\xb7 Enter/Space to change \xc2\xb7 Esc to cancel");
+    tui_truncate(&c, buf_str(&h), width, "...", false);
+    lines_addb(out, &c);
+    buf_free(&h);
+    border_line(out, width, T_BORDER);
+}
+
+static void setting_changed(const char *id, const char *v) {
+    if (!strcmp(id, "autocompact")) U->auto_compact = !strcmp(v, "true");
+    else if (!strcmp(id, "hide-thinking")) U->hide_thinking = !strcmp(v, "true");
+}
+
+static void open_settings(void) {
+    close_selector();
+    U->sel = SEL_SETTINGS;
+    SetSel *s = xcalloc(1, sizeof *s);
+    U->sel_data = s;
+    U->sel_free = set_sel_free;
+    settings_build(s);
+    settings_filter(s, "");
+}
+
+static void settings_key(const Key *k) {
+    SetSel *s = U->sel_data;
+    if (k->kind == K_UP && s->nshown) s->selected = s->selected ? s->selected - 1 : s->nshown - 1;
+    else if (k->kind == K_DOWN && s->nshown) s->selected = s->selected + 1 >= s->nshown ? 0 : s->selected + 1;
+    else if (k->kind == K_ENTER || (k->kind == K_CHAR && k->ch == ' ' && !U->search.value.len)) {
+        if (!s->nshown) return;
+        SetItem *it = &s->items[s->shown[s->selected]];
+        if (!it->values[0]) {
+            Buf b = {0};
+            buf_printf(&b, "%s is not available in Saetta Code yet.", it->label);
+            show_status(b.ptr);
+            buf_free(&b);
+            return;
+        }
+        size_t nv = 0, ci = 0;
+        while (nv < 7 && it->values[nv]) {
+            if (!strcmp(it->values[nv], it->cur)) ci = nv;
+            nv++;
+        }
+        snprintf(it->cur, sizeof it->cur, "%s", it->values[(ci + 1) % nv]);
+        setting_changed(it->id, it->cur);
+    } else if (k->kind == K_ESC || (k->kind == K_CTRL && k->ch == 'c')) close_selector();
+    else if (input_key(&U->search, k)) settings_filter(s, U->search.value.ptr ? U->search.value.ptr : "");
+}
+
+// ---- the session tree (tree-selector.ts) ------------------------------------------------------------------
+
+typedef struct {
+    const JValue *entry;
+    int indent;
+    bool connector, last;
+} TreeRow;
+
+typedef struct {
+    Arena a;
+    JValue *entries;
+    const char *leaf;
+    VEC(TreeRow) flat;
+    VEC(size_t) shown;
+    size_t selected;
+    StrMap active; // ids on the path from the root to the leaf
+    Buf query;
+    int max_visible;
+} TreeSel;
+
+static void add_user(const JValue *m);
+
+static bool contains_ci(Str hay, Str needle) {
+    if (!needle.len) return true;
+    for (size_t i = 0; i + needle.len <= hay.len; i++)
+        if (!strncasecmp(hay.ptr + i, needle.ptr, needle.len)) return true;
+    return false;
+}
+
+static const JValue *entry_by_id(TreeSel *t, Str id) {
+    for (size_t i = 1; i < t->entries->arr.len; i++)
+        if (str_eq(json_strs(json_get(t->entries->arr.items[i], "id")), id)) return t->entries->arr.items[i];
+    return NULL;
+}
+
+static bool has_text(const JValue *content) {
+    if (json_is(content, J_STRING)) return str_trim(content->s).len > 0;
+    for (size_t i = 0; content && json_is(content, J_ARRAY) && i < content->arr.len; i++)
+        if (str_eqz(json_strs(json_get(content->arr.items[i], "type")), "text") && str_trim(json_strs(json_get(content->arr.items[i], "text"))).len)
+            return true;
+    return false;
+}
+
+static void content_text(Buf *b, const JValue *content, size_t max) {
+    if (json_is(content, J_STRING)) buf_addstr(b, content->s);
+    else
+        for (size_t i = 0; content && json_is(content, J_ARRAY) && i < content->arr.len; i++)
+            if (str_eqz(json_strs(json_get(content->arr.items[i], "type")), "text")) buf_addstr(b, json_strs(json_get(content->arr.items[i], "text")));
+    // the first 200 characters, newlines and tabs as spaces, trimmed
+    size_t cut = 0, chars = 0;
+    while (cut < b->len && chars < max) {
+        size_t k = cut;
+        tui_cp(buf_str(b), &k);
+        cut = k;
+        chars++;
+    }
+    b->len = cut;
+    for (size_t i = 0; i < b->len; i++)
+        if (b->ptr[i] == '\n' || b->ptr[i] == '\t') b->ptr[i] = ' ';
+    Str t = str_trim(buf_str(b));
+    if (b->ptr) {
+        memmove(b->ptr, t.ptr, t.len);
+        b->len = t.len;
+        b->ptr[b->len] = 0;
+    }
+}
+
+static void tool_call_label(TreeSel *t, Buf *b, Str call_id, const char *tool_name) {
+    // the call in an assistant message
+    const JValue *args = NULL;
+    Str name = str(tool_name ? tool_name : "tool");
+    bool found = false;
+    for (size_t i = 1; i < t->entries->arr.len && !found; i++) {
+        const JValue *m = json_get(t->entries->arr.items[i], "message");
+        const JValue *c = json_get(m, "content");
+        for (size_t k = 0; c && json_is(c, J_ARRAY) && k < c->arr.len; k++)
+            if (str_eqz(json_strs(json_get(c->arr.items[k], "type")), "toolCall") && str_eq(json_strs(json_get(c->arr.items[k], "id")), call_id)) {
+                args = json_get(c->arr.items[k], "arguments");
+                name = json_strs(json_get(c->arr.items[k], "name"));
+                found = true;
+                break;
+            }
+    }
+    if (!found) {
+        buf_printf(b, "[%.*s]", (int)name.len, name.ptr);
+        return;
+    }
+    Buf p = {0};
+    const JValue *pv = json_get(args, "path");
+    if (!pv) pv = json_get(args, "file_path");
+    shorten_path(&p, json_strs(pv).len ? json_strs(pv) : (str_eqz(name, "grep") || str_eqz(name, "find") || str_eqz(name, "ls") ? S(".") : S("")));
+    if (str_eqz(name, "read") || str_eqz(name, "write") || str_eqz(name, "edit") || str_eqz(name, "ls"))
+        buf_printf(b, "[%.*s: %s]", (int)name.len, name.ptr, p.ptr ? p.ptr : "");
+    else if (str_eqz(name, "bash")) {
+        Buf c = {0};
+        Str raw = json_strs(json_get(args, "command"));
+        for (size_t i = 0; i < raw.len; i++) buf_addc(&c, raw.ptr[i] == '\n' || raw.ptr[i] == '\t' ? ' ' : raw.ptr[i]);
+        Str tr = str_trim(buf_str(&c));
+        buf_printf(b, "[bash: %.*s%s]", (int)MIN(tr.len, 50), tr.ptr, raw.len > 50 ? "..." : "");
+        buf_free(&c);
+    } else if (str_eqz(name, "grep"))
+        buf_printf(b, "[grep: /%s/ in %s]", json_str(json_get(args, "pattern")) ? json_str(json_get(args, "pattern")) : "", p.ptr);
+    else if (str_eqz(name, "find"))
+        buf_printf(b, "[find: %s in %s]", json_str(json_get(args, "pattern")) ? json_str(json_get(args, "pattern")) : "", p.ptr);
+    else {
+        Buf j = {0};
+        json_write(&j, args);
+        buf_printf(b, "[%.*s: %.*s%s]", (int)name.len, name.ptr, (int)MIN(j.len, 40), j.ptr ? j.ptr : "", j.len > 40 ? "..." : "");
+        buf_free(&j);
+    }
+    buf_free(&p);
+}
+
+// getEntryDisplayText
+static void entry_text(TreeSel *t, const JValue *e, bool selected, Buf *out) {
+    Buf r = {0};
+    Str type = json_strs(json_get(e, "type"));
+    if (str_eqz(type, "message")) {
+        const JValue *m = json_get(e, "message");
+        Str role = json_strs(json_get(m, "role"));
+        Buf c = {0};
+        if (str_eqz(role, "user")) {
+            content_text(&c, json_get(m, "content"), 200);
+            th_fgz(&r, T_ACCENT, "user: ");
+            buf_addstr(&r, buf_str(&c));
+        } else if (str_eqz(role, "assistant")) {
+            content_text(&c, json_get(m, "content"), 200);
+            th_fgz(&r, T_SUCCESS, "assistant: ");
+            if (c.len) buf_addstr(&r, buf_str(&c));
+            else if (str_eqz(json_strs(json_get(m, "stopReason")), "aborted")) th_fgz(&r, T_MUTED, "(aborted)");
+            else if (json_str(json_get(m, "errorMessage"))) {
+                Buf em = {0};
+                Str es = json_strs(json_get(m, "errorMessage"));
+                for (size_t i = 0; i < es.len; i++) buf_addc(&em, es.ptr[i] == '\n' || es.ptr[i] == '\t' ? ' ' : es.ptr[i]);
+                Str tr = str_trim(buf_str(&em));
+                th_fg(&r, T_ERROR, str_n(tr.ptr, MIN(tr.len, 80)));
+                buf_free(&em);
+            } else th_fgz(&r, T_MUTED, "(no content)");
+        } else if (str_eqz(role, "toolResult")) {
+            Buf l = {0};
+            tool_call_label(t, &l, json_strs(json_get(m, "toolCallId")), json_str(json_get(m, "toolName")));
+            th_fg(&r, T_MUTED, buf_str(&l));
+            buf_free(&l);
+        } else {
+            Buf l = {0};
+            buf_printf(&l, "[%.*s]", (int)role.len, role.ptr);
+            th_fg(&r, T_DIM, buf_str(&l));
+            buf_free(&l);
+        }
+        buf_free(&c);
+    } else if (str_eqz(type, "compaction")) {
+        Buf l = {0};
+        buf_printf(&l, "[compaction: %.0fk tokens]", round(jnum(json_get(e, "tokensBefore")) / 1000));
+        th_fg(&r, T_BORDER_ACCENT, buf_str(&l));
+        buf_free(&l);
+    } else if (str_eqz(type, "branch_summary")) {
+        th_fgz(&r, T_WARNING, "[branch summary]: ");
+        buf_addstr(&r, str_trim(json_strs(json_get(e, "summary"))));
+    } else {
+        Buf l = {0};
+        if (str_eqz(type, "model_change")) buf_printf(&l, "[model: %s]", json_str(json_get(e, "modelId")) ? json_str(json_get(e, "modelId")) : "");
+        else if (str_eqz(type, "thinking_level_change"))
+            buf_printf(&l, "[thinking: %s]", json_str(json_get(e, "thinkingLevel")) ? json_str(json_get(e, "thinkingLevel")) : "");
+        else if (str_eqz(type, "context_edit"))
+            buf_printf(&l, "[context %s: %s]", json_is(json_get(e, "replacement"), J_NULL) ? "omit" : "replace",
+                       json_str(json_get(e, "targetId")) ? json_str(json_get(e, "targetId")) : "");
+        else if (str_eqz(type, "custom")) buf_printf(&l, "[custom: %s]", json_str(json_get(e, "customType")) ? json_str(json_get(e, "customType")) : "");
+        else if (str_eqz(type, "label")) buf_printf(&l, "[label: %s]", json_str(json_get(e, "label")) ? json_str(json_get(e, "label")) : "(cleared)");
+        if (l.len) th_fg(&r, T_DIM, buf_str(&l));
+        buf_free(&l);
+    }
+    if (selected) {
+        buf_adds(out, "\x1b[1m");
+        buf_addstr(out, buf_str(&r));
+        buf_adds(out, "\x1b[22m");
+    } else buf_addstr(out, buf_str(&r));
+    buf_free(&r);
+}
+
+static bool tree_hidden(TreeSel *t, const JValue *e) {
+    Str type = json_strs(json_get(e, "type"));
+    if (str_eqz(type, "usage")) return true;
+    bool leaf = t->leaf && str_eqz(json_strs(json_get(e, "id")), t->leaf);
+    if (str_eqz(type, "message") && !leaf) {
+        const JValue *m = json_get(e, "message");
+        if (str_eqz(json_strs(json_get(m, "role")), "assistant")) {
+            Str stop = json_strs(json_get(m, "stopReason"));
+            bool err = stop.len && !str_eqz(stop, "stop") && !str_eqz(stop, "toolUse");
+            if (!has_text(json_get(m, "content")) && !err) return true;
+        }
+    }
+    return str_eqz(type, "label") || str_eqz(type, "context_edit") || str_eqz(type, "custom") || str_eqz(type, "model_change") ||
+           str_eqz(type, "thinking_level_change") || str_eqz(type, "session_info");
+}
+
+// flattenTree: depth first, the branch holding the leaf first, children of a branching node indented.
+static void tree_flatten(TreeSel *t) {
+    size_t n = t->entries->arr.len;
+    // children lists
+    VEC(size_t) *kids = xcalloc(n + 1, sizeof *kids);
+    VEC(size_t) roots = {0};
+    for (size_t i = 1; i < n; i++) {
+        const JValue *p = json_get(t->entries->arr.items[i], "parentId");
+        long pi = -1;
+        if (json_is(p, J_STRING))
+            for (size_t k = 1; k < n; k++)
+                if (str_eq(json_strs(json_get(t->entries->arr.items[k], "id")), p->s)) {
+                    pi = (long)k;
+                    break;
+                }
+        if (pi < 0) vec_push(&roots, i);
+        else vec_push(&kids[pi], i);
+    }
+    bool *active = xcalloc(n + 1, sizeof *active);
+    for (size_t i = 1; i < n; i++) active[i] = strmap_has(&t->active, json_strs(json_get(t->entries->arr.items[i], "id")));
+    typedef struct {
+        size_t node;
+        int indent;
+        bool just_branched, connector, last;
+    } Item;
+    VEC(Item) stack = {0};
+    bool multi = roots.len > 1;
+    for (size_t i = roots.len; i-- > 0;) vec_push(&stack, ((Item){roots.ptr[i], multi ? 1 : 0, multi, multi, i == roots.len - 1}));
+    while (stack.len) {
+        Item it = stack.ptr[--stack.len];
+        vec_push(&t->flat, ((TreeRow){t->entries->arr.items[it.node], multi ? MAX(0, it.indent - 1) : it.indent, it.connector, it.last}));
+        size_t nk = kids[it.node].len;
+        bool many = nk > 1;
+        int ci = many ? it.indent + 1 : (it.just_branched && it.indent > 0) ? it.indent + 1 : it.indent;
+        // the active child first
+        VEC(size_t) ord = {0};
+        for (size_t k = 0; k < nk; k++)
+            if (active[kids[it.node].ptr[k]]) vec_push(&ord, kids[it.node].ptr[k]);
+        for (size_t k = 0; k < nk; k++)
+            if (!active[kids[it.node].ptr[k]]) vec_push(&ord, kids[it.node].ptr[k]);
+        for (size_t k = ord.len; k-- > 0;) vec_push(&stack, ((Item){ord.ptr[k], ci, many, many, k == ord.len - 1}));
+        vec_free(&ord);
+    }
+    for (size_t i = 0; i <= n; i++) vec_free(&kids[i]);
+    free(kids);
+    free(active);
+    vec_free(&roots);
+    vec_free(&stack);
+}
+
+static void tree_filter(TreeSel *t, bool keep) {
+    const JValue *prev = keep && t->shown.len ? t->flat.ptr[t->shown.ptr[t->selected]].entry : NULL;
+    t->shown.len = 0;
+    for (size_t i = 0; i < t->flat.len; i++) {
+        const JValue *e = t->flat.ptr[i].entry;
+        if (tree_hidden(t, e)) continue;
+        if (t->query.len) {
+            Buf hay = {0};
+            entry_text(t, e, false, &hay);
+            Buf plain = {0};
+            tui_strip(&plain, buf_str(&hay));
+            bool ok = true;
+            Str q = buf_str(&t->query);
+            for (size_t p = 0; p < q.len && ok;) {
+                while (p < q.len && q.ptr[p] == ' ') p++;
+                size_t s0 = p;
+                while (p < q.len && q.ptr[p] != ' ') p++;
+                if (p > s0 && !contains_ci(buf_str(&plain), str_sub(q, s0, p))) ok = false;
+            }
+            buf_free(&hay);
+            buf_free(&plain);
+            if (!ok) continue;
+        }
+        vec_push(&t->shown, i);
+    }
+    t->selected = t->shown.len ? t->shown.len - 1 : 0;
+    // the leaf (or the nearest visible entry above it), else the one kept
+    const char *target = prev ? json_str(json_get(prev, "id")) : t->leaf;
+    for (const char *id = target; id;) {
+        bool found = false;
+        for (size_t k = 0; k < t->shown.len; k++)
+            if (!strcmp(json_str(json_get(t->flat.ptr[t->shown.ptr[k]].entry, "id")), id)) {
+                t->selected = k;
+                found = true;
+                break;
+            }
+        if (found) break;
+        const JValue *e = entry_by_id(t, str(id));
+        const JValue *p = e ? json_get(e, "parentId") : NULL;
+        id = json_is(p, J_STRING) ? p->s.ptr : NULL;
+    }
+}
+
+static void tree_render(int width, Lines *out) {
+    TreeSel *t = U->sel_data;
+    lines_addz(out, "");
+    border_line(out, width, T_BORDER);
+    Buf b = {0};
+    buf_adds(&b, "\x1b[1m  Session Tree\x1b[22m");
+    text_lines(buf_str(&b), 1, width, out);
+    b.len = 0;
+    // the key help, wrapped on item boundaries (TreeHelp)
+    static const char *const help[] = {"\xe2\x86\x91/\xe2\x86\x93 move", "\xe2\x86\x90/\xe2\x86\x92 page", "option+\xe2\x86\x90/\xe2\x86\x92 branch",
+                                       "ctrl+x copy", "shift+l label", "shift+t label time", "filters ctrl+d/t/u/l/a",
+                                       "cycle ctrl+o/shift+ctrl+o"};
+    Buf cur = {0};
+    for (size_t i = 0; i < COUNT(help); i++) {
+        Buf cand = {0};
+        if (cur.len) buf_printf(&cand, "%s \xc2\xb7 %s", cur.ptr, help[i]);
+        else buf_printf(&cand, "  %s", help[i]);
+        if (!cur.len || tui_width(buf_str(&cand)) <= width) {
+            buf_free(&cur);
+            cur = cand;
+            continue;
+        }
+        Lines w = {0};
+        tui_wrap(buf_str(&cur), width, &w);
+        for (size_t k = 0; k < w.n; k++) {
+            Buf l = {0};
+            th_fgz(&l, T_MUTED, w.v[k]);
+            lines_addb(out, &l);
+        }
+        lines_free(&w);
+        buf_free(&cur);
+        buf_printf(&cur, "  %s", help[i]);
+        buf_free(&cand);
+    }
+    if (cur.len) {
+        Lines w = {0};
+        tui_wrap(buf_str(&cur), width, &w);
+        for (size_t k = 0; k < w.n; k++) {
+            Buf l = {0};
+            th_fgz(&l, T_MUTED, w.v[k]);
+            lines_addb(out, &l);
+        }
+        lines_free(&w);
+    }
+    buf_free(&cur);
+    // the search line, focused
+    buf_adds(&b, "  ");
+    th_fgz(&b, T_MUTED, "Type to search:");
+    buf_addc(&b, ' ');
+    if (t->query.len) th_fg(&b, T_ACCENT, buf_str(&t->query));
+    Buf c = {0};
+    tui_truncate(&c, buf_str(&b), MAX(0, width - 1), "...", false);
+    buf_adds(&c, "\x1b[7m \x1b[27m");
+    lines_addb(out, &c);
+    buf_free(&b);
+    border_line(out, width, T_BORDER);
+    lines_addz(out, "");
+    if (!t->shown.len) {
+        Buf l = {0};
+        th_fgz(&l, T_MUTED, "  No entries found");
+        lines_addb(out, &l);
+        th_fgz(&l, T_MUTED, "  (0/0)");
+        lines_addb(out, &l);
+    } else {
+        long start = (long)t->selected - t->max_visible / 2;
+        if (start > (long)t->shown.len - t->max_visible) start = (long)t->shown.len - t->max_visible;
+        if (start < 0) start = 0;
+        size_t end = MIN((size_t)start + (size_t)t->max_visible, t->shown.len);
+        for (size_t i = (size_t)start; i < end; i++) {
+            const TreeRow *row = &t->flat.ptr[t->shown.ptr[i]];
+            bool sel = i == t->selected;
+            Buf l = {0}, prefix = {0};
+            if (sel) th_fgz(&l, T_ACCENT, "\xe2\x80\xba ");
+            else buf_adds(&l, "  ");
+            for (int k = 0; k < row->indent; k++) {
+                if (k == row->indent - 1 && row->connector) buf_adds(&prefix, row->last ? "\xe2\x94\x94\xe2\x94\x80 " : "\xe2\x94\x9c\xe2\x94\x80 ");
+                else buf_adds(&prefix, "   ");
+            }
+            th_fg(&l, T_DIM, buf_str(&prefix));
+            if (strmap_has(&t->active, json_strs(json_get(row->entry, "id")))) th_fgz(&l, T_ACCENT, "\xe2\x80\xa2 ");
+            entry_text(t, row->entry, sel, &l);
+            Buf cut = {0};
+            tui_truncate(&cut, buf_str(&l), width, "", false);
+            lines_addb(out, &cut);
+            buf_free(&l);
+            buf_free(&prefix);
+        }
+        Buf info = {0}, l = {0};
+        buf_printf(&info, "  (%zu/%zu)", t->selected + 1, t->shown.len);
+        th_fg(&l, T_MUTED, buf_str(&info));
+        lines_addb(out, &l);
+        buf_free(&info);
+    }
+    lines_addz(out, "");
+    border_line(out, width, T_BORDER);
+}
+
+static void render_history(void);
+static void tree_free_any(void *p);
+
+static void open_tree(void) {
+    const char *leaf = NULL;
+    const JValue *entries = U->ops->entries ? U->ops->entries(U->host, &leaf) : NULL;
+    if (!entries || !json_is(entries, J_ARRAY) || entries->arr.len <= 1) {
+        show_status("No entries in session");
+        return;
+    }
+    close_selector();
+    TreeSel *t = xcalloc(1, sizeof *t);
+    t->entries = jcopy(&t->a, entries);
+    t->leaf = leaf ? arena_strdup(&t->a, leaf) : NULL;
+    t->max_visible = MAX(5, U->scr.rows / 2);
+    // the active path
+    for (const char *id = t->leaf; id;) {
+        const JValue *e = entry_by_id(t, str(id));
+        if (!e) break;
+        strmap_put(&t->active, json_strs(json_get(e, "id")), (void *)e);
+        const JValue *p = json_get(e, "parentId");
+        id = json_is(p, J_STRING) ? p->s.ptr : NULL;
+    }
+    tree_flatten(t);
+    tree_filter(t, false);
+    U->sel = SEL_TREE;
+    U->sel_data = t;
+    U->sel_free = tree_free_any;
+}
+
+static void tree_free(TreeSel *t);
+static void tree_free_any(void *p) { tree_free(p); }
+static void tree_free(TreeSel *t) {
+    vec_free(&t->flat);
+    vec_free(&t->shown);
+    strmap_free(&t->active);
+    buf_free(&t->query);
+    arena_reset(&t->a);
+    free(t);
+}
+
+static void tree_key(const Key *k) {
+    TreeSel *t = U->sel_data;
+    size_t n = t->shown.len;
+    if (k->kind == K_UP && n) t->selected = t->selected ? t->selected - 1 : n - 1;
+    else if (k->kind == K_DOWN && n) t->selected = t->selected + 1 >= n ? 0 : t->selected + 1;
+    else if ((k->kind == K_LEFT || k->kind == K_PGUP) && n) t->selected = t->selected > (size_t)t->max_visible ? t->selected - (size_t)t->max_visible : 0;
+    else if ((k->kind == K_RIGHT || k->kind == K_PGDN) && n) t->selected = MIN(n - 1, t->selected + (size_t)t->max_visible);
+    else if (k->kind == K_ESC || (k->kind == K_CTRL && k->ch == 'c')) {
+        if (t->query.len) {
+            t->query.len = 0;
+            tree_filter(t, true);
+        } else close_selector();
+    } else if (k->kind == K_ENTER && n) {
+        const JValue *e = t->flat.ptr[t->shown.ptr[t->selected]].entry;
+        const char *id = json_str(json_get(e, "id"));
+        if (t->leaf && id && !strcmp(id, t->leaf)) {
+            close_selector();
+            show_status("Already at this point");
+            return;
+        }
+        // navigateTree without a summary: a user message goes back to the editor and the leaf moves
+        // to its parent; any other entry becomes the leaf
+        const JValue *m = json_get(e, "message");
+        bool user = str_eqz(json_strs(json_get(e, "type")), "message") && str_eqz(json_strs(json_get(m, "role")), "user");
+        Buf text = {0};
+        if (user) {
+            const JValue *c = json_get(m, "content");
+            if (json_is(c, J_STRING)) buf_addstr(&text, c->s);
+            else
+                for (size_t i = 0; c && json_is(c, J_ARRAY) && i < c->arr.len; i++)
+                    if (str_eqz(json_strs(json_get(c->arr.items[i], "type")), "text")) buf_addstr(&text, json_strs(json_get(c->arr.items[i], "text")));
+        }
+        const JValue *p = json_get(e, "parentId");
+        char *target = user ? (json_is(p, J_STRING) ? strndup(p->s.ptr, p->s.len) : NULL) : strdup(id);
+        close_selector();
+        if (U->ops->set_leaf) U->ops->set_leaf(U->host, target);
+        free(target);
+        render_history();
+        if (user) editor_set_text(U->ed, buf_str(&text));
+        buf_free(&text);
+    } else if (k->kind == K_BACKSPACE && t->query.len) {
+        size_t p = t->query.len - 1;
+        while (p > 0 && ((unsigned char)t->query.ptr[p] & 0xc0) == 0x80) p--;
+        t->query.len = p;
+        t->query.ptr[p] = 0;
+        tree_filter(t, true);
+    } else if (k->kind == K_CHAR && k->ch >= 0x20) {
+        char enc[5] = {0};
+        size_t i = 0;
+        uint32_t cp = k->ch;
+        if (cp < 0x80) enc[i++] = (char)cp;
+        else if (cp < 0x800) {
+            enc[i++] = (char)(0xc0 | cp >> 6);
+            enc[i++] = (char)(0x80 | (cp & 0x3f));
+        } else {
+            enc[i++] = (char)(0xe0 | cp >> 12);
+            enc[i++] = (char)(0x80 | ((cp >> 6) & 0x3f));
+            enc[i++] = (char)(0x80 | (cp & 0x3f));
+        }
+        buf_add(&t->query, enc, i);
+        tree_filter(t, true);
+    }
+}
+
+// ---- the transcript of a session (renderSessionItems) ------------------------------------------------------
+
+static void render_history(void) {
+    comp_clear(U->chat);
+    U->stats.len = 0;
+    U->last_status_text = U->last_status_spacer = NULL;
+    U->pending_tools.len = 0;
+    const JValue *msgs = U->ops->messages ? U->ops->messages(U->host) : NULL;
+    VEC(ToolView *) open = {0};
+    for (size_t i = 0; msgs && json_is(msgs, J_ARRAY) && i < msgs->arr.len; i++) {
+        const JValue *m = msgs->arr.items[i];
+        account(m);
+        Str role = json_strs(json_get(m, "role"));
+        if (str_eqz(role, "user")) add_user(m);
+        else if (str_eqz(role, "assistant")) {
+            AsstView *v = asst_new(m);
+            chat_add(&v->base);
+            const JValue *c = json_get(m, "content");
+            for (size_t k = 0; c && json_is(c, J_ARRAY) && k < c->arr.len; k++) {
+                const JValue *b = c->arr.items[k];
+                if (!str_eqz(json_strs(json_get(b, "type")), "toolCall")) continue;
+                ToolView *t = tool_new(json_str(json_get(b, "name")), json_str(json_get(b, "id")), json_get(b, "arguments"));
+                t->started = t->args_complete = true;
+                chat_add(&t->base);
+                vec_push(&open, t);
+            }
+            Str stop = json_strs(json_get(m, "stopReason"));
+            if (str_eqz(stop, "aborted") || str_eqz(stop, "error")) {
+                const char *em = json_str(json_get(m, "errorMessage"));
+                Arena ra = {0};
+                JValue *res = json_new(&ra, J_OBJECT), *content = json_new(&ra, J_ARRAY), *blk = json_new(&ra, J_OBJECT);
+                json_put(&ra, blk, S("type"), json_string(&ra, S("text")));
+                json_put(&ra, blk, S("text"), json_string(&ra, str(em ? em : "Error")));
+                json_push(&ra, content, blk);
+                json_put(&ra, res, S("content"), content);
+                for (size_t k = 0; k < open.len; k++) tool_set_result(open.ptr[k], res, true, false, NULL);
+                open.len = 0;
+                arena_reset(&ra);
+            }
+        } else if (str_eqz(role, "toolResult")) {
+            Str id = json_strs(json_get(m, "toolCallId"));
+            for (size_t k = 0; k < open.len; k++)
+                if (str_eqz(id, open.ptr[k]->id)) {
+                    tool_set_result(open.ptr[k], m, jtrue(json_get(m, "isError")), false, json_get(m, "durationMs"));
+                    memmove(open.ptr + k, open.ptr + k + 1, (open.len - k - 1) * sizeof(ToolView *));
+                    open.len--;
+                    break;
+                }
+        }
+    }
+    vec_free(&open);
 }
 
 // ---- layout and drawing --------------------------------------------------------------------------------
@@ -1666,6 +2713,9 @@ static void render_dock(int width, Lines *out) {
     comp_render(U->status, width, out);
     lines_addz(out, ""); // the widgets above the editor: a spacer when there are none
     if (U->sel == SEL_THINKING) thinking_render(width, out);
+    else if (U->sel == SEL_MODEL) model_render(width, out);
+    else if (U->sel == SEL_SETTINGS) settings_render(width, out);
+    else if (U->sel == SEL_TREE) tree_render(width, out);
     else editor_render(U->ed, width, out);
     footer_render(NULL, width, out);
 }
@@ -1772,6 +2822,11 @@ static void handle_event(const JValue *ev) {
     if (str_eqz(type, "ui_idle")) {
         U->busy = false;
         set_working(false);
+        if (U->pending_thinking) {
+            if (U->ops->set_thinking) U->ops->set_thinking(U->host, U->pending_thinking);
+            free(U->pending_thinking);
+            U->pending_thinking = NULL;
+        }
         if (U->queued.len) {
             char *next = U->queued.ptr[0];
             memmove(U->queued.ptr, U->queued.ptr + 1, (U->queued.len - 1) * sizeof(char *));
@@ -1977,12 +3032,40 @@ static void submit(char *text) {
             free(s);
             return;
         }
+        if (!strcmp(c, "settings")) {
+            open_settings();
+            free(s);
+            return;
+        }
+        if (!strcmp(c, "tree")) {
+            if (!U->busy) open_tree();
+            free(s);
+            return;
+        }
+        if (!strcmp(c, "model") || !strncmp(c, "model ", 6)) {
+            const char *arg = !strncmp(c, "model ", 6) ? c + 6 : NULL;
+            while (arg && *arg == ' ') arg++;
+            if (arg && *arg) {
+                // an exact provider/id or id
+                const CodeUiModel *hit = NULL;
+                for (size_t i = 0; i < U->cfg->nmodels && !hit; i++) {
+                    const CodeUiModel *m = &U->cfg->models[i];
+                    char full[512];
+                    snprintf(full, sizeof full, "%s/%s", m->provider, m->id);
+                    if (!strcasecmp(arg, full) || !strcasecmp(arg, m->id)) hit = m;
+                }
+                if (hit) choose_model(hit, false);
+                else open_model(arg);
+            } else open_model(NULL);
+            free(s);
+            return;
+        }
         if (!strcmp(c, "quit")) {
             U->quit = true;
             free(s);
             return;
         }
-        static const char *const known[] = {"settings", "model", "tree", "scoped-models", "export", "import", "share", "bug", "copy",
+        static const char *const known[] = {"scoped-models", "export", "import", "share", "bug", "copy",
                                             "name", "session", "changelog", "hotkeys", "fork", "clone", "trust", "login", "logout",
                                             "compact", "resume", "reload", "llama", "mcp"};
         for (size_t i = 0; i < COUNT(known); i++) {
@@ -2023,7 +3106,7 @@ static void toggle_tools(void) {
 }
 
 static void cycle_thinking(void) {
-    if (!U->cfg->reasoning) {
+    if (!U->model.reasoning) {
         show_status("Current model does not support thinking");
         return;
     }
@@ -2039,7 +3122,10 @@ static void cycle_thinking(void) {
 }
 
 static void selector_key(const Key *k) {
-    if (U->sel == SEL_THINKING) {
+    if (U->sel == SEL_MODEL) model_key(k);
+    else if (U->sel == SEL_SETTINGS) settings_key(k);
+    else if (U->sel == SEL_TREE) tree_key(k);
+    else if (U->sel == SEL_THINKING) {
         if (k->kind == K_UP) sel_up(&U->list);
         else if (k->kind == K_DOWN) sel_down(&U->list);
         else if (k->kind == K_ENTER) {
@@ -2114,6 +3200,10 @@ static void handle_key(const Key *k) {
         toggle_tools();
         return;
     }
+    if (k->kind == K_CTRL && k->ch == 'l') {
+        open_model(NULL);
+        return;
+    }
     if (k->kind == K_CTRL && k->ch == 't') {
         U->hide_thinking = !U->hide_thinking;
         return;
@@ -2155,7 +3245,17 @@ Err code_ui_run(const CodeUiConfig *cfg, const CodeUiOps *ops, CodeUiHost *host,
     ui.ops = ops;
     ui.host = host;
     ui.thinking = dupz(cfg->thinking ? cfg->thinking : "off");
-    ui.default_thinking = dupz("medium");
+    ui.model = (CodeUiModel){dupz(cfg->model.provider), dupz(cfg->model.id), dupz(cfg->model.name), cfg->model.reasoning,
+                             cfg->model.context_window};
+    ui.auto_compact = cfg->auto_compact;
+    ui.default_provider = dupz(cfg->default_provider);
+    ui.default_model = dupz(cfg->default_model);
+    {
+        const char *dt = json_str(json_get(cfg->settings, "defaultThinkingLevel"));
+        free(ui.default_thinking);
+        ui.default_thinking = dupz(dt ? dt : "medium");
+        ui.hide_thinking = json_is(json_get(cfg->settings, "hideThinkingBlock"), J_BOOL) && json_get(cfg->settings, "hideThinkingBlock")->b;
+    }
     ui.header = comp_fn(header_render, NULL);
     ui.chat = comp_container();
     ui.pending = comp_container();
@@ -2175,6 +3275,7 @@ Err code_ui_run(const CodeUiConfig *cfg, const CodeUiOps *ops, CodeUiHost *host,
     sa.sa_handler = on_winch;
     sigaction(SIGWINCH, &sa, NULL);
     screen_start(&ui.scr);
+    if (cfg->resumed) render_history();
     draw(true);
     for (size_t i = 0; i < ninitial; i++) submit((char *)initial[i]);
     char in[65536];
@@ -2288,6 +3389,12 @@ Err code_ui_run(const CodeUiConfig *cfg, const CodeUiOps *ops, CodeUiHost *host,
     vec_free(&ui.queued);
     free(ui.thinking);
     free(ui.default_thinking);
+    free((char *)ui.model.provider);
+    free((char *)ui.model.id);
+    free((char *)ui.model.name);
+    free(ui.default_provider);
+    free(ui.default_model);
+    free(ui.pending_thinking);
     free(ui.job);
     U = NULL;
     return OK;

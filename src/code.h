@@ -124,6 +124,10 @@ const JValue *code_session_header(const CodeSession *s);
 const JValue *code_session_last(const CodeSession *s, const char *type, const char *field);
 // The session file (written once the session holds a message), NULL when not persisted.
 const char *code_session_path(const CodeSession *s);
+// Every entry, the header first (the whole tree, for /tree).
+const JValue *code_session_entries(const CodeSession *s);
+// Moves the current leaf (pi's branch()): the next entry is appended under it. NULL: the root.
+void code_session_set_leaf(CodeSession *s, const char *id);
 // The id of the last entry appended (the current leaf), NULL before the first.
 const char *code_session_leaf(const CodeSession *s);
 // The last entry appended (the header before any).

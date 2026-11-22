@@ -920,7 +920,68 @@ static void host_set_thinking(CodeUiHost *h, const char *level) {
     (void)code_session_append(r->session, "thinking_level_change", f);
 }
 
-static const JValue *host_entries(CodeUiHost *h) { return code_session_messages(h->r->session); }
+static const JValue *host_entries(CodeUiHost *h, const char **leaf) {
+    *leaf = code_session_leaf(h->r->session);
+    return code_session_entries(h->r->session);
+}
+
+static const JValue *host_messages(CodeUiHost *h) { return code_session_messages(h->r->session); }
+
+static void host_set_leaf(CodeUiHost *h, const char *id) { code_session_set_leaf(h->r->session, id); }
+
+static bool host_set_model(CodeUiHost *h, const char *provider, const char *id) {
+    Run *r = h->r;
+    if (r->model.engine) return !strcmp(provider, r->model.provider) && !strcmp(id, r->model.id);
+    Arena *a = r->a;
+    CodeModel keep = r->model;
+    Args o = {.provider = arena_strdup(a, provider), .model = arena_strdup(a, id)};
+    JValue *settings = read_json(a, path_join(a, r->env.agent_dir, "settings.json"));
+    if (find_model(r, &o, settings)) {
+        r->model = keep;
+        return false;
+    }
+    r->model.thinking = r->model.reasoning ? keep.thinking : "off";
+    r->model.engine = NULL;
+    r->env.provider = r->model.provider;
+    r->env.model = r->model.id;
+    r->env.thinking = r->model.thinking;
+    JValue *f = json_new(a, J_OBJECT);
+    json_put(a, f, S("provider"), json_string(a, str(r->model.provider)));
+    json_put(a, f, S("modelId"), json_string(a, str(r->model.id)));
+    (void)code_session_append(r->session, "model_change", f);
+    return true;
+}
+
+// The models pi's models.json lists (openai-completions providers), for /model.
+static CodeUiModel *list_models(Arena *a, const Run *r, size_t *n) {
+    *n = 0;
+    if (r->model.engine) {
+        CodeUiModel *m = arena_alloc(a, sizeof *m);
+        *m = (CodeUiModel){r->model.provider, r->model.id, r->model.name, r->model.reasoning, r->model.context_window};
+        *n = 1;
+        return m;
+    }
+    JValue *models = read_json(a, path_join(a, r->env.agent_dir, "models.json"));
+    const JValue *providers = json_get(models, "providers");
+    size_t cap = 0;
+    for (size_t i = 0; providers && json_is(providers, J_OBJECT) && i < providers->obj.len; i++) {
+        const JValue *list = json_get(providers->obj.items[i].val, "models");
+        cap += json_is(list, J_ARRAY) ? list->arr.len : 0;
+    }
+    CodeUiModel *out = arena_alloc(a, (cap + 1) * sizeof *out);
+    for (size_t i = 0; providers && json_is(providers, J_OBJECT) && i < providers->obj.len; i++) {
+        const JMember *p = &providers->obj.items[i];
+        const JValue *list = json_get(p->val, "models");
+        for (size_t k = 0; json_is(list, J_ARRAY) && k < list->arr.len; k++) {
+            const JValue *m = list->arr.items[k];
+            const char *api = json_str(json_get(m, "api")) ? json_str(json_get(m, "api")) : json_str(json_get(p->val, "api"));
+            if (!api || strcmp(api, "openai-completions") || !json_str(json_get(m, "id"))) continue;
+            out[(*n)++] = (CodeUiModel){str_z(a, p->key), json_str(json_get(m, "id")), json_str(json_get(m, "name")),
+                                        jbool(json_get(m, "reasoning"), false), juint(json_get(m, "contextWindow"), 128000)};
+        }
+    }
+    return out;
+}
 
 static void host_abort(CodeUiHost *h) {
     (void)h;
@@ -950,20 +1011,25 @@ static Err interactive(Run *r, const Args *o, const JValue *settings) {
     r->env.abort = &g_abort;
     signal(SIGINT, SIG_IGN); // Ctrl-C is a key in raw mode
     const JValue *compaction = json_get(settings, "compaction");
+    size_t nmodels;
+    CodeUiModel *models = list_models(a, r, &nmodels);
     CodeUiConfig cfg = {
         .cwd = r->env.cwd,
         .home = r->env.home,
         .agent_dir = r->env.agent_dir,
-        .provider = r->model.provider,
-        .model_id = r->model.id,
-        .model_name = r->model.name,
+        .model = {r->model.provider, r->model.id, r->model.name, r->model.reasoning, r->model.context_window},
         .thinking = r->model.thinking,
-        .reasoning = r->model.reasoning,
-        .context_window = r->model.context_window,
         .auto_compact = jbool(json_get(compaction, "enabled"), true),
         .fd_path = find_fd(a, r->env.agent_dir),
+        .models = models,
+        .nmodels = nmodels,
+        .default_provider = json_str(json_get(settings, "defaultProvider")),
+        .default_model = json_str(json_get(settings, "defaultModel")),
+        .settings = settings,
+        .resumed = o->cont && code_session_messages(r->session)->arr.len > 0,
     };
-    CodeUiOps ops = {host_prompt, host_new_session, host_set_thinking, host_entries, host_abort};
+    CodeUiOps ops = {host_prompt, host_new_session, host_set_thinking, host_entries, host_messages,
+                     host_set_leaf, host_set_model, host_abort};
     CodeUiHost host = {r};
     Err e = code_ui_run(&cfg, &ops, &host, o->prompts.ptr, o->prompts.len);
     g_tty_saved = 0;

@@ -321,6 +321,9 @@ typedef struct {
     bool unavailable;   // a pack not downloaded yet (choosing it offers the download)
     bool too_big;       // its memory need exceeds this Mac's
     unsigned disk_gb, min_ram_gb;
+    // a pack's name and quantization for the footer (code_cfg.h cfg_pack_label), the brief one
+    // without "(mixed ...)"; NULL: the footer shows the id, as pi does
+    const char *label, *label_brief;
 } CodeUiModel;
 typedef struct {
     // Runs one prompt to its end (on the agent thread); events arrive through code_ui_event.
@@ -342,6 +345,9 @@ typedef struct {
     // engine): recorded, and once the UI has ended the program starts again on it, the session
     // continued. Called from the UI thread with the agent idle.
     void (*restart)(CodeUiHost *h, const char *provider, const char *id);
+    // /model's list again, after /model changed models.json (they stay valid to the end of the
+    // run); NULL keeps the list the UI started with.
+    const CodeUiModel *(*reload_models)(CodeUiHost *h, size_t *n);
 } CodeUiOps;
 typedef struct {
     const char *cwd, *home, *agent_dir;

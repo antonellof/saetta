@@ -9,6 +9,7 @@
 // grep, find, ls), core/tools/render-utils.ts, components/diff.ts and visual-truncate.ts,
 // core/compaction/compaction.ts (the context estimate the footer shows).
 #include "code_tui.h"
+#include "code_cfg.h"
 #include "code_oai.h"
 #include "code_monitor.h"
 #include "download.h"
@@ -1733,13 +1734,23 @@ static void footer_render(void *ctx, int width, Lines *out) {
         sw = tui_width(buf_str(&stats));
     }
     Buf right = {0};
-    const char *model = U->model.id ? U->model.id : "no-model";
-    if (U->model.reasoning) {
-        const char *lv = U->thinking ? U->thinking : "off";
-        if (!strcmp(lv, "off")) buf_printf(&right, "%s \xe2\x80\xa2 thinking off", model);
-        else buf_printf(&right, "%s \xe2\x80\xa2 %s", model, lv);
-    } else buf_adds(&right, model);
-    int rw = tui_width(buf_str(&right));
+    // a pack: its name and quantization, shortened to fit (the "(mixed ...)" part, then the
+    // quantization dropped) before the line is cut; another model: its id, as pi shows it
+    const char *names[] = {U->model.label, U->model.label_brief, U->model.label ? U->model.name : NULL,
+                           U->model.id ? U->model.id : "no-model"};
+    int rw = 0;
+    for (size_t c = 0; c < COUNT(names); c++) {
+        const char *model = names[c];
+        if (!model) continue;
+        right.len = 0;
+        if (U->model.reasoning) {
+            const char *lv = U->thinking ? U->thinking : "off";
+            if (!strcmp(lv, "off")) buf_printf(&right, "%s \xe2\x80\xa2 thinking off", model);
+            else buf_printf(&right, "%s \xe2\x80\xa2 %s", model, lv);
+        } else buf_adds(&right, model);
+        rw = tui_width(buf_str(&right));
+        if (sw + 2 + rw <= width || !U->model.label || c >= 2) break;
+    }
     Buf line = {0};
     Buf rem = {0};
     if (sw + 2 + rw <= width) {
@@ -1992,11 +2003,20 @@ static void open_thinking(void) {
 
 // ---- the model selector (model-selector.ts) ---------------------------------------------------------
 
+typedef struct ProvDlg ProvDlg;
+
 typedef struct {
-    size_t *idx; // indexes into cfg->models, sorted (current, default, then by provider)
+    size_t *idx; // indexes into cfg->models, sorted (current, default, then by provider), then MODEL_ADD / MODEL_EDIT
     size_t n, all;
     size_t selected;
+    ProvDlg *dlg; // adding, editing or removing an OpenAI-compatible provider, in the selector's place
 } ModelSel;
+
+// the entries after the models (Saetta Code's own: pi adds providers with /login)
+#define MODEL_ADD SIZE_MAX
+#define MODEL_EDIT (SIZE_MAX - 1)
+#define MODEL_ADD_LABEL "Add an OpenAI-compatible model..."
+#define MODEL_EDIT_LABEL "Edit or remove an OpenAI-compatible provider..."
 
 static bool is_current(const CodeUiModel *m) {
     return U->model.provider && U->model.id && !strcmp(m->provider, U->model.provider) && !strcmp(m->id, U->model.id);
@@ -2054,9 +2074,356 @@ static bool name_distinct(const char *id, const char *name) {
     return !all;
 }
 
+static void prov_dlg_free(ProvDlg *d);
+
 static void model_sel_free(void *p) {
+    prov_dlg_free(((ModelSel *)p)->dlg);
     free(((ModelSel *)p)->idx);
     free(p);
+}
+
+// ---- OpenAI-compatible providers from /model (Saetta Code's own; models.json in pi's format) ------------
+//
+// Adding asks, one input at a time (pi's ExtensionInputComponent, extension-input.ts), for the
+// provider's name, base URL, API key and model ids, and writes the provider into the agent folder's
+// models.json (code_cfg.h cfg_openai_provider), so pi lists the same models. Editing picks one of
+// models.json's providers (pi's ExtensionSelectorComponent, extension-selector.ts), then Edit (the
+// same inputs, filled in) or Remove (confirmed).
+
+enum { DLG_NAME, DLG_URL, DLG_KEY, DLG_IDS, DLG_PICK, DLG_ACTION, DLG_REMOVE };
+
+struct ProvDlg {
+    int step;
+    char *edit;    // the provider being edited or removed, NULL when adding
+    char *val[4];  // name, base URL, API key, model ids
+    Input in;
+    char *error;   // why the last value was refused
+    char **opts;   // the choices of a list step
+    size_t nopts, sel;
+};
+
+static void prov_dlg_free(ProvDlg *d) {
+    if (!d) return;
+    free(d->edit);
+    for (int i = 0; i < 4; i++) free(d->val[i]);
+    buf_free(&d->in.value);
+    free(d->error);
+    for (size_t i = 0; i < d->nopts; i++) free(d->opts[i]);
+    free(d->opts);
+    free(d);
+}
+
+static void dlg_opts(ProvDlg *d, const char *const *opts, size_t n) {
+    for (size_t i = 0; i < d->nopts; i++) free(d->opts[i]);
+    free(d->opts);
+    d->opts = xcalloc(n + 1, sizeof *d->opts);
+    for (size_t i = 0; i < n; i++) d->opts[i] = strdup(opts[i]);
+    d->nopts = n;
+    d->sel = 0;
+}
+
+// The input of a step, holding what was given for it before.
+static void dlg_step(ProvDlg *d, int step) {
+    d->step = step;
+    free(d->error);
+    d->error = NULL;
+    d->in.value.len = 0;
+    d->in.cursor = 0;
+    if (step <= DLG_IDS && d->val[step]) {
+        buf_adds(&d->in.value, d->val[step]);
+        d->in.cursor = d->in.value.len;
+    }
+}
+
+// The providers /model edits: models.json's openai-completions ones, saetta's own left out.
+static size_t editable_providers(Arena *a, const char ***out) {
+    JValue *m = cfg_read_models(a, U->cfg->agent_dir);
+    const JValue *pv = json_get(m, "providers");
+    size_t n = 0;
+    *out = arena_alloc(a, (json_is(pv, J_OBJECT) ? pv->obj.len : 0) * sizeof **out + sizeof **out);
+    for (size_t i = 0; json_is(pv, J_OBJECT) && i < pv->obj.len; i++) {
+        const JMember *p = &pv->obj.items[i];
+        const char *api = json_str(json_get(p->val, "api"));
+        if (str_eqz(p->key, "saetta") || (api && strcmp(api, "openai-completions"))) continue;
+        (*out)[n++] = str_z(a, p->key);
+    }
+    return n;
+}
+
+static void open_model(const char *search);
+
+static void dlg_start(ModelSel *ms, bool add) {
+    ProvDlg *d = xcalloc(1, sizeof *d);
+    ms->dlg = d;
+    if (add) {
+        dlg_step(d, DLG_NAME);
+        return;
+    }
+    Arena a = {0};
+    const char **names;
+    size_t n = editable_providers(&a, &names);
+    dlg_opts(d, names, n);
+    arena_reset(&a);
+    d->step = DLG_PICK;
+}
+
+// The provider's current values into the inputs (editing).
+static void dlg_load(ProvDlg *d) {
+    Arena a = {0};
+    const JValue *p = json_get(json_get(cfg_read_models(&a, U->cfg->agent_dir), "providers"), d->edit);
+    d->val[0] = strdup(d->edit);
+    d->val[1] = dupz(json_str(json_get(p, "baseUrl")));
+    const char *key = json_str(json_get(p, "apiKey"));
+    d->val[2] = dupz(key && strcmp(key, "none") ? key : NULL);
+    Buf ids = {0};
+    const JValue *ms = json_get(p, "models");
+    for (size_t i = 0; json_is(ms, J_ARRAY) && i < ms->arr.len; i++) {
+        const char *id = json_str(json_get(ms->arr.items[i], "id"));
+        if (id) buf_printf(&ids, "%s%s", ids.len ? ", " : "", id);
+    }
+    d->val[3] = ids.len ? strndup(ids.ptr, ids.len) : NULL;
+    buf_free(&ids);
+    arena_reset(&a);
+}
+
+// The list again, from the models.json just written, filtered to that provider.
+static void dlg_done(const char *search) {
+    if (U->ops->reload_models) {
+        size_t n = 0;
+        const CodeUiModel *models = U->ops->reload_models(U->host, &n);
+        if (models) {
+            CodeUiConfig *cfg = (CodeUiConfig *)U->cfg; // code_main.c's own, not const there
+            cfg->models = models;
+            cfg->nmodels = n;
+        }
+    }
+    char *s = dupz(search);
+    open_model(s);
+    free(s);
+}
+
+static void dlg_save(ProvDlg *d) {
+    Arena a = {0};
+    const JValue *old = d->edit ? json_get(json_get(cfg_read_models(&a, U->cfg->agent_dir), "providers"), d->edit) : NULL;
+    JValue *e = cfg_openai_provider(&a, old, d->val[1], d->val[2], d->val[3]);
+    Buf why = {0};
+    if (!cfg_put_provider(U->cfg->agent_dir, d->val[0], d->edit, e, &why)) {
+        free(d->error);
+        d->error = strndup(why.ptr ? why.ptr : "", why.len);
+        buf_free(&why);
+        arena_reset(&a);
+        return;
+    }
+    const JValue *ms = json_get(e, "models");
+    Buf st = {0};
+    size_t nm = json_is(ms, J_ARRAY) ? ms->arr.len : 0;
+    buf_printf(&st, "%s provider %s (%zu model%s) in models.json", d->edit ? "Saved" : "Added", d->val[0], nm, nm == 1 ? "" : "s");
+    char *name = strdup(d->val[0]);
+    arena_reset(&a);
+    dlg_done(name);
+    show_status(st.ptr);
+    buf_free(&st);
+    free(name);
+}
+
+// Enter on an input: the value checked, then the next step.
+static void dlg_submit(ProvDlg *d) {
+    Str v = str_trim(buf_str(&d->in.value));
+    const char *err = NULL;
+    Buf eb = {0};
+    if (d->step == DLG_NAME) {
+        bool bad = false;
+        for (size_t i = 0; i < v.len; i++) bad |= v.ptr[i] == '/' || v.ptr[i] == ' ' || v.ptr[i] == '\t';
+        Arena a = {0};
+        JValue *pv = json_get(cfg_read_models(&a, U->cfg->agent_dir), "providers");
+        char *nm = str_z(&a, v);
+        if (!v.len) err = "Enter a name for the provider";
+        else if (bad) err = "The name cannot hold spaces or \"/\"";
+        else if (!strcmp(nm, "saetta")) err = "saetta is Saetta Code's own provider; choose another name";
+        else if (json_get(pv, nm) && (!d->edit || strcmp(d->edit, nm))) {
+            buf_printf(&eb, "models.json has a provider named %s already; edit it from /model", nm);
+            err = eb.ptr;
+        }
+        arena_reset(&a);
+    } else if (d->step == DLG_URL) {
+        if (!str_starts(v, S("http://")) && !str_starts(v, S("https://"))) err = "The base URL starts with http:// or https://";
+    } else if (d->step == DLG_IDS) {
+        if (!v.len) err = "Enter at least one model id";
+    }
+    if (err) {
+        free(d->error);
+        d->error = strdup(err);
+        buf_free(&eb);
+        return;
+    }
+    free(d->val[d->step]);
+    d->val[d->step] = strndup(v.ptr, v.len);
+    if (d->step == DLG_IDS) dlg_save(d);
+    else dlg_step(d, d->step + 1);
+}
+
+static void dlg_render(ProvDlg *d, int width, Lines *out) {
+    Buf t = {0};
+    border_line(out, width, T_BORDER);
+    lines_addz(out, "");
+    if (d->step >= DLG_PICK) {
+        // ExtensionSelectorComponent
+        Buf title = {0};
+        if (d->step == DLG_PICK) buf_adds(&title, "Edit or remove an OpenAI-compatible provider");
+        else if (d->step == DLG_ACTION) buf_printf(&title, "Provider %s", d->edit);
+        else buf_printf(&title, "Remove provider %s from models.json?", d->edit);
+        buf_adds(&t, "\x1b[1m");
+        th_fg(&t, T_ACCENT, buf_str(&title));
+        buf_adds(&t, "\x1b[22m");
+        text_lines(buf_str(&t), 1, width, out);
+        buf_free(&title);
+        lines_addz(out, "");
+        if (!d->nopts) {
+            t.len = 0;
+            th_fgz(&t, T_MUTED, "No OpenAI-compatible providers in models.json");
+            text_lines(buf_str(&t), 1, width, out);
+        }
+        const size_t maxv = 10;
+        size_t start = d->sel > maxv / 2 ? d->sel - maxv / 2 : 0;
+        if (d->nopts > maxv && start > d->nopts - maxv) start = d->nopts - maxv;
+        size_t end = MIN(start + maxv, d->nopts);
+        for (size_t i = start; i < end; i++) {
+            t.len = 0;
+            if (i == d->sel) {
+                th_fgz(&t, T_ACCENT, "\xe2\x86\x92 ");
+                th_fgz(&t, T_ACCENT, d->opts[i]);
+            } else {
+                buf_adds(&t, "  ");
+                th_fgz(&t, T_TEXT, d->opts[i]);
+            }
+            text_lines(buf_str(&t), 1, width, out);
+        }
+        if (start > 0 || end < d->nopts) {
+            Buf si = {0};
+            buf_printf(&si, "  (%zu/%zu)", d->sel + 1, d->nopts);
+            t.len = 0;
+            th_fg(&t, T_MUTED, buf_str(&si));
+            text_lines(buf_str(&t), 0, width, out);
+            buf_free(&si);
+        }
+        lines_addz(out, "");
+        t.len = 0;
+        key_hint(&t, "\xe2\x86\x91\xe2\x86\x93", "navigate");
+        buf_adds(&t, "  ");
+        key_hint(&t, "enter", "select");
+        buf_adds(&t, "  ");
+        key_hint(&t, "escape/ctrl+c", "cancel");
+        text_lines(buf_str(&t), 1, width, out);
+    } else {
+        // ExtensionInputComponent
+        static const char *const titles[] = {"provider name", "base URL", "API key", "model ids"};
+        static const char *const descs[] = {
+            "The provider's name in models.json, such as ollama or lmstudio.",
+            "The server's OpenAI-compatible API, such as http://127.0.0.1:11434/v1 (chat completions).",
+            "Optional: the key, or $NAME to read it from that environment variable. Empty: none.",
+            "One or more ids the server knows the models by, separated by commas.",
+        };
+        Buf title = {0};
+        buf_printf(&title, "%s (%d/4): %s", d->edit ? "Edit an OpenAI-compatible provider" : "Add an OpenAI-compatible model",
+                   d->step + 1, titles[d->step]);
+        th_fg(&t, T_ACCENT, buf_str(&title));
+        text_lines(buf_str(&t), 1, width, out);
+        buf_free(&title);
+        lines_addz(out, "");
+        t.len = 0;
+        th_fgz(&t, T_TEXT, descs[d->step]);
+        text_lines(buf_str(&t), 1, width, out);
+        lines_addz(out, "");
+        input_render(&d->in, width, out);
+        lines_addz(out, "");
+        t.len = 0;
+        key_hint(&t, "enter", "submit");
+        buf_adds(&t, "  ");
+        key_hint(&t, "escape/ctrl+c", "cancel");
+        text_lines(buf_str(&t), 1, width, out);
+    }
+    if (d->error) {
+        lines_addz(out, "");
+        t.len = 0;
+        th_fgz(&t, T_ERROR, d->error);
+        text_lines(buf_str(&t), 1, width, out);
+    }
+    lines_addz(out, "");
+    border_line(out, width, T_BORDER);
+    buf_free(&t);
+}
+
+static void dlg_key(ModelSel *ms, const Key *k) {
+    ProvDlg *d = ms->dlg;
+    bool cancel = k->kind == K_ESC || (k->kind == K_CTRL && k->ch == 'c');
+    if (cancel) { // back to the list
+        prov_dlg_free(d);
+        ms->dlg = NULL;
+        return;
+    }
+    if (d->step < DLG_PICK) {
+        if (k->kind == K_ENTER) dlg_submit(d);
+        else if (input_key(&d->in, k)) {
+            free(d->error); // the refused value is being changed
+            d->error = NULL;
+        }
+        return;
+    }
+    if ((k->kind == K_UP || (k->kind == K_CHAR && k->ch == 'k')) && d->sel > 0) d->sel--;
+    else if ((k->kind == K_DOWN || (k->kind == K_CHAR && k->ch == 'j')) && d->sel + 1 < d->nopts) d->sel++;
+    else if (k->kind == K_ENTER && d->sel < d->nopts) {
+        const char *o = d->opts[d->sel];
+        if (d->step == DLG_PICK) {
+            free(d->edit);
+            d->edit = strdup(o);
+            d->step = DLG_ACTION;
+            dlg_opts(d, (const char *const[]){"Edit", "Remove"}, 2);
+        } else if (d->step == DLG_ACTION && !strcmp(o, "Edit")) {
+            dlg_load(d);
+            dlg_step(d, DLG_NAME);
+        } else if (d->step == DLG_ACTION) {
+            d->step = DLG_REMOVE;
+            dlg_opts(d, (const char *const[]){"Yes", "No"}, 2);
+        } else if (!strcmp(o, "Yes")) {
+            Buf why = {0};
+            if (!cfg_put_provider(U->cfg->agent_dir, d->edit, NULL, NULL, &why)) {
+                free(d->error);
+                d->error = strndup(why.ptr ? why.ptr : "", why.len);
+            } else {
+                Buf st = {0};
+                buf_printf(&st, "Removed provider %s from models.json", d->edit);
+                dlg_done(NULL);
+                show_status(st.ptr);
+                buf_free(&st);
+            }
+            buf_free(&why);
+        } else {
+            prov_dlg_free(d);
+            ms->dlg = NULL;
+        }
+    }
+}
+
+// The add and edit entries after the models, when the query matches their words (fuzzyMatch).
+static void model_filter_extra(ModelSel *ms, const char *query) {
+    Arena a = {0};
+    const char **names;
+    bool any = editable_providers(&a, &names) > 0;
+    arena_reset(&a);
+    const char *labels[] = {MODEL_ADD_LABEL, any ? MODEL_EDIT_LABEL : NULL};
+    const size_t ids[] = {MODEL_ADD, MODEL_EDIT};
+    for (size_t e = 0; e < 2; e++) {
+        if (!labels[e]) continue;
+        bool ok = true;
+        const char *h = labels[e];
+        for (const char *q = query ? query : ""; *q && ok; q++) {
+            if (*q == ' ') continue;
+            while (*h && tolower((unsigned char)*h) != tolower((unsigned char)*q)) h++;
+            if (!*h) ok = false;
+            else h++;
+        }
+        if (ok) ms->idx[ms->n++] = ids[e];
+    }
 }
 
 static void model_filter(ModelSel *ms, const char *query) {
@@ -2067,7 +2434,7 @@ static void model_filter(ModelSel *ms, const char *query) {
     g_sort_models = ms_all;
     qsort(order, n, sizeof *order, model_cmp);
     free(ms->idx);
-    ms->idx = xmalloc((n + 1) * sizeof *ms->idx);
+    ms->idx = xmalloc((n + 3) * sizeof *ms->idx);
     ms->n = 0;
     for (size_t k = 0; k < n; k++) {
         const CodeUiModel *m = &ms_all[order[k]];
@@ -2093,14 +2460,19 @@ static void model_filter(ModelSel *ms, const char *query) {
         if (ok) ms->idx[ms->n++] = order[k];
     }
     free(order);
+    model_filter_extra(ms, query);
     ms->selected = 0;
     if (!query || !*query)
         for (size_t i = 0; i < ms->n; i++)
-            if (is_current(&ms_all[ms->idx[i]])) ms->selected = i;
+            if (ms->idx[i] < n && is_current(&ms_all[ms->idx[i]])) ms->selected = i;
 }
 
 static void model_render(int width, Lines *out) {
     ModelSel *ms = U->sel_data;
+    if (ms->dlg) {
+        dlg_render(ms->dlg, width, out);
+        return;
+    }
     border_line(out, width, T_BORDER);
     lines_addz(out, "");
     Buf w = {0};
@@ -2116,8 +2488,22 @@ static void model_render(int width, Lines *out) {
     if (start < 0) start = 0;
     size_t end = MIN((size_t)start + maxv, ms->n);
     for (size_t i = (size_t)start; i < end; i++) {
-        const CodeUiModel *m = &U->cfg->models[ms->idx[i]];
         bool sel = i == ms->selected;
+        if (ms->idx[i] == MODEL_ADD || ms->idx[i] == MODEL_EDIT) {
+            Buf l = {0};
+            const char *label = ms->idx[i] == MODEL_ADD ? MODEL_ADD_LABEL : MODEL_EDIT_LABEL;
+            if (sel) {
+                th_fgz(&l, T_ACCENT, "\xe2\x86\x92   ");
+                th_fgz(&l, T_ACCENT, label);
+            } else {
+                buf_adds(&l, "    ");
+                buf_adds(&l, label);
+            }
+            text_lines(buf_str(&l), 0, width, out);
+            buf_free(&l);
+            continue;
+        }
+        const CodeUiModel *m = &U->cfg->models[ms->idx[i]];
         Buf l = {0};
         if (sel) th_fgz(&l, T_ACCENT, "\xe2\x86\x92 ");
         else buf_adds(&l, "  ");
@@ -2169,8 +2555,11 @@ static void model_render(int width, Lines *out) {
     else {
         lines_addz(out, "");
         Buf nm = {0};
-        const CodeUiModel *m = &U->cfg->models[ms->idx[ms->selected]];
-        buf_printf(&nm, "  Model Name: %s", m->name ? m->name : m->id);
+        size_t sx = ms->idx[ms->selected];
+        const CodeUiModel *m = sx < U->cfg->nmodels ? &U->cfg->models[sx] : NULL;
+        if (m) buf_printf(&nm, "  Model Name: %s", m->name ? m->name : m->id);
+        else if (sx == MODEL_ADD) buf_adds(&nm, "  A server with an OpenAI-compatible API, added to models.json (pi lists it too)");
+        else buf_adds(&nm, "  Change or remove a provider of models.json");
         th_fg(&t, T_MUTED, buf_str(&nm));
         buf_free(&nm);
     }
@@ -2479,6 +2868,15 @@ static void open_model(const char *search) {
 
 static void model_key(const Key *k) {
     ModelSel *ms = U->sel_data;
+    if (ms->dlg) {
+        dlg_key(ms, k);
+        return;
+    }
+    size_t sx = ms->n ? ms->idx[ms->selected] : 0;
+    if (ms->n && (sx == MODEL_ADD || sx == MODEL_EDIT) && (k->kind == K_ENTER || (k->kind == K_CTRL && k->ch == 's'))) {
+        if (k->kind == K_ENTER) dlg_start(ms, sx == MODEL_ADD);
+        return;
+    }
     if (k->kind == K_UP && ms->n) ms->selected = ms->selected ? ms->selected - 1 : ms->n - 1;
     else if (k->kind == K_DOWN && ms->n) ms->selected = ms->selected + 1 >= ms->n ? 0 : ms->selected + 1;
     else if (k->kind == K_ENTER) {
@@ -4216,14 +4614,11 @@ static const SlashCmd builtin_cmds[] = {
     {"fork", "Create a new fork from a previous user message", NULL},
     {"clone", "Duplicate the current session at the current position", NULL},
     {"trust", "Save project trust decision for future sessions", NULL},
-    {"login", "Configure provider authentication", "<provider>"},
-    {"logout", "Remove provider authentication", NULL},
     {"new", "Start a new session", NULL},
     {"compact", "Manually compact the session context", NULL},
     {"resume", "Resume another session", NULL},
     {"reload", "Reload keybindings, extensions, skills, prompts, themes, and context files", NULL},
     {"quit", "Quit Saetta Code", NULL},
-    {"llama", "Manage llama.cpp router models", NULL},
     {"mcp", "Manage MCP servers: sign in, reconnect, enable or disable, and change exposure", NULL},
     {"theme", "Select color theme", NULL},
     {"monitor", "Show the model's live statistics (saetta monitor)", NULL},
@@ -4402,8 +4797,8 @@ static void submit(char *text) {
             return;
         }
         static const char *const known[] = {"scoped-models", "export", "import", "share", "copy",
-                                            "name", "session", "changelog", "hotkeys", "fork", "clone", "trust", "login", "logout",
-                                            "compact", "resume", "reload", "llama", "mcp"};
+                                            "name", "session", "changelog", "hotkeys", "fork", "clone", "trust",
+                                            "compact", "resume", "reload", "mcp"};
         for (size_t i = 0; i < COUNT(known); i++) {
             size_t kl = strlen(known[i]);
             if (!strncmp(c, known[i], kl) && (c[kl] == 0 || c[kl] == ' ')) {

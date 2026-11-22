@@ -15,6 +15,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "code_cfg.h"
 #include "ctxlimits.h"
 #include "fit.h"
 #include "download.h"
@@ -380,36 +381,28 @@ static Err pi_setup(Arena *a, Env *env, Argv *argv, const char *base, uint32_t c
     if (!home) return "NoHome";
     char *dir = path_join(a, path_join(a, home, ".saetta"), "pi");
     TRY(mkdir_p(dir));
-    const char *models = arena_printf(a,
-        "{\n"
-        "  \"providers\": {\n"
-        "    \"saetta\": {\n"
-        "      \"baseUrl\": \"%s/v1\",\n"
-        "      \"api\": \"openai-completions\",\n"
-        "      \"apiKey\": \"saetta\",\n"
-        "      \"compat\": {\n"
-        "        \"supportsDeveloperRole\": false,\n"
-        "        \"supportsStore\": false,\n"
-        "        \"supportsReasoningEffort\": false,\n"
-        "        \"maxTokensField\": \"max_tokens\",\n"
-        "        \"thinkingFormat\": \"qwen-chat-template\"\n"
-        "      },\n"
-        "      \"models\": [{\n"
-        "        \"id\": \"%s\",\n"
-        "        \"name\": \"%s\",\n"
-        "        \"reasoning\": %s,\n"
-        "        \"input\": [\"text\"],\n"
-        "        \"contextWindow\": %u,\n"
-        "        \"maxTokens\": 32768,\n"
-        "        \"cost\": { \"input\": 0, \"output\": 0, \"cacheRead\": 0, \"cacheWrite\": 0 }\n"
-        "      }]\n"
-        "    }\n"
-        "  }\n"
-        "}\n",
-        base, model_id, model_label, lora_arg ? "false" : "true", ctx);
-    TRY(write_in(a, dir, "models.json", models));
-    TRY(write_in(a, dir, "settings.json",
-                 arena_printf(a, "{\n  \"defaultProvider\": \"saetta\",\n  \"defaultModel\": \"%s\"\n}\n", model_id)));
+    // models.json: only the "saetta" provider is ours (the user's other providers stay);
+    // settings.json: only defaultProvider and defaultModel (theme and the rest stay). A file that
+    // does not parse is left alone, with a warning (pi gets the model on its command line).
+    Buf q[3] = {0};
+    json_write_string(&q[0], str(arena_printf(a, "%s/v1", base)));
+    json_write_string(&q[1], str(model_id));
+    json_write_string(&q[2], str(model_label));
+    const char *entry = arena_printf(a,
+        "{\"baseUrl\":%s,\"api\":\"openai-completions\",\"apiKey\":\"saetta\","
+        "\"compat\":{\"supportsDeveloperRole\":false,\"supportsStore\":false,\"supportsReasoningEffort\":false,"
+        "\"maxTokensField\":\"max_tokens\",\"thinkingFormat\":\"qwen-chat-template\"},"
+        "\"models\":[{\"id\":%s,\"name\":%s,\"reasoning\":%s,\"input\":[\"text\"],\"contextWindow\":%u,"
+        "\"maxTokens\":32768,\"cost\":{\"input\":0,\"output\":0,\"cacheRead\":0,\"cacheWrite\":0}}]}",
+        q[0].ptr, q[1].ptr, q[2].ptr, lora_arg ? "false" : "true", ctx);
+    for (int k = 0; k < 3; k++) buf_free(&q[k]);
+    JValue *ev;
+    TRY(json_parse(a, str(entry), false, &ev));
+    Buf why = {0};
+    if (!cfg_put_provider(dir, "saetta", NULL, ev, &why)) dbg("saetta start: warning: %s\n", why.ptr);
+    why.len = 0;
+    if (!cfg_set_default_model(dir, "saetta", model_id, &why)) dbg("saetta start: warning: %s\n", why.ptr);
+    buf_free(&why);
     env_put(env, "PI_CODING_AGENT_DIR", dir);
     env_put(env, "PI_SKIP_VERSION_CHECK", "1");
     const char *args[] = {"pi", "--provider", "saetta", "--model", model_id};

@@ -4,8 +4,12 @@
 // SAETTA_CODE_GOLDEN is the golden-pi folder (skipped when unset); the scenarios are read from
 // SAETTA_CODE_SCENARIOS, else the scenarios folder beside it.
 #include "../code.h"
+#include "../metal/shim.h"
 #include "../test.h"
 
+#include <errno.h>
+#include <pthread.h>
+#include <signal.h>
 #include <stdlib.h>
 #include <unistd.h>
 
@@ -241,5 +245,154 @@ TEST(code_tools_schemas) {
         JValue *mine = code_tool_schemas(&a, &cases[c][1], n);
         EXPECT_STR(write_json(&a, mine), write_json(&a, json_get(req, "tools")));
     }
+    arena_reset(&a);
+}
+
+// ---- abort and large directories (no golden needed)
+
+typedef struct {
+    volatile int *flag;
+    int after_ms;
+    bool kill_detached; // call code_tools_kill_detached instead of setting the flag
+} Aborter;
+
+static void *aborter(void *p) {
+    Aborter *ab = p;
+    usleep((useconds_t)ab->after_ms * 1000);
+    if (ab->kill_detached) code_tools_kill_detached();
+    else *ab->flag = 1;
+    return NULL;
+}
+
+static JValue *bash_call(Arena *a, const char *cmd) {
+    JValue *call = json_new(a, J_OBJECT);
+    json_put(a, call, S("type"), json_string(a, S("toolCall")));
+    json_put(a, call, S("id"), json_string(a, S("call_1")));
+    json_put(a, call, S("name"), json_string(a, S("bash")));
+    JValue *args = json_new(a, J_OBJECT);
+    json_put(a, args, S("command"), json_string(a, str(cmd)));
+    json_put(a, call, S("arguments"), args);
+    return call;
+}
+
+static Str result_text(Arena *a, const JValue *res) {
+    const JValue *c = json_get(res, "content");
+    return c && c->arr.len ? json_strs(json_get(c->arr.items[0], "text")) : S("");
+}
+
+// Runs cmd (which writes its shell pid, the group id, to root/pid) and aborts it after 200 ms.
+static JValue *abort_case(Arena *a, const char *root, const char *cmd, bool kill_detached, double *secs, bool *group_gone) {
+    volatile int flag = 0;
+    CodeEnv env = {.cwd = root, .home = root, .agent_dir = arena_printf(a, "%s/agent", root), .abort = &flag};
+    Aborter ab = {.flag = &flag, .after_ms = 200, .kill_detached = kill_detached};
+    pthread_t th;
+    pthread_create(&th, NULL, aborter, &ab);
+    uint64_t t0 = now_ns();
+    JValue *res = NULL, *raw;
+    if (code_tool_run(a, &env, bash_call(a, cmd), &res, &raw)) res = NULL;
+    *secs = (double)(now_ns() - t0) / 1e9;
+    pthread_join(th, NULL);
+    char *text;
+    size_t len;
+    *group_gone = false;
+    if (!read_file(arena_printf(a, "%s/pid", root), 64, &text, &len)) {
+        pid_t g = (pid_t)atoi(text);
+        free(text);
+        // SIGKILL is delivered at once, but reaping a non-child takes the kernel a moment
+        for (int i = 0; i < 50 && !*group_gone; i++) {
+            *group_gone = g > 0 && kill(-g, 0) < 0 && errno == ESRCH;
+            if (!*group_gone) usleep(10000);
+        }
+    }
+    return res;
+}
+
+TEST(code_tools_bash_abort) {
+    Arena a = {0};
+    char tmpl[] = "/tmp/sct-abort-XXXXXX";
+    char *root = mkdtemp(tmpl);
+    char real[4096];
+    root = arena_strdup(&a, realpath(root, real) ? real : root);
+    const char *pidf = arena_printf(&a, "%s/pid", root);
+    double secs;
+    bool gone;
+    // a silent command with a background job in its group: pi's text, everything killed
+    JValue *res = abort_case(&a, root, arena_printf(&a, "sleep 30 & echo $$ > '%s'; sleep 30", pidf), false, &secs, &gone);
+    EXPECT(res);
+    EXPECT_STR(result_text(&a, res), S("Command aborted"));
+    EXPECT(json_get(res, "isError")->b);
+    dbg("code_tools: silent bash aborted after %.3f s\n", secs);
+    EXPECT(secs < 1.0);
+    EXPECT(gone);
+    // partial output is kept above the status, its last newline too (as in the timeout golden)
+    res = abort_case(&a, root, arena_printf(&a, "echo partial; echo $$ > '%s'; sleep 30", pidf), false, &secs, &gone);
+    EXPECT(res);
+    EXPECT_STR(result_text(&a, res), S("partial\n\n\nCommand aborted"));
+    EXPECT(secs < 1.0);
+    EXPECT(gone);
+    // code_tools_kill_detached kills a running command's group (the shell then dies of SIGKILL)
+    res = abort_case(&a, root, arena_printf(&a, "echo $$ > '%s'; sleep 30", pidf), true, &secs, &gone);
+    EXPECT(res);
+    EXPECT_STR(result_text(&a, res), S("(no output)\n\nCommand exited with code 137"));
+    EXPECT(secs < 1.0);
+    EXPECT(gone);
+    // a call made while the flag is set does not run
+    volatile int flag = 1;
+    CodeEnv env = {.cwd = root, .home = root, .agent_dir = root, .abort = &flag};
+    const char *marker = arena_printf(&a, "%s/ran", root);
+    JValue *raw;
+    EXPECT_OK(code_tool_run(&a, &env, bash_call(&a, arena_printf(&a, "touch '%s'", marker)), &res, &raw));
+    EXPECT_STR(result_text(&a, res), S("Operation aborted"));
+    EXPECT(json_get(res, "isError")->b);
+    EXPECT(!json_get(res, "durationMs"));
+    EXPECT(!file_exists(marker));
+    if (system(arena_printf(&a, "rm -rf '%s'", root))) {}
+    arena_reset(&a);
+}
+
+TEST(code_tools_ls_large) {
+    Arena a = {0};
+    char tmpl[] = "/tmp/sct-ls-XXXXXX";
+    char *root = mkdtemp(tmpl);
+    char real[4096];
+    root = arena_strdup(&a, realpath(root, real) ? real : root);
+    const char *dir = arena_printf(&a, "%s/big", root);
+    mkdir_p(dir);
+    // mixed case, digits and punctuation, so the locale order differs from the byte order
+    static const char *stems[] = {"Alpha", "beta", "_gamma", "Delta-", "eps.ilon", "10x", "9x", "zeta", "Ägir", "ä"};
+    for (int i = 0; i < 2000; i++) {
+        const char *p = arena_printf(&a, "%s/%s%d", dir, stems[i % COUNT(stems)], i);
+        write_file(p, "", 0);
+    }
+    CodeEnv env = {.cwd = root, .home = root, .agent_dir = root};
+    JValue *call = json_new(&a, J_OBJECT);
+    json_put(&a, call, S("type"), json_string(&a, S("toolCall")));
+    json_put(&a, call, S("id"), json_string(&a, S("call_1")));
+    json_put(&a, call, S("name"), json_string(&a, S("ls")));
+    JValue *args = json_new(&a, J_OBJECT);
+    json_put(&a, args, S("path"), json_string(&a, S("big")));
+    json_put(&a, args, S("limit"), json_int(&a, 5000));
+    json_put(&a, call, S("arguments"), args);
+    uint64_t t0 = now_ns();
+    JValue *res, *raw;
+    EXPECT_OK(code_tool_run(&a, &env, call, &res, &raw));
+    double secs = (double)(now_ns() - t0) / 1e9;
+    dbg("code_tools: ls of 2000 entries in %.3f s\n", secs);
+    EXPECT(secs < 1.0);
+    Str t = result_text(&a, res);
+    size_t lines = 0;
+    Str prev = {0};
+    bool ordered = true;
+    for (size_t pos = 0; pos < t.len;) {
+        ptrdiff_t nl = str_find_char(t, '\n', pos);
+        Str l = str_n(t.ptr + pos, (nl < 0 ? t.len : (size_t)nl) - pos);
+        if (prev.ptr && sx_locale_compare_lower(prev.ptr, prev.len, l.ptr, l.len) > 0) ordered = false;
+        prev = l;
+        lines++;
+        pos = nl < 0 ? t.len : (size_t)nl + 1;
+    }
+    EXPECT_EQ(lines, 2000);
+    EXPECT(ordered);
+    if (system(arena_printf(&a, "rm -rf '%s'", root))) {}
     arena_reset(&a);
 }

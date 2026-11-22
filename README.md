@@ -43,6 +43,8 @@ saetta start code        # or: saetta start claude, saetta start pi, saetta star
 
 Needs an Apple Silicon Mac (M1 or later) with 32 GB of memory or more, and macOS 27.2 or later. Update with `saetta update`. `SAETTA_PREFIX` changes the install folder, `SAETTA_VERSION=0.16.0` pins a release, `HF_TOKEN` raises Hugging Face's limits.
 
+The documentation is at [saetta.dev/docs](https://saetta.dev/docs/) (source in [`docs/`](docs)): the agent's commands, sessions, skills and MCP servers, the other agents, the HTTP API and every option.
+
 ## Saetta Code
 
 <p align="center">

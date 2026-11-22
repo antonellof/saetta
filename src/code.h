@@ -50,6 +50,9 @@ typedef struct {
     // The session facts pi's bash tool exports as PI_SESSION_ID, PI_SESSION_FILE, PI_PROVIDER,
     // PI_MODEL and PI_REASONING_LEVEL (bash.ts resolveSpawnContext); NULL leaves one unset.
     const char *session_id, *session_file, *provider, *model, *thinking;
+    // Set (by a signal handler) to abort the request in flight: the client stops reading and
+    // records the answer as pi does, stopReason "aborted". NULL when nothing aborts.
+    volatile int *abort;
 } CodeEnv;
 
 // ---- system prompt (code_prompt.c; pi: core/system-prompt.js, resource-loader.js, skills.js)

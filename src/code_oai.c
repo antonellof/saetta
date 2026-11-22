@@ -2426,6 +2426,7 @@ typedef struct {
     CodeOaiStream *s;
     bool ok_status, seen;
     Buf errbody;
+    volatile int *abort; // CodeEnv.abort
 } HttpCtx;
 
 static int on_http(void *ctx, int status, const void *p, size_t n) {
@@ -2436,28 +2437,8 @@ static int on_http(void *ctx, int status, const void *p, size_t n) {
         return 0;
     }
     h->ok_status = true;
+    if (h->abort && *h->abort) return 1; // Esc / Ctrl-C: stop the transfer (the server stops generating)
     return code_oai_stream_feed(h->s, p, n) ? 0 : 1;
-}
-
-// getAttributionHeaders for pi's identity, by target.
-static size_t attribution(Arena *a, const CodeModel *m, sx_header *h) {
-    const char *p = m->provider ? m->provider : "", *u = m->base_url ? m->base_url : "";
-    if (!strcmp(p, "openrouter") || strstr(u, "openrouter.ai")) {
-        h[0] = (sx_header){"HTTP-Referer", "https://pi.dev"};
-        h[1] = (sx_header){"X-OpenRouter-Title", "pi"};
-        h[2] = (sx_header){"X-OpenRouter-Categories", "cli-agent"};
-        return 3;
-    }
-    if (!strcmp(p, "nvidia") || strstr(u, "://integrate.api.nvidia.com")) {
-        h[0] = (sx_header){"X-BILLING-INVOKE-ORIGIN", "Pi"};
-        return 1;
-    }
-    if (!strcmp(p, "opencode") || !strcmp(p, "opencode-go") || strstr(u, "://opencode.ai")) {
-        h[0] = (sx_header){"x-opencode-client", "pi"};
-        return 1;
-    }
-    (void)a;
-    return 0;
 }
 
 Err code_oai_complete(Arena *a, const CodeModel *m, const CodeEnv *env, Str body, const CodeSink *sink, JValue **assistant) {
@@ -2475,8 +2456,7 @@ Err code_oai_complete(Arena *a, const CodeModel *m, const CodeEnv *env, Str body
     h[nh++] = (sx_header){"Content-Type", "application/json"};
     h[nh++] = (sx_header){"Authorization", arena_printf(a, "Bearer %s", m->api_key)};
     h[nh++] = (sx_header){"User-Agent", "saetta-code (darwin; arm64)"};
-    nh += attribution(a, m, h + nh);
-    HttpCtx hc = {.s = s};
+    HttpCtx hc = {.s = s, .abort = env ? env->abort : NULL};
     int status = 0;
     char err[512] = "";
     int rc = sx_http("POST", url, h, nh, body.ptr, body.len, 300, on_http, &hc, &status, err, sizeof err);
@@ -2495,5 +2475,9 @@ Err code_oai_complete(Arena *a, const CodeModel *m, const CodeEnv *env, Str body
         *assistant = code_oai_stream_end(s, NULL);
     }
     buf_free(&hc.errbody);
+    if (hc.abort && *hc.abort) { // pi: stopReason "aborted", errorMessage "Request was aborted"
+        json_put(a, *assistant, S("stopReason"), json_string(a, S("aborted")));
+        json_put(a, *assistant, S("errorMessage"), json_string(a, S("Request was aborted")));
+    }
     return OK;
 }

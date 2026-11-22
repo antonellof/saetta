@@ -220,6 +220,9 @@ static bool downloaded(Arena *a, const DownloadPack *p) {
 }
 
 // Whether `name` runs from PATH.
+// Saetta Code is part of this binary
+static bool builtin_agent(const char *name) { return strcmp(name, "code") == 0; }
+
 static bool on_path(Arena *a, const char *name) {
     const char *path = getenv("PATH");
     if (!path) return false;
@@ -259,7 +262,7 @@ static const Choice models[] = {
 
 static const struct {
     const char *cmd, *label;
-} agents[] = {{"claude", "Claude Code"}, {"pi", "pi"}, {"opencode", "opencode"}};
+} agents[] = {{"claude", "Claude Code"}, {"pi", "pi"}, {"opencode", "opencode"}, {"code", "Saetta Code"}};
 
 Err wizard_run(int *code) {
     *code = 1;
@@ -339,18 +342,18 @@ Err wizard_run(int *code) {
         Item ai[COUNT(agents)];
         size_t adef = COUNT(agents);
         for (size_t i = 0; i < COUNT(agents); i++) {
-            const bool inst = on_path(&a, agents[i].cmd);
+            const bool inst = builtin_agent(agents[i].cmd) || on_path(&a, agents[i].cmd);
             ai[i] = (Item){agents[i].label, inst ? "installed" : "not installed", inst ? "" : "choose it to install", false};
             if (inst && adef == COUNT(agents)) adef = i;
         }
         int g = menu("Choose a coding agent", ai, COUNT(agents), adef == COUNT(agents) ? 0 : adef);
         if (g < 0) {
-            printf("Later: saetta start <claude|pi|opencode> --pack %s\n", pk->name);
+            printf("Later: saetta start <claude|pi|opencode|code> --pack %s\n", pk->name);
             *code = 0;
             arena_reset(&a);
             return OK;
         }
-        if (!on_path(&a, agents[g].cmd)) {
+        if (!builtin_agent(agents[g].cmd) && !on_path(&a, agents[g].cmd)) {
             const char *cmd = launch_install_command(agents[g].cmd);
             printf("\n%s is not installed. Its official installer:\n\n    %s\n", agents[g].label, cmd);
             if (!ask("Run it now?", false)) continue;

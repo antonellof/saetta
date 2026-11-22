@@ -9,6 +9,7 @@
 // utils/shell.ts (killTrackedDetachedChildren), packages/ai/src/utils/transcript.ts
 // (getCurrentSystemMessage, getToolStateChanges), utils/retry.ts (the retryable patterns).
 #include "code.h"
+#include "code_mcp.h"
 #include "code_oai.h"
 #include "code_tui.h"
 #include "download.h"
@@ -36,7 +37,7 @@ static const char *const default_tools[] = {"read", "bash", "edit", "write"};
 
 typedef struct {
     const char *provider, *model, *thinking, *mode, *system_prompt, *tools, *pack, *ctx, *session;
-    bool print, cont, no_session, no_tools;
+    bool print, cont, no_session, no_tools, no_mcp;
     VEC(const char *) prompts;
     VEC(const char *) append;
 } Args;
@@ -48,6 +49,8 @@ typedef struct {
     CodeSession *session;
     const char **tools;
     size_t ntools;
+    const char **base_tools; // the built-in ones (--tools); tools adds the MCP tools (code_mcp.c)
+    size_t nbase_tools;
     bool json;
     bool ui; // the interactive mode prints the stream as it arrives
     int64_t retry_attempt; // the retries of the current prompt so far (pi's _retryAttempt)
@@ -109,6 +112,7 @@ static Err parse_args(const char *const *v, size_t n, Args *o) {
         else if (!strcmp(x, "--ctx") && more) o->ctx = v[++i];
         else if (!strcmp(x, "--session") && more) o->session = v[++i];
         else if (!strcmp(x, "--no-tools") || !strcmp(x, "-nt")) o->no_tools = true;
+        else if (!strcmp(x, "--no-mcp")) o->no_mcp = true;
         else if (!strcmp(x, "--help") || !strcmp(x, "-h")) {
             printf("usage: saetta code [options] [prompt ...]\n"
                    "\n"
@@ -126,6 +130,7 @@ static Err parse_args(const char *const *v, size_t n, Args *o) {
                    "  --provider P --model M   the model (M may be provider/id and end in :thinking)\n"
                    "  --thinking LEVEL         off, minimal, low, medium, high, xhigh, max\n"
                    "  --tools a,b,c | --no-tools   the tool set\n"
+                   "  --no-mcp                 no MCP servers (pi's mcp.json) and no MCP tools\n"
                    "  --system-prompt T, --append-system-prompt T   text or a file\n"
                    "  --pack P                 run the model in this process (a download name such as coder, or a\n"
                    "                           folder): no server, no HTTP; the requests are the same\n"
@@ -789,9 +794,23 @@ static JValue *user_message(Arena *a, const char *text) {
     return user;
 }
 
+// The tools of this prompt: the built-in ones, then the MCP tools declared now (the first prompt
+// waits for their servers first, pi's before_agent_start).
+static void mcp_tools(Run *r) {
+    code_mcp_before_prompt();
+    const char **m;
+    size_t nm = code_mcp_declared(r->a, &m);
+    const char **all = arena_alloc(r->a, (r->nbase_tools + nm + 1) * sizeof *all);
+    for (size_t i = 0; i < r->nbase_tools; i++) all[i] = r->base_tools[i];
+    for (size_t i = 0; i < nm; i++) all[r->nbase_tools + i] = m[i];
+    r->tools = all;
+    r->ntools = r->nbase_tools + nm;
+}
+
 // One prompt: agent_start, the turns, agent_end (agentLoop + AgentSession.prompt).
 static Err prompt(Run *r, const char *text) {
     Arena *a = r->a;
+    mcp_tools(r);
     r->new_messages = json_new(a, J_ARRAY);
     emit(r, ev_new(a, "agent_start"));
     emit(r, ev_new(a, "turn_start"));
@@ -1612,6 +1631,9 @@ Err code_run(const char *const *args, size_t n, int *code) {
     r.env.provider = r.model.provider;
     r.env.model = r.model.id;
     r.env.thinking = level;
+    r.base_tools = r.tools;
+    r.nbase_tools = r.ntools;
+    code_mcp_start(&r.env, !o.no_mcp, r.tools, r.ntools, o.tools || o.no_tools);
     if (!o.print && !piped && !r.json && isatty(0) && isatty(1)) {
         e = interactive(&r, &o, settings);
         if (!e) *code = 0;
@@ -1646,6 +1668,7 @@ Err code_run(const char *const *args, size_t n, int *code) {
         }
     }
 done:
+    code_mcp_shutdown();
     code_tools_kill_detached();
     vec_free(&o.prompts);
     vec_free(&o.append);

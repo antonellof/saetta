@@ -144,6 +144,12 @@ int sx_http(const char *method, const char *url, const sx_header *headers, size_
 int sx_http_cancellable(const char *method, const char *url, const sx_header *headers, size_t nheaders,
                         const void *body, size_t body_len, double timeout_s, sx_http_sink on_data, void *ctx,
                         int *status, char *err, size_t err_cap, volatile int *cancel);
+// sx_http_cancellable that also hands over the response's headers: on_header(ctx, name, value)
+// for each (names as the server sent them), before the body's first byte.
+typedef void (*sx_http_header_sink)(void *ctx, const char *name, const char *value);
+int sx_http_ex(const char *method, const char *url, const sx_header *headers, size_t nheaders, const void *body,
+               size_t body_len, double timeout_s, sx_http_header_sink on_header, sx_http_sink on_data, void *ctx,
+               int *status, char *err, size_t err_cap, volatile int *cancel);
 
 #ifdef __cplusplus
 }

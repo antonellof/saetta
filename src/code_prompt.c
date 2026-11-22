@@ -1222,3 +1222,7 @@ Str code_system_text(Arena *a, const JValue *system) {
     buf_free(&content);
     return out;
 }
+
+// The project trust above, for the MCP configuration (code_mcp.c reads <cwd>/.pi/mcp.json only
+// for a trusted project, as pi's loadMcpConfig does).
+bool code_project_trusted(Arena *a, const CodeEnv *env) { return project_trusted(a, env->cwd, env->agent_dir, env->home); }

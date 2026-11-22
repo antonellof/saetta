@@ -85,6 +85,10 @@ void code_resources_reload(const CodeEnv *env);
 // error (may be NULL) gets the read or parse error of a known skill.
 const char *code_skill_expand(Arena *a, const CodeEnv *env, const char *text, const char **error);
 
+// The settings as pi's SettingsManager merges them: agent_dir/settings.json, deep-merged with the
+// project's .pi/settings.json when the folder is trusted (an object; never NULL).
+JValue *code_settings_merged(Arena *a, const CodeEnv *env);
+
 // ---- project trust (code_trust.c) ----------------------------------------------------------------
 
 // hasTrustRequiringProjectResources
@@ -100,11 +104,14 @@ bool code_trust_trusted(const CodeEnv *env);
 // Before a restart on another model (exec of saetta code): the current folder's decision handed to
 // the next process for that folder only.
 void code_trust_export_restart(const CodeEnv *env);
+// The hand-off taken back (the restart's exec failed): no later child inherits it.
+void code_trust_cancel_restart(void);
 // A session switch into cwd in the interactive mode (switchSession's projectTrustContextFactory):
 // true when its trust needs the question (project resources, no override, nothing decided or
 // stored, defaultProjectTrust "ask"); code_trust_switch_ask asks it in place of the editor, saves
-// and remembers the answer (cancel: untrusted), then calls done(ctx).
+// and remembers the answer (cancel: untrusted), then calls done(ctx); dropped(ctx) instead when
+// the question closes unanswered (another panel replaced it, or the UI ended).
 bool code_trust_switch_asks(const char *cwd);
-void code_trust_switch_ask(const char *cwd, void (*done)(void *), void *ctx);
+void code_trust_switch_ask(const char *cwd, void (*done)(void *), void (*dropped)(void *), void *ctx);
 
 #endif

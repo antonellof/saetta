@@ -92,6 +92,14 @@ static char *write_target(const char *path) {
     return cur;
 }
 
+// The process's umask, read once while it is single-threaded (before main): umask() can only be
+// read by setting it, and setting it later would race the other threads' files and children.
+static mode_t g_umask = 022;
+__attribute__((constructor)) static void read_umask(void) {
+    g_umask = umask(0);
+    umask(g_umask);
+}
+
 bool cfg_write_file(const char *path, const void *data, size_t n, Buf *why) {
     char *target = write_target(path);
     Buf tmp = {0};
@@ -103,9 +111,7 @@ bool cfg_write_file(const char *path, const void *data, size_t n, Buf *why) {
         // the file's mode kept (a models.json holding keys may be private); a new one gets
         // writeFileSync's 0666 less the umask
         struct stat st;
-        mode_t um = umask(0);
-        umask(um);
-        fchmod(fd, stat(target, &st) == 0 ? (st.st_mode & 07777) : (0666 & ~um));
+        fchmod(fd, stat(target, &st) == 0 ? (st.st_mode & 07777) : (0666 & ~g_umask));
     }
     const char *p = data;
     for (size_t off = 0; ok && off < n;) {

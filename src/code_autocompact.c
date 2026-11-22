@@ -6,6 +6,7 @@
 #include "code_autocompact.h"
 
 #include "code_cfg.h"
+#include "code_res.h"
 #include "code_sessions.h"
 
 #include <math.h>
@@ -218,14 +219,11 @@ static double messages_tokens(const JValue *msgs) {
 
 // ---- the session ------------------------------------------------------------------------------------
 
+// settingsManager.getCompactionSettings(model): the merged settings (the trusted project's
+// .pi/settings.json over the agent folder's, code_skills.c).
 static CodeCompactionSettings load_settings(const CodeAutoCompact *c) {
     Arena t = {0};
-    char *data = NULL;
-    size_t n = 0;
-    JValue *root = NULL;
-    if (!read_file(path_join(&t, c->env->agent_dir, "settings.json"), 1 << 24, &data, &n)) (void)json_parse(&t, str_n(data, n), true, &root);
-    free(data);
-    CodeCompactionSettings s = code_compaction_settings(root, c->model->provider, c->model->id);
+    CodeCompactionSettings s = code_compaction_settings(code_settings_merged(&t, c->env), c->model->provider, c->model->id);
     arena_reset(&t);
     return s;
 }
@@ -336,8 +334,12 @@ static bool run_auto(CodeAutoCompact *c, const char *reason, bool will_retry) {
     CodeCompactionSettings set = load_settings(c);
     Start st = {c, reason, false};
     const JValue *entry = NULL;
+    volatile int *ab = c->env->abort;
+    int ab_before = ab ? __atomic_load_n(ab, __ATOMIC_SEQ_CST) : 0;
     const char *err = code_sessions_compact_cb(a, *c->session, c->model, c->env, NULL, set.keep_recent_tokens, &entry, on_started, &st);
-    bool aborted = c->env->abort && *c->env->abort;
+    // the aborts that came while the summary ran (an Esc counts one, code_main.c host_abort)
+    int ab_during = ab ? __atomic_load_n(ab, __ATOMIC_SEQ_CST) - ab_before : 0;
+    bool aborted = ab && *ab;
     if (!st.started) return false; // prepareCompaction found nothing to compact
     JValue *end = ev_new(a, "compaction_end");
     json_put(a, end, S("reason"), json_string(a, str(reason)));
@@ -373,8 +375,9 @@ static bool run_auto(CodeAutoCompact *c, const char *reason, bool will_retry) {
                  json_string(a, str(arena_printf(a, !strcmp(reason, "overflow") ? "Context overflow recovery failed: %s" : "Auto-compaction failed: %s", m))));
     }
     c->emit(c->ctx, end);
-    // abortCompaction stops the compaction only, not the run
-    if (aborted && c->env->abort) *c->env->abort = 0;
+    // abortCompaction stops the compaction only, not the run: the aborts it took are given back,
+    // one that came after it stopped (an Esc for the run) is kept
+    if (aborted && ab && ab_during > 0) __atomic_fetch_sub(ab, ab_during, __ATOMIC_SEQ_CST);
     return false;
 }
 

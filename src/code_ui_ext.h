@@ -32,6 +32,8 @@ void uix_start_compact(const char *instructions);
 // The working status in the editor's top border (a status indicator), NULL to clear it.
 void uix_working(const char *message);
 void uix_abort(void); // the run in flight stopped
+// Ctrl+X's selection first: true when a transcript selection (not copied on select) was copied.
+bool uix_copy_selection(void);
 
 // ---- code_sessions_ui.c -------------------------------------------------------------------------
 

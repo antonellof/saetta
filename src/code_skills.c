@@ -131,6 +131,27 @@ static Settings load_settings(Arena *a, const char *cwd, const char *agent_dir, 
     return st;
 }
 
+// isMergeableObject, deepMergeObjects (settings-manager.ts): base's keys, each override's value
+// in place (both objects: merged), into a new object.
+static JValue *deep_merge(Arena *a, const JValue *base, const JValue *over) {
+    JValue *r = json_new(a, J_OBJECT);
+    for (size_t i = 0; json_is(base, J_OBJECT) && i < base->obj.len; i++) json_put(a, r, base->obj.items[i].key, base->obj.items[i].val);
+    for (size_t i = 0; json_is(over, J_OBJECT) && i < over->obj.len; i++) {
+        JValue *ov = over->obj.items[i].val;
+        const JValue *bv = json_get(base, over->obj.items[i].key.ptr);
+        json_put(a, r, over->obj.items[i].key, json_is(bv, J_OBJECT) && json_is(ov, J_OBJECT) ? deep_merge(a, bv, ov) : ov);
+    }
+    return r;
+}
+
+// SettingsManager.create's settings: deepMergeSettings(global, project), the project's only when
+// the folder is trusted.
+JValue *code_settings_merged(Arena *a, const CodeEnv *env) {
+    const char *cwd = code_path_resolve(a, "/", env->cwd);
+    Settings st = load_settings(a, cwd, code_path_resolve(a, cwd, env->agent_dir), code_trust_trusted(env));
+    return deep_merge(a, st.global, st.project);
+}
+
 // the string entries of a settings array ("skills")
 static void string_entries(const JValue *arr, VecStr *out) {
     for (size_t i = 0; json_is(arr, J_ARRAY) && i < arr->arr.len; i++)

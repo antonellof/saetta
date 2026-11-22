@@ -95,6 +95,11 @@ saetta start claude -- -p "fix the failing test"   # anything after -- goes to t
 ```
 
 <p align="center">
+  <img src="docs/assets/demo-code.gif" width="900" alt="saetta start code: Saetta Code loads the model, writes a Game of Life in Python, and it runs">
+  <br><sub><code>saetta start code</code>: Saetta Code loads the model and writes a Game of Life (the writing at 3x speed), then it runs.</sub>
+</p>
+
+<p align="center">
   <img src="docs/assets/demo.gif" width="900" alt="saetta start claude: Claude Code on Saetta writes a snake game in Python, checks it, and the game runs">
   <br><sub><code>saetta start claude</code>: Claude Code on the local model writes a snake game and checks it. Real time, no cloud.</sub>
 </p>

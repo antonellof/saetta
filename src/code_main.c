@@ -1166,6 +1166,81 @@ static void host_abort(CodeUiHost *h) {
     g_abort = 1;
 }
 
+// ---- for /export, /share and /import (code_cmds.c) ---------------------------------------------------
+
+static const char *host_session_file(CodeUiHost *h) { return code_session_path(h->r->session); }
+
+// getSessionDir: the folder of the session file, else the default one for the cwd
+// (agent_dir/sessions/--<cwd with / and : as ->--)
+static const char *host_session_dir(CodeUiHost *h) {
+    Run *r = h->r;
+    const char *p = code_session_path(r->session);
+    if (p && strrchr(p, '/')) return arena_strndup(r->a, p, (size_t)(strrchr(p, '/') - p));
+    const char *c = r->env.cwd;
+    while (*c == '/') c++;
+    char *safe = arena_printf(r->a, "--%s--", c);
+    for (char *q = safe + 2; *q; q++)
+        if (*q == '/' || *q == '\\' || *q == ':') *q = '-';
+    return path_join(r->a, path_join(r->a, r->env.agent_dir, "sessions"), safe);
+}
+
+static const char *host_session_cwd(CodeUiHost *h) { return h->r->env.cwd; }
+
+// state.systemPrompt: the transcript's system prompt, else the one the next prompt starts with
+// (pi's agent holds it from its creation)
+static const char *host_system_prompt(CodeUiHost *h) {
+    Run *r = h->r;
+    const JValue *msgs = code_session_messages(r->session);
+    bool have = false;
+    for (size_t i = 0; msgs && i < msgs->arr.len && !have; i++)
+        have = str_eqz(json_strs(json_get(msgs->arr.items[i], "role")), "system");
+    JValue *sys = NULL;
+    if (have) sys = current_system(r->a, msgs);
+    else if (code_system_message(r->a, &r->env, r->tools, r->ntools, &sys)) return NULL;
+    return str_z(r->a, code_system_text(r->a, sys));
+}
+
+// state.tools as the export lists them: name, description, parameters
+static const JValue *host_tool_decls(CodeUiHost *h) {
+    Run *r = h->r;
+    Arena *a = r->a;
+    JValue *schemas = code_tool_schemas(a, r->tools, r->ntools), *out = json_new(a, J_ARRAY);
+    for (size_t i = 0; i < schemas->arr.len; i++) {
+        const JValue *f = json_get(schemas->arr.items[i], "function");
+        JValue *d = json_new(a, J_OBJECT);
+        json_put(a, d, S("name"), (JValue *)json_get(f, "name"));
+        json_put(a, d, S("description"), (JValue *)json_get(f, "description"));
+        json_put(a, d, S("parameters"), (JValue *)json_get(f, "parameters"));
+        json_push(a, out, d);
+    }
+    return out;
+}
+
+// The agent on another session file (AgentSessionRuntime createRuntime for a resume): its entries,
+// id and file, run in cwd; the thinking level it recorded, when the model reasons.
+static Err host_open_session(CodeUiHost *h, const char *path, const char *cwd) {
+    Run *r = h->r;
+    Arena *a = r->a;
+    CodeSession *s;
+    TRY(code_session_open_path(a, path, &s));
+    r->session = s;
+    r->env.cwd = arena_strdup(a, cwd);
+    r->env.session_id = json_str(json_get(code_session_header(s), "id"));
+    r->env.session_file = code_session_path(s);
+    // the session's thinking level when it recorded one; else the current level, recorded (as the
+    // start of a resumed session does)
+    const char *lv = json_str(code_session_last(s, "thinking_level_change", "thinkingLevel"));
+    if (lv && r->model.reasoning) {
+        r->model.thinking = arena_strdup(a, lv);
+        r->env.thinking = r->model.thinking;
+    } else if (!lv) {
+        JValue *f = json_new(a, J_OBJECT);
+        json_put(a, f, S("thinkingLevel"), json_string(a, str(level_of(r))));
+        (void)code_session_append(s, "thinking_level_change", f);
+    }
+    return OK;
+}
+
 // fd for the "@" completion: on PATH, else pi's managed copy in the agent folder
 static const char *find_fd(Arena *a, const char *agent_dir) {
     const char *path = getenv("PATH");
@@ -1219,7 +1294,9 @@ static Err interactive(Run *r, const Args *o, const JValue *settings) {
     cfg.engine = r->model.engine != NULL;
     cfg.self_exe = self_exe(a);
     CodeUiOps ops = {host_prompt, host_new_session, host_set_thinking, host_entries, host_messages,
-                     host_set_leaf, host_set_model, host_abort, host_restart};
+                     host_set_leaf, host_set_model, host_abort, host_restart,
+                     .session_file = host_session_file, .session_dir = host_session_dir, .session_cwd = host_session_cwd,
+                     .system_prompt = host_system_prompt, .tool_decls = host_tool_decls, .open_session = host_open_session};
     CodeUiHost host = {r};
     // a stand-in for a slow model load, for the loader's test scenario: SAETTA_CODE_LOAD_DEMO_MS
     const char *demo = getenv("SAETTA_CODE_LOAD_DEMO_MS");

@@ -10,6 +10,7 @@
 // core/compaction/compaction.ts (the context estimate the footer shows).
 #include "code_tui.h"
 #include "code_oai.h"
+#include "code_cmds.h"
 #include "download.h"
 
 #include <ctype.h>
@@ -415,6 +416,7 @@ static void header_render(void *ctx, int width, Lines *out) {
     lines_addz(out, "");
     comp_free(c);
     buf_free(&t);
+    cmds_header_notice(width, out); // the model scope (/scoped-models)
 }
 
 // ---- assistant messages (assistant-message.ts) ------------------------------------------------------
@@ -3464,6 +3466,7 @@ static void render_dock(int width, Lines *out) {
     else if (U->sel == SEL_TREE) tree_render(width, out);
     else if (U->sel == SEL_CONFIRM) confirm_render(width, out);
     else if (U->sel == SEL_THEME) theme_render(width, out);
+    else if (cmds_dock_active()) cmds_dock_render(width, out);
     else editor_render(U->ed, width, out);
     footer_render(NULL, width, out);
 }
@@ -3690,7 +3693,7 @@ static void draw(bool force) {
     v->jump_w = 0;
     if (!v->follow) {
         Buf l = {0}, t = {0};
-        th_fgz(&l, T_TEXT, " \xe2\x86\x93 Jump to latest message \xc2\xb7 ctrl+end ");
+        th_fgz(&l, T_TEXT, " \xe2\x86\x93 Jump to latest message \xc2\xb7 Ctrl+End ");
         tui_truncate(&t, buf_str(&l), w, "", false);
         int lw = tui_width(buf_str(&t));
         int col = (w - lw) / 2;
@@ -4322,6 +4325,10 @@ static void submit(char *text) {
     char *s = strndup(t.ptr, t.len);
     if (s[0] == '/') {
         const char *c = s + 1;
+        if (cmds_submit(s)) {
+            free(s);
+            return;
+        }
         if (!strcmp(c, "thinking") || !strncmp(c, "thinking ", 9)) {
             const char *arg = !strncmp(c, "thinking ", 9) ? c + 9 : NULL;
             if (arg && *arg) {
@@ -4387,8 +4394,7 @@ static void submit(char *text) {
             free(s);
             return;
         }
-        static const char *const known[] = {"scoped-models", "export", "import", "share", "copy",
-                                            "name", "session", "changelog", "hotkeys", "fork", "clone", "trust", "login", "logout",
+        static const char *const known[] = {"name", "session", "changelog", "fork", "clone", "trust", "login", "logout",
                                             "compact", "resume", "reload", "llama", "mcp"};
         for (size_t i = 0; i < COUNT(known); i++) {
             size_t kl = strlen(known[i]);
@@ -4496,6 +4502,10 @@ static void selector_key(const Key *k) {
 static void handle_key(const Key *k) {
     if (U->sel != SEL_NONE) {
         selector_key(k);
+        return;
+    }
+    if (cmds_dock_active()) {
+        cmds_dock_key(k);
         return;
     }
     // app actions (custom-editor.ts)
@@ -4654,6 +4664,7 @@ static void external_editor(void) {
 
 // app.model.cycleForward / Backward over the models /model lists that run now (downloaded).
 static void cycle_model(int dir) {
+    if (cmds_cycle_model(dir)) return; // the scoped models (/scoped-models)
     size_t n = U->cfg->nmodels, cur = n;
     size_t runnable = 0;
     // only the models this process switches to in place: the servers of models.json (packs, and
@@ -4692,6 +4703,19 @@ static bool viewport_key(const Key *k) {
     case K_CTRL_END: view_end(); return true;
     default: return false;
     }
+}
+
+// What code_cmds.c reads and calls here.
+static bool cmds_busy(void) { return U->busy; }
+static const CodeUiModel *cmds_model(void) { return &U->model; }
+static void cmds_choose(const CodeUiModel *m) { choose_model(m, false); }
+static const char *cmds_thinking(void) { return U->thinking; }
+static const char *cmds_theme(void) { return U->theme ? U->theme : "system"; }
+static const TermColors *cmds_colors(void) { return U->have_colors ? &U->colors : NULL; }
+static int cmds_appearance(void) { return U->have_colors && U->colors.has_bg ? 0 : U->mac_appearance; }
+static void cmds_set_cwd(const char *cwd) {
+    ((CodeUiConfig *)U->cfg)->cwd = strdup(cwd); // the caller's own config; kept to the end
+    git_refresh();
 }
 
 Err code_ui_run(const CodeUiConfig *cfg, const CodeUiOps *ops, CodeUiHost *host, const char *const *initial, size_t ninitial) {
@@ -4756,6 +4780,11 @@ Err code_ui_run(const CodeUiConfig *cfg, const CodeUiOps *ops, CodeUiHost *host,
     // pi's system theme is grayscale until the terminal reports its colors; the others draw at once
     if (!ui.theme || !strcmp(ui.theme, "system")) theme_set(NULL, true);
     else theme_use(ui.theme, NULL, ui.mac_appearance);
+    cmds_init(&(CmdsUi){.cfg = cfg, .ops = ops, .host = host, .show_status = show_status, .show_error = show_error,
+                        .chat_add = chat_add, .request_render = request_render, .render_history = render_history,
+                        .busy = cmds_busy, .model = cmds_model, .choose_model = cmds_choose, .thinking = cmds_thinking,
+                        .set_thinking = set_thinking, .theme_name = cmds_theme, .term_colors = cmds_colors,
+                        .appearance = cmds_appearance, .toggle_tools = toggle_tools, .set_cwd = cmds_set_cwd});
     screen_start(&ui.scr);
     if (cfg->resumed) render_history();
     draw(true);
@@ -4782,6 +4811,7 @@ Err code_ui_run(const CodeUiConfig *cfg, const CodeUiOps *ops, CodeUiHost *host,
         if (editor_busy(ui.ed)) timeout = MIN(timeout, 10);
         if (g_view.bar_until > now) timeout = MIN(timeout, (int)((g_view.bar_until - now) / 1000000) + 1);
         if (ui.scr.color_query) timeout = MIN(timeout, 10);
+        if (cmds_dock_active()) timeout = MIN(timeout, 80);
         // asleep only with the ring empty (the producer wakes a sleeping consumer once)
         atomic_store(&g_ui_sleeping, 1);
         if (atomic_load(&g_rhead) != atomic_load(&g_rtail)) timeout = 0;
@@ -4808,6 +4838,7 @@ Err code_ui_run(const CodeUiConfig *cfg, const CodeUiOps *ops, CodeUiHost *host,
         if (editor_tick(ui.ed)) request_render();
         if (atomic_exchange(&g_git_changed, false)) request_render();
         download_poll();
+        if (cmds_tick()) request_render();
         // keys
         if (r > 0 && (fds[0].revents & (POLLIN | POLLHUP))) {
             char in[65536];

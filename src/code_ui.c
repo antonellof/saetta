@@ -1606,7 +1606,12 @@ static void prompt_line(Buf *out) {
     const char *cwd = U->cfg->cwd, *home = getenv("HOME");
     size_t hl = home ? strlen(home) : 0;
     char where[4096];
+    char real_home[PATH_MAX];
+    const char *rh = home && realpath(home, real_home) ? real_home : NULL;
+    size_t rl = rh ? strlen(rh) : 0;
+    // the home folder as given, or its real path (a /tmp or /var home is /private/... once resolved)
     if (hl > 1 && !strncmp(cwd, home, hl) && (cwd[hl] == '/' || cwd[hl] == 0)) snprintf(where, sizeof where, "~%s", cwd + hl);
+    else if (rl > 1 && !strncmp(cwd, rh, rl) && (cwd[rl] == '/' || cwd[rl] == 0)) snprintf(where, sizeof where, "~%s", cwd + rl);
     else snprintf(where, sizeof where, "%s", cwd);
     const char *base = where;
     // the folder in bold cyan

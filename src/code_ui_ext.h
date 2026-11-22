@@ -39,6 +39,8 @@ void uix_abort(void); // the run in flight stopped
 bool sess_ui_command(const char *cmd);
 // Every agent event, before the interactive mode handles it.
 void sess_ui_event(const JValue *ev);
+// A compaction is running (compaction_start seen, compaction_end not yet).
+bool sess_ui_compacting(void);
 // At ui_idle: true when a session command waiting for the run to stop took over (the rest of
 // the idle handling is skipped).
 bool sess_ui_idle(void);

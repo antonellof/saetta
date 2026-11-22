@@ -369,7 +369,8 @@ static const char *copy_to_clipboard(Str text) {
     return "Clipboard unavailable";
 }
 
-static void cmd_copy(void) {
+// handleCopyCommand: flash (app.message.copy's flashConfirmation) confirms with it instead of the status.
+void cmds_copy(void (*flash)(const char *msg)) {
     char *text = last_assistant_text();
     if (!text) {
         G.show_error("No agent messages to copy yet.");
@@ -377,9 +378,12 @@ static void cmd_copy(void) {
     }
     const char *err = copy_to_clipboard(str(text));
     if (err) G.show_error(err);
+    else if (flash) flash("Copied!");
     else G.show_status("Copied last agent message to clipboard");
     free(text);
 }
+
+static void cmd_copy(void) { cmds_copy(NULL); }
 
 // ---- /hotkeys (handleHotkeysCommand) ---------------------------------------------------------------------
 

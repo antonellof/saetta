@@ -316,9 +316,9 @@ static KeyKind csi_key(char final, int p1, int mods) {
         case 7: return ctrl ? K_CTRL_HOME : K_HOME;
         case 4:
         case 8: return ctrl ? K_CTRL_END : K_END;
-        case 3: return K_DELETE;
-        case 5: return K_PGUP;
-        case 6: return K_PGDN;
+        case 3: return alt ? K_ALT_DELETE : K_DELETE;
+        case 5: return ctrl ? K_CTRL_PGUP : K_PGUP;
+        case 6: return ctrl ? K_CTRL_PGDN : K_PGDN;
         default: return K_NONE;
         }
     default: return K_NONE;
@@ -339,6 +339,11 @@ static void code_key(Key *k, int code, int shifted, int mods) {
     default: break;
     }
     if (code >= 57344 && code <= 63743) return; // Kitty's functional keys (keypad, media, lone modifiers)
+    if (ctrl && alt && code == ']') { // ctrl+alt+] as its legacy form, ESC + Ctrl+] (tui.editor.jumpBackward)
+        k->kind = K_ALT;
+        k->ch = 0x1d;
+        return;
+    }
     if (ctrl && code < 0x80 && code > ' ') {
         k->kind = K_CTRL;
         k->ch = (uint32_t)(code >= 'A' && code <= 'Z' ? code + 32 : code);

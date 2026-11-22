@@ -1301,6 +1301,30 @@ static const char *turn_prefix_summary(Arena *a, const CodeModel *m, const CodeE
 
 const char *code_sessions_compact(Arena *a, CodeSession *s, const CodeModel *m, const CodeEnv *env, const char *instructions,
                                   int64_t keep_recent, const JValue **entry) {
+    return code_sessions_compact_cb(a, s, m, env, instructions, keep_recent, entry, NULL, NULL);
+}
+
+double code_sessions_projected_tokens(Arena *a, const JValue *entries, const char *leaf) {
+    JValue *path = code_sessions_branch(a, entries, leaf);
+    Projection p = {0};
+    JValue *all = json_new(a, J_ARRAY);
+    project(a, path, &p, all);
+    double t = projected_tokens(a, &p, all, path);
+    vec_free(&p);
+    return t;
+}
+
+JValue *code_sessions_projection(Arena *a, const JValue *entries, const char *leaf) {
+    JValue *path = code_sessions_branch(a, entries, leaf);
+    Projection p = {0};
+    JValue *all = json_new(a, J_ARRAY);
+    project(a, path, &p, all);
+    vec_free(&p);
+    return all;
+}
+
+const char *code_sessions_compact_cb(Arena *a, CodeSession *s, const CodeModel *m, const CodeEnv *env, const char *instructions,
+                                     int64_t keep_recent, const JValue **entry, void (*started)(void *ctx), void *ctx) {
     *entry = NULL;
     const JValue *entries = code_session_entries(s);
     JValue *path = code_sessions_branch(a, entries, code_session_leaf(s));
@@ -1349,6 +1373,7 @@ const char *code_sessions_compact(Arena *a, CodeSession *s, const CodeModel *m, 
     if (cp.split)
         for (size_t i = 0; i < prefix->arr.len; i++) file_ops_of(prefix->arr.items[i], &ops);
     vec_free(&p);
+    if (started) started(ctx); // the preparation is done: compaction_start (_runAutoCompaction)
     // compact()
     Buf summary = {0};
     const JValue *usage = NULL;

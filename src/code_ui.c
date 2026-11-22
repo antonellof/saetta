@@ -17,6 +17,8 @@
 #include "code_cmds.h"
 #include "code_update.h"
 #include "code_ui_ext.h"
+#include "code_autocompact.h"
+#include "code_ui_keys.h"
 #include "download.h"
 
 #include <ctype.h>
@@ -194,6 +196,14 @@ char *code_ui_take_queued(bool steering_only) {
     pthread_mutex_unlock(&g_mlock);
     if (t) q_post("{\"type\":\"queue_update\"}");
     return t;
+}
+
+// agent.hasQueuedMessages(): a steering or follow-up message waiting (the auto-compaction's continue)
+bool code_ui_has_queued(void) {
+    pthread_mutex_lock(&g_mlock);
+    bool any = g_msgq.len > 0;
+    pthread_mutex_unlock(&g_mlock);
+    return any;
 }
 
 // ---- small helpers ---------------------------------------------------------------------------------
@@ -3171,7 +3181,10 @@ static void settings_render(int width, Lines *out) {
 }
 
 static void setting_changed(const char *id, const char *v) {
-    if (!strcmp(id, "autocompact")) U->auto_compact = !strcmp(v, "true");
+    if (!strcmp(id, "autocompact")) {
+        U->auto_compact = !strcmp(v, "true");
+        code_compaction_set_enabled(U->cfg->agent_dir, U->auto_compact); // setAutoCompactionEnabled
+    }
     else if (!strcmp(id, "hide-thinking")) {
         U->hide_thinking = !strcmp(v, "true");
         invalidate_kind(&asst_vt);
@@ -3924,6 +3937,47 @@ static void view_end(void) {
     request_render();
 }
 
+// The components whose first row pi marks with OSC 133;A: a user message, and an assistant
+// message without tool calls (user-message.ts, assistant-message.ts render).
+static bool prompt_zone(const Comp *c) {
+    if (comp_markdown_is_user(c)) return true;
+    if (c->vt != &asst_vt) return false;
+    const JValue *content = json_get(((const AsstView *)c)->msg, "content");
+    for (size_t i = 0; json_is(content, J_ARRAY) && i < content->arr.len; i++)
+        if (str_eqz(json_strs(json_get(content->arr.items[i], "type")), "toolCall")) return false;
+    return true;
+}
+
+// scrollToPrompt (tui-alt-screen.ts): the view's top to the previous (dir -1) or next prompt
+// zone's first row; nothing when there is none.
+static void view_prompt(int dir) {
+    View *v = &g_view;
+    int w = U->scr.cols;
+    int row = (int)comp_lines(U->header, w)->n;
+    VEC(int) starts = {0};
+    CompVec *kids = comp_children(U->chat);
+    for (size_t k = 0; k < kids->len; k++) {
+        const Lines *l = comp_lines(kids->ptr[k], w);
+        if (l->n && prompt_zone(kids->ptr[k])) vec_push(&starts, row);
+        row += (int)l->n;
+    }
+    int max_top = MAX(0, v->total - v->view);
+    int top = v->follow ? max_top : v->top;
+    for (int r = top + dir; r >= 0 && r < row; r += dir) {
+        bool start = false;
+        for (size_t i = 0; i < starts.len && !start; i++) start = starts.ptr[i] == r;
+        if (!start) continue;
+        // ScrollView.scrollTo: clamped; the end follows again when it lands there
+        int next = MAX(0, MIN(max_top, r));
+        if (next != top) v->bar_until = now_ns() + 1000000000ull;
+        v->top = next;
+        v->follow = next == max_top;
+        request_render();
+        break;
+    }
+    vec_free(&starts);
+}
+
 // WheelScrollAccelerator("auto"): one line per event where the terminal accelerates (macOS, not
 // over SSH), else faster spins move up to six.
 static int wheel_lines(int dir) {
@@ -4006,6 +4060,7 @@ static void copy_selection(int width) {
         // pbcopy, else an OSC 52 write
         static const char *const pb[] = {"pbcopy", NULL};
         bool ok = tui_run((char *const *)pb, NULL, buf_str(&text), NULL, 2000);
+        if (ok) uik_flash("Copied!", 1000); // copyTextToClipboard
         if (!ok) {
             static const char b64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
             Buf o = {0};
@@ -4127,6 +4182,17 @@ static void draw(bool force) {
         lines_push(&frame, dock.v[i]);
         dock.v[i] = NULL;
     }
+    // compositeFlashes: the flash messages at the top right (code_ui_keys.c)
+    Lines fl = {0};
+    uik_flash_render(w, &fl);
+    for (size_t i = fl.n > (size_t)h ? fl.n - (size_t)h : 0, row = 0; i < fl.n && row < frame.n; i++, row++) {
+        int fw = tui_width(str(fl.v[i]));
+        if (!fw) continue;
+        char *nl = overlay(frame.v[row], w - fw, w, str(fl.v[i]), w);
+        free(frame.v[row]);
+        frame.v[row] = nl;
+    }
+    lines_free(&fl);
     screen_draw(s, &frame, force);
     lines_free(&dock);
     lines_free(&frame);
@@ -4987,8 +5053,9 @@ static void handle_key(const Key *k) {
             return;
         }
         if (U->busy) {
-            // restoreQueuedMessagesToEditor({abort: true})
-            restore_queued();
+            // during a compaction escape cancels it only (compaction_start's onEscape:
+            // abortCompaction); else restoreQueuedMessagesToEditor({abort: true})
+            if (!sess_ui_compacting()) restore_queued();
             U->ops->abort(U->host);
         }
         return;
@@ -5052,6 +5119,7 @@ static void handle_key(const Key *k) {
         }
         return;
     }
+    if (uik_key(k)) return; // app.clipboard.pasteImage, app.message.copy (code_ui_keys.c)
     char *text = NULL;
     if (editor_key(U->ed, k, &text) && text) {
         submit(text);
@@ -5173,6 +5241,8 @@ static bool viewport_key(const Key *k) {
     case K_PGDN: view_scroll(MAX(1, v->view - PAGE_SCROLL_OVERLAP)); return true;
     case K_CTRL_HOME: view_top(); return true;
     case K_CTRL_END: view_end(); return true;
+    case K_CTRL_UP: view_prompt(-1); return true;  // tui.altScreen.previousPrompt
+    case K_CTRL_DOWN: view_prompt(1); return true; // tui.altScreen.nextPrompt
     default: return false;
     }
 }
@@ -5291,6 +5361,8 @@ Err code_ui_run(const CodeUiConfig *cfg, const CodeUiOps *ops, CodeUiHost *host,
         if (g_dirty) timeout = MIN(timeout, 8);
         if (editor_busy(ui.ed)) timeout = MIN(timeout, 10);
         if (g_view.bar_until > now) timeout = MIN(timeout, (int)((g_view.bar_until - now) / 1000000) + 1);
+        int flash_ms = uik_flash_wait_ms(now);
+        if (flash_ms >= 0) timeout = MIN(timeout, flash_ms);
         int sess_ms = sess_ui_tick(now);
         if (sess_ms >= 0) timeout = MIN(timeout, sess_ms);
         if (ui.scr.color_query) timeout = MIN(timeout, 10);
@@ -5382,6 +5454,7 @@ Err code_ui_run(const CodeUiConfig *cfg, const CodeUiOps *ops, CodeUiHost *host,
             g_last_spin = now;
             g_dirty = true;
         }
+        if (uik_flash_expire(now)) g_dirty = true;
         if (g_view.bar_until && now >= g_view.bar_until) {
             g_view.bar_until = 0;
             g_dirty = true;

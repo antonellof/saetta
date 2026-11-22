@@ -9,6 +9,7 @@
 // utils/shell.ts (killTrackedDetachedChildren), packages/ai/src/utils/transcript.ts
 // (getCurrentSystemMessage, getToolStateChanges), utils/retry.ts (the retryable patterns).
 #include "code.h"
+#include "code_autocompact.h"
 #include "code_cfg.h"
 #include "code_mcp.h"
 #include "code_oai.h"
@@ -68,6 +69,8 @@ typedef struct {
     size_t argc;
     const JValue *call;   // the tool call running (for its partial results)
     char *restart_provider, *restart_id; // set by the interactive mode: start again on this model
+    CodeAutoCompact ac;   // automatic compaction (code_autocompact.c)
+    bool deliver_queued;  // the run continues to deliver queued messages (agent.continue())
 } Run;
 
 static double wall_ms(void) { return (double)(wall_ns() / 1000000); }
@@ -415,6 +418,7 @@ static JValue *current_tools(Arena *a, const JValue *system) {
 // ---- the agent loop (agent-loop.ts runLoop, streamAssistantResponse, executeToolCalls) ------------
 
 static Err add_message(Run *r, JValue *m) {
+    code_autocompact_observe(&r->ac, m);
     emit_message(r, "message_start", m);
     emit_message(r, "message_end", m);
     json_push(r->a, r->new_messages, m);
@@ -510,6 +514,7 @@ static Err stream_assistant(Run *r, JValue **out) {
     buf_free(&body);
     TRY(e);
     json_put(a, msg, S("thinkingLevel"), json_string(a, str(level_of(r))));
+    code_autocompact_observe(&r->ac, msg);
     if (!st.started) emit_message(r, "message_start", msg);
     emit_message(r, "message_end", msg);
     // a successful answer ends the retries at once (AgentSession._handleAgentEvent)
@@ -782,7 +787,7 @@ typedef struct {
 static RetryPolicy g_retry = {true, 3, 2000, 60000};
 
 static Err run_agent(Run *r, bool started);
-static void finish_agent(Run *r, bool will_retry, const JValue *last);
+static bool finish_agent(Run *r, bool will_retry, const JValue *last, const char *last_id);
 static Err run_turns(Run *r, JValue **last_out, const char **last_id);
 
 static void sleep_abortable(int64_t ms) {
@@ -819,9 +824,27 @@ static void mcp_tools(Run *r) {
     r->ntools = r->nbase_tools + nm;
 }
 
+// The automatic compaction's view of the run (code_autocompact.c).
+static void ac_emit(void *ctx, JValue *ev) { emit(ctx, ev); }
+
+static bool ac_has_queued(void *ctx) { return ((Run *)ctx)->ui && code_ui_has_queued(); }
+
+static void ac_bind(Run *r) {
+    r->ac.a = r->a;
+    r->ac.session = &r->session;
+    r->ac.model = &r->model;
+    r->ac.env = &r->env;
+    r->ac.emit = ac_emit;
+    r->ac.has_queued = ac_has_queued;
+    r->ac.ctx = r;
+}
+
 // One prompt: agent_start, the turns, agent_end (agentLoop + AgentSession.prompt).
 static Err prompt(Run *r, const char *text) {
     Arena *a = r->a;
+    ac_bind(r);
+    // _prepareRun: compact first when needed (catches aborted responses)
+    code_autocompact_before_prompt(&r->ac);
     mcp_tools(r);
     r->new_messages = json_new(a, J_ARRAY);
     emit(r, ev_new(a, "agent_start"));
@@ -844,6 +867,15 @@ static Err run_agent(Run *r, bool started) {
             r->new_messages = json_new(a, J_ARRAY);
             emit(r, ev_new(a, "agent_start"));
             emit(r, ev_new(a, "turn_start"));
+            // agent.continue() after an auto-compaction with messages queued: they start the run
+            char *queued = r->deliver_queued ? code_ui_take_queued(true) : NULL;
+            if (r->deliver_queued && !queued) queued = code_ui_take_queued(false);
+            r->deliver_queued = false;
+            if (queued) {
+                JValue *user = user_message(a, code_skill_expand(a, &r->env, queued, NULL));
+                free(queued);
+                TRY(add_message(r, user));
+            }
         }
         started = false;
         JValue *last = NULL;
@@ -863,7 +895,7 @@ static Err run_agent(Run *r, bool started) {
             const char *em = json_str(json_get(last, "errorMessage"));
             json_put(a, e, S("errorMessage"), json_string(a, str(em ? em : "Unknown error")));
             // agent_end (willRetry) is emitted before the retry starts
-            finish_agent(r, true, NULL);
+            finish_agent(r, true, NULL, NULL);
             emit(r, e);
             JValue *f = json_new(a, J_OBJECT);
             json_put(a, f, S("targetId"), json_string(a, str(last_id)));
@@ -887,19 +919,21 @@ static Err run_agent(Run *r, bool started) {
             }
             continue;
         }
-        finish_agent(r, false, last);
+        if (finish_agent(r, false, last, last_id)) continue; // the overflow retry, or queued messages
         (void)again;
         return OK;
     }
 }
 
-static void finish_agent(Run *r, bool will_retry, const JValue *last) {
+// agent_end, then _handlePostAgentRun's end of the retries and _checkCompaction: true when the
+// run continues (agent.continue()), else agent_settled.
+static bool finish_agent(Run *r, bool will_retry, const JValue *last, const char *last_id) {
     Arena *a = r->a;
     JValue *ae = ev_new(a, "agent_end");
     json_put(a, ae, S("messages"), r->new_messages);
     json_put(a, ae, S("willRetry"), json_bool(a, will_retry));
     emit(r, ae);
-    if (will_retry) return;
+    if (will_retry) return false;
     // retries used up on an error (_handlePostAgentRun)
     if (r->retry_attempt > 0 && last && str_eqz(json_strs(json_get(last, "stopReason")), "error")) {
         JValue *end = ev_new(a, "auto_retry_end");
@@ -909,9 +943,17 @@ static void finish_agent(Run *r, bool will_retry, const JValue *last) {
         emit(r, end);
         r->retry_attempt = 0;
     }
+    if (last && !g_abort && code_autocompact_check(&r->ac, last, last_id, true)) {
+        // the overflow retry continues from the context (the failed answer left out of it);
+        // after an answer, the queued messages start the run
+        const JValue *msgs = code_session_messages(r->session);
+        r->deliver_queued = msgs->arr.len && str_eqz(json_strs(json_get(msgs->arr.items[msgs->arr.len - 1], "role")), "assistant");
+        return true;
+    }
     JValue *settled = ev_new(a, "agent_settled");
     json_put(a, settled, S("aborted"), json_bool(a, g_abort != 0));
     emit(r, settled);
+    return false;
 }
 
 // The turns of one agent run (runLoop): *last the final assistant message and its entry id.
@@ -971,6 +1013,8 @@ static Err run_turns(Run *r, JValue **last_out, const char **last_id) {
         char *queued = r->ui ? code_ui_take_queued(true) : NULL;
         if (!queued && !more && r->ui) queued = code_ui_take_queued(false);
         if (!more && !queued) break;
+        // prepareNextTurn: _compactBeforeNextAssistantResponse
+        code_autocompact_before_turn(&r->ac);
         if (queued) {
             emit(r, ev_new(a, "turn_start"));
             JValue *user = user_message(a, code_skill_expand(a, &r->env, queued, NULL));

@@ -3,6 +3,28 @@
 All notable changes to saetta and Saetta Code (`saetta code`), newest first. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are saetta's.
 
+## [0.16.0] - 2026-11-22
+
+### Added
+
+- Saetta Code has pi's full terminal UI, ported to C: the editor with "/" commands and "@" file completion, markdown with code highlighting, tool views with diffs and live bash output, selectors, scrolling and mouse selection, pi's keys (kill ring, undo, character jump, Ctrl+X copy, Ctrl+V paste). Its screens match pi's on 69 recorded scenarios.
+- Saetta Code's own look: a theme with macOS's system colors (chosen at the first start, `/theme` to change it; pi's themes stay available), a footer with the folder, git branch, time per turn and the model's full name and quantization, and a 3D lightning loader while the model loads.
+- `/model` lists every saetta pack, downloads one from the list, switches packs in process, and adds, edits or removes OpenAI-compatible models in models.json.
+- `/monitor`: the engine's live statistics inside the agent (speed, GPU, memory, prompt-cache reuse, speculation, recent requests).
+- pi's session commands: `/compact` and automatic compaction, `/resume`, `/fork`, `/clone`, `/tree`, `/name`, `/session`, `/export` (pi's HTML page, or JSONL), `/import`, `/share` (a secret GitHub gist), `/copy`, `/hotkeys`, `/scoped-models`.
+- Skills controls (`--skill`, `--no-skills`, settings entries, `/skill:name`, the startup list of loaded skills and context files, `/reload`), project trust shared with pi (`/trust`, the prompt for untrusted projects), `/changelog`.
+- MCP: stdio and Streamable HTTP servers from pi's mcp.json, their tools offered to the model, the `/mcp` manager, `--no-mcp`.
+- An update check at start (off with `SAETTA_SKIP_VERSION_CHECK=1` or `PI_OFFLINE=1`).
+
+### Changed
+
+- `saetta start code` and `saetta start pi` update only their own entries in settings.json and models.json and keep everything else.
+
+### Notes
+
+- Requests, session files and output match pi's byte for byte on 58 recorded scenarios.
+- Not yet: OAuth sign-in for MCP servers, pi's TypeScript extensions and packages, RPC and SDK modes, image input.
+
 ## [0.15.0] - 2026-11-22
 
 ### Added

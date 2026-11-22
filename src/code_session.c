@@ -133,6 +133,26 @@ static Err persist(CodeSession *s, const JValue *entry) {
 
 // ---- the most recent session for a cwd (findMostRecentSession) ---------------------------------
 
+// The file's first line, without reading the rest; NULL when longer than max or unreadable.
+static char *first_line(Arena *a, const char *path, size_t max) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    Buf b = {0};
+    int c;
+    while ((c = fgetc(f)) != EOF && c != '\n') {
+        if (b.len >= max) {
+            fclose(f);
+            buf_free(&b);
+            return NULL;
+        }
+        buf_addc(&b, (char)c);
+    }
+    fclose(f);
+    char *r = arena_strndup(a, b.ptr ? b.ptr : "", b.len);
+    buf_free(&b);
+    return r;
+}
+
 static char *most_recent(Arena *a, const char *dir, const char *cwd) {
     DIR *d = opendir(dir);
     if (!d) return NULL;
@@ -147,16 +167,11 @@ static char *most_recent(Arena *a, const char *dir, const char *cwd) {
         if (stat(p, &st) != 0) continue;
         double mt = (double)st.st_mtimespec.tv_sec * 1e3 + (double)st.st_mtimespec.tv_nsec / 1e6;
         if (mt <= best_mtime) continue;
-        // the header's cwd must match
-        char *text;
-        size_t len;
-        if (read_file(p, (size_t)1 << 20, &text, &len)) continue;
-        Str s = str_n(text, len);
-        ssize_t nl = str_find(s, S("\n"), 0);
+        // the header's cwd must match; only the first line is read (pi's header scan, at most 1 MiB)
+        char *line = first_line(a, p, (size_t)1 << 20);
         JValue *h = NULL;
-        bool ok = !json_parse(a, nl >= 0 ? str_sub(s, 0, (size_t)nl) : s, true, &h) && h &&
-                  str_eqz(json_strs(json_get(h, "type")), "session") && str_eqz(json_strs(json_get(h, "cwd")), cwd);
-        free(text);
+        bool ok = line && !json_parse(a, str(line), true, &h) && h && str_eqz(json_strs(json_get(h, "type")), "session") &&
+                  str_eqz(json_strs(json_get(h, "cwd")), cwd);
         if (!ok) continue;
         best = p;
         best_mtime = mt;
@@ -250,14 +265,212 @@ static void branch(const CodeSession *s, JValue *out) {
     vec_free(&up);
 }
 
+// ---- UTF-8 ---------------------------------------------------------------------------------------
+
+// The length of the well-formed sequence at p (1 to 4), or 0 with *bad the length of its
+// maximal ill-formed subpart (Unicode 3.9, as TextDecoder replaces).
+static size_t u8_len(const unsigned char *p, size_t n, size_t *bad) {
+    unsigned char c = p[0];
+    *bad = 1;
+    if (c < 0x80) return 1;
+    size_t need;
+    unsigned char lo = 0x80, hi = 0xBF;
+    if (c >= 0xC2 && c <= 0xDF) need = 1;
+    else if (c >= 0xE0 && c <= 0xEF) {
+        need = 2;
+        if (c == 0xE0) lo = 0xA0;
+        if (c == 0xED) hi = 0x9F;
+    } else if (c >= 0xF0 && c <= 0xF4) {
+        need = 3;
+        if (c == 0xF0) lo = 0x90;
+        if (c == 0xF4) hi = 0x8F;
+    } else return 0;
+    for (size_t k = 1; k <= need; k++) {
+        if (k >= n) return 0;
+        unsigned char x = p[k];
+        if (x < (k == 1 ? lo : 0x80) || x > (k == 1 ? hi : 0xBF)) return 0;
+        *bad = k + 1;
+    }
+    return need + 1;
+}
+
+Str code_utf8_clean(Arena *a, Str s) {
+    const unsigned char *p = (const unsigned char *)s.ptr;
+    size_t i = 0, bad;
+    while (i < s.len) {
+        size_t l = u8_len(p + i, s.len - i, &bad);
+        if (!l) break;
+        i += l;
+    }
+    if (i == s.len) return s;
+    Buf b = {0};
+    buf_add(&b, s.ptr, i);
+    while (i < s.len) {
+        size_t l = u8_len(p + i, s.len - i, &bad);
+        if (l) {
+            buf_add(&b, s.ptr + i, l);
+            i += l;
+        } else {
+            buf_adds(&b, "\xef\xbf\xbd");
+            i += bad > s.len - i ? s.len - i : bad;
+        }
+    }
+    Str r = {arena_strndup(a, b.ptr, b.len), b.len};
+    buf_free(&b);
+    return r;
+}
+
+// ---- the context (buildSessionContext: buildContextEntries, sessionEntryToContextMessages and
+// convertToLlm for the roles the client does not know) -----------------------------------------
+
+// new Date(iso).getTime() for pi's own timestamps (2026-11-22T08:37:11.713Z)
+static int64_t iso_ms(Str t) {
+    struct tm tm = {0};
+    int ms = 0;
+    char buf[40];
+    size_t n = t.len < sizeof buf - 1 ? t.len : sizeof buf - 1;
+    memcpy(buf, t.ptr, n);
+    buf[n] = 0;
+    if (sscanf(buf, "%4d-%2d-%2dT%2d:%2d:%2d.%3dZ", &tm.tm_year, &tm.tm_mon, &tm.tm_mday, &tm.tm_hour, &tm.tm_min, &tm.tm_sec, &ms) < 6) return 0;
+    tm.tm_year -= 1900;
+    tm.tm_mon -= 1;
+    return (int64_t)timegm(&tm) * 1000 + ms;
+}
+
+static JValue *text_user(Arena *a, const char *text, int64_t ts) {
+    JValue *m = json_new(a, J_OBJECT);
+    json_put(a, m, S("role"), json_string(a, S("user")));
+    JValue *c = json_new(a, J_ARRAY), *b = json_new(a, J_OBJECT);
+    json_put(a, b, S("type"), json_string(a, S("text")));
+    json_put(a, b, S("text"), json_string(a, str(text)));
+    json_push(a, c, b);
+    json_put(a, m, S("content"), c);
+    json_put(a, m, S("timestamp"), json_int(a, ts));
+    return m;
+}
+
+// messages.ts bashExecutionToText
+static char *bash_text(Arena *a, const JValue *m) {
+    Buf b = {0};
+    Str cmd = json_strs(json_get(m, "command")), out = json_strs(json_get(m, "output"));
+    buf_printf(&b, "Ran `%.*s`\n", (int)cmd.len, cmd.ptr);
+    if (out.len) buf_printf(&b, "```\n%.*s\n```", (int)out.len, out.ptr);
+    else buf_adds(&b, "(no output)");
+    const JValue *ec = json_get(m, "exitCode");
+    if (json_is(json_get(m, "cancelled"), J_BOOL) && json_get(m, "cancelled")->b) buf_adds(&b, "\n\n(command cancelled)");
+    else if (json_is(ec, J_INTEGER) && ec->i != 0) buf_printf(&b, "\n\nCommand exited with code %lld", (long long)ec->i);
+    Str full = json_strs(json_get(m, "fullOutputPath"));
+    if (json_is(json_get(m, "truncated"), J_BOOL) && json_get(m, "truncated")->b && full.len)
+        buf_printf(&b, "\n\n[Output truncated. Full output: %.*s]", (int)full.len, full.ptr);
+    char *r = arena_strndup(a, b.ptr ? b.ptr : "", b.len);
+    buf_free(&b);
+    return r;
+}
+
+// One entry's model-visible messages.
+static void entry_messages(Arena *a, const JValue *e, const JValue *edit, JValue *out) {
+    Str type = json_strs(json_get(e, "type"));
+    int64_t ts = iso_ms(json_strs(json_get(e, "timestamp")));
+    JValue *m = NULL;
+    if (str_eqz(type, "message")) {
+        m = (JValue *)json_get(e, "message");
+        if (!m) return;
+        Str role = json_strs(json_get(m, "role"));
+        const JValue *c = json_get(m, "content");
+        if (!c || c->kind == J_NULL) { // old or hand-edited files
+            JValue *copy = json_new(a, J_OBJECT);
+            for (size_t i = 0; i < m->obj.len; i++) json_put(a, copy, m->obj.items[i].key, m->obj.items[i].val);
+            json_put(a, copy, S("content"), str_eqz(role, "system") ? json_string(a, S("")) : json_new(a, J_ARRAY));
+            m = copy;
+        }
+        if (str_eqz(role, "bashExecution")) {
+            if (json_is(json_get(m, "excludeFromContext"), J_BOOL) && json_get(m, "excludeFromContext")->b) return;
+            const JValue *t = json_get(m, "timestamp");
+            m = text_user(a, bash_text(a, m), json_is(t, J_INTEGER) ? t->i : ts);
+        } else if (str_eqz(role, "custom")) {
+            const JValue *cc = json_get(m, "content");
+            const JValue *t = json_get(m, "timestamp");
+            JValue *u = text_user(a, "", json_is(t, J_INTEGER) ? t->i : ts);
+            if (json_is(cc, J_STRING)) json_put(a, json_get(u, "content")->arr.items[0], S("text"), (JValue *)cc);
+            else json_put(a, u, S("content"), (JValue *)cc);
+            m = u;
+        }
+    } else if (str_eqz(type, "custom_message")) {
+        const JValue *cc = json_get(e, "content");
+        JValue *u = text_user(a, "", ts);
+        if (json_is(cc, J_STRING)) json_put(a, json_get(u, "content")->arr.items[0], S("text"), (JValue *)cc);
+        else if (cc) json_put(a, u, S("content"), (JValue *)cc);
+        else json_put(a, u, S("content"), json_new(a, J_ARRAY));
+        m = u;
+    } else if (str_eqz(type, "branch_summary") && json_strs(json_get(e, "summary")).len) {
+        Str sum = json_strs(json_get(e, "summary"));
+        m = text_user(a, arena_printf(a, "The following is a summary of a branch that this conversation came back from:\n\n<summary>\n%.*s</summary>", (int)sum.len, sum.ptr), ts);
+    } else if (str_eqz(type, "compaction")) {
+        const JValue *sys = json_get(e, "systemMessage");
+        if (sys) json_push(a, out, (JValue *)sys);
+        Str sum = json_strs(json_get(e, "summary"));
+        m = text_user(a, arena_printf(a, "The conversation history before this point was compacted into the following summary:\n\n<summary>\n%.*s\n</summary>", (int)sum.len, sum.ptr), ts);
+    }
+    if (!m) return;
+    if (edit) { // context_edit: replace or drop the content
+        const JValue *rep = json_get(edit, "replacement");
+        if (!rep || rep->kind == J_NULL) return;
+        Str role = json_strs(json_get(m, "role"));
+        if (str_eqz(role, "user") || str_eqz(role, "assistant") || str_eqz(role, "toolResult")) {
+            JValue *copy = json_new(a, J_OBJECT);
+            for (size_t i = 0; i < m->obj.len; i++) json_put(a, copy, m->obj.items[i].key, m->obj.items[i].val);
+            const JValue *rc = json_get(rep, "content");
+            if (json_is(rc, J_STRING) && !str_eqz(role, "user")) {
+                JValue *arr = json_new(a, J_ARRAY), *b = json_new(a, J_OBJECT);
+                json_put(a, b, S("type"), json_string(a, S("text")));
+                json_put(a, b, S("text"), (JValue *)rc);
+                json_push(a, arr, b);
+                json_put(a, copy, S("content"), arr);
+            } else json_put(a, copy, S("content"), (JValue *)rc);
+            m = copy;
+        }
+    }
+    json_push(a, out, m);
+}
+
 const JValue *code_session_messages(const CodeSession *s) {
     CodeSession *m = (CodeSession *)s;
-    JValue *path = json_new(s->a, J_ARRAY);
+    Arena *a = s->a;
+    JValue *path = json_new(a, J_ARRAY);
     branch(s, path);
-    m->messages = json_new(s->a, J_ARRAY);
-    for (size_t i = 0; i < path->arr.len; i++) {
-        const JValue *e = path->arr.items[i];
-        if (str_eqz(json_strs(json_get(e, "type")), "message")) json_push(s->a, m->messages, (JValue *)json_get(e, "message"));
+    // the latest compaction: itself, the kept entries before it (but their system messages),
+    // then everything after it
+    ptrdiff_t ci = -1;
+    for (size_t i = 0; i < path->arr.len; i++)
+        if (str_eqz(json_strs(json_get(path->arr.items[i], "type")), "compaction")) ci = (ptrdiff_t)i;
+    JValue *ctx = path;
+    if (ci >= 0) {
+        ctx = json_new(a, J_ARRAY);
+        const JValue *comp = path->arr.items[ci];
+        json_push(a, ctx, (JValue *)comp);
+        Str first = json_strs(json_get(comp, "firstKeptEntryId"));
+        bool kept = false;
+        for (ptrdiff_t i = 0; i < ci; i++) {
+            const JValue *e = path->arr.items[i];
+            if (str_eq(json_strs(json_get(e, "id")), first)) kept = true;
+            bool sys = str_eqz(json_strs(json_get(e, "type")), "message") && str_eqz(json_strs(json_get(json_get(e, "message"), "role")), "system");
+            if (kept && !sys) json_push(a, ctx, (JValue *)e);
+        }
+        for (size_t i = (size_t)ci + 1; i < path->arr.len; i++) json_push(a, ctx, path->arr.items[i]);
+    }
+    m->messages = json_new(a, J_ARRAY);
+    for (size_t i = 0; i < ctx->arr.len; i++) {
+        const JValue *e = ctx->arr.items[i];
+        // an older compaction kept inside the newest range contributes nothing
+        if (i > 0 && str_eqz(json_strs(json_get(e, "type")), "compaction")) continue;
+        // the latest context_edit targeting this entry
+        const JValue *edit = NULL;
+        Str id = json_strs(json_get(e, "id"));
+        for (size_t k = 0; k < ctx->arr.len; k++) {
+            const JValue *x = ctx->arr.items[k];
+            if (str_eqz(json_strs(json_get(x, "type")), "context_edit") && str_eq(json_strs(json_get(x, "targetId")), id)) edit = x;
+        }
+        entry_messages(a, e, edit, m->messages);
     }
     return m->messages;
 }
@@ -274,6 +487,10 @@ const JValue *code_session_last(const CodeSession *s, const char *type, const ch
 }
 
 const char *code_session_path(const CodeSession *s) { return s->path; }
+
+const char *code_session_leaf(const CodeSession *s) { return s->leaf; }
+
+const JValue *code_session_entry_last(const CodeSession *s) { return s->entries->arr.items[s->entries->arr.len - 1]; }
 
 bool code_session_is_new(const CodeSession *s) { return s->entries->arr.len == 1; }
 

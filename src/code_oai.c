@@ -6,7 +6,7 @@
 // api/transform-messages.ts, api/simple-options.ts (clampMaxTokensToContext, thinking
 // budgets), utils/estimate.ts, utils/streaming-json.ts (StreamingJsonParser),
 // utils/json-parse.ts (repairJson, parseToolCallArguments), utils/error-body.ts,
-// utils/event-stream.ts (durationMs), utils/identity.ts (User-Agent, attribution), utils/hash.ts;
+// utils/event-stream.ts (durationMs), utils/hash.ts;
 // and the openai SDK 7.19.0 pi bundles (Apache-2.0, Copyright 2026 OpenAI): core/streaming.js
 // (SSE decoding), core/error.js (APIError messages), client.js (status errors).
 //
@@ -2233,7 +2233,8 @@ static void on_chunk(CodeOaiStream *s, const JValue *chunk) {
 }
 
 static void on_sse(CodeOaiStream *s) {
-    Str data = buf_str(&s->data), event = buf_str(&s->event);
+    // pi decodes the stream with TextDecoder: ill-formed UTF-8 becomes U+FFFD
+    Str data = code_utf8_clean(s->a, buf_str(&s->data)), event = buf_str(&s->event);
     bool has_event = s->has_event;
     if (str_eqz(data, "[DONE]")) {
         s->sentinel = true;
@@ -2459,7 +2460,8 @@ Err code_oai_complete(Arena *a, const CodeModel *m, const CodeEnv *env, Str body
     HttpCtx hc = {.s = s, .abort = env ? env->abort : NULL};
     int status = 0;
     char err[512] = "";
-    int rc = sx_http("POST", url, h, nh, body.ptr, body.len, 300, on_http, &hc, &status, err, sizeof err);
+    // 600 s without a byte, the OpenAI SDK's default timeout pi uses
+    int rc = sx_http_cancellable("POST", url, h, nh, body.ptr, body.len, 600, on_http, &hc, &status, err, sizeof err, hc.abort);
     if (s->failed) {
         *assistant = code_oai_stream_end(s, NULL);
     } else if (rc != 0) {

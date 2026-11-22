@@ -206,7 +206,7 @@ td.num { font-family: var(--mono); font-size: 13px; white-space: nowrap; }
 .code .c { color: var(--dim); }
 .copy { font: 500 11px var(--sans); color: var(--muted); background: none; border: 1px solid var(--border); border-radius: 5px; padding: 2px 8px; cursor: pointer; }
 .copy:hover { color: var(--fg); }
-.agents { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-top: 16px; }
+.agents { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-top: 16px; }
 .agent { border: 1px solid var(--border); border-radius: 10px; padding: 16px; }
 .agent .k { font-weight: 600; font-size: 15px; margin-bottom: 8px; }
 .agent code { font-size: 12.5px; color: var(--accent); }

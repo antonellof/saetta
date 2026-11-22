@@ -1,5 +1,7 @@
-// Tests for src/code_oai.c against pi 1.5.2's real behaviour (tests/code/golden-pi in
-// saetta_private, $SAETTA_CODE_GOLDEN): every request body byte for byte, and every answer
+// Tests for src/code_oai.c against pi 1.5.2's real behaviour, recorded as captures of pi runs
+// in $SAETTA_CODE_GOLDEN (one folder per scenario: the request bodies, session files and output,
+// with paths, ids and times normalized; the scenario files beside it): every request body byte
+// for byte, and every answer
 // (the SSE bytes the mock sends, parsed without a socket and over HTTP) as pi's assistant
 // message and json-mode events. Skipped without $SAETTA_CODE_GOLDEN.
 #include "../code_oai.h"
@@ -19,7 +21,7 @@
 
 extern char **environ;
 
-// run_scenario.py models_json(): the "saetta" provider of every capture.
+// The "saetta" provider every capture used.
 static const char *COMPAT = "{\"supportsDeveloperRole\":false,\"supportsStore\":false,\"supportsReasoningEffort\":false,"
                             "\"maxTokensField\":\"max_tokens\",\"thinkingFormat\":\"qwen-chat-template\"}";
 
@@ -80,7 +82,7 @@ static Str raw_message(Str line) {
     return str_n(line.ptr + i + 11, line.len - (size_t)i - 12);
 }
 
-// "durationMs":N -> "durationMs":0, as run_scenario.py normalizes.
+// "durationMs":N -> "durationMs":0, as the captures are normalized.
 static Str norm_duration(Arena *a, Str s) {
     Buf b = {0};
     size_t i = 0;
@@ -418,7 +420,7 @@ static int raw_sink(void *ctx, int status, const void *p, size_t n) {
 
 // Strips the "usage" of message_update lines: in pi it depends on timing (which events its
 // consumer copied before the usage chunk was parsed), so the goldens hold "$USAGE" there
-// (tools/code/run_scenario.py) and no check compares it.
+// in the captures) and no check compares it.
 static Str no_usage(Arena *a, Str l) {
     ptrdiff_t u = str_find(l, S(",\"usage\":"), 0), e = str_find(l, S(",\"assistantMessageEvent\":"), 0);
     if (u < 0 || e < 0) return l;
@@ -504,8 +506,9 @@ TEST(code_oai_stream_golden) {
     const char *golden = golden_dir();
     if (!golden) SKIP("no $SAETTA_CODE_GOLDEN");
     Arena a = {0};
+    // the mock OpenAI server that answered the captures (an executable script), for the HTTP part
     const char *mock_py = getenv("SAETTA_CODE_MOCK");
-    if (!mock_py) mock_py = arena_printf(&a, "%s/../../../tools/code/mock_openai.py", golden);
+    if (!mock_py) SKIP("no $SAETTA_CODE_MOCK");
     const char *tmp = getenv("TMPDIR");
     char **names;
     size_t n = scenarios(&a, golden, &names), answers = 0, event_lines = 0;

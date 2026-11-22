@@ -5,11 +5,13 @@
 #include "code.h"
 #include "code_oai.h"
 
+#include <ctype.h>
 #include <limits.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <termios.h>
+#include <time.h>
 #include <unistd.h>
 
 static const char *const default_tools[] = {"read", "bash", "edit", "write"};
@@ -30,6 +32,7 @@ typedef struct {
     size_t ntools;
     bool json;
     bool ui; // the interactive mode prints the stream as it arrives
+    int64_t retry_attempt; // the retries of the current prompt so far (pi's _retryAttempt)
     JValue *new_messages; // this run's messages, for agent_end
 } Run;
 
@@ -366,13 +369,43 @@ static int g_ui_state; // 0 nothing, 1 thinking, 2 text
 #define RED "\x1b[31m"
 #define RESET "\x1b[0m"
 
+// Text from the model or a tool, shown without terminal control: escape sequences (CSI and the
+// rest) and other C0 controls but newline and tab are dropped.
+static void ui_write(Str t) {
+    size_t i = 0, run = 0;
+    while (i < t.len) {
+        unsigned char c = (unsigned char)t.ptr[i];
+        if (c >= 0x20 && c != 0x7f) {
+            i++;
+            continue;
+        }
+        if (c == '\n' || c == '\t') {
+            i++;
+            continue;
+        }
+        fwrite(t.ptr + run, 1, i - run, stdout);
+        if (c == 0x1b && i + 1 < t.len && t.ptr[i + 1] == '[') { // CSI: to its final byte
+            i += 2;
+            while (i < t.len && !((unsigned char)t.ptr[i] >= 0x40 && (unsigned char)t.ptr[i] <= 0x7e)) i++;
+            if (i < t.len) i++;
+        } else if (c == 0x1b && i + 1 < t.len && t.ptr[i + 1] == ']') { // OSC: to BEL or ST
+            i += 2;
+            while (i < t.len && t.ptr[i] != 0x07 && !(t.ptr[i] == 0x1b && i + 1 < t.len && t.ptr[i + 1] == '\\')) i++;
+            i += i < t.len && t.ptr[i] == 0x07 ? 1 : 2;
+            if (i > t.len) i = t.len;
+        } else i++;
+        run = i;
+    }
+    fwrite(t.ptr + run, 1, i - run, stdout);
+}
+
 static void ui_event(Str type, const JValue *event) {
     Str delta = json_strs(json_get(event, "delta"));
     if (str_eqz(type, "thinking_start")) {
         printf("%s%s", g_ui_state ? "\n" : "", DIM);
         g_ui_state = 1;
     } else if (str_eqz(type, "thinking_delta")) {
-        fwrite(delta.ptr, 1, delta.len, stdout);
+        ui_write(delta);
     } else if (str_eqz(type, "thinking_end")) {
         printf("%s\n", RESET);
         g_ui_state = 0;
@@ -380,7 +413,7 @@ static void ui_event(Str type, const JValue *event) {
         if (g_ui_state == 1) printf("%s\n", RESET);
         g_ui_state = 2;
     } else if (str_eqz(type, "text_delta")) {
-        fwrite(delta.ptr, 1, delta.len, stdout);
+        ui_write(delta);
     } else if (str_eqz(type, "text_end")) {
         printf("\n");
         g_ui_state = 0;
@@ -402,8 +435,11 @@ static void ui_tool_start(const JValue *call) {
     while (nl < arg.len && arg.ptr[nl] != '\n') nl++;
     if (g_ui_state) printf("%s\n", RESET);
     g_ui_state = 0;
-    printf("%s%s\xe2\x97\x8f %.*s%s %.*s%s%s\n", CYAN, BOLD, (int)name.len, name.ptr, RESET, (int)(nl > 120 ? 120 : nl), arg.ptr,
-           nl < arg.len || nl > 120 ? " ..." : "", RESET);
+    printf("%s%s\xe2\x97\x8f ", CYAN, BOLD);
+    ui_write(name);
+    printf("%s ", RESET);
+    ui_write(str_n(arg.ptr, nl > 120 ? 120 : nl));
+    printf("%s%s\n", nl < arg.len || nl > 120 ? " ..." : "", RESET);
     fflush(stdout);
 }
 
@@ -417,7 +453,9 @@ static void ui_tool_end(const JValue *msg) {
     while (i < t.len && lines < 6) {
         size_t j = i;
         while (j < t.len && t.ptr[j] != '\n') j++;
-        printf("  %.*s\n", (int)(j - i > 200 ? 200 : j - i), t.ptr + i);
+        printf("  ");
+        ui_write(str_n(t.ptr + i, j - i > 200 ? 200 : j - i));
+        printf("\n");
         lines++;
         i = j + 1;
     }
@@ -483,6 +521,14 @@ static Err stream_assistant(Run *r, JValue **out) {
     json_put(a, msg, S("thinkingLevel"), json_string(a, str(level_of(r))));
     if (!st.started) emit_message(r, "message_start", msg);
     emit_message(r, "message_end", msg);
+    // a successful answer ends the retries at once (AgentSession._handleAgentEvent)
+    if (r->retry_attempt > 0 && !str_eqz(json_strs(json_get(msg, "stopReason")), "error")) {
+        JValue *end = ev_new(a, "auto_retry_end");
+        json_put(a, end, S("success"), json_bool(a, true));
+        json_put(a, end, S("attempt"), json_int(a, r->retry_attempt));
+        emit(r, end);
+        r->retry_attempt = 0;
+    }
     json_push(a, r->new_messages, msg);
     JValue *f = json_new(a, J_OBJECT);
     json_put(a, f, S("message"), msg);
@@ -532,6 +578,69 @@ static void emit_tool_end(Run *r, const JValue *call, JValue *msg, JValue *raw) 
     emit(r, e);
 }
 
+// createErrorToolResult + createToolResultMessage for a call that is not run.
+static void error_result(Arena *a, const JValue *call, const char *text, JValue **msg, JValue **raw) {
+    JValue *content = json_new(a, J_ARRAY);
+    JValue *block = json_new(a, J_OBJECT);
+    json_put(a, block, S("type"), json_string(a, S("text")));
+    json_put(a, block, S("text"), json_string(a, str(text)));
+    json_push(a, content, block);
+    *raw = json_new(a, J_OBJECT);
+    json_put(a, *raw, S("content"), content);
+    json_put(a, *raw, S("details"), json_new(a, J_OBJECT));
+    JValue *m = json_new(a, J_OBJECT);
+    json_put(a, m, S("role"), json_string(a, S("toolResult")));
+    json_put(a, m, S("toolCallId"), (JValue *)json_get(call, "id"));
+    json_put(a, m, S("toolName"), (JValue *)json_get(call, "name"));
+    json_put(a, m, S("content"), content);
+    json_put(a, m, S("details"), json_new(a, J_OBJECT));
+    json_put(a, m, S("isError"), json_bool(a, true));
+    json_put(a, m, S("timestamp"), json_int(a, (int64_t)wall_ms()));
+    *msg = m;
+}
+
+static void emit_tool_start(Run *r, const JValue *call) {
+    JValue *e = ev_new(r->a, "tool_execution_start");
+    json_put(r->a, e, S("toolCallId"), (JValue *)json_get(call, "id"));
+    json_put(r->a, e, S("toolName"), (JValue *)json_get(call, "name"));
+    json_put(r->a, e, S("args"), (JValue *)json_get(call, "arguments"));
+    emit(r, e);
+}
+
+// failToolCallsFromTruncatedMessage: a message cut by the output limit runs none of its calls.
+static Err fail_truncated(Run *r, const JValue *assistant, JValue *results) {
+    Arena *a = r->a;
+    const JValue *content = json_get(assistant, "content");
+    for (size_t i = 0; content && i < content->arr.len; i++) {
+        const JValue *call = content->arr.items[i];
+        if (!str_eqz(json_strs(json_get(call, "type")), "toolCall")) continue;
+        emit_tool_start(r, call);
+        Str name = json_strs(json_get(call, "name"));
+        JValue *msg, *raw;
+        error_result(a, call,
+                     arena_printf(a,
+                                  "Tool call \"%.*s\" was not executed: the response hit the output token limit, so its arguments may be "
+                                  "truncated. Re-issue the tool call with complete arguments.",
+                                  (int)name.len, name.ptr),
+                     &msg, &raw);
+        emit_tool_end(r, call, msg, raw);
+        if (r->ui) ui_tool_end(msg);
+        TRY(add_message(r, msg));
+        json_push(a, results, msg);
+    }
+    return OK;
+}
+
+// The tools the transcript declares (pi runs only the tools in the context: a call to any
+// other is "Tool <name> not found", whatever the tools module knows).
+static bool declared(Arena *a, const JValue *system, Str name) {
+    const JValue *decl = system ? json_get(system, "toolsAdded") : NULL;
+    for (size_t i = 0; decl && json_is(decl, J_ARRAY) && i < decl->arr.len; i++)
+        if (str_eq(json_strs(json_get(decl->arr.items[i], "name")), name)) return true;
+    (void)a;
+    return false;
+}
+
 // executeToolCallsParallel: each call's tool_execution_start in order; a call that fails before
 // running (unknown tool, bad arguments: its result has no durationMs) ends at once, the executed
 // ones end after every start (failures first); then the results, in call order.
@@ -543,15 +652,18 @@ static Err run_tools(Run *r, const JValue *assistant, JValue *results) {
         if (str_eqz(json_strs(json_get(content->arr.items[i], "type")), "toolCall")) vec_push(&calls, content->arr.items[i]);
     JValue **msgs = arena_alloc(a, (calls.len + 1) * sizeof *msgs);
     JValue **raws = arena_alloc(a, (calls.len + 1) * sizeof *raws);
+    const JValue *system = current_system(a, code_session_messages(r->session));
     Err err = OK;
     for (size_t i = 0; i < calls.len && !err; i++) {
-        JValue *e = ev_new(a, "tool_execution_start");
-        json_put(a, e, S("toolCallId"), (JValue *)json_get(calls.ptr[i], "id"));
-        json_put(a, e, S("toolName"), (JValue *)json_get(calls.ptr[i], "name"));
-        json_put(a, e, S("args"), (JValue *)json_get(calls.ptr[i], "arguments"));
-        emit(r, e);
+        emit_tool_start(r, calls.ptr[i]);
         if (r->ui) ui_tool_start(calls.ptr[i]);
         r->env.now_ms = wall_ms();
+        Str name = json_strs(json_get(calls.ptr[i], "name"));
+        if (!declared(a, system, name)) {
+            error_result(a, calls.ptr[i], arena_printf(a, "Tool %.*s not found", (int)name.len, name.ptr), &msgs[i], &raws[i]);
+            emit_tool_end(r, calls.ptr[i], msgs[i], raws[i]);
+            continue;
+        }
         prepare_edit_in_place(a, calls.ptr[i]);
         err = code_tool_run(a, &r->env, calls.ptr[i], &msgs[i], &raws[i]);
         if (!err && !json_get(msgs[i], "durationMs")) emit_tool_end(r, calls.ptr[i], msgs[i], raws[i]);
@@ -573,6 +685,96 @@ static Err run_tools(Run *r, const JValue *assistant, JValue *results) {
     return err;
 }
 
+// ---- retries (ai/src/utils/retry.ts isRetryableAssistantError, agent-session.ts _prepareRetry) -----
+
+// A case-insensitive match of pat anywhere in hay, where pat has literal characters, '.' (any
+// character) and '?' after an item (optional): the subset of regex pi's patterns use.
+static bool pm_here(const char *h, const char *p) {
+    if (!*p) return true;
+    bool opt = p[1] == '?';
+    const char *next = p + (opt ? 2 : 1);
+    bool one = *h && (*p == '.' || tolower((unsigned char)*h) == tolower((unsigned char)*p));
+    if (one && pm_here(h + 1, next)) return true;
+    return opt && pm_here(h, next);
+}
+
+static bool pm(const char *hay, const char *pat) {
+    for (const char *h = hay;; h++) {
+        if (pm_here(h, pat)) return true;
+        if (!*h) return false;
+    }
+}
+
+// an HTTP status code not touching a letter or digit: (?<![a-z0-9])(?:429|500|...)(?![a-z0-9])
+static bool status_code(const char *m) {
+    static const char *const codes[] = {"429", "500", "502", "503", "504", "520", "524"};
+    for (size_t k = 0; k < COUNT(codes); k++)
+        for (const char *p = strstr(m, codes[k]); p; p = strstr(p + 1, codes[k])) {
+            bool before = p > m && isalnum((unsigned char)p[-1]);
+            bool after = isalnum((unsigned char)p[3]);
+            if (!before && !after) return true;
+        }
+    return false;
+}
+
+static bool retryable(const JValue *msg) {
+    if (!str_eqz(json_strs(json_get(msg, "stopReason")), "error")) return false;
+    const char *m = json_str(json_get(msg, "errorMessage"));
+    if (!m || !*m) return false;
+    static const char *const never[] = {"GoUsageLimitError", "FreeUsageLimitError", "Monthly usage limit reached", "available balance",
+                                        "insufficient_quota", "out of budget", "quota exceeded", "billing",
+                                        "subscription_sharing_usage_limit_exceeded",
+                                        "subscription_sharing_workplace_individual_usage_limit_exceeded"};
+    for (size_t k = 0; k < COUNT(never); k++)
+        if (pm(m, never[k])) return false;
+    if (status_code(m)) return true;
+    static const char *const yes[] = {
+        "overloaded", "server_busy", "servers are currently busy", "currently experiencing high demand", "model is at capacity",
+        "rate.?limit", "too many requests", "service.?unavailable", "service.?is.?unavailable", "service.?temporarily.?unavailable",
+        "service.?is.?temporarily.?unavailable", "server.?error", "internal.?error", "provider.?returned.?error",
+        "provider.?returned.?an.?error", "exceeded request buffer limit while retrying upstream", "unable to forward upstream",
+        "upstream.?request.?failed", "upstream_stream_read_error", "stream was interrupted", "http/?2 stream failed",
+        "network.?error", "connection.?error", "connection.?refused", "connection.?lost", "other side closed", "fetch failed",
+        "getaddrinfo", "ENOTFOUND", "EAI_AGAIN", "upstream.?connect", "reset before headers", "socket hang up",
+        "socket connection was closed", "timed? out", "timeout", "terminated", "websocket.?closed", "websocket.?error",
+        "ended without", "stream ended before message_stop", "stream ended before a terminal response event",
+        "http2 request did not get a response", "stream disconnected before completion", "cut short after the reply had begun",
+        "pending stream has been canceled", "retry delay", "you can retry your request", "try your request again",
+        "please retry your request", "ResourceExhausted", "subscription_sharing_usage_unavailable",
+        "subscription_sharing_user_unavailable"};
+    for (size_t k = 0; k < COUNT(yes); k++)
+        if (pm(m, yes[k])) return true;
+    // "request to \S+ failed, reason:"
+    const char *q = strcasestr(m, "request to ");
+    if (q) {
+        const char *t = q + 11;
+        if (*t && !isspace((unsigned char)*t)) {
+            while (*t && !isspace((unsigned char)*t)) t++;
+            if (!strncasecmp(t, " failed, reason:", 16)) return true;
+        }
+    }
+    return false;
+}
+
+// settings.retry with pi's defaults (settings-defaults.ts): enabled, 3 retries, 2 s doubling, 60 s cap
+typedef struct {
+    bool enabled;
+    int64_t max_retries, base_ms, cap_ms;
+} RetryPolicy;
+
+static RetryPolicy g_retry = {true, 3, 2000, 60000};
+
+static Err run_agent(Run *r, bool started);
+static void finish_agent(Run *r, bool will_retry, const JValue *last);
+static Err run_turns(Run *r, JValue **last_out, const char **last_id);
+
+static void sleep_abortable(int64_t ms) {
+    for (int64_t t = 0; t < ms && !g_abort; t += 50) {
+        struct timespec ts = {0, 50 * 1000000L};
+        nanosleep(&ts, NULL);
+    }
+}
+
 // One prompt: agent_start, the turns, agent_end (agentLoop + AgentSession.prompt).
 static Err prompt(Run *r, const char *text) {
     Arena *a = r->a;
@@ -587,15 +789,100 @@ static Err prompt(Run *r, const char *text) {
     JValue *content = json_new(a, J_ARRAY);
     JValue *block = json_new(a, J_OBJECT);
     json_put(a, block, S("type"), json_string(a, S("text")));
-    json_put(a, block, S("text"), json_string(a, str(text)));
+    json_put(a, block, S("text"), json_string(a, code_utf8_clean(a, str(text))));
     json_push(a, content, block);
     json_put(a, user, S("content"), content);
     json_put(a, user, S("timestamp"), json_int(a, (int64_t)wall_ms()));
     TRY(add_message(r, user));
+    return run_agent(r, true);
+}
+
+// The agent loop until it ends, then the retry policy: a retryable error is kept in the file,
+// omitted from the model's context with a context_edit entry, and the turn runs again after
+// the backoff (agent_start .. agent_end each time, as pi's continue does).
+static Err run_agent(Run *r, bool started) {
+    Arena *a = r->a;
+    r->retry_attempt = 0;
+    for (;;) {
+        if (!started) {
+            r->new_messages = json_new(a, J_ARRAY);
+            emit(r, ev_new(a, "agent_start"));
+            emit(r, ev_new(a, "turn_start"));
+        }
+        started = false;
+        JValue *last = NULL;
+        const char *last_id = NULL;
+        TRY(run_turns(r, &last, &last_id));
+        bool again = false;
+        if (last && retryable(last) && g_retry.enabled && !g_abort && r->retry_attempt < g_retry.max_retries) {
+            int64_t attempt = ++r->retry_attempt;
+            int64_t delay = g_retry.base_ms << (attempt - 1);
+            if (delay > g_retry.cap_ms) delay = g_retry.cap_ms;
+            JValue *e = ev_new(a, "auto_retry_start");
+            json_put(a, e, S("attempt"), json_int(a, attempt));
+            json_put(a, e, S("maxAttempts"), json_int(a, g_retry.max_retries));
+            json_put(a, e, S("delayMs"), json_int(a, delay));
+            const char *em = json_str(json_get(last, "errorMessage"));
+            json_put(a, e, S("errorMessage"), json_string(a, str(em ? em : "Unknown error")));
+            if (r->ui) printf("%sretrying in %lld s (%lld of %lld)%s\n", DIM, (long long)(delay / 1000), (long long)attempt, (long long)g_retry.max_retries, RESET);
+            // agent_end (willRetry) is emitted before the retry starts
+            finish_agent(r, true, NULL);
+            emit(r, e);
+            JValue *f = json_new(a, J_OBJECT);
+            json_put(a, f, S("targetId"), json_string(a, str(last_id)));
+            json_put(a, f, S("replacement"), json_new(a, J_NULL));
+            TRY(code_session_append(r->session, "context_edit", f));
+            JValue *ea = ev_new(a, "entry_appended");
+            json_put(a, ea, S("entry"), (JValue *)code_session_entry_last(r->session));
+            emit(r, ea);
+            sleep_abortable(delay);
+            again = !g_abort;
+            if (!again) {
+                JValue *end = ev_new(a, "auto_retry_end");
+                json_put(a, end, S("success"), json_bool(a, false));
+                json_put(a, end, S("attempt"), json_int(a, r->retry_attempt));
+                json_put(a, end, S("finalError"), json_string(a, S("Retry cancelled")));
+                emit(r, end);
+                return OK;
+            }
+            continue;
+        }
+        finish_agent(r, false, last);
+        (void)again;
+        return OK;
+    }
+}
+
+static void finish_agent(Run *r, bool will_retry, const JValue *last) {
+    Arena *a = r->a;
+    JValue *ae = ev_new(a, "agent_end");
+    json_put(a, ae, S("messages"), r->new_messages);
+    json_put(a, ae, S("willRetry"), json_bool(a, will_retry));
+    emit(r, ae);
+    if (will_retry) return;
+    // retries used up on an error (_handlePostAgentRun)
+    if (r->retry_attempt > 0 && last && str_eqz(json_strs(json_get(last, "stopReason")), "error")) {
+        JValue *end = ev_new(a, "auto_retry_end");
+        json_put(a, end, S("success"), json_bool(a, false));
+        json_put(a, end, S("attempt"), json_int(a, r->retry_attempt));
+        json_put(a, end, S("finalError"), (JValue *)json_get(last, "errorMessage"));
+        emit(r, end);
+        r->retry_attempt = 0;
+    }
+    JValue *settled = ev_new(a, "agent_settled");
+    json_put(a, settled, S("aborted"), json_bool(a, g_abort != 0));
+    emit(r, settled);
+}
+
+// The turns of one agent run (runLoop): *last the final assistant message and its entry id.
+static Err run_turns(Run *r, JValue **last_out, const char **last_id) {
+    Arena *a = r->a;
     for (bool first = true;; first = false) {
         if (!first) emit(r, ev_new(a, "turn_start"));
         JValue *msg;
         TRY(stream_assistant(r, &msg));
+        *last_out = msg;
+        *last_id = code_session_leaf(r->session);
         Str stop = json_strs(json_get(msg, "stopReason"));
         if (r->ui && (str_eqz(stop, "error") || str_eqz(stop, "aborted"))) {
             printf("%s%s%s%s\n", g_ui_state ? "\n" : "", RED, json_str(json_get(msg, "errorMessage")) ? json_str(json_get(msg, "errorMessage")) : "error", RESET);
@@ -606,7 +893,8 @@ static Err prompt(Run *r, const char *text) {
         if (!str_eqz(stop, "error") && !str_eqz(stop, "aborted")) {
             const JValue *c = json_get(msg, "content");
             for (size_t i = 0; c && i < c->arr.len; i++) more |= str_eqz(json_strs(json_get(c->arr.items[i], "type")), "toolCall");
-            if (more) TRY(run_tools(r, msg, results));
+            if (more && str_eqz(stop, "length")) TRY(fail_truncated(r, msg, results));
+            else if (more) TRY(run_tools(r, msg, results));
         }
         JValue *te = ev_new(a, "turn_end");
         json_put(a, te, S("message"), msg);
@@ -614,13 +902,6 @@ static Err prompt(Run *r, const char *text) {
         emit(r, te);
         if (!more || g_abort) break;
     }
-    JValue *ae = ev_new(a, "agent_end");
-    json_put(a, ae, S("messages"), r->new_messages);
-    json_put(a, ae, S("willRetry"), json_bool(a, false));
-    emit(r, ae);
-    JValue *settled = ev_new(a, "agent_settled");
-    json_put(a, settled, S("aborted"), json_bool(a, false));
-    emit(r, settled);
     return OK;
 }
 
@@ -639,10 +920,32 @@ static void raw_on(void) {
     t.c_iflag &= ~(tcflag_t)(IXON | ICRNL);
     t.c_cc[VMIN] = 1;
     t.c_cc[VTIME] = 0;
-    tcsetattr(0, TCSAFLUSH, &t);
+    tcsetattr(0, TCSANOW, &t); // keep what was typed or pasted ahead
+    fputs("\x1b[?2004h", stdout); // bracketed paste: a pasted newline does not send
+    fflush(stdout);
 }
 
-static void raw_off(void) { tcsetattr(0, TCSAFLUSH, &g_cooked); }
+static void raw_off(void) {
+    fputs("\x1b[?2004l", stdout);
+    fflush(stdout);
+    tcsetattr(0, TCSANOW, &g_cooked);
+}
+
+// the tools module's (code_tools.c) replaces this when it tracks background jobs
+__attribute__((weak)) void code_tools_kill_detached(void) {}
+
+static volatile sig_atomic_t g_tty_saved;
+
+// SIGTERM / SIGHUP: the terminal back as it was, the bash jobs stopped, exit as pi does (143, 129)
+static void on_term(int sig) {
+    if (g_tty_saved) {
+        static const char off[] = "\x1b[?2004l\x1b[0m\r\n";
+        (void)!write(1, off, sizeof off - 1);
+        tcsetattr(0, TCSANOW, &g_cooked);
+    }
+    code_tools_kill_detached();
+    _exit(sig == SIGHUP ? 129 : 143);
+}
 
 // Code points in s (the cursor moves by those; wide characters are not measured).
 static size_t cps(const char *s, size_t n) {
@@ -664,6 +967,7 @@ static void redraw(const char *prompt, const Buf *line, size_t cur) {
 static bool read_prompt(Arena *a, VecStr *history, char **out) {
     Buf text = {0}, line = {0};
     size_t cur = 0, hist = history->len;
+    bool pasting = false;
     const char *prompt = BOLD "> " RESET;
     raw_on();
     redraw(prompt, &line, cur);
@@ -673,6 +977,15 @@ static bool read_prompt(Arena *a, VecStr *history, char **out) {
         if (read(0, &c, 1) != 1) {
             ok = false;
             break;
+        }
+        if ((c == '\r' || c == '\n') && pasting) { // a pasted line break: keep going
+            buf_addstr(&text, buf_str(&line));
+            buf_addc(&text, '\n');
+            line.len = cur = 0;
+            printf("\r\n");
+            prompt = "  ";
+            redraw(prompt, &line, cur);
+            continue;
         }
         if (c == '\r' || c == '\n') {
             if (line.len && line.ptr[line.len - 1] == '\\') { // continue
@@ -715,10 +1028,25 @@ static bool read_prompt(Arena *a, VecStr *history, char **out) {
         else if (c == 5) cur = line.len;
         else if (c == 21) line.len = cur = 0;
         else if (c == 27) {
-            unsigned char seq[2];
-            if (read(0, &seq[0], 1) != 1 || read(0, &seq[1], 1) != 1) continue;
-            if (seq[0] != '[') continue;
-            if (seq[1] == 'D' && cur > 0) {
+            // an escape sequence, read to its final byte (CSI parameters, then 0x40..0x7e)
+            unsigned char seq[2], params[16];
+            size_t np = 0;
+            if (read(0, &seq[0], 1) != 1) continue;
+            if (seq[0] != '[' && seq[0] != 'O') continue; // Alt+key and the like: ignored
+            for (;;) {
+                unsigned char x;
+                if (read(0, &x, 1) != 1) break;
+                if (x >= 0x40 && x <= 0x7e) {
+                    seq[1] = x;
+                    break;
+                }
+                if (np < sizeof params) params[np++] = x;
+            }
+            if (seq[1] == '~' && np == 3 && !memcmp(params, "200", 3)) pasting = true;
+            else if (seq[1] == '~' && np == 3 && !memcmp(params, "201", 3)) pasting = false;
+            else if (np) {
+                // other parameterized keys (Home, End, Delete, modified arrows): ignored
+            } else if (seq[1] == 'D' && cur > 0) {
                 cur--;
                 while (cur > 0 && ((unsigned char)line.ptr[cur] & 0xC0) == 0x80) cur--;
             } else if (seq[1] == 'C' && cur < line.len) {
@@ -751,6 +1079,11 @@ static Err interactive(Run *r, const Args *o) {
     r->ui = true;
     g_cwd = r->env.cwd;
     tcgetattr(0, &g_cooked);
+    g_tty_saved = 1;
+    struct sigaction st = {0};
+    st.sa_handler = on_term;
+    sigaction(SIGTERM, &st, NULL);
+    sigaction(SIGHUP, &st, NULL);
     struct sigaction sa = {0};
     sa.sa_handler = on_sigint;
     sigaction(SIGINT, &sa, NULL);
@@ -880,6 +1213,29 @@ Err code_run(const char *const *args, size_t n, int *code) {
     r.env.nappend_system_prompt = o.append.len;
     pick_tools(a, &o, &r);
     JValue *settings = read_json(a, path_join(a, r.env.agent_dir, "settings.json"));
+    const JValue *rs = json_get(settings, "retry");
+    g_retry.enabled = jbool(json_get(rs, "enabled"), true);
+    g_retry.max_retries = (int64_t)juint(json_get(rs, "maxRetries"), 3);
+    g_retry.base_ms = (int64_t)juint(json_get(rs, "baseDelayMs"), 2000);
+    g_retry.cap_ms = (int64_t)juint(json_get(rs, "maxAgentDelayMs"), 60000);
+    // piped stdin (readPipedStdin, buildInitialMessage): trimmed, joined to the first prompt with
+    // nothing between, and it makes the run a print run
+    bool piped = false;
+    if (!isatty(0)) {
+        Buf in = {0};
+        char chunk[65536];
+        ssize_t got;
+        while ((got = read(0, chunk, sizeof chunk)) > 0) buf_add(&in, chunk, (size_t)got);
+        Str t = str_trim(buf_str(&in));
+        if (t.len) {
+            piped = true;
+            Str first = o.prompts.len ? str(o.prompts.ptr[0]) : S("");
+            char *joined = arena_printf(a, "%.*s%.*s", (int)t.len, t.ptr, (int)first.len, first.ptr);
+            if (o.prompts.len) o.prompts.ptr[0] = joined;
+            else vec_push(&o.prompts, joined);
+        }
+        buf_free(&in);
+    }
     e = find_model(&r, &o, settings);
     if (e) {
         dbg("saetta code: no model %s%s%s in %s/models.json (Saetta Code runs openai-completions providers)\n",
@@ -915,7 +1271,7 @@ Err code_run(const char *const *args, size_t n, int *code) {
     r.env.provider = r.model.provider;
     r.env.model = r.model.id;
     r.env.thinking = level;
-    if (!o.print && !r.json && isatty(0) && isatty(1)) {
+    if (!o.print && !piped && !r.json && isatty(0) && isatty(1)) {
         e = interactive(&r, &o);
         if (!e) *code = 0;
         goto done;
@@ -949,6 +1305,7 @@ Err code_run(const char *const *args, size_t n, int *code) {
         }
     }
 done:
+    code_tools_kill_detached();
     vec_free(&o.prompts);
     vec_free(&o.append);
     arena_reset(a);

@@ -79,6 +79,10 @@ JValue *code_tool_schemas(Arena *a, const char *const *tools, size_t ntools);
 // mode's tool_execution_end prints it ({"content","details","structuredContent",...}).
 Err code_tool_run(Arena *a, const CodeEnv *env, const JValue *call, JValue **result, JValue **raw);
 
+// Kills the process groups of bash jobs still running in the background (pi's
+// killTrackedDetachedChildren), at exit and on SIGTERM / SIGHUP. Async-signal-safe.
+void code_tools_kill_detached(void);
+
 // ---- OpenAI chat completions client (code_oai.c; pi-ai: api/openai-completions.js,
 // transform-messages.js)
 
@@ -115,8 +119,16 @@ const JValue *code_session_header(const CodeSession *s);
 const JValue *code_session_last(const CodeSession *s, const char *type, const char *field);
 // The session file (written once the session holds a message), NULL when not persisted.
 const char *code_session_path(const CodeSession *s);
+// The id of the last entry appended (the current leaf), NULL before the first.
+const char *code_session_leaf(const CodeSession *s);
+// The last entry appended (the header before any).
+const JValue *code_session_entry_last(const CodeSession *s);
 // True when the session has no entry yet besides its header.
 bool code_session_is_new(const CodeSession *s);
+
+// s with each maximal ill-formed UTF-8 subpart replaced by U+FFFD (TextDecoder's replacement),
+// s itself when it is well formed.
+Str code_utf8_clean(Arena *a, Str s);
 
 // ---- `saetta code` (code_main.c)
 

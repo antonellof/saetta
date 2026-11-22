@@ -442,6 +442,12 @@ static BOOL same_parent_domain(NSString *parent, NSString *child) {
 int sx_http(const char *method, const char *url, const sx_header *headers, size_t nheaders,
             const void *body, size_t body_len, double timeout_s, sx_http_sink on_data, void *ctx,
             int *status, char *err, size_t err_cap) {
+    return sx_http_cancellable(method, url, headers, nheaders, body, body_len, timeout_s, on_data, ctx, status, err, err_cap, NULL);
+}
+
+int sx_http_cancellable(const char *method, const char *url, const sx_header *headers, size_t nheaders,
+                        const void *body, size_t body_len, double timeout_s, sx_http_sink on_data, void *ctx,
+                        int *status, char *err, size_t err_cap, volatile int *cancel) {
     @autoreleasepool {
         NSURL *u = [NSURL URLWithString:@(url)];
         if (!u) { copy_err(err, err_cap, @"invalid URL"); return 1; }
@@ -476,7 +482,15 @@ int sx_http(const char *method, const char *url, const sx_header *headers, size_
         NSURLSession *session = [NSURLSession sessionWithConfiguration:cfg delegate:t delegateQueue:q];
         NSURLSessionDataTask *task = [session dataTaskWithRequest:req];
         [task resume];
-        dispatch_semaphore_wait(t.done, DISPATCH_TIME_FOREVER);
+        if (!cancel) dispatch_semaphore_wait(t.done, DISPATCH_TIME_FOREVER);
+        else { // wake every 100 ms to see the flag, then cancel the task and wait for it to finish
+            bool cancelled = false;
+            while (dispatch_semaphore_wait(t.done, dispatch_time(DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC)) != 0)
+                if (*cancel && !cancelled) {
+                    cancelled = true;
+                    [task cancel];
+                }
+        }
         [session finishTasksAndInvalidate]; // releases the delegate
 
         if (status) *status = t.status;

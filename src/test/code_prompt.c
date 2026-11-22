@@ -1,6 +1,7 @@
-// Tests for src/code_prompt.c against pi 1.5.2's own prompts: with SAETTA_CODE_GOLDEN at
-// saetta_private's tests/code/golden-pi, every scenario's workspace and home are recreated in
-// a temporary folder as tools/code/run_scenario.py makes them, and the system message's
+// Tests for src/code_prompt.c against pi 1.5.2's own prompts: with SAETTA_CODE_GOLDEN at the
+// captures of pi runs (one folder per scenario, the scenario files beside it), every scenario's
+// workspace and home are recreated in a temporary folder as the captures were made, and the
+// system message's
 // sections and the prompt text are compared byte for byte (after the same normalization) with
 // the golden session's system message and the golden first request's messages[0].content.
 #include "../code.h"
@@ -218,7 +219,7 @@ static void put(Arena *a, const char *root, const char *rel, const char *text) {
 
 // Lookup above cwd (root first, after the agent dir's), a nested git worktree shadowing the
 // main repo's file, and no <docs> without pi_docs: pi's loadProjectContextFiles and
-// buildSystemPromptSections, checked by hand (run_scenario.py keeps cwd at the workspace root).
+// buildSystemPromptSections, checked by hand (the captures keep cwd at the workspace root).
 TEST(code_prompt_lookup) {
     Arena a = {0};
     char tmpl[PATH_MAX], tmp[PATH_MAX];

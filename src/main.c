@@ -19,6 +19,7 @@
 
 #include "base.h"
 #include "chat.h"
+#include "code.h"
 #include "control.h"
 #include "download.h"
 #include "gguf.h"
@@ -572,6 +573,15 @@ static Err run(Arena *arena, int argc, char **argv) {
         Err err = monitor_run(rest, nrest, &code);
         if (err) {
             dbg("saetta monitor: %s\n", err);
+            exit(1);
+        }
+        exit(code);
+    }
+    if (argc >= 2 && eq(cmd, "code")) {
+        int code;
+        Err err = code_run(rest, nrest, &code);
+        if (err) {
+            dbg("saetta code: %s\n", err);
             exit(1);
         }
         exit(code);

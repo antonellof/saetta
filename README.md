@@ -115,17 +115,17 @@ saetta start claude -- -p "fix the failing test"   # anything after -- goes to t
 
 ### Saetta Code
 
-A minimal coding agent inside the `saetta` binary, in C, nothing to install: a port of [pi](https://pi.dev) 1.5.2 that behaves as pi does. The same tools (read, bash, edit, write; grep, find and ls with `--tools`), system prompt, `AGENTS.md` / `CLAUDE.md` files, skills, prompt files and session files, so pi and Saetta Code continue each other's sessions (compacted ones too). The model runs inside it, with no server and no HTTP in between (`--pack`); or it talks to a Saetta server or any OpenAI-compatible server listed in pi's `models.json`. pi's TypeScript extensions are not supported.
+A coding agent inside the `saetta` binary, in C, nothing to install, compatible with [pi](https://pi.dev) 1.5.2. The same tools (read, bash, edit, write; grep, find and ls with `--tools`), system prompt, `AGENTS.md` / `CLAUDE.md` files, skills, prompt files and session files, so pi and Saetta Code continue each other's sessions (compacted ones too). The model runs inside it, with no server and no HTTP in between (`--pack`); or it talks to a Saetta server or any OpenAI-compatible server listed in pi's `models.json`. pi's TypeScript extensions are not supported.
 
 ```sh
 saetta start code                             # the model inside Saetta Code (or the running server, if one is up)
-saetta code --pack coder                      # the same, by hand: pi's screen, Escape stops a turn
+saetta code --pack coder                      # the same, by hand: Escape stops a turn
 saetta code -p "fix the failing test"         # print mode against pi's models.json, as pi -p
 saetta code --mode json -p "..."              # pi's JSON event stream
 saetta code -c                                # continue this folder's last session (also pi's)
 ```
 
-Its requests, session files and output match pi's byte for byte on 47 recorded scenarios (tool errors, edits, truncation, sessions, compaction, retries, skills, JSON events), and on three coding tasks it solves what pi solves with less time of its own per turn. The interactive view is pi's terminal UI ported to C: the same screens as pi on its 18 recorded scenarios (editor, "/" commands with completion, "@" file completion, markdown with highlighted code, tool views, errors, aborts, and the model, thinking, settings and session tree selectors). Next: sessions kept on disk with the engine's state, and prompts read while tools run.
+Its requests, session files and output match pi's byte for byte on 47 recorded scenarios (tool errors, edits, truncation, sessions, compaction, retries, skills, JSON events), apart from its own system prompt preamble, and on three coding tasks it solves what pi solves with less time of its own per turn. The interactive view follows pi's terminal UI: the same screens as pi on its 20 recorded scenarios (editor, "/" commands with completion, "@" file completion, markdown with highlighted code, tool views, errors, aborts, the model, thinking, settings and session tree selectors, pi's themes on dark and light terminals), with Saetta Code's own header and footer. Its own: a theme with macOS's colors (`/theme` switches to pi's system, dark or light themes, with a live preview; a first start asks once), bash output shown as it runs, transcript scrolling (Page Up/Down, the wheel, Ctrl+Home/End) and mouse selection copied to the clipboard, a footer line like a starship prompt (folder, branch, git status, the last turn's time), `/model` listing the models this Mac can run (downloading one from there, with its size and the free disk shown first) besides the servers of `models.json`, and a first run that offers the model that fits this Mac when nothing is set up. Next: sessions kept on disk with the engine's state, and prompts read while tools run.
 
 Without `saetta start`, point any agent at `http://127.0.0.1:8080/v1` (OpenAI) or `http://127.0.0.1:8080` (Anthropic), any API key: configs in [`config/`](config) ([Claude Code](docs/claude-code.md), [opencode](docs/opencode.md)).
 

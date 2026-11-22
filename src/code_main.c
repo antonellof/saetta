@@ -26,6 +26,11 @@
 #include <mach-o/dyld.h>
 #include <errno.h>
 #include "fit.h"
+#include <fcntl.h>
+#include <netdb.h>
+#include <poll.h>
+#include <sys/mount.h>
+#include <sys/socket.h>
 
 static const char *const default_tools[] = {"read", "bash", "edit", "write"};
 
@@ -1356,6 +1361,122 @@ static void pick_tools(Arena *a, const Args *o, Run *r) {
     }
 }
 
+// ---- the first run (first-time-setup.ts, Saetta's way: a model pack on this Mac, or an
+// OpenAI-compatible server in pi's models.json) ----------------------------------------------------
+
+static bool ask_yes(const char *q, bool dflt) {
+    printf("%s %s ", q, dflt ? "[Y/n]" : "[y/N]");
+    fflush(stdout);
+    char line[64];
+    if (!fgets(line, sizeof line, stdin)) return false;
+    Str t = str_trim(str(line));
+    if (!t.len) return dflt;
+    return t.ptr[0] == 'y' || t.ptr[0] == 'Y';
+}
+
+static bool pack_here(Arena *a, const DownloadPack *p) {
+    char *dir;
+    return !download_pack_dir(a, p, &dir) && file_exists(path_join(a, dir, "config.json"));
+}
+
+// The best downloaded pack that fits this Mac (saetta start's choice), or NULL.
+static const DownloadPack *downloaded_pack(Arena *a) {
+    uint64_t ram = fit_ram_bytes();
+    for (size_t i = 0; i < DOWNLOAD_NPACKS; i++) {
+        const DownloadPack *p = &download_packs[i];
+        if (!p->min_ram_gb || (ram && ((uint64_t)p->min_ram_gb << 30) > ram)) continue;
+        if (pack_here(a, p)) return p;
+    }
+    return NULL;
+}
+
+// Whether the server of base_url accepts a connection (1 s).
+static bool server_answers(const char *base_url) {
+    if (!base_url) return false;
+    const char *h = strstr(base_url, "://");
+    h = h ? h + 3 : base_url;
+    char host[256] = {0};
+    size_t n = strcspn(h, ":/");
+    snprintf(host, sizeof host, "%.*s", (int)MIN(n, sizeof host - 1), h);
+    int port = strncmp(base_url, "https", 5) ? 80 : 443;
+    if (h[n] == ':') port = atoi(h + n + 1);
+    char ps[16];
+    snprintf(ps, sizeof ps, "%d", port);
+    struct addrinfo hints = {.ai_socktype = SOCK_STREAM}, *res = NULL;
+    if (getaddrinfo(host, ps, &hints, &res) || !res) return false;
+    bool ok = false;
+    for (struct addrinfo *ai = res; ai && !ok; ai = ai->ai_next) {
+        int fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (fd < 0) continue;
+        fcntl(fd, F_SETFL, O_NONBLOCK);
+        if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0) ok = true;
+        else if (errno == EINPROGRESS) {
+            struct pollfd pf = {fd, POLLOUT, 0};
+            int err = 0;
+            socklen_t el = sizeof err;
+            if (poll(&pf, 1, 1000) == 1 && !getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &el) && !err) ok = true;
+        }
+        close(fd);
+    }
+    freeaddrinfo(res);
+    return ok;
+}
+
+// No model to talk to: guide the user to one (in a terminal only). Sets *pack to a download name
+// to run in process, or returns false to stop (the reason printed).
+static bool first_run(Arena *a, bool server_down, const char *base_url, const char **pack) {
+    *pack = NULL;
+    const DownloadPack *have = downloaded_pack(a);
+    printf("\x1b[1m\xe2\x86\xaf Saetta Code\x1b[0m\n\n");
+    if (server_down) printf("The server at %s does not answer.\n", base_url);
+    else printf("No model is set up yet. Saetta Code runs a model on this Mac, or talks to an OpenAI-compatible\nserver listed in %s.\n", "~/.pi/agent/models.json");
+    if (have) {
+        printf("\n%s is downloaded on this Mac.\n", have->title ? have->title : have->name);
+        if (ask_yes(arena_printf(a, "Run %s here?", have->title ? have->title : have->name), true)) {
+            *pack = have->name;
+            return true;
+        }
+        return false;
+    }
+    const char *rec = fit_default_pack();
+    const DownloadPack *p = rec ? download_find(rec) : NULL;
+    if (!p) {
+        printf("\nThis Mac has %llu GB of memory: no saetta model fits it (they need 32 GB or more).\n",
+               (unsigned long long)(fit_ram_bytes() >> 30));
+        printf("Add an OpenAI-compatible server to ~/.pi/agent/models.json to use Saetta Code here.\n");
+        return false;
+    }
+    char *mdir = NULL;
+    struct statfs st;
+    uint64_t freeb = !download_models_dir(a, &mdir) && !statfs(mdir, &st) ? (uint64_t)st.f_bavail * st.f_bsize : 0;
+    if (getenv("SAETTA_CODE_FREE_GB")) freeb = (uint64_t)atoll(getenv("SAETTA_CODE_FREE_GB")) * 1000000000ull; // tests
+    printf("\nFor this Mac (%llu GB of memory): %s, about %u GB to download (%llu GB free on that disk).\n",
+           (unsigned long long)(fit_ram_bytes() >> 30), p->title ? p->title : p->name, p->disk_gb, (unsigned long long)(freeb / 1000000000ull));
+    if (freeb && freeb < (uint64_t)p->disk_gb * 1000000000ull) {
+        printf("Not enough free disk for it. Free some space, or add a server to ~/.pi/agent/models.json.\n");
+        return false;
+    }
+    if (!ask_yes("Download it now (resumable)?", true)) {
+        printf("Later: saetta download %s, then saetta code.\n", p->name);
+        return false;
+    }
+    const char *test = getenv("SAETTA_CODE_DOWNLOAD"); // a stand-in for the tests
+    Err de;
+    if (test && *test) {
+        char *cmd = arena_printf(a, "'%s' %s", test, p->name);
+        de = system(cmd) == 0 ? OK : "DownloadFailed";
+    } else {
+        const char *dargs[] = {p->name};
+        de = download_run(dargs, 1);
+    }
+    if (de) {
+        printf("The download stopped (%s); run saetta download %s to resume it.\n", de, p->name);
+        return false;
+    }
+    *pack = p->name;
+    return true;
+}
+
 Err code_run(const char *const *args, size_t n, int *code) {
     *code = 1;
     Arena arena = {0};
@@ -1412,11 +1533,30 @@ Err code_run(const char *const *args, size_t n, int *code) {
         }
         buf_free(&in);
     }
+    bool tty = !o.print && !piped && !r.json && isatty(0) && isatty(1);
+    if (!o.pack) {
+        e = find_model(&r, &o, settings);
+        // the first run: nothing configured, or a server that does not answer
+        bool down = !e && tty && r.model.base_url && !server_answers(r.model.base_url);
+        if (tty && (e || down)) {
+            const char *p;
+            if (first_run(a, down, r.model.base_url, &p)) {
+                o.pack = p;
+                r.pack = p;
+                r.model = (CodeModel){0};
+                e = OK;
+            } else if (e) {
+                *code = 0;
+                e = OK;
+                goto done;
+            } else e = OK; // the server stays (pi's behavior: the request reports the error)
+        }
+    }
     if (o.pack) {
-        e = open_engine(a, &r, o.pack, o.ctx, !o.print && !piped && !r.json && isatty(0) && isatty(1));
+        e = open_engine(a, &r, o.pack, o.ctx, tty);
         if (e) goto done;
         if (o.thinking) r.model.thinking = o.thinking;
-    } else e = find_model(&r, &o, settings);
+    }
     if (e && !o.pack) {
         dbg("saetta code: no model %s%s%s in %s/models.json (Saetta Code runs openai-completions providers)\n",
             o.provider ? o.provider : "", o.provider ? "/" : "", o.model ? o.model : "", r.env.agent_dir);

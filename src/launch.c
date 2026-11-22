@@ -147,6 +147,18 @@ static Err pack_for(Arena *a, const char *arg, const char **out) {
     return OK;
 }
 
+// Whether any model pack that fits this Mac is downloaded.
+static bool any_pack(Arena *a) {
+    const uint64_t ram = fit_ram_bytes();
+    for (size_t i = 0; i < DOWNLOAD_NPACKS; i++) {
+        const DownloadPack *p = &download_packs[i];
+        char *dir;
+        if (!p->min_ram_gb || (ram && ((uint64_t)p->min_ram_gb << 30) > ram)) continue;
+        if (!download_pack_dir(a, p, &dir) && has_config(a, dir)) return true;
+    }
+    return false;
+}
+
 typedef struct {
     char b[256];
     size_t n;
@@ -437,10 +449,12 @@ static Err code_in_process(Arena *a, const char *dir, uint32_t ctx, const char *
     Argv argv = {0};
     vec_push(&argv, arena_strdup(a, self));
     vec_push(&argv, "code");
-    vec_push(&argv, "--pack");
-    vec_push(&argv, dir);
-    vec_push(&argv, "--ctx");
-    vec_push(&argv, arena_printf(a, "%u", ctx));
+    if (dir) {
+        vec_push(&argv, "--pack");
+        vec_push(&argv, dir);
+        vec_push(&argv, "--ctx");
+        vec_push(&argv, arena_printf(a, "%u", ctx));
+    }
     for (size_t k = 0; k < n_extra; k++) vec_push(&argv, extra[k]);
     vec_push(&argv, NULL);
     pid_t child;
@@ -541,6 +555,10 @@ static Err session(Arena *a, Session *ss, Agent agent, const char *pack_arg, uin
             return OK;
         }
         const char *dir;
+        // Saetta Code in a terminal with nothing downloaded: it guides the first run itself (the
+        // model that fits this Mac, downloaded on confirmation), or uses a server of its models.json
+        if (agent == AGENT_CODE && !pack_arg && !lora_arg && isatty(0) && isatty(1) && !any_pack(a))
+            return code_in_process(a, NULL, ctx, extra, n_extra, code);
         TRY(pack_for(a, pack_arg, &dir));
         if (!dir) {
             *code = 1;

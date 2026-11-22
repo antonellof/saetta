@@ -2202,6 +2202,7 @@ static void confirm_download(const CodeUiModel *m) {
     char *mdir = NULL;
     Arena a = {0};
     uint64_t freeb = download_models_dir(&a, &mdir) ? 0 : free_disk_bytes(mdir);
+    if (getenv("SAETTA_CODE_FREE_GB")) freeb = (uint64_t)atoll(getenv("SAETTA_CODE_FREE_GB")) * 1000000000ull; // tests
     free(U->dl_name);
     free(U->dl_title);
     free(U->dl_models_dir);
@@ -2223,8 +2224,7 @@ static void confirm_render(int width, Lines *out) {
     t.len = 0;
     lines_addz(out, "");
     Buf d = {0};
-    buf_printf(&d, "About %u GB into %s (%u GB free). A cancelled download resumes where it stopped.", U->dl_disk,
-               U->dl_models_dir ? U->dl_models_dir : "~/Models", U->dl_free_gb);
+    buf_printf(&d, "About %u GB (%u GB free on that disk). A cancelled download resumes where it stopped.", U->dl_disk, U->dl_free_gb);
     th_fg(&t, U->dl_free_gb < U->dl_disk ? T_ERROR : T_MUTED, buf_str(&d));
     text_lines(buf_str(&t), 1, width, out);
     lines_addz(out, "");
@@ -2307,6 +2307,17 @@ static void download_poll(void) {
                 }
                 U->dl_line.len = 0;
             } else buf_addc(&U->dl_line, c);
+        }
+        // the line being written (download.c rewrites it after each \r)
+        Str l = str_trim(buf_str(&U->dl_line));
+        if (l.len && str_find(l, S(" GB"), 0) >= 0) {
+            Buf m = {0}, cl = {0};
+            tui_strip(&cl, l);
+            buf_printf(&m, "Downloading %s: %.*s (escape to cancel)", U->dl_title, (int)cl.len, cl.ptr ? cl.ptr : "");
+            editor_set_working(U->ed, m.ptr);
+            buf_free(&m);
+            buf_free(&cl);
+            request_render();
         }
     }
     if (n != 0) return; // more to come

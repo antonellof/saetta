@@ -1397,6 +1397,8 @@ const char *server_engine_model(const Engine *e) { return base_id; }
 
 size_t server_engine_context(const Engine *e) { return e->s->max_cap; }
 
+Stats *server_engine_stats(Engine *e) { return e->st; }
+
 Err server_engine_chat(Engine *e, Str body, int (*sink)(void *ctx, int status, const void *p, size_t n), void *ctx) {
     Conn *c = xcalloc(1, sizeof(Conn));
     conn_init(c, -1);

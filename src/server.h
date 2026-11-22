@@ -34,6 +34,8 @@ Err server_engine_open(Arena *arena, const char *dir, const char *kwargs_default
 // The model id the engine answers as, and its context in tokens.
 const char *server_engine_model(const Engine *e);
 size_t server_engine_context(const Engine *e);
+// The engine's live statistics (stats.h; Saetta Code's /monitor reads them with stats_json).
+struct Stats *server_engine_stats(Engine *e);
 // One POST /v1/chat/completions with this body, on the caller's thread: the response body
 // bytes (the SSE stream, or the JSON answer or error) go to sink as they are produced, with the
 // response status; sink returns nonzero to stop (the request ends as when a client leaves), and

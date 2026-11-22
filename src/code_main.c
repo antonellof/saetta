@@ -9,7 +9,14 @@
 // utils/shell.ts (killTrackedDetachedChildren), packages/ai/src/utils/transcript.ts
 // (getCurrentSystemMessage, getToolStateChanges), utils/retry.ts (the retryable patterns).
 #include "code.h"
+#include "code_autocompact.h"
+#include "code_cfg.h"
+#include "code_mcp.h"
 #include "code_oai.h"
+#include "code_res.h"
+#include "code_sessions.h"
+#include "code_tui.h"
+#include "code_monitor.h"
 #include "download.h"
 #include "instance.h"
 #include "server.h"
@@ -22,12 +29,23 @@
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
+#include <mach-o/dyld.h>
+#include <errno.h>
+#include "fit.h"
+#include <fcntl.h>
+#include <netdb.h>
+#include <poll.h>
+#include <sys/mount.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
 
 static const char *const default_tools[] = {"read", "bash", "edit", "write"};
 
 typedef struct {
-    const char *provider, *model, *thinking, *mode, *system_prompt, *tools, *pack, *ctx;
-    bool print, cont, no_session, no_tools;
+    const char *provider, *model, *thinking, *mode, *system_prompt, *tools, *pack, *ctx, *session;
+    bool print, cont, no_session, no_tools, no_skills, no_mcp;
+    int approve; // --approve 1, --no-approve 0, else -1
+    VEC(const char *) skills;
     VEC(const char *) prompts;
     VEC(const char *) append;
 } Args;
@@ -37,12 +55,22 @@ typedef struct {
     CodeEnv env;
     CodeModel model;
     CodeSession *session;
+    Arena *session_arena; // the arena of a session loaded after the start (/resume, /import), else NULL
     const char **tools;
     size_t ntools;
+    const char **base_tools; // the built-in ones (--tools); tools adds the MCP tools (code_mcp.c)
+    size_t nbase_tools;
     bool json;
     bool ui; // the interactive mode prints the stream as it arrives
     int64_t retry_attempt; // the retries of the current prompt so far (pi's _retryAttempt)
     JValue *new_messages; // this run's messages, for agent_end
+    const char *pack;     // --pack as given (a download name or a folder), NULL over HTTP
+    const char *const *argv; // the command line after "code", for a restart on another model
+    size_t argc;
+    const JValue *call;   // the tool call running (for its partial results)
+    char *restart_provider, *restart_id; // set by the interactive mode: start again on this model
+    CodeAutoCompact ac;   // automatic compaction (code_autocompact.c)
+    bool deliver_queued;  // the run continues to deliver queued messages (agent.continue())
 } Run;
 
 static double wall_ms(void) { return (double)(wall_ns() / 1000000); }
@@ -50,6 +78,10 @@ static double wall_ms(void) { return (double)(wall_ns() / 1000000); }
 // ---- output --------------------------------------------------------------------------------------
 
 static void emit(Run *r, JValue *ev) {
+    if (r->ui) {
+        code_ui_event(ev);
+        return;
+    }
     if (!r->json) return;
     Buf b = {0};
     json_write(&b, ev);
@@ -89,11 +121,17 @@ static Err parse_args(const char *const *v, size_t n, Args *o) {
         else if (!strcmp(x, "--tools") && more) o->tools = v[++i];
         else if (!strcmp(x, "--pack") && more) o->pack = v[++i];
         else if (!strcmp(x, "--ctx") && more) o->ctx = v[++i];
+        else if (!strcmp(x, "--session") && more) o->session = v[++i];
         else if (!strcmp(x, "--no-tools") || !strcmp(x, "-nt")) o->no_tools = true;
+        else if (!strcmp(x, "--skill") && more) vec_push(&o->skills, v[++i]);
+        else if (!strcmp(x, "--no-skills") || !strcmp(x, "-ns")) o->no_skills = true;
+        else if (!strcmp(x, "--approve") || !strcmp(x, "-a")) o->approve = 1;
+        else if (!strcmp(x, "--no-approve") || !strcmp(x, "-na")) o->approve = 0;
+        else if (!strcmp(x, "--no-mcp")) o->no_mcp = true;
         else if (!strcmp(x, "--help") || !strcmp(x, "-h")) {
             printf("usage: saetta code [options] [prompt ...]\n"
                    "\n"
-                   "Saetta Code, a minimal coding agent that behaves as pi 1.5.2 does: the same tools (read, bash,\n"
+                   "Saetta Code, a coding agent compatible with pi 1.5.2: the same tools (read, bash,\n"
                    "edit, write; grep, find, ls with --tools), system prompt, AGENTS.md / CLAUDE.md files, skills and\n"
                    "session files, so pi and Saetta Code resume each other's sessions. It talks to saetta or any\n"
                    "OpenAI-compatible chat completions server named in pi's models.json ($PI_CODING_AGENT_DIR, else\n"
@@ -102,18 +140,24 @@ static Err parse_args(const char *const *v, size_t n, Args *o) {
                    "  -p, --print              answer the prompt and exit (text output)\n"
                    "  --mode json              print pi's JSON event stream\n"
                    "  -c, --continue           continue the most recent session in this folder\n"
+                   "  --session FILE           continue this session file\n"
                    "  --no-session             do not save the session\n"
                    "  --provider P --model M   the model (M may be provider/id and end in :thinking)\n"
                    "  --thinking LEVEL         off, minimal, low, medium, high, xhigh, max\n"
                    "  --tools a,b,c | --no-tools   the tool set\n"
+                   "  --no-mcp                 no MCP servers (pi's mcp.json) and no MCP tools\n"
                    "  --system-prompt T, --append-system-prompt T   text or a file\n"
+                   "  --skill PATH             load a skill file or folder (can be repeated)\n"
+                   "  --no-skills, -ns         no skill discovery (--skill paths still load)\n"
+                   "  --approve, -a            trust this project for the session (--no-approve, -na: do not)\n"
                    "  --pack P                 run the model in this process (a download name such as coder, or a\n"
                    "                           folder): no server, no HTTP; the requests are the same\n"
                    "  --ctx N                  with --pack: the context in tokens (default 204800, as saetta start;\n"
                    "                           less when this Mac's memory holds less)\n"
                    "\n"
-                   "Without -p in a terminal it opens a prompt: Enter sends, a trailing \\ continues on a new line,\n"
-                   "Ctrl-C stops a turn, /new starts a session, /exit quits.\n");
+                   "Without -p in a terminal it opens the interactive screen: Enter sends, Shift+Enter (or a\n"
+                   "trailing \\) starts a new line, \"/\" lists the commands, \"@\" completes file names, Escape stops a\n"
+                   "turn, Ctrl-C clears, Ctrl-C twice or Ctrl-D quits.\n");
             exit(0);
         } else if (x[0] == '-' && x[1]) {
             dbg("saetta code: unknown option %s\n", x);
@@ -149,12 +193,9 @@ static bool jbool(const JValue *v, bool dflt) { return json_is(v, J_BOOL) ? v->b
 
 static uint64_t juint(const JValue *v, uint64_t dflt) { return json_is(v, J_INTEGER) && v->i >= 0 ? (uint64_t)v->i : dflt; }
 
-// resolveConfigValue: an environment variable of that name, else the literal.
-static const char *config_value(const char *v) {
-    if (!v) return NULL;
-    const char *e = getenv(v);
-    return e && e[0] ? e : v;
-}
+// resolveConfigValue (resolve-config-value.ts): "$NAME" / "${NAME}" interpolated, "!command"
+// run, the rest literal (code_cfg.c).
+static const char *config_value(Arena *a, const char *v) { return cfg_resolve_value(a, v); }
 
 static Err find_model(Run *r, const Args *args, const JValue *settings) {
     Arena *a = r->a;
@@ -194,7 +235,7 @@ static Err find_model(Run *r, const Args *args, const JValue *settings) {
             cm->id = json_str(json_get(m, "id"));
             cm->name = json_str(json_get(m, "name"));
             cm->base_url = json_str(json_get(m, "baseUrl")) ? json_str(json_get(m, "baseUrl")) : json_str(json_get(p->val, "baseUrl"));
-            cm->api_key = config_value(json_str(json_get(p->val, "apiKey")));
+            cm->api_key = config_value(a, json_str(json_get(p->val, "apiKey")));
             cm->reasoning = jbool(json_get(m, "reasoning"), false);
             cm->context_window = juint(json_get(m, "contextWindow"), 128000);
             cm->max_tokens = juint(json_get(m, "maxTokens"), 16384);
@@ -377,6 +418,7 @@ static JValue *current_tools(Arena *a, const JValue *system) {
 // ---- the agent loop (agent-loop.ts runLoop, streamAssistantResponse, executeToolCalls) ------------
 
 static Err add_message(Run *r, JValue *m) {
+    code_autocompact_observe(&r->ac, m);
     emit_message(r, "message_start", m);
     emit_message(r, "message_end", m);
     json_push(r->a, r->new_messages, m);
@@ -392,116 +434,11 @@ typedef struct {
     bool started;
 } Stream;
 
-// ---- the interactive display (a minimal stand-in for pi's TUI) ------------------------------------
+// ---- the interactive mode's state ------------------------------------------------------------------
+
+const char *code_version = "dev";
 
 static volatile int g_abort;
-static const char *g_cwd;
-static int g_ui_state; // 0 nothing, 1 thinking, 2 text
-
-#define DIM "\x1b[2m"
-#define BOLD "\x1b[1m"
-#define CYAN "\x1b[36m"
-#define RED "\x1b[31m"
-#define RESET "\x1b[0m"
-
-// Text from the model or a tool, shown without terminal control: escape sequences (CSI and the
-// rest) and other C0 controls but newline and tab are dropped.
-static void ui_write(Str t) {
-    size_t i = 0, run = 0;
-    while (i < t.len) {
-        unsigned char c = (unsigned char)t.ptr[i];
-        if (c >= 0x20 && c != 0x7f) {
-            i++;
-            continue;
-        }
-        if (c == '\n' || c == '\t') {
-            i++;
-            continue;
-        }
-        fwrite(t.ptr + run, 1, i - run, stdout);
-        if (c == 0x1b && i + 1 < t.len && t.ptr[i + 1] == '[') { // CSI: to its final byte
-            i += 2;
-            while (i < t.len && !((unsigned char)t.ptr[i] >= 0x40 && (unsigned char)t.ptr[i] <= 0x7e)) i++;
-            if (i < t.len) i++;
-        } else if (c == 0x1b && i + 1 < t.len && t.ptr[i + 1] == ']') { // OSC: to BEL or ST
-            i += 2;
-            while (i < t.len && t.ptr[i] != 0x07 && !(t.ptr[i] == 0x1b && i + 1 < t.len && t.ptr[i + 1] == '\\')) i++;
-            i += i < t.len && t.ptr[i] == 0x07 ? 1 : 2;
-            if (i > t.len) i = t.len;
-        } else i++;
-        run = i;
-    }
-    fwrite(t.ptr + run, 1, i - run, stdout);
-}
-
-static void ui_event(Str type, const JValue *event) {
-    Str delta = json_strs(json_get(event, "delta"));
-    if (str_eqz(type, "thinking_start")) {
-        printf("%s%s", g_ui_state ? "\n" : "", DIM);
-        g_ui_state = 1;
-    } else if (str_eqz(type, "thinking_delta")) {
-        ui_write(delta);
-    } else if (str_eqz(type, "thinking_end")) {
-        printf("%s\n", RESET);
-        g_ui_state = 0;
-    } else if (str_eqz(type, "text_start")) {
-        if (g_ui_state == 1) printf("%s\n", RESET);
-        g_ui_state = 2;
-    } else if (str_eqz(type, "text_delta")) {
-        ui_write(delta);
-    } else if (str_eqz(type, "text_end")) {
-        printf("\n");
-        g_ui_state = 0;
-    }
-    fflush(stdout);
-}
-
-// "read calc.py", "bash ls -la", "edit stats.py": the call's main argument, one line
-static void ui_tool_start(const JValue *call) {
-    const JValue *args = json_get(call, "arguments");
-    Str name = json_strs(json_get(call, "name"));
-    Str arg = json_strs(json_get(args, "path"));
-    if (!arg.len) arg = json_strs(json_get(args, "command"));
-    if (!arg.len) arg = json_strs(json_get(args, "pattern"));
-    // paths under the working directory are shown relative to it
-    Str cwd = str(g_cwd);
-    if (cwd.len && arg.len > cwd.len + 1 && str_starts(arg, cwd) && arg.ptr[cwd.len] == '/') arg = str_sub(arg, cwd.len + 1, arg.len);
-    size_t nl = 0;
-    while (nl < arg.len && arg.ptr[nl] != '\n') nl++;
-    if (g_ui_state) printf("%s\n", RESET);
-    g_ui_state = 0;
-    printf("%s%s\xe2\x97\x8f ", CYAN, BOLD);
-    ui_write(name);
-    printf("%s ", RESET);
-    ui_write(str_n(arg.ptr, nl > 120 ? 120 : nl));
-    printf("%s%s\n", nl < arg.len || nl > 120 ? " ..." : "", RESET);
-    fflush(stdout);
-}
-
-// the first lines of the result, dimmed (red when it failed)
-static void ui_tool_end(const JValue *msg) {
-    bool err = json_is(json_get(msg, "isError"), J_BOOL) && json_get(msg, "isError")->b;
-    const JValue *c = json_get(msg, "content");
-    Str t = c && c->arr.len ? json_strs(json_get(c->arr.items[0], "text")) : S("");
-    size_t lines = 0, i = 0;
-    printf("%s", err ? RED : DIM);
-    while (i < t.len && lines < 6) {
-        size_t j = i;
-        while (j < t.len && t.ptr[j] != '\n') j++;
-        printf("  ");
-        ui_write(str_n(t.ptr + i, j - i > 200 ? 200 : j - i));
-        printf("\n");
-        lines++;
-        i = j + 1;
-    }
-    if (i < t.len) {
-        size_t more = 0;
-        for (size_t k = i; k < t.len; k++) more += t.ptr[k] == '\n';
-        printf("  ... %zu more lines\n", more + 1);
-    }
-    printf("%s", RESET);
-    fflush(stdout);
-}
 
 // pi's message_update, as json mode prints it: usage, and the event without its partial
 // (toolcall_start gains the call's id and name).
@@ -516,7 +453,30 @@ static void on_event(void *ctx, const JValue *event, const JValue *partial) {
         return;
     }
     if (str_eqz(type, "done") || str_eqz(type, "error")) return;
-    if (r->ui) ui_event(type, event);
+    // the interactive mode: the deltas go into the UI's ring as they are (no JSON, no allocation:
+    // the per-token path); the UI rebuilds the partial message. The *_end events carry nothing
+    // it shows (the final message comes with message_end).
+    if (r->ui) {
+        const JValue *idx = json_get(event, "contentIndex");
+        long k = -1;
+        if (json_is(idx, J_INTEGER)) k = (long)idx->i;
+        else if (json_is(idx, J_FLOAT)) k = (long)idx->f;
+        else if (json_is(idx, J_NUMBER_STRING)) {
+            k = 0;
+            for (size_t i = 0; i < idx->s.len && idx->s.ptr[i] >= '0' && idx->s.ptr[i] <= '9'; i++) k = k * 10 + (idx->s.ptr[i] - '0');
+        }
+        Str delta = json_strs(json_get(event, "delta"));
+        if (str_eqz(type, "text_start")) code_ui_stream(UI_S_TEXT_START, (int)k, S(""), S(""));
+        else if (str_eqz(type, "text_delta")) code_ui_stream(UI_S_TEXT, (int)k, delta, S(""));
+        else if (str_eqz(type, "thinking_start")) code_ui_stream(UI_S_THINK_START, (int)k, S(""), S(""));
+        else if (str_eqz(type, "thinking_delta")) code_ui_stream(UI_S_THINK, (int)k, delta, S(""));
+        else if (str_eqz(type, "toolcall_start")) {
+            const JValue *content = json_get(partial, "content");
+            const JValue *tc = k >= 0 && json_is(content, J_ARRAY) && (size_t)k < content->arr.len ? content->arr.items[k] : NULL;
+            code_ui_stream(UI_S_TOOL_START, (int)k, json_strs(json_get(tc, "id")), json_strs(json_get(tc, "name")));
+        } else if (str_eqz(type, "toolcall_delta")) code_ui_stream(UI_S_TOOL_ARGS, (int)k, delta, S(""));
+        return;
+    }
     JValue *e = ev_new(a, "message_update");
     json_put(a, e, S("usage"), (JValue *)json_get(partial, "usage"));
     JValue *ame = json_new(a, J_OBJECT);
@@ -554,6 +514,7 @@ static Err stream_assistant(Run *r, JValue **out) {
     buf_free(&body);
     TRY(e);
     json_put(a, msg, S("thinkingLevel"), json_string(a, str(level_of(r))));
+    code_autocompact_observe(&r->ac, msg);
     if (!st.started) emit_message(r, "message_start", msg);
     emit_message(r, "message_end", msg);
     // a successful answer ends the retries at once (AgentSession._handleAgentEvent)
@@ -634,6 +595,21 @@ static void error_result(Arena *a, const JValue *call, const char *text, JValue 
     *msg = m;
 }
 
+// tool_execution_update (emitToolExecutionUpdate): a tool's partial result, built in a throwaway
+// arena (a long command sends one every 100 ms)
+static void on_tool_partial(void *ctx, const JValue *partial) {
+    Run *r = ctx;
+    if (!r->call || (!r->ui && !r->json)) return;
+    Arena t = {0};
+    JValue *e = ev_new(&t, "tool_execution_update");
+    json_put(&t, e, S("toolCallId"), (JValue *)json_get(r->call, "id"));
+    json_put(&t, e, S("toolName"), (JValue *)json_get(r->call, "name"));
+    json_put(&t, e, S("args"), (JValue *)json_get(r->call, "arguments"));
+    json_put(&t, e, S("partialResult"), (JValue *)partial);
+    emit(r, e);
+    arena_reset(&t);
+}
+
 static void emit_tool_start(Run *r, const JValue *call) {
     JValue *e = ev_new(r->a, "tool_execution_start");
     json_put(r->a, e, S("toolCallId"), (JValue *)json_get(call, "id"));
@@ -659,7 +635,6 @@ static Err fail_truncated(Run *r, const JValue *assistant, JValue *results) {
                                   (int)name.len, name.ptr),
                      &msg, &raw);
         emit_tool_end(r, call, msg, raw);
-        if (r->ui) ui_tool_end(msg);
         TRY(add_message(r, msg));
         json_push(a, results, msg);
     }
@@ -692,7 +667,6 @@ static Err run_tools(Run *r, const JValue *assistant, JValue *results) {
         if (g_abort && i > 0) break;
         started = i + 1;
         emit_tool_start(r, calls.ptr[i]);
-        if (r->ui) ui_tool_start(calls.ptr[i]);
         r->env.now_ms = wall_ms();
         Str name = json_strs(json_get(calls.ptr[i], "name"));
         if (!declared(r, name)) {
@@ -701,7 +675,9 @@ static Err run_tools(Run *r, const JValue *assistant, JValue *results) {
             continue;
         }
         prepare_edit_in_place(a, calls.ptr[i]);
+        r->call = calls.ptr[i];
         err = code_tool_run(a, &r->env, calls.ptr[i], &msgs[i], &raws[i]);
+        r->call = NULL;
         if (!err && !json_get(msgs[i], "durationMs")) emit_tool_end(r, calls.ptr[i], msgs[i], raws[i]);
     }
     // pi runs the executed calls concurrently and ends each as it settles; a call that throws
@@ -714,7 +690,6 @@ static Err run_tools(Run *r, const JValue *assistant, JValue *results) {
             if (failed == (pass == 0)) emit_tool_end(r, calls.ptr[i], msgs[i], raws[i]);
         }
     for (size_t i = 0; i < calls.len && !err; i++) {
-        if (r->ui) ui_tool_end(msgs[i]);
         err = add_message(r, msgs[i]);
         json_push(a, results, msgs[i]);
     }
@@ -754,7 +729,10 @@ static bool status_code(const char *m) {
     return false;
 }
 
-static bool retryable(const JValue *msg) {
+// agent-session.ts _isRetryableError: a context overflow goes to compaction, never to a retry;
+// else isRetryableAssistantError. window: the model's contextWindow (_modelForMessage ?? model).
+static bool retryable(const JValue *msg, uint64_t window) {
+    if (code_context_overflow(msg, window)) return false;
     if (!str_eqz(json_strs(json_get(msg, "stopReason")), "error")) return false;
     const char *m = json_str(json_get(msg, "errorMessage"));
     if (!m || !*m) return false;
@@ -812,7 +790,7 @@ typedef struct {
 static RetryPolicy g_retry = {true, 3, 2000, 60000};
 
 static Err run_agent(Run *r, bool started);
-static void finish_agent(Run *r, bool will_retry, const JValue *last);
+static bool finish_agent(Run *r, bool will_retry, const JValue *last, const char *last_id);
 static Err run_turns(Run *r, JValue **last_out, const char **last_id);
 
 static void sleep_abortable(int64_t ms) {
@@ -822,15 +800,8 @@ static void sleep_abortable(int64_t ms) {
     }
 }
 
-// One prompt: agent_start, the turns, agent_end (agentLoop + AgentSession.prompt).
-static Err prompt(Run *r, const char *text) {
-    Arena *a = r->a;
-    r->new_messages = json_new(a, J_ARRAY);
-    emit(r, ev_new(a, "agent_start"));
-    emit(r, ev_new(a, "turn_start"));
-    JValue *sys;
-    TRY(pending_system(r, code_session_messages(r->session), &sys));
-    if (sys) TRY(add_message(r, sys));
+// A user message of this text, as pi records it.
+static JValue *user_message(Arena *a, const char *text) {
     JValue *user = json_new(a, J_OBJECT);
     json_put(a, user, S("role"), json_string(a, S("user")));
     JValue *content = json_new(a, J_ARRAY);
@@ -840,7 +811,51 @@ static Err prompt(Run *r, const char *text) {
     json_push(a, content, block);
     json_put(a, user, S("content"), content);
     json_put(a, user, S("timestamp"), json_int(a, (int64_t)wall_ms()));
-    TRY(add_message(r, user));
+    return user;
+}
+
+// The tools of this prompt: the built-in ones, then the MCP tools declared now (the first prompt
+// waits for their servers first, pi's before_agent_start).
+static void mcp_tools(Run *r) {
+    code_mcp_before_prompt();
+    const char **m;
+    size_t nm = code_mcp_declared(r->a, &m);
+    const char **all = arena_alloc(r->a, (r->nbase_tools + nm + 1) * sizeof *all);
+    for (size_t i = 0; i < r->nbase_tools; i++) all[i] = r->base_tools[i];
+    for (size_t i = 0; i < nm; i++) all[r->nbase_tools + i] = m[i];
+    r->tools = all;
+    r->ntools = r->nbase_tools + nm;
+}
+
+// The automatic compaction's view of the run (code_autocompact.c).
+static void ac_emit(void *ctx, JValue *ev) { emit(ctx, ev); }
+
+static bool ac_has_queued(void *ctx) { return ((Run *)ctx)->ui && code_ui_has_queued(); }
+
+static void ac_bind(Run *r) {
+    r->ac.a = r->a;
+    r->ac.session = &r->session;
+    r->ac.model = &r->model;
+    r->ac.env = &r->env;
+    r->ac.emit = ac_emit;
+    r->ac.has_queued = ac_has_queued;
+    r->ac.ctx = r;
+}
+
+// One prompt: agent_start, the turns, agent_end (agentLoop + AgentSession.prompt).
+static Err prompt(Run *r, const char *text) {
+    Arena *a = r->a;
+    ac_bind(r);
+    // _prepareRun: compact first when needed (catches aborted responses)
+    code_autocompact_before_prompt(&r->ac);
+    mcp_tools(r);
+    r->new_messages = json_new(a, J_ARRAY);
+    emit(r, ev_new(a, "agent_start"));
+    emit(r, ev_new(a, "turn_start"));
+    JValue *sys;
+    TRY(pending_system(r, code_session_messages(r->session), &sys));
+    if (sys) TRY(add_message(r, sys));
+    TRY(add_message(r, user_message(a, code_skill_expand(a, &r->env, text, NULL)))); // /skill:name
     return run_agent(r, true);
 }
 
@@ -855,13 +870,22 @@ static Err run_agent(Run *r, bool started) {
             r->new_messages = json_new(a, J_ARRAY);
             emit(r, ev_new(a, "agent_start"));
             emit(r, ev_new(a, "turn_start"));
+            // agent.continue() after an auto-compaction with messages queued: they start the run
+            char *queued = r->deliver_queued ? code_ui_take_queued(true) : NULL;
+            if (r->deliver_queued && !queued) queued = code_ui_take_queued(false);
+            r->deliver_queued = false;
+            if (queued) {
+                JValue *user = user_message(a, code_skill_expand(a, &r->env, queued, NULL));
+                free(queued);
+                TRY(add_message(r, user));
+            }
         }
         started = false;
         JValue *last = NULL;
         const char *last_id = NULL;
         TRY(run_turns(r, &last, &last_id));
         bool again = false;
-        if (last && retryable(last) && g_retry.enabled && !g_abort && r->retry_attempt < g_retry.max_retries) {
+        if (last && retryable(last, r->model.context_window) && g_retry.enabled && !g_abort && r->retry_attempt < g_retry.max_retries) {
             int64_t attempt = ++r->retry_attempt;
             // baseDelayMs * 2^(attempt-1), capped (and never shifted past the cap)
             int64_t delay = g_retry.base_ms;
@@ -873,9 +897,8 @@ static Err run_agent(Run *r, bool started) {
             json_put(a, e, S("delayMs"), json_int(a, delay));
             const char *em = json_str(json_get(last, "errorMessage"));
             json_put(a, e, S("errorMessage"), json_string(a, str(em ? em : "Unknown error")));
-            if (r->ui) printf("%sretrying in %lld s (%lld of %lld)%s\n", DIM, (long long)(delay / 1000), (long long)attempt, (long long)g_retry.max_retries, RESET);
             // agent_end (willRetry) is emitted before the retry starts
-            finish_agent(r, true, NULL);
+            finish_agent(r, true, NULL, NULL);
             emit(r, e);
             JValue *f = json_new(a, J_OBJECT);
             json_put(a, f, S("targetId"), json_string(a, str(last_id)));
@@ -899,19 +922,21 @@ static Err run_agent(Run *r, bool started) {
             }
             continue;
         }
-        finish_agent(r, false, last);
+        if (finish_agent(r, false, last, last_id)) continue; // the overflow retry, or queued messages
         (void)again;
         return OK;
     }
 }
 
-static void finish_agent(Run *r, bool will_retry, const JValue *last) {
+// agent_end, then _handlePostAgentRun's end of the retries and _checkCompaction: true when the
+// run continues (agent.continue()), else agent_settled.
+static bool finish_agent(Run *r, bool will_retry, const JValue *last, const char *last_id) {
     Arena *a = r->a;
     JValue *ae = ev_new(a, "agent_end");
     json_put(a, ae, S("messages"), r->new_messages);
     json_put(a, ae, S("willRetry"), json_bool(a, will_retry));
     emit(r, ae);
-    if (will_retry) return;
+    if (will_retry) return false;
     // retries used up on an error (_handlePostAgentRun)
     if (r->retry_attempt > 0 && last && str_eqz(json_strs(json_get(last, "stopReason")), "error")) {
         JValue *end = ev_new(a, "auto_retry_end");
@@ -921,28 +946,58 @@ static void finish_agent(Run *r, bool will_retry, const JValue *last) {
         emit(r, end);
         r->retry_attempt = 0;
     }
+    if (last && !g_abort && code_autocompact_check(&r->ac, last, last_id, true)) {
+        // the overflow retry continues from the context (the failed answer left out of it);
+        // after an answer, the queued messages start the run
+        const JValue *msgs = code_session_messages(r->session);
+        r->deliver_queued = msgs->arr.len && str_eqz(json_strs(json_get(msgs->arr.items[msgs->arr.len - 1], "role")), "assistant");
+        return true;
+    }
     JValue *settled = ev_new(a, "agent_settled");
     json_put(a, settled, S("aborted"), json_bool(a, g_abort != 0));
     emit(r, settled);
+    return false;
 }
 
 // The turns of one agent run (runLoop): *last the final assistant message and its entry id.
+static bool switch_model(Run *r, const char *provider, const char *id);
+static void apply_thinking(Run *r, const char *level);
+
+// What the user chose in the interactive mode while the run went on: applied here, between turns,
+// on this thread (pi's setModel takes effect at the next request).
+static void ui_requests(Run *r) {
+    if (!r->ui) return;
+    char *p, *m;
+    if (code_ui_take_model(&p, &m)) {
+        if (!switch_model(r, p, m)) {
+            Arena t = {0};
+            JValue *ev = ev_new(&t, "ui_error");
+            json_put(&t, ev, S("message"), json_string(&t, str(arena_printf(&t, "Could not switch to %s/%s", p, m))));
+            code_ui_event(ev);
+            arena_reset(&t);
+        }
+        free(p);
+        free(m);
+    }
+    char *lv = code_ui_take_thinking();
+    if (lv) {
+        apply_thinking(r, lv);
+        free(lv);
+    }
+}
+
 static Err run_turns(Run *r, JValue **last_out, const char **last_id) {
     Arena *a = r->a;
+    bool turn_started = false;
     for (bool first = true;; first = false) {
-        if (!first) emit(r, ev_new(a, "turn_start"));
+        if (!first && !turn_started) emit(r, ev_new(a, "turn_start"));
+        turn_started = false;
+        ui_requests(r);
         JValue *msg;
         TRY(stream_assistant(r, &msg));
         *last_out = msg;
         *last_id = code_session_leaf(r->session);
         Str stop = json_strs(json_get(msg, "stopReason"));
-        if (r->ui && (str_eqz(stop, "error") || str_eqz(stop, "aborted"))) {
-            printf("%s%s", g_ui_state ? "\n" : "", RED);
-            const char *em = json_str(json_get(msg, "errorMessage"));
-            ui_write(str(em ? em : "error"));
-            printf("%s\n", RESET);
-            g_ui_state = 0;
-        }
         JValue *results = json_new(a, J_ARRAY);
         bool more = false;
         if (!str_eqz(stop, "error") && !str_eqz(stop, "aborted")) {
@@ -955,37 +1010,29 @@ static Err run_turns(Run *r, JValue **last_out, const char **last_id) {
         json_put(a, te, S("message"), msg);
         json_put(a, te, S("toolResults"), results);
         emit(r, te);
-        if (!more || g_abort) break;
+        if (g_abort || str_eqz(stop, "error") || str_eqz(stop, "aborted")) break;
+        // the interactive mode's queues (runLoop's getSteeringMessages, then getFollowUpMessages
+        // when the run would end): the message joins the run before its next turn
+        char *queued = r->ui ? code_ui_take_queued(true) : NULL;
+        if (!queued && !more && r->ui) queued = code_ui_take_queued(false);
+        if (!more && !queued) break;
+        // prepareNextTurn: _compactBeforeNextAssistantResponse
+        code_autocompact_before_turn(&r->ac);
+        if (queued) {
+            emit(r, ev_new(a, "turn_start"));
+            JValue *user = user_message(a, code_skill_expand(a, &r->env, queued, NULL));
+            free(queued);
+            TRY(add_message(r, user));
+            turn_started = true;
+            continue;
+        }
     }
     return OK;
 }
 
-// ---- interactive mode: a prompt loop with a small line editor -------------------------------------
-
-static void on_sigint(int sig) {
-    (void)sig;
-    g_abort = 1;
-}
+// ---- interactive mode (code_ui.c draws pi's screen; this is the agent's side) ----------------------
 
 static struct termios g_cooked;
-
-static void raw_on(void) {
-    struct termios t = g_cooked;
-    t.c_lflag &= ~(tcflag_t)(ICANON | ECHO | ISIG);
-    t.c_iflag &= ~(tcflag_t)(IXON | ICRNL);
-    t.c_cc[VMIN] = 1;
-    t.c_cc[VTIME] = 0;
-    tcsetattr(0, TCSANOW, &t); // keep what was typed or pasted ahead
-    fputs("\x1b[?2004h", stdout); // bracketed paste: a pasted newline does not send
-    fflush(stdout);
-}
-
-static void raw_off(void) {
-    fputs("\x1b[?2004l", stdout);
-    fflush(stdout);
-    tcsetattr(0, TCSANOW, &g_cooked);
-}
-
 static volatile sig_atomic_t g_tty_saved;
 
 // SIGTERM / SIGHUP: the terminal back as it was, the running bash commands stopped, then the exit
@@ -994,194 +1041,524 @@ static volatile sig_atomic_t g_tty_saved;
 static volatile sig_atomic_t g_interactive;
 
 static void on_term(int sig) {
-    if (g_tty_saved) {
-        static const char off[] = "\x1b[?2004l\x1b[0m\r\n";
-        (void)!write(1, off, sizeof off - 1);
-        tcsetattr(0, TCSANOW, &g_cooked);
-    }
+    // everything the screen turned on (mouse, keyboard protocols, the alternate screen, raw mode)
+    screen_restore_signal_safe();
+    if (g_tty_saved) tcsetattr(0, TCSANOW, &g_cooked);
     code_tools_kill_detached();
     _exit(g_interactive ? 0 : sig == SIGHUP ? 129 : 143);
 }
 
-// Code points in s (the cursor moves by those; wide characters are not measured).
-static size_t cps(const char *s, size_t n) {
-    size_t c = 0;
-    for (size_t i = 0; i < n; i++) c += ((unsigned char)s[i] & 0xC0) != 0x80;
-    return c;
-}
+struct CodeUiHost {
+    Run *r;
+};
 
-static void redraw(const char *prompt, const Buf *line, size_t cur) {
-    printf("\r\x1b[K%s%.*s", prompt, (int)line->len, line->ptr ? line->ptr : "");
-    size_t back = cps(line->ptr + cur, line->len - cur);
-    if (back) printf("\x1b[%zuD", back);
-    fflush(stdout);
-}
-
-// One prompt from the user: Enter sends, a trailing backslash continues on a new line, arrows
-// move and walk the history, Ctrl-A / Ctrl-E jump, Ctrl-U clears, Ctrl-C clears (or quits on an
-// empty line), Ctrl-D quits on an empty line. Returns false to quit.
-static bool read_prompt(Arena *a, VecStr *history, char **out) {
-    Buf text = {0}, line = {0};
-    size_t cur = 0, hist = history->len;
-    bool pasting = false;
-    const char *prompt = BOLD "> " RESET;
-    raw_on();
-    redraw(prompt, &line, cur);
-    bool ok = true;
-    for (;;) {
-        unsigned char c;
-        if (read(0, &c, 1) != 1) {
-            ok = false;
-            break;
-        }
-        if ((c == '\r' || c == '\n') && pasting) { // a pasted line break: keep going
-            buf_addstr(&text, buf_str(&line));
-            buf_addc(&text, '\n');
-            line.len = cur = 0;
-            printf("\r\n");
-            prompt = "  ";
-            redraw(prompt, &line, cur);
-            continue;
-        }
-        if (c == '\r' || c == '\n') {
-            if (line.len && line.ptr[line.len - 1] == '\\') { // continue
-                line.len--;
-                buf_addstr(&text, buf_str(&line));
-                buf_addc(&text, '\n');
-                line.len = cur = 0;
-                printf("\r\n");
-                prompt = "  ";
-                redraw(prompt, &line, cur);
-                continue;
-            }
-            buf_addstr(&text, buf_str(&line));
-            printf("\r\n");
-            break;
-        }
-        if (c == 3) { // Ctrl-C
-            if (!line.len && !text.len) {
-                ok = false;
-                printf("\r\n");
-                break;
-            }
-            line.len = cur = text.len = 0;
-            prompt = BOLD "> " RESET;
-        } else if (c == 4) { // Ctrl-D
-            if (!line.len && !text.len) {
-                ok = false;
-                printf("\r\n");
-                break;
-            }
-        } else if (c == 127 || c == 8) {
-            if (cur > 0) {
-                size_t k = cur - 1;
-                while (k > 0 && ((unsigned char)line.ptr[k] & 0xC0) == 0x80) k--;
-                memmove(line.ptr + k, line.ptr + cur, line.len - cur);
-                line.len -= cur - k;
-                cur = k;
-            }
-        } else if (c == 1) cur = 0;
-        else if (c == 5) cur = line.len;
-        else if (c == 21) line.len = cur = 0;
-        else if (c == 27) {
-            // an escape sequence, read to its final byte (CSI parameters, then 0x40..0x7e)
-            unsigned char seq[2] = {0, 0}, params[16];
-            size_t np = 0;
-            if (read(0, &seq[0], 1) != 1) continue;
-            if (seq[0] != '[' && seq[0] != 'O') continue; // Alt+key and the like: ignored
-            for (;;) {
-                unsigned char x;
-                if (read(0, &x, 1) != 1) break;
-                if (x >= 0x40 && x <= 0x7e) {
-                    seq[1] = x;
-                    break;
-                }
-                if (np < sizeof params) params[np++] = x;
-            }
-            if (seq[1] == '~' && np == 3 && !memcmp(params, "200", 3)) pasting = true;
-            else if (seq[1] == '~' && np == 3 && !memcmp(params, "201", 3)) pasting = false;
-            else if (np) {
-                // other parameterized keys (Home, End, Delete, modified arrows): ignored
-            } else if (seq[1] == 'D' && cur > 0) {
-                cur--;
-                while (cur > 0 && ((unsigned char)line.ptr[cur] & 0xC0) == 0x80) cur--;
-            } else if (seq[1] == 'C' && cur < line.len) {
-                cur++;
-                while (cur < line.len && ((unsigned char)line.ptr[cur] & 0xC0) == 0x80) cur++;
-            } else if ((seq[1] == 'A' && hist > 0) || (seq[1] == 'B' && hist < history->len)) {
-                hist += seq[1] == 'A' ? (size_t)-1 : 1;
-                line.len = 0;
-                if (hist < history->len) buf_addstr(&line, history->ptr[hist]);
-                cur = line.len;
-            }
-        } else if (c >= 32 || c == '\t') {
-            buf_reserve(&line, 1);
-            memmove(line.ptr + cur + 1, line.ptr + cur, line.len - cur);
-            line.ptr[cur++] = (char)c;
-            line.len++;
-        }
-        redraw(prompt, &line, cur);
+static void host_prompt(CodeUiHost *h, const char *text) {
+    Run *r = h->r;
+    g_abort = 0;
+    Err e = prompt(r, text);
+    if (e) {
+        Arena a = {0};
+        JValue *ev = ev_new(&a, "ui_error");
+        json_put(&a, ev, S("message"), json_string(&a, str(arena_printf(&a, "saetta code: %s", e))));
+        code_ui_event(ev);
+        arena_reset(&a);
     }
-    raw_off();
-    *out = ok ? str_z(a, buf_str(&text)) : NULL;
-    if (ok && text.len) vec_push(history, str(*out));
-    buf_free(&text);
-    buf_free(&line);
-    return ok;
 }
 
-static Err interactive(Run *r, const Args *o) {
+static void host_new_session(CodeUiHost *h) {
+    Run *r = h->r;
+    Arena *a = r->a;
+    if (code_session_open(a, &r->env, false, false, &r->session)) return;
+    r->env.session_id = json_str(json_get(code_session_header(r->session), "id"));
+    r->env.session_file = code_session_path(r->session);
+    JValue *f = json_new(a, J_OBJECT);
+    json_put(a, f, S("provider"), json_string(a, str(r->model.provider)));
+    json_put(a, f, S("modelId"), json_string(a, str(r->model.id)));
+    (void)code_session_append(r->session, "model_change", f);
+    f = json_new(a, J_OBJECT);
+    json_put(a, f, S("thinkingLevel"), json_string(a, str(r->model.thinking)));
+    (void)code_session_append(r->session, "thinking_level_change", f);
+}
+
+static void host_set_thinking(CodeUiHost *h, const char *level) { apply_thinking(h->r, level); }
+
+static void apply_thinking(Run *r, const char *level) {
+    Arena *a = r->a;
+    if (r->model.thinking && !strcmp(r->model.thinking, level)) return;
+    r->model.thinking = arena_strdup(a, level);
+    r->env.thinking = r->model.thinking;
+    JValue *f = json_new(a, J_OBJECT);
+    json_put(a, f, S("thinkingLevel"), json_string(a, str(level)));
+    (void)code_session_append(r->session, "thinking_level_change", f);
+}
+
+static const JValue *host_entries(CodeUiHost *h, const char **leaf) {
+    *leaf = code_session_leaf(h->r->session);
+    return code_session_entries(h->r->session);
+}
+
+static const JValue *host_messages(CodeUiHost *h) { return code_session_messages(h->r->session); }
+
+static void host_set_leaf(CodeUiHost *h, const char *id) { code_session_set_leaf(h->r->session, id); }
+
+static bool host_set_model(CodeUiHost *h, const char *provider, const char *id) { return switch_model(h->r, provider, id); }
+
+// ---- the session commands' side (code_sessions_ui.c draws them; code_sessions.c does the work) ----
+
+static CodeSession *host_session(CodeUiHost *h) { return h->r->session; }
+
+// createAgentSession for a session made current (/fork, /clone, /resume): its thinking level
+// restored from the branch (or recorded when the branch has none), the model and thinking level
+// recorded in a session without messages.
+static void use_session(Run *r, CodeSession *s) {
+    Arena *a = r->a;
+    r->session = s;
+    r->env.session_id = json_str(json_get(code_session_header(s), "id"));
+    r->env.session_file = code_session_path(s);
+    bool existing = code_session_messages(s)->arr.len > 0;
+    const char *recorded = json_str(code_session_last(s, "thinking_level_change", "thinkingLevel"));
+    const char *level = r->model.thinking ? r->model.thinking : "medium";
+    if (existing && recorded) level = recorded;
+    else if (existing) {
+        JValue *settings = read_json(a, path_join(a, r->env.agent_dir, "settings.json"));
+        const char *d = json_str(json_get(settings, "defaultThinkingLevel"));
+        level = d ? d : "medium";
+    }
+    if (!r->model.reasoning) level = "off";
+    level = arena_strdup(a, level);
+    if (!existing) {
+        JValue *f = json_new(a, J_OBJECT);
+        json_put(a, f, S("provider"), json_string(a, str(r->model.provider)));
+        json_put(a, f, S("modelId"), json_string(a, str(r->model.id)));
+        (void)code_session_append(s, "model_change", f);
+    }
+    if (!existing || !recorded) {
+        JValue *f = json_new(a, J_OBJECT);
+        json_put(a, f, S("thinkingLevel"), json_string(a, str(level)));
+        (void)code_session_append(s, "thinking_level_change", f);
+    }
+    r->model.thinking = level;
+    r->env.thinking = level;
+}
+
+// A session loaded after the start lives in an arena of its own, freed when the next one replaces
+// it (a long session that resumes and imports many keeps one tree in memory, not all of them).
+static Arena *session_arena_new(void) { return xcalloc(1, sizeof(Arena)); }
+
+static void session_arena_drop(Arena *sa) {
+    if (!sa) return;
+    arena_reset(sa);
+    free(sa);
+}
+
+// The session in sa made current; the previous loaded one's arena freed.
+static void session_arena_use(Run *r, Arena *sa) {
+    Arena *old = r->session_arena;
+    r->session_arena = sa;
+    if (old != sa) session_arena_drop(old);
+}
+
+// A fork may share its parent's entries: it stays in the run's arena, and the parent's arena (a
+// loaded session's) is kept until the next /resume or /import replaces them both.
+static const char *host_fork(CodeUiHost *h, const char *entry_id, bool at, char **selected) {
+    Run *r = h->r;
+    CodeSession *s;
+    const char *err = code_sessions_fork(r->a, r->session, json_str(json_get(code_session_header(r->session), "cwd")), entry_id, at, &s, selected);
+    if (!err) use_session(r, s);
+    return err;
+}
+
+// AgentSessionRuntime.switchSession: the session file opened; the process moves to its folder, as
+// pi's runtime does, unless it stays here (cwdOverride: the session's folder is gone).
+static const char *host_resume(CodeUiHost *h, const char *path, bool stay) {
+    Run *r = h->r;
+    CodeSession *s;
+    Arena *sa = session_arena_new();
+    Err e = code_session_open_path(sa, path, &s);
+    if (e) {
+        const char *m = arena_printf(r->a, "Failed to resume session: %s", e);
+        session_arena_drop(sa);
+        return m;
+    }
+    const char *cwd = json_str(json_get(code_session_header(s), "cwd"));
+    if (!stay && cwd && *cwd && strcmp(cwd, r->env.cwd)) {
+        if (chdir(cwd) != 0) {
+            const char *m = arena_printf(r->a, "Failed to resume session: %s", strerror(errno));
+            session_arena_drop(sa);
+            return m;
+        }
+        r->env.cwd = arena_strdup(r->a, cwd);
+        // createRuntime in another folder: its own project trust, then its resources under it
+        (void)code_trust_trusted(&r->env);
+        code_resources_reload(&r->env);
+    }
+    use_session(r, s);
+    session_arena_use(r, sa);
+    return NULL;
+}
+
+// AgentSession.compact (manual), on the agent thread: compaction_start, then compaction_end with
+// the result, the error or the abort, as pi emits them.
+static void host_compact(CodeUiHost *h, const char *instructions) {
+    Run *r = h->r;
+    Arena *a = r->a;
+    g_abort = 0;
+    JValue *ev = ev_new(a, "compaction_start");
+    json_put(a, ev, S("reason"), json_string(a, S("manual")));
+    code_ui_event(ev);
+    // settingsManager.getCompactionKeepRecentTokens(model): the merged settings, the model's override
+    int64_t keep = code_compaction_settings(code_settings_merged(a, &r->env), r->model.provider, r->model.id).keep_recent_tokens;
+    const JValue *entry = NULL;
+    const char *err = code_sessions_compact(a, r->session, &r->model, &r->env, instructions && *instructions ? instructions : NULL, keep, &entry);
+    bool aborted = g_abort || (err && !strcmp(err, "aborted"));
+    JValue *end = ev_new(a, "compaction_end");
+    json_put(a, end, S("reason"), json_string(a, S("manual")));
+    if (!err && entry) {
+        JValue *res = json_new(a, J_OBJECT);
+        json_put(a, res, S("summary"), json_get(entry, "summary"));
+        json_put(a, res, S("firstKeptEntryId"), json_get(entry, "firstKeptEntryId"));
+        json_put(a, res, S("tokensBefore"), json_get(entry, "tokensBefore"));
+        if (json_get(entry, "usage")) json_put(a, res, S("usage"), json_get(entry, "usage"));
+        json_put(a, res, S("details"), json_get(entry, "details"));
+        json_put(a, end, S("result"), res);
+    }
+    json_put(a, end, S("aborted"), json_bool(a, !entry && aborted));
+    json_put(a, end, S("willRetry"), json_bool(a, false));
+    if (err && !aborted) json_put(a, end, S("errorMessage"), json_string(a, str(arena_printf(a, "Compaction failed: %s", err))));
+    code_ui_event(end);
+}
+
+static bool switch_model(Run *r, const char *provider, const char *id) {
+    if (r->model.engine) return !strcmp(provider, r->model.provider) && !strcmp(id, r->model.id);
+    Arena *a = r->a;
+    CodeModel keep = r->model;
+    Args o = {.provider = arena_strdup(a, provider), .model = arena_strdup(a, id)};
+    JValue *settings = read_json(a, path_join(a, r->env.agent_dir, "settings.json"));
+    if (find_model(r, &o, settings)) {
+        r->model = keep;
+        return false;
+    }
+    r->model.thinking = r->model.reasoning ? keep.thinking : "off";
+    r->model.engine = NULL;
+    r->env.provider = r->model.provider;
+    r->env.model = r->model.id;
+    r->env.thinking = r->model.thinking;
+    code_monitor_set_model(NULL, r->model.provider, r->model.base_url);
+    JValue *f = json_new(a, J_OBJECT);
+    json_put(a, f, S("provider"), json_string(a, str(r->model.provider)));
+    json_put(a, f, S("modelId"), json_string(a, str(r->model.id)));
+    (void)code_session_append(r->session, "model_change", f);
+    return true;
+}
+
+// What /model lists: the model packs this Mac can run in process (downloaded or not; the ones that
+// need more memory than it has marked), then the openai-completions models of pi's models.json.
+static bool pack_is_current(Arena *a, const Run *r, const DownloadPack *p) {
+    if (!r->pack) return false;
+    if (!strcmp(r->pack, p->name)) return true;
+    char *dir;
+    return !download_pack_dir(a, p, &dir) && !strcmp(dir, r->pack);
+}
+
+static CodeUiModel *list_models(Arena *a, const Run *r, size_t *n, CodeUiModel *current) {
+    *n = 0;
+    JValue *models = read_json(a, path_join(a, r->env.agent_dir, "models.json"));
+    const JValue *providers = json_get(models, "providers");
+    size_t cap = DOWNLOAD_NPACKS + 1;
+    for (size_t i = 0; providers && json_is(providers, J_OBJECT) && i < providers->obj.len; i++) {
+        const JValue *list = json_get(providers->obj.items[i].val, "models");
+        cap += json_is(list, J_ARRAY) ? list->arr.len : 0;
+    }
+    CodeUiModel *out = arena_alloc(a, (cap + 1) * sizeof *out);
+    const uint64_t ram = fit_ram_bytes();
+    for (size_t i = 0; i < DOWNLOAD_NPACKS; i++) {
+        const DownloadPack *p = &download_packs[i];
+        if (!p->min_ram_gb) continue; // adapters are not models
+        char *dir;
+        bool have = !download_pack_dir(a, p, &dir) && file_exists(path_join(a, dir, "config.json"));
+        CodeUiModel m = {.provider = "saetta", .id = p->name, .name = p->title ? p->title : p->name, .reasoning = true,
+                         .context_window = 204800, .pack = true, .unavailable = !have,
+                         .too_big = ram && ((uint64_t)p->min_ram_gb << 30) > ram, .disk_gb = p->disk_gb, .min_ram_gb = p->min_ram_gb};
+        if (have) cfg_pack_label(a, m.name, p->gguf_file, dir, &m.label, &m.label_brief);
+        if (pack_is_current(a, r, p)) {
+            m.unavailable = false;
+            m.context_window = r->model.context_window;
+            *current = m;
+        }
+        out[(*n)++] = m;
+    }
+    if (r->pack && !current->id) { // a pack folder that is not a known download
+        CodeUiModel m = {.provider = "saetta", .id = r->pack, .name = r->model.id, .reasoning = true,
+                         .context_window = r->model.context_window, .pack = true};
+        cfg_pack_label(a, NULL, NULL, r->pack, &m.label, &m.label_brief);
+        *current = m;
+        out[(*n)++] = m;
+    }
+    for (size_t i = 0; providers && json_is(providers, J_OBJECT) && i < providers->obj.len; i++) {
+        const JMember *p = &providers->obj.items[i];
+        const JValue *list = json_get(p->val, "models");
+        for (size_t k = 0; json_is(list, J_ARRAY) && k < list->arr.len; k++) {
+            const JValue *m = list->arr.items[k];
+            const char *api = json_str(json_get(m, "api")) ? json_str(json_get(m, "api")) : json_str(json_get(p->val, "api"));
+            if (!api || strcmp(api, "openai-completions") || !json_str(json_get(m, "id"))) continue;
+            out[(*n)++] = (CodeUiModel){.provider = str_z(a, p->key), .id = json_str(json_get(m, "id")), .name = json_str(json_get(m, "name")),
+                                        .reasoning = jbool(json_get(m, "reasoning"), false),
+                                        .context_window = juint(json_get(m, "contextWindow"), 128000)};
+        }
+    }
+    return out;
+}
+
+// The interactive mode chose a model this process cannot switch to in place (another pack, or
+// away from the engine): saetta code starts again on it once the UI has ended, the session
+// continued (-c), the other options kept.
+static void host_restart(CodeUiHost *h, const char *provider, const char *id) {
+    Run *r = h->r;
+    free(r->restart_provider);
+    free(r->restart_id);
+    r->restart_provider = strdup(provider);
+    r->restart_id = strdup(id);
+}
+
+static void restart_on(Run *r) {
+    Arena *a = r->a;
+    char self[PATH_MAX];
+    uint32_t sz = sizeof self;
+    if (_NSGetExecutablePath(self, &sz) != 0) return;
+    VEC(const char *) v = {0};
+    vec_push(&v, self);
+    vec_push(&v, "code");
+    for (size_t i = 0; i < r->argc; i++) {
+        const char *x = r->argv[i];
+        bool more = i + 1 < r->argc;
+        bool takes = !strcmp(x, "--provider") || !strcmp(x, "--model") || !strcmp(x, "--pack") || !strcmp(x, "--thinking") ||
+                     !strcmp(x, "--mode") || !strcmp(x, "--system-prompt") || !strcmp(x, "--append-system-prompt") ||
+                     !strcmp(x, "--tools") || !strcmp(x, "--ctx") || !strcmp(x, "--session") || !strcmp(x, "--skill");
+        if (takes && more) {
+            if (strcmp(x, "--provider") && strcmp(x, "--model") && strcmp(x, "--pack") && strcmp(x, "--session")) {
+                vec_push(&v, x);
+                vec_push(&v, r->argv[i + 1]);
+            }
+            i++;
+        } else if (x[0] == '-' && strcmp(x, "-c") && strcmp(x, "--continue")) vec_push(&v, x);
+        // prompts are not run again
+    }
+    if (!strcmp(r->restart_provider, "saetta")) {
+        vec_push(&v, "--pack");
+        vec_push(&v, r->restart_id);
+    } else {
+        vec_push(&v, "--provider");
+        vec_push(&v, r->restart_provider);
+        vec_push(&v, "--model");
+        vec_push(&v, r->restart_id);
+    }
+    // the current folder's project trust goes on, for that folder only (never --approve: the
+    // next process resolves every other folder by its own decision, as pi's projectTrustByCwd)
+    code_trust_export_restart(&r->env);
+    // the conversation goes on in this session's own file (never "the latest in the folder"); one
+    // not written yet (no conversation) starts fresh; --no-session stays as it was
+    if (code_session_written(r->session)) {
+        vec_push(&v, "--session");
+        vec_push(&v, code_session_path(r->session));
+    }
+    vec_push(&v, NULL);
+    code_tools_kill_detached();
+    fflush(NULL);
+    execv(self, (char *const *)v.ptr);
+    int e = errno;
+    code_trust_cancel_restart();
+    errno = e;
+    fprintf(stderr, "saetta code: cannot start again on %s/%s: %s\n", r->restart_provider, r->restart_id, strerror(errno));
+    (void)a;
+    vec_free(&v);
+}
+
+// /model's list after /model added, edited or removed a provider of models.json: built in an arena
+// of its own (the UI thread calls it, maybe while the agent thread uses r->a). Two arenas take
+// turns: the list before stays valid (the UI may still hold its strings until it takes the new
+// one), the one before that is freed.
+static const CodeUiModel *host_reload_models(CodeUiHost *h, size_t *n) {
+    static Arena lists[2];
+    static int shown = 1; // the arena of the list the UI holds now
+    int next = shown ^ 1;
+    arena_reset(&lists[next]);
+    CodeUiModel cur = {0};
+    const CodeUiModel *m = list_models(&lists[next], h->r, n, &cur);
+    if (m) shown = next;
+    return m;
+}
+
+// Each Esc counts (any nonzero value aborts): an automatic compaction gives back only the presses
+// that stopped it (code_autocompact.c run_auto), so a later one still stops the run.
+static void host_abort(CodeUiHost *h) {
+    (void)h;
+    __atomic_fetch_add(&g_abort, 1, __ATOMIC_SEQ_CST);
+}
+
+// ---- for /export, /share and /import (code_cmds.c) ---------------------------------------------------
+
+static const char *host_session_file(CodeUiHost *h) { return code_session_path(h->r->session); }
+
+// getSessionDir: the folder of the session file, else the default one for the cwd
+// (agent_dir/sessions/--<cwd with / and : as ->--)
+static const char *host_session_dir(CodeUiHost *h) {
+    Run *r = h->r;
+    const char *p = code_session_path(r->session);
+    if (p && strrchr(p, '/')) return arena_strndup(r->a, p, (size_t)(strrchr(p, '/') - p));
+    const char *c = r->env.cwd;
+    while (*c == '/') c++;
+    char *safe = arena_printf(r->a, "--%s--", c);
+    for (char *q = safe + 2; *q; q++)
+        if (*q == '/' || *q == '\\' || *q == ':') *q = '-';
+    return path_join(r->a, path_join(r->a, r->env.agent_dir, "sessions"), safe);
+}
+
+static const char *host_session_cwd(CodeUiHost *h) { return h->r->env.cwd; }
+
+// state.systemPrompt: the transcript's system prompt, else the one the next prompt starts with
+// (pi's agent holds it from its creation)
+static const char *host_system_prompt(CodeUiHost *h) {
+    Run *r = h->r;
+    const JValue *msgs = code_session_messages(r->session);
+    bool have = false;
+    for (size_t i = 0; msgs && i < msgs->arr.len && !have; i++)
+        have = str_eqz(json_strs(json_get(msgs->arr.items[i], "role")), "system");
+    JValue *sys = NULL;
+    if (have) sys = current_system(r->a, msgs);
+    else if (code_system_message(r->a, &r->env, r->tools, r->ntools, &sys)) return NULL;
+    return str_z(r->a, code_system_text(r->a, sys));
+}
+
+// state.tools as the export lists them: name, description, parameters
+static const JValue *host_tool_decls(CodeUiHost *h) {
+    Run *r = h->r;
+    Arena *a = r->a;
+    JValue *schemas = code_tool_schemas(a, r->tools, r->ntools), *out = json_new(a, J_ARRAY);
+    for (size_t i = 0; i < schemas->arr.len; i++) {
+        const JValue *f = json_get(schemas->arr.items[i], "function");
+        JValue *d = json_new(a, J_OBJECT);
+        json_put(a, d, S("name"), (JValue *)json_get(f, "name"));
+        json_put(a, d, S("description"), (JValue *)json_get(f, "description"));
+        json_put(a, d, S("parameters"), (JValue *)json_get(f, "parameters"));
+        json_push(a, out, d);
+    }
+    return out;
+}
+
+// The agent on another session file (AgentSessionRuntime createRuntime for a resume): its entries,
+// id and file, run in cwd; the thinking level it recorded, when the model reasons.
+static Err host_open_session(CodeUiHost *h, const char *path, const char *cwd) {
+    Run *r = h->r;
+    Arena *a = r->a;
+    CodeSession *s;
+    Arena *sa = session_arena_new();
+    Err e = code_session_open_path(sa, path, &s);
+    if (e) {
+        e = arena_strdup(a, e);
+        session_arena_drop(sa);
+        return e;
+    }
+    r->session = s;
+    session_arena_use(r, sa);
+    bool moved = strcmp(cwd, r->env.cwd) != 0;
+    r->env.cwd = arena_strdup(a, cwd);
+    r->env.session_id = json_str(json_get(code_session_header(s), "id"));
+    r->env.session_file = code_session_path(s);
+    if (moved) {
+        // createRuntime in another folder: its own project trust, then its resources under it
+        (void)code_trust_trusted(&r->env);
+        code_resources_reload(&r->env);
+    }
+    // the session's thinking level when it recorded one; else the current level, recorded (as the
+    // start of a resumed session does)
+    const char *lv = json_str(code_session_last(s, "thinking_level_change", "thinkingLevel"));
+    if (lv && r->model.reasoning) {
+        r->model.thinking = arena_strdup(a, lv);
+        r->env.thinking = r->model.thinking;
+    } else if (!lv) {
+        JValue *f = json_new(a, J_OBJECT);
+        json_put(a, f, S("thinkingLevel"), json_string(a, str(level_of(r))));
+        (void)code_session_append(s, "thinking_level_change", f);
+    }
+    return OK;
+}
+
+// fd for the "@" completion: on PATH, else pi's managed copy in the agent folder
+static const char *find_fd(Arena *a, const char *agent_dir) {
+    const char *path = getenv("PATH");
+    for (Str rest = str(path ? path : ""); rest.len;) {
+        ptrdiff_t c = str_find_char(rest, ':', 0);
+        Str dir = c >= 0 ? str_sub(rest, 0, (size_t)c) : rest;
+        rest = c >= 0 ? str_sub(rest, (size_t)c + 1, rest.len) : S("");
+        char *cand = path_join(a, str_z(a, dir), "fd");
+        if (access(cand, X_OK) == 0) return cand;
+    }
+    char *managed = path_join(a, path_join(a, agent_dir, "bin"), "fd");
+    return access(managed, X_OK) == 0 ? managed : NULL;
+}
+
+static const char *self_exe(Arena *a) {
+    char self[PATH_MAX];
+    uint32_t sz = sizeof self;
+    return _NSGetExecutablePath(self, &sz) == 0 ? arena_strdup(a, self) : NULL;
+}
+
+static Err interactive(Run *r, const Args *o, const JValue *settings) {
     Arena *a = r->a;
     r->ui = true;
-    g_cwd = r->env.cwd;
     tcgetattr(0, &g_cooked);
     g_tty_saved = 1;
     g_interactive = 1;
-    struct sigaction sa = {0};
-    sa.sa_handler = on_sigint;
-    sigaction(SIGINT, &sa, NULL);
     r->env.abort = &g_abort;
-    printf("%sSaetta Code%s %s%s/%s, thinking %s%s\n", BOLD, RESET, DIM, r->model.provider, r->model.id, r->model.thinking, RESET);
-    printf("%s%s  (Enter sends, \\ then Enter for a new line, Ctrl-C stops a turn, /help)%s\n\n", DIM, r->env.cwd, RESET);
-    VecStr history = {0};
-    for (size_t i = 0; i < o->prompts.len; i++) {
-        g_abort = 0;
-        TRY(prompt(r, o->prompts.ptr[i]));
+    signal(SIGINT, SIG_IGN); // Ctrl-C is a key in raw mode
+    const JValue *compaction = json_get(settings, "compaction");
+    size_t nmodels;
+    CodeUiModel cur = {0};
+    CodeUiModel *models = list_models(a, r, &nmodels, &cur);
+    CodeUiConfig cfg = {
+        .cwd = r->env.cwd,
+        .home = r->env.home,
+        .agent_dir = r->env.agent_dir,
+        .model = cur.id ? cur
+                        : (CodeUiModel){.provider = r->model.provider, .id = r->model.id, .name = r->model.name, .reasoning = r->model.reasoning,
+                                        .context_window = r->model.context_window},
+        .thinking = r->model.thinking,
+        .auto_compact = jbool(json_get(compaction, "enabled"), true),
+        .fd_path = find_fd(a, r->env.agent_dir),
+        .models = models,
+        .nmodels = nmodels,
+        .default_provider = json_str(json_get(settings, "defaultProvider")),
+        .default_model = json_str(json_get(settings, "defaultModel")),
+        .settings = settings,
+        .resumed = (o->cont || o->session) && code_session_messages(r->session)->arr.len > 0,
+        .version = code_version,
+    };
+    cfg.engine = r->model.engine != NULL;
+    cfg.self_exe = self_exe(a);
+    CodeUiOps ops = {host_prompt, host_new_session, host_set_thinking, host_entries, host_messages,
+                     host_set_leaf, host_set_model, host_abort, host_restart, host_reload_models,
+                     .session_file = host_session_file, .session_dir = host_session_dir, .session_cwd = host_session_cwd,
+                     .system_prompt = host_system_prompt, .tool_decls = host_tool_decls, .open_session = host_open_session,
+                     .session = host_session, .fork = host_fork, .resume = host_resume, .compact = host_compact};
+    CodeUiHost host = {r};
+    // a stand-in for a slow model load, for the loader's test scenario: SAETTA_CODE_LOAD_DEMO_MS
+    const char *demo = getenv("SAETTA_CODE_LOAD_DEMO_MS");
+    if (demo && atoi(demo) > 0) {
+        Splash *sp = splash_start(arena_printf(a, "Loading %s ...", r->model.name ? r->model.name : r->model.id));
+        struct timespec ts = {atoi(demo) / 1000, (long)(atoi(demo) % 1000) * 1000000L};
+        nanosleep(&ts, NULL);
+        splash_stop(sp);
     }
-    for (;;) {
-        char *text;
-        if (!read_prompt(a, &history, &text)) break;
-        Str t = str_trim(str(text));
-        if (!t.len) continue;
-        if (str_eqz(t, "/exit") || str_eqz(t, "/quit")) break;
-        if (str_eqz(t, "/help")) {
-            printf("%s/new      a new session\n/exit     quit (also Ctrl-D)\nSessions are pi's (~/.pi/agent/sessions or "
-                   "$PI_CODING_AGENT_DIR): saetta code -c continues the last one, and so does pi -c.%s\n\n",
-                   DIM, RESET);
-            continue;
-        }
-        if (str_eqz(t, "/new")) {
-            TRY(code_session_open(a, &r->env, false, false, &r->session));
-            r->env.session_id = json_str(json_get(code_session_header(r->session), "id"));
-            r->env.session_file = code_session_path(r->session);
-            JValue *f = json_new(a, J_OBJECT);
-            json_put(a, f, S("provider"), json_string(a, str(r->model.provider)));
-            json_put(a, f, S("modelId"), json_string(a, str(r->model.id)));
-            TRY(code_session_append(r->session, "model_change", f));
-            f = json_new(a, J_OBJECT);
-            json_put(a, f, S("thinkingLevel"), json_string(a, str(r->model.thinking)));
-            TRY(code_session_append(r->session, "thinking_level_change", f));
-            printf("%snew session%s\n\n", DIM, RESET);
-            continue;
-        }
-        g_abort = 0;
-        uint64_t t0 = now_ns();
-        Err e = prompt(r, text);
-        if (e) printf("%ssaetta code: %s%s\n", RED, e, RESET);
-        printf("%s%.1f s%s\n\n", DIM, (double)(now_ns() - t0) / 1e9, RESET);
+    code_monitor_set_model(r->model.engine, r->model.provider, r->model.base_url);
+    Err e = code_ui_run(&cfg, &ops, &host, o->prompts.ptr, o->prompts.len);
+    g_tty_saved = 0;
+    if (e && !strcmp(e, "AgentBusy")) {
+        // the run ignored the abort: leave without touching what it uses
+        code_tools_kill_detached();
+        _exit(0);
     }
-    vec_free(&history);
-    return OK;
+    if (!e && r->restart_id) restart_on(r);
+    return e;
 }
 
 // ---- entry ---------------------------------------------------------------------------------------
@@ -1221,17 +1598,22 @@ static const char *find_pi_docs(Arena *a) {
 // --pack: the engine in this process, described as `saetta start pi` describes the server to pi
 // (launch.c pi_setup), so the requests stay byte for byte the same. The engine's own log lines
 // go to ~/.saetta/code.log.
-static Err open_engine(Arena *a, Run *r, const char *arg, const char *ctx) {
+static Err open_engine(Arena *a, Run *r, const char *arg, const char *ctx, bool splash) {
     const DownloadPack *pk = download_find(arg);
     char *dir = (char *)arg;
     if (pk) TRY(download_pack_dir(a, pk, &dir));
+    // a folder given by path (saetta start code passes one): the known pack in it, for its name
+    for (size_t i = 0; !pk && i < DOWNLOAD_NPACKS; i++) {
+        char *d;
+        if (!download_pack_dir(a, &download_packs[i], &d) && !strcmp(d, dir)) pk = &download_packs[i];
+    }
     if (!file_exists(path_join(a, dir, "config.json"))) {
         dbg("saetta code: no model at %s%s%s\n", dir, pk ? "; download it with: saetta download " : "", pk ? arg : "");
         return "NoModel";
     }
     char *logdir = path_join(a, r->env.home, ".saetta");
     mkdir_p(logdir);
-    FILE *log = fopen(path_join(a, logdir, "code.log"), "a");
+    FILE *log = fopen(path_join(a, logdir, "code.log"), "ae");
     if (log) {
         setvbuf(log, NULL, _IOLBF, 0);
         dbg_out = log;
@@ -1241,10 +1623,13 @@ static Err open_engine(Arena *a, Run *r, const char *arg, const char *ctx) {
     if (ctx) setenv("SAETTA_CTX", ctx, 1);
     else if (!getenv("SAETTA_CTX")) setenv("SAETTA_CTX", "204800", 1);
     uint64_t t0 = now_ns();
-    if (isatty(2)) fprintf(stderr, "saetta code: loading %s ...\r", pk ? arg : dir);
+    // the loader while the engine loads (interactive runs only); the load itself runs here at full speed
+    Splash *sp = splash ? splash_start(arena_printf(a, "Loading %s ...", pk && pk->title ? pk->title : (strrchr(arg, '/') && strrchr(arg, '/')[1] ? strrchr(arg, '/') + 1 : arg))) : NULL;
+    if (!sp && isatty(2)) fprintf(stderr, "saetta code: loading %s ...\r", pk ? arg : dir);
     Engine *e;
     Err err = server_engine_open(a, dir, NULL, &e);
-    if (isatty(2)) fprintf(stderr, "\x1b[K");
+    splash_stop(sp);
+    if (!sp && isatty(2)) fprintf(stderr, "\x1b[K");
     if (err && !strcmp(err, "EngineBusy")) {
         Server srv;
         int pid = 0;
@@ -1307,14 +1692,146 @@ static void pick_tools(Arena *a, const Args *o, Run *r) {
     }
 }
 
+// ---- the first run (first-time-setup.ts, Saetta's way: a model pack on this Mac, or an
+// OpenAI-compatible server in pi's models.json) ----------------------------------------------------
+
+static bool ask_yes(const char *q, bool dflt) {
+    printf("%s %s ", q, dflt ? "[Y/n]" : "[y/N]");
+    fflush(stdout);
+    char line[64];
+    if (!fgets(line, sizeof line, stdin)) return false;
+    Str t = str_trim(str(line));
+    if (!t.len) return dflt;
+    return t.ptr[0] == 'y' || t.ptr[0] == 'Y';
+}
+
+static bool pack_here(Arena *a, const DownloadPack *p) {
+    char *dir;
+    return !download_pack_dir(a, p, &dir) && file_exists(path_join(a, dir, "config.json"));
+}
+
+// The best downloaded pack that fits this Mac (saetta start's choice), or NULL.
+static const DownloadPack *downloaded_pack(Arena *a) {
+    uint64_t ram = fit_ram_bytes();
+    for (size_t i = 0; i < DOWNLOAD_NPACKS; i++) {
+        const DownloadPack *p = &download_packs[i];
+        if (!p->min_ram_gb || (ram && ((uint64_t)p->min_ram_gb << 30) > ram)) continue;
+        if (pack_here(a, p)) return p;
+    }
+    return NULL;
+}
+
+// Whether the server of base_url accepts a connection (1 s).
+static bool server_answers(const char *base_url) {
+    if (!base_url) return false;
+    const char *h = strstr(base_url, "://");
+    h = h ? h + 3 : base_url;
+    char host[256] = {0};
+    size_t n = strcspn(h, ":/");
+    snprintf(host, sizeof host, "%.*s", (int)MIN(n, sizeof host - 1), h);
+    int port = strncmp(base_url, "https", 5) ? 80 : 443;
+    if (h[n] == ':') port = atoi(h + n + 1);
+    char ps[16];
+    snprintf(ps, sizeof ps, "%d", port);
+    struct addrinfo hints = {.ai_socktype = SOCK_STREAM}, *res = NULL;
+    if (getaddrinfo(host, ps, &hints, &res) || !res) return false;
+    bool ok = false;
+    for (struct addrinfo *ai = res; ai && !ok; ai = ai->ai_next) {
+        int fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (fd < 0) continue;
+        fcntl(fd, F_SETFL, O_NONBLOCK);
+        if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0) ok = true;
+        else if (errno == EINPROGRESS) {
+            struct pollfd pf = {fd, POLLOUT, 0};
+            int err = 0;
+            socklen_t el = sizeof err;
+            if (poll(&pf, 1, 1000) == 1 && !getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &el) && !err) ok = true;
+        }
+        close(fd);
+    }
+    freeaddrinfo(res);
+    return ok;
+}
+
+// No model to talk to: guide the user to one (in a terminal only). Sets *pack to a download name
+// to run in process, or returns false to stop (the reason printed).
+// The nearest existing folder's free space (the models folder may not exist yet).
+static uint64_t free_bytes(const char *dir) {
+    char probe[PATH_MAX];
+    snprintf(probe, sizeof probe, "%s", dir);
+    struct statfs st;
+    while (statfs(probe, &st) != 0) {
+        char *sl = strrchr(probe, '/');
+        if (!sl || sl == probe) return 0;
+        *sl = 0;
+    }
+    return (uint64_t)st.f_bavail * st.f_bsize;
+}
+
+static bool first_run(Arena *a, const char *agent_dir, bool server_down, const char *base_url, const char **pack) {
+    *pack = NULL;
+    // the models.json this run reads, ~ for the home folder
+    const char *home = getenv("HOME");
+    const char *mj = path_join(a, agent_dir, "models.json");
+    if (home && *home && !strncmp(mj, home, strlen(home)) && mj[strlen(home)] == '/') mj = arena_printf(a, "~%s", mj + strlen(home));
+    const DownloadPack *have = downloaded_pack(a);
+    printf("\x1b[1m\xe2\x86\xaf Saetta Code\x1b[0m\n\n");
+    if (server_down) printf("The server at %s does not answer.\n", base_url);
+    else printf("No model is set up yet. Saetta Code runs a model on this Mac, or talks to an OpenAI-compatible\nserver listed in %s.\n", mj);
+    if (have) {
+        printf("\n%s is downloaded on this Mac.\n", have->title ? have->title : have->name);
+        if (ask_yes(arena_printf(a, "Run %s here?", have->title ? have->title : have->name), true)) {
+            *pack = have->name;
+            return true;
+        }
+        return false;
+    }
+    const char *rec = fit_default_pack();
+    const DownloadPack *p = rec ? download_find(rec) : NULL;
+    if (!p) {
+        printf("\nThis Mac has %llu GB of memory: no saetta model fits it (they need 32 GB or more).\n",
+               (unsigned long long)(fit_ram_bytes() >> 30));
+        printf("Add an OpenAI-compatible server to %s to use Saetta Code here.\n", mj);
+        return false;
+    }
+    char *mdir = NULL;
+    uint64_t freeb = !download_models_dir(a, &mdir) ? free_bytes(mdir) : 0;
+    if (getenv("SAETTA_CODE_FREE_GB")) freeb = (uint64_t)atoll(getenv("SAETTA_CODE_FREE_GB")) * 1000000000ull; // tests
+    printf("\nFor this Mac (%llu GB of memory): %s, about %u GB to download (%llu GB free on that disk).\n",
+           (unsigned long long)(fit_ram_bytes() >> 30), p->title ? p->title : p->name, p->disk_gb, (unsigned long long)(freeb / 1000000000ull));
+    if (freeb && freeb < (uint64_t)p->disk_gb * 1000000000ull) {
+        printf("Not enough free disk for it. Free some space, or add a server to %s.\n", mj);
+        return false;
+    }
+    if (!ask_yes("Download it now (resumable)?", true)) {
+        printf("Later: saetta download %s, then saetta code.\n", p->name);
+        return false;
+    }
+    const char *test = getenv("SAETTA_CODE_DOWNLOAD"); // a stand-in for the tests
+    Err de;
+    if (test && *test) {
+        char *cmd = arena_printf(a, "'%s' %s", test, p->name);
+        de = system(cmd) == 0 ? OK : "DownloadFailed";
+    } else {
+        const char *dargs[] = {p->name};
+        de = download_run(dargs, 1);
+    }
+    if (de) {
+        printf("The download stopped (%s); run saetta download %s to resume it.\n", de, p->name);
+        return false;
+    }
+    *pack = p->name;
+    return true;
+}
+
 Err code_run(const char *const *args, size_t n, int *code) {
     *code = 1;
     Arena arena = {0};
     Arena *a = &arena;
-    Args o = {0};
+    Args o = {.approve = -1};
     Err e = parse_args(args, n, &o);
     if (e) goto done;
-    Run r = {.a = a, .json = o.mode && !strcmp(o.mode, "json")};
+    Run r = {.a = a, .json = o.mode && !strcmp(o.mode, "json"), .pack = o.pack, .argv = args, .argc = n};
     char cwd[PATH_MAX];
     if (!getcwd(cwd, sizeof cwd)) {
         e = "NoCwd";
@@ -1337,6 +1854,8 @@ Err code_run(const char *const *args, size_t n, int *code) {
     r.env.append_system_prompt = o.append.ptr;
     r.env.nappend_system_prompt = o.append.len;
     pick_tools(a, &o, &r);
+    r.env.on_partial = on_tool_partial;
+    r.env.partial_ctx = &r;
     JValue *settings = read_json(a, path_join(a, r.env.agent_dir, "settings.json"));
     const JValue *rs = json_get(settings, "retry");
     g_retry.enabled = jbool(json_get(rs, "enabled"), true);
@@ -1361,17 +1880,36 @@ Err code_run(const char *const *args, size_t n, int *code) {
         }
         buf_free(&in);
     }
+    bool tty = !o.print && !piped && !r.json && isatty(0) && isatty(1);
+    if (!o.pack) {
+        e = find_model(&r, &o, settings);
+        // the first run: nothing configured, or a server that does not answer
+        bool down = !e && tty && r.model.base_url && !server_answers(r.model.base_url);
+        if (tty && (e || down)) {
+            const char *p;
+            if (first_run(a, r.env.agent_dir, down, r.model.base_url, &p)) {
+                o.pack = p;
+                r.pack = p;
+                r.model = (CodeModel){0};
+                e = OK;
+            } else if (e) {
+                *code = 0;
+                e = OK;
+                goto done;
+            } else e = OK; // the server stays (pi's behavior: the request reports the error)
+        }
+    }
     if (o.pack) {
-        e = open_engine(a, &r, o.pack, o.ctx);
+        e = open_engine(a, &r, o.pack, o.ctx, tty);
         if (e) goto done;
         if (o.thinking) r.model.thinking = o.thinking;
-    } else e = find_model(&r, &o, settings);
+    }
     if (e && !o.pack) {
         dbg("saetta code: no model %s%s%s in %s/models.json (Saetta Code runs openai-completions providers)\n",
             o.provider ? o.provider : "", o.provider ? "/" : "", o.model ? o.model : "", r.env.agent_dir);
         goto done;
     }
-    e = code_session_open(a, &r.env, o.cont, o.no_session, &r.session);
+    e = o.session ? code_session_open_path(a, o.session, &r.session) : code_session_open(a, &r.env, o.cont, o.no_session, &r.session);
     if (e) goto done;
     // thinking level: the flag, else the session's, else the settings' default, else medium
     const JValue *recorded = code_session_last(r.session, "thinking_level_change", "thinkingLevel");
@@ -1400,8 +1938,16 @@ Err code_run(const char *const *args, size_t n, int *code) {
     r.env.provider = r.model.provider;
     r.env.model = r.model.id;
     r.env.thinking = level;
+    // project trust (the startup prompt in the interactive mode), then the skills and context files
+    code_skills_options(o.no_skills, o.skills.ptr, o.skills.len);
+    code_trust_override(o.approve);
+    code_trust_resolve(&r.env, tty);
+    (void)code_resources(&r.env);
+    r.base_tools = r.tools;
+    r.nbase_tools = r.ntools;
+    code_mcp_start(&r.env, !o.no_mcp, r.tools, r.ntools, o.tools || o.no_tools);
     if (!o.print && !piped && !r.json && isatty(0) && isatty(1)) {
-        e = interactive(&r, &o);
+        e = interactive(&r, &o, settings);
         if (!e) *code = 0;
         goto done;
     }
@@ -1434,9 +1980,14 @@ Err code_run(const char *const *args, size_t n, int *code) {
         }
     }
 done:
+    code_mcp_shutdown();
     code_tools_kill_detached();
     vec_free(&o.prompts);
     vec_free(&o.append);
+    vec_free(&o.skills);
     arena_reset(a);
     return e;
 }
+
+// getCurrentSystemMessage for code_sessions.c (compaction's system message and estimates).
+JValue *code_current_system(Arena *a, const JValue *messages) { return current_system(a, messages); }

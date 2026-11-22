@@ -1058,6 +1058,37 @@ static JValue *sjp_args(SJP *p, JValue *empty) {
     return r && r->kind == J_OBJECT ? r : empty;
 }
 
+// The parser on its own, for the interactive mode: it rebuilds the partial arguments of a
+// streamed tool call on the UI thread from the raw deltas.
+struct CodeArgsParser {
+    Arena a;
+    SJP p;
+    JValue *empty;
+};
+
+CodeArgsParser *code_args_parser_new(void) {
+    CodeArgsParser *c = xcalloc(1, sizeof *c);
+    c->p.a = &c->a;
+    c->empty = jobj(&c->a);
+    return c;
+}
+
+void code_args_parser_feed(CodeArgsParser *c, Str text) {
+    c->p.a = &c->a;
+    sjp_append(&c->p, text);
+}
+
+const JValue *code_args_parser_value(CodeArgsParser *c) { return sjp_args(&c->p, c->empty); }
+
+void code_args_parser_free(CodeArgsParser *c) {
+    if (!c) return;
+    vec_free(&c->p.stack);
+    buf_free(&c->p.keybuf);
+    buf_free(&c->p.scalar);
+    arena_reset(&c->a);
+    free(c);
+}
+
 // ---- compat (getCompat over detectCompat) ------------------------------------------------
 
 typedef struct {

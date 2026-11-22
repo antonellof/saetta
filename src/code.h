@@ -40,6 +40,9 @@ typedef struct {
     struct Engine *engine;
 } CodeModel;
 
+// saetta's version (main.c sets it), for Saetta Code's header.
+extern const char *code_version;
+
 // Where the agent runs.
 typedef struct {
     const char *cwd;       // process working directory, as pi's process.cwd()
@@ -58,6 +61,10 @@ typedef struct {
     // "Operation aborted" and a running bash command has its process group killed ("Command
     // aborted"). NULL when nothing aborts.
     volatile int *abort;
+    // A running tool's partial result (pi's onUpdate: the bash tool's output so far, at most every
+    // 100 ms), or NULL. The value is valid during the call only.
+    void (*on_partial)(void *ctx, const JValue *partial);
+    void *partial_ctx;
 } CodeEnv;
 
 // ---- system prompt (code_prompt.c; pi: core/system-prompt.js, resource-loader.js, skills.js)
@@ -113,6 +120,10 @@ typedef struct CodeSession CodeSession;
 // Opens a new session file for env->cwd under agent_dir/sessions, or (cont) the most recent
 // one there; path NULL with no_session keeps it in memory.
 Err code_session_open(Arena *a, const CodeEnv *env, bool cont, bool no_session, CodeSession **out);
+// That session file (--session).
+Err code_session_open_path(Arena *a, const char *path, CodeSession **out);
+// Whether the session has been written to its file (pi writes it once there is a conversation).
+bool code_session_written(const CodeSession *s);
 // The messages on the current branch, in order (pi buildSessionContext).
 const JValue *code_session_messages(const CodeSession *s);
 // Appends an entry ("message", "model_change", "thinking_level_change", ...): type, id,
@@ -124,6 +135,10 @@ const JValue *code_session_header(const CodeSession *s);
 const JValue *code_session_last(const CodeSession *s, const char *type, const char *field);
 // The session file (written once the session holds a message), NULL when not persisted.
 const char *code_session_path(const CodeSession *s);
+// Every entry, the header first (the whole tree, for /tree).
+const JValue *code_session_entries(const CodeSession *s);
+// Moves the current leaf (pi's branch()): the next entry is appended under it. NULL: the root.
+void code_session_set_leaf(CodeSession *s, const char *id);
 // The id of the last entry appended (the current leaf), NULL before the first.
 const char *code_session_leaf(const CodeSession *s);
 // The last entry appended (the header before any).

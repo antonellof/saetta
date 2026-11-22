@@ -44,7 +44,7 @@
 #include "weights.h"
 
 // Release version; keep equal to the git tag (v<version>).
-#define SAETTA_VERSION "0.15.0"
+#define SAETTA_VERSION "0.16.0"
 
 #define CFG_IN_MAX ((size_t)16384)
 #define CFG_OUT_MAX ((size_t)262144)
@@ -764,6 +764,7 @@ static Err run(Arena *arena, int argc, char **argv) {
 static void sigpipe_noop(int sig) { (void)sig; }
 
 int main(int argc, char **argv) {
+    code_version = SAETTA_VERSION;
     // a closed pipe or socket makes write return EPIPE instead of killing the process. A
     // handler, not SIG_IGN: handlers reset on exec, so spawned agents and tools get the
     // default SIGPIPE (Zig's std installs a no-op handler the same way)

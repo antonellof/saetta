@@ -15,6 +15,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "code_cfg.h"
 #include "ctxlimits.h"
 #include "fit.h"
 #include "download.h"
@@ -145,6 +146,18 @@ static Err pack_for(Arena *a, const char *arg, const char **out) {
     else
         fit_suggest(ram);
     return OK;
+}
+
+// Whether any model pack that fits this Mac is downloaded.
+static bool any_pack(Arena *a) {
+    const uint64_t ram = fit_ram_bytes();
+    for (size_t i = 0; i < DOWNLOAD_NPACKS; i++) {
+        const DownloadPack *p = &download_packs[i];
+        char *dir;
+        if (!p->min_ram_gb || (ram && ((uint64_t)p->min_ram_gb << 30) > ram)) continue;
+        if (!download_pack_dir(a, p, &dir) && has_config(a, dir)) return true;
+    }
+    return false;
 }
 
 typedef struct {
@@ -368,36 +381,28 @@ static Err pi_setup(Arena *a, Env *env, Argv *argv, const char *base, uint32_t c
     if (!home) return "NoHome";
     char *dir = path_join(a, path_join(a, home, ".saetta"), "pi");
     TRY(mkdir_p(dir));
-    const char *models = arena_printf(a,
-        "{\n"
-        "  \"providers\": {\n"
-        "    \"saetta\": {\n"
-        "      \"baseUrl\": \"%s/v1\",\n"
-        "      \"api\": \"openai-completions\",\n"
-        "      \"apiKey\": \"saetta\",\n"
-        "      \"compat\": {\n"
-        "        \"supportsDeveloperRole\": false,\n"
-        "        \"supportsStore\": false,\n"
-        "        \"supportsReasoningEffort\": false,\n"
-        "        \"maxTokensField\": \"max_tokens\",\n"
-        "        \"thinkingFormat\": \"qwen-chat-template\"\n"
-        "      },\n"
-        "      \"models\": [{\n"
-        "        \"id\": \"%s\",\n"
-        "        \"name\": \"%s\",\n"
-        "        \"reasoning\": %s,\n"
-        "        \"input\": [\"text\"],\n"
-        "        \"contextWindow\": %u,\n"
-        "        \"maxTokens\": 32768,\n"
-        "        \"cost\": { \"input\": 0, \"output\": 0, \"cacheRead\": 0, \"cacheWrite\": 0 }\n"
-        "      }]\n"
-        "    }\n"
-        "  }\n"
-        "}\n",
-        base, model_id, model_label, lora_arg ? "false" : "true", ctx);
-    TRY(write_in(a, dir, "models.json", models));
-    TRY(write_in(a, dir, "settings.json",
-                 arena_printf(a, "{\n  \"defaultProvider\": \"saetta\",\n  \"defaultModel\": \"%s\"\n}\n", model_id)));
+    // models.json: only the "saetta" provider is ours (the user's other providers stay);
+    // settings.json: only defaultProvider and defaultModel (theme and the rest stay). A file that
+    // does not parse is left alone, with a warning (pi gets the model on its command line).
+    Buf q[3] = {0};
+    json_write_string(&q[0], str(arena_printf(a, "%s/v1", base)));
+    json_write_string(&q[1], str(model_id));
+    json_write_string(&q[2], str(model_label));
+    const char *entry = arena_printf(a,
+        "{\"baseUrl\":%s,\"api\":\"openai-completions\",\"apiKey\":\"saetta\","
+        "\"compat\":{\"supportsDeveloperRole\":false,\"supportsStore\":false,\"supportsReasoningEffort\":false,"
+        "\"maxTokensField\":\"max_tokens\",\"thinkingFormat\":\"qwen-chat-template\"},"
+        "\"models\":[{\"id\":%s,\"name\":%s,\"reasoning\":%s,\"input\":[\"text\"],\"contextWindow\":%u,"
+        "\"maxTokens\":32768,\"cost\":{\"input\":0,\"output\":0,\"cacheRead\":0,\"cacheWrite\":0}}]}",
+        q[0].ptr, q[1].ptr, q[2].ptr, lora_arg ? "false" : "true", ctx);
+    for (int k = 0; k < 3; k++) buf_free(&q[k]);
+    JValue *ev;
+    TRY(json_parse(a, str(entry), false, &ev));
+    Buf why = {0};
+    if (!cfg_put_provider(dir, "saetta", NULL, ev, &why)) dbg("saetta start: warning: %s\n", why.ptr);
+    why.len = 0;
+    if (!cfg_set_default_model(dir, "saetta", model_id, &why)) dbg("saetta start: warning: %s\n", why.ptr);
+    buf_free(&why);
     env_put(env, "PI_CODING_AGENT_DIR", dir);
     env_put(env, "PI_SKIP_VERSION_CHECK", "1");
     const char *args[] = {"pi", "--provider", "saetta", "--model", model_id};
@@ -437,10 +442,12 @@ static Err code_in_process(Arena *a, const char *dir, uint32_t ctx, const char *
     Argv argv = {0};
     vec_push(&argv, arena_strdup(a, self));
     vec_push(&argv, "code");
-    vec_push(&argv, "--pack");
-    vec_push(&argv, dir);
-    vec_push(&argv, "--ctx");
-    vec_push(&argv, arena_printf(a, "%u", ctx));
+    if (dir) {
+        vec_push(&argv, "--pack");
+        vec_push(&argv, dir);
+        vec_push(&argv, "--ctx");
+        vec_push(&argv, arena_printf(a, "%u", ctx));
+    }
     for (size_t k = 0; k < n_extra; k++) vec_push(&argv, extra[k]);
     vec_push(&argv, NULL);
     pid_t child;
@@ -541,6 +548,10 @@ static Err session(Arena *a, Session *ss, Agent agent, const char *pack_arg, uin
             return OK;
         }
         const char *dir;
+        // Saetta Code in a terminal with nothing downloaded: it guides the first run itself (the
+        // model that fits this Mac, downloaded on confirmation), or uses a server of its models.json
+        if (agent == AGENT_CODE && !pack_arg && !lora_arg && isatty(0) && isatty(1) && !any_pack(a))
+            return code_in_process(a, NULL, ctx, extra, n_extra, code);
         TRY(pack_for(a, pack_arg, &dir));
         if (!dir) {
             *code = 1;

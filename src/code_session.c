@@ -206,6 +206,18 @@ static Err load(CodeSession *s, const char *path) {
 
 // ---- public -------------------------------------------------------------------------------------
 
+Err code_session_open_path(Arena *a, const char *path, CodeSession **out) {
+    CodeSession *s = arena_alloc(a, sizeof *s);
+    s->a = a;
+    s->entries = json_new(a, J_ARRAY);
+    TRY(load(s, path));
+    if (!s->entries->arr.len) return "BadSession";
+    *out = s;
+    return OK;
+}
+
+bool code_session_written(const CodeSession *s) { return s->path && s->flushed; }
+
 Err code_session_open(Arena *a, const CodeEnv *env, bool cont, bool no_session, CodeSession **out) {
     CodeSession *s = arena_alloc(a, sizeof *s);
     s->a = a;
@@ -490,6 +502,10 @@ const JValue *code_session_last(const CodeSession *s, const char *type, const ch
 
 const char *code_session_path(const CodeSession *s) { return s->path; }
 
+const JValue *code_session_entries(const CodeSession *s) { return s->entries; }
+
+void code_session_set_leaf(CodeSession *s, const char *id) { s->leaf = id ? arena_strdup(s->a, id) : NULL; }
+
 const char *code_session_leaf(const CodeSession *s) { return s->leaf; }
 
 const JValue *code_session_entry_last(const CodeSession *s) { return s->entries->arr.items[s->entries->arr.len - 1]; }
@@ -516,3 +532,67 @@ Err code_session_append(CodeSession *s, const char *type, JValue *fields) {
     }
     return err;
 }
+
+// ---- sessions made from entries (/fork, /clone, /resume: code_sessions.c) -----------------------
+
+char *code_session_uuid(Arena *a, double now_ms) { return uuid_v7(a, now_ms); }
+
+char *code_session_iso(Arena *a, double now_ms) { return iso_time(a, now_ms); }
+
+char *code_session_new_entry_id(Arena *a, const JValue *entries) { return short_id(a, entries); }
+
+// pi's constructor with preloaded entries and _rewriteFile: the file is (re)written now when the
+// entries hold a conversation, else at the first message (_persist).
+Err code_session_from_entries(Arena *a, const char *path, JValue *entries, CodeSession **out) {
+    CodeSession *s = arena_alloc(a, sizeof *s);
+    s->a = a;
+    s->entries = entries;
+    for (size_t i = 0; i < entries->arr.len; i++) {
+        const JValue *e = entries->arr.items[i];
+        if (str_eqz(json_strs(json_get(e, "type")), "session")) s->id = json_str(json_get(e, "id"));
+        else s->leaf = json_str(json_get(e, "id"));
+    }
+    s->path = path ? arena_strdup(a, path) : NULL;
+    if (s->path && has_conversation(entries)) {
+        Buf b = {0};
+        for (size_t i = 0; i < entries->arr.len; i++) write_line(&b, entries->arr.items[i]);
+        int fd = open(s->path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+        Err e = fd < 0 ? err_errno(errno) : OK;
+        for (size_t off = 0; !e && off < b.len;) {
+            ssize_t w = write(fd, b.ptr + off, b.len - off);
+            if (w < 0 && errno == EINTR) continue;
+            if (w < 0) e = err_errno(errno);
+            else off += (size_t)w;
+        }
+        if (fd >= 0) close(fd);
+        buf_free(&b);
+        if (e) return e;
+        s->flushed = true;
+    }
+    *out = s;
+    return OK;
+}
+
+// appendCompaction's entry: its timestamp is also its system message's (ms), so the caller gives it.
+Err code_session_append_at(CodeSession *s, const char *type, JValue *fields, double now_ms) {
+    Arena *a = s->a;
+    JValue *e = json_new(a, J_OBJECT);
+    json_put(a, e, S("type"), json_string(a, str(type)));
+    const char *id = short_id(a, s->entries);
+    json_put(a, e, S("id"), json_string(a, str(id)));
+    json_put(a, e, S("parentId"), s->leaf ? json_string(a, str(s->leaf)) : json_new(a, J_NULL));
+    json_put(a, e, S("timestamp"), json_string(a, str(iso_time(a, now_ms))));
+    if (fields)
+        for (size_t i = 0; i < fields->obj.len; i++) json_put(a, e, fields->obj.items[i].key, fields->obj.items[i].val);
+    json_push(a, s->entries, e);
+    const char *prev = s->leaf;
+    s->leaf = id;
+    Err err = persist(s, e);
+    if (err) {
+        s->entries->arr.len--;
+        s->leaf = prev;
+    }
+    return err;
+}
+
+Arena *code_session_arena(const CodeSession *s) { return s->a; }

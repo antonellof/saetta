@@ -1,4 +1,4 @@
-// saetta.dev: theme toggle, copy buttons, and the terminal replays (what `saetta auto` and the
+// saetta.dev: theme toggle, tabs, copy buttons, and the terminal replays (what `saetta auto` and the
 // local API print; simulated, labelled as such on the page).
 
 const root = document.documentElement;
@@ -7,6 +7,31 @@ document.getElementById("theme").addEventListener("click", () => {
   root.dataset.theme = t;
   try { localStorage.setItem("theme", t); } catch (e) {}
 });
+
+// tabs: the install box (which command block shows; Copy follows it) and the session captures
+for (const box of document.querySelectorAll(".install")) {
+  const copy = box.querySelector(".copy");
+  for (const t of box.querySelectorAll(".itab")) {
+    t.addEventListener("click", () => {
+      for (const o of box.querySelectorAll(".itab")) {
+        const on = o === t;
+        o.setAttribute("aria-selected", on ? "true" : "false");
+        document.getElementById(o.getAttribute("aria-controls")).hidden = !on;
+      }
+      copy.dataset.copy = t.getAttribute("aria-controls");
+    });
+  }
+}
+for (const fig of document.querySelectorAll("[data-tabs]")) {
+  const title = fig.querySelector("[data-title]");
+  for (const t of fig.querySelectorAll("button[data-shot]")) {
+    t.addEventListener("click", () => {
+      for (const o of fig.querySelectorAll("button[data-shot]")) o.setAttribute("aria-selected", o === t ? "true" : "false");
+      for (const img of fig.querySelectorAll("img[data-shot]")) img.hidden = img.dataset.shot !== t.dataset.shot;
+      title.textContent = t.textContent;
+    });
+  }
+}
 
 for (const b of document.querySelectorAll(".copy")) {
   b.addEventListener("click", async () => {
@@ -28,7 +53,7 @@ const pad = (s, n) => s + " ".repeat(Math.max(0, n - s.length));
 let run = 0; // bumped on tab change: an older replay stops at its next step
 
 const models = [["coder", "downloaded, recommended"], ["full", "105 GB"], ["27b-turbo", "20 GB"], ["27b-8bit", "29 GB"], ["27b-4bit", "16 GB"]];
-const agents = [["Claude Code", "installed"], ["pi", "installed"], ["opencode", "not installed"]];
+const agents = [["Saetta Code", "built in, recommended"], ["Claude Code", "installed"], ["pi", "installed"], ["opencode", "not installed"]];
 const menu = (title, rows, sel) =>
   `${title}\n` + rows.map(([a, b], i) => i === sel
     ? `  <span class="sel"><span class="a">&gt;</span> ${pad(a, 16)}${b} </span>`
@@ -57,10 +82,9 @@ async function auto(id) {
   for (const s of [0, 1, 2, 1, 0]) if (!(await show(id, intro + menu("Choose a model", models, s), s ? 380 : 1100))) return;
   const m = intro + 'Choose a model: <span class="g">coder</span> (downloaded)\n\n';
   if (!(await show(id, m + menu("Choose a coding agent", agents, 0), 1300))) return;
-  const s = m + "Starting Claude Code on coder (next time: saetta start claude --pack coder)\n\n" +
-    "saetta: loading Qwen3.8-Flash-Next-GSQ-RCO-Coder-MLX (context 204800 tokens)...\n";
+  const s = m + "Starting Saetta Code on coder (next time: saetta start code --pack coder)\n\n";
   if (!(await show(id, s + '<span class="cursor"></span>', 1400))) return;
-  await show(id, s + '<span class="g">saetta: ready at http://127.0.0.1:8080 (6.8 s)</span>\n\n' +
+  await show(id, s + '<span class="d">the model loads inside Saetta Code: no server, no HTTP</span>\n\n' +
     '<span class="a">&gt;</span> fix the failing test<span class="cursor"></span>', 4000);
 }
 

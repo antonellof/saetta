@@ -376,6 +376,7 @@ void sx_cmd_wait_event(sx_cmd *c, sx_event *e, uint64_t v) {
 
 @interface SxHttpTask : NSObject <NSURLSessionDataDelegate>
 @property(nonatomic) sx_http_sink sink;
+@property(nonatomic) sx_http_header_sink header_sink;
 @property(nonatomic) void *ctx;
 @property(nonatomic) int status;
 @property(nonatomic) BOOL cancelled;
@@ -389,8 +390,15 @@ void sx_cmd_wait_event(sx_cmd *c, sx_event *e, uint64_t v) {
               dataTask:(NSURLSessionDataTask *)task
     didReceiveResponse:(NSURLResponse *)response
      completionHandler:(void (^)(NSURLSessionResponseDisposition))completionHandler {
-    if ([response isKindOfClass:[NSHTTPURLResponse class]])
-        self.status = (int)((NSHTTPURLResponse *)response).statusCode;
+    if ([response isKindOfClass:[NSHTTPURLResponse class]]) {
+        NSHTTPURLResponse *h = (NSHTTPURLResponse *)response;
+        self.status = (int)h.statusCode;
+        if (self.header_sink)
+            [h.allHeaderFields enumerateKeysAndObjectsUsingBlock:^(id name, id value, BOOL *stop) {
+                if ([name isKindOfClass:[NSString class]] && [value isKindOfClass:[NSString class]])
+                    self.header_sink(self.ctx, [name UTF8String], [value UTF8String]);
+            }];
+    }
     completionHandler(NSURLSessionResponseAllow);
 }
 
@@ -448,6 +456,12 @@ int sx_http(const char *method, const char *url, const sx_header *headers, size_
 int sx_http_cancellable(const char *method, const char *url, const sx_header *headers, size_t nheaders,
                         const void *body, size_t body_len, double timeout_s, sx_http_sink on_data, void *ctx,
                         int *status, char *err, size_t err_cap, volatile int *cancel) {
+    return sx_http_ex(method, url, headers, nheaders, body, body_len, timeout_s, NULL, on_data, ctx, status, err, err_cap, cancel);
+}
+
+int sx_http_ex(const char *method, const char *url, const sx_header *headers, size_t nheaders, const void *body,
+               size_t body_len, double timeout_s, sx_http_header_sink on_header, sx_http_sink on_data, void *ctx,
+               int *status, char *err, size_t err_cap, volatile int *cancel) {
     @autoreleasepool {
         NSURL *u = [NSURL URLWithString:@(url)];
         if (!u) { copy_err(err, err_cap, @"invalid URL"); return 1; }
@@ -474,6 +488,7 @@ int sx_http_cancellable(const char *method, const char *url, const sx_header *he
 
         SxHttpTask *t = [SxHttpTask new];
         t.sink = on_data;
+        t.header_sink = on_header;
         t.ctx = ctx;
         t.auth = auth;
         t.done = dispatch_semaphore_create(0);

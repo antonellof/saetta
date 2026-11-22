@@ -277,16 +277,37 @@ static int sink_buf(void *ctx, int status, const void *p, size_t n) {
 
 static _Thread_local char http_err[256];
 
-static Err get(const char *url, Got *g) {
+static Err get_within(const char *url, double timeout_s, Got *g) {
     sx_header h[2] = {{"accept-encoding", "identity"}, {"user-agent", "saetta"}};
     char err[256] = "";
     *g = (Got){0};
-    if (sx_http("GET", url, h, 2, NULL, 0, 300.0, sink_buf, &g->body, &g->status, err, sizeof err) != 0) {
+    if (sx_http("GET", url, h, 2, NULL, 0, timeout_s, sink_buf, &g->body, &g->status, err, sizeof err) != 0) {
         buf_free(&g->body);
         snprintf(http_err, sizeof http_err, "%s", err[0] ? err : "HttpFailed");
         return http_err;
     }
     return OK;
+}
+
+static Err get(const char *url, Got *g) { return get_within(url, 300.0, g); }
+
+Err control_latest_release(Arena *a, double timeout_s, ControlRelease *r) {
+    *r = (ControlRelease){.version = "", .notes = ""};
+    Got g;
+    TRY(get_within("https://api.github.com/repos/" REPO "/releases/latest", timeout_s, &g));
+    r->status = g.status;
+    Err e = OK;
+    if (g.status == 200) {
+        JValue *v;
+        e = json_parse(a, str_n(arena_dup(a, buf_str(&g.body).ptr, g.body.len + 1), g.body.len), true, &v);
+        if (!e) {
+            const char *tag = jstr(v, "tag_name");
+            r->version = tag[0] == 'v' ? tag + 1 : tag;
+            r->notes = jstr(v, "body");
+        }
+    }
+    buf_free(&g.body);
+    return e;
 }
 
 // std.process.executablePathAlloc: _NSGetExecutablePath, symlinks resolved.
@@ -323,7 +344,7 @@ static Err run_quiet(const char *const *argv, bool *success) {
     return OK;
 }
 
-static Err update_in(Arena *a, FILE *out, const char *current, int *code, Got *latest, Got *tgz, Got *sum) {
+static Err update_in(Arena *a, FILE *out, const char *current, int *code, Got *tgz, Got *sum) {
     // a Homebrew install is Homebrew's to replace (its Cellar, its links)
     char *self;
     if (!exe_path(a, &self) && strstr(self, "/Cellar/saetta/") != NULL) {
@@ -332,17 +353,15 @@ static Err update_in(Arena *a, FILE *out, const char *current, int *code, Got *l
         return OK;
     }
     // the latest release tag, from the GitHub API
-    TRY(get("https://api.github.com/repos/" REPO "/releases/latest", latest));
-    if (latest->status != 200) {
-        fprintf(out, "saetta update: could not read the latest release (HTTP %d)%s\n", latest->status,
-                latest->status == 404 ? "; the repository may be private" : "");
+    ControlRelease latest;
+    TRY(control_latest_release(a, 300.0, &latest));
+    if (latest.status != 200) {
+        fprintf(out, "saetta update: could not read the latest release (HTTP %d)%s\n", latest.status,
+                latest.status == 404 ? "; the repository may be private" : "");
         *code = 1;
         return OK;
     }
-    JValue *v;
-    TRY(json_parse(a, str_n(arena_dup(a, buf_str(&latest->body).ptr, latest->body.len + 1), latest->body.len), true, &v));
-    const char *tag = jstr(v, "tag_name");
-    const char *ver = tag[0] == 'v' ? tag + 1 : tag;
+    const char *ver = latest.version;
     if (!ver[0]) return "BadRelease";
     SemanticVersion cur, nv;
     if (semver_parse(str(current), &cur)) return "BadVersion";
@@ -404,9 +423,8 @@ out:
 
 Err control_update(FILE *out, const char *current, int *code) {
     Arena a = {0};
-    Got latest = {0}, tgz = {0}, sum = {0};
-    Err e = update_in(&a, out, current, code, &latest, &tgz, &sum);
-    buf_free(&latest.body);
+    Got tgz = {0}, sum = {0};
+    Err e = update_in(&a, out, current, code, &tgz, &sum);
     buf_free(&tgz.body);
     buf_free(&sum.body);
     arena_reset(&a);

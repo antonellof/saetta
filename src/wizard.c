@@ -262,7 +262,7 @@ static const Choice models[] = {
 
 static const struct {
     const char *cmd, *label;
-} agents[] = {{"claude", "Claude Code"}, {"pi", "pi"}, {"opencode", "opencode"}, {"code", "Saetta Code"}};
+} agents[] = {{"code", "Saetta Code"}, {"claude", "Claude Code"}, {"pi", "pi"}, {"opencode", "opencode"}};
 
 Err wizard_run(int *code) {
     *code = 1;
@@ -343,8 +343,11 @@ Err wizard_run(int *code) {
         size_t adef = COUNT(agents);
         for (size_t i = 0; i < COUNT(agents); i++) {
             const bool inst = builtin_agent(agents[i].cmd) || on_path(&a, agents[i].cmd);
-            ai[i] = (Item){agents[i].label, inst ? "installed" : "not installed", inst ? "" : "choose it to install", false};
-            if (inst && adef == COUNT(agents)) adef = i;
+            const bool own = builtin_agent(agents[i].cmd);
+            ai[i] = (Item){agents[i].label, own ? "built in, recommended" : inst ? "installed" : "not installed",
+                           inst ? "" : "choose it to install", false};
+            if (own) adef = i; // Saetta Code, the default
+            else if (inst && adef == COUNT(agents)) adef = i;
         }
         int g = menu("Choose a coding agent", ai, COUNT(agents), adef == COUNT(agents) ? 0 : adef);
         if (g < 0) {

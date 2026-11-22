@@ -15,6 +15,7 @@
 // character lines) count UTF-16 units. Decoding follows TextDecoder (invalid bytes become
 // U+FFFD), so byte counts match Buffer.byteLength of pi's decoded text.
 #include "code.h"
+#include "code_mcp.h"
 #include "metal/shim.h"
 
 #include <dirent.h>
@@ -1205,6 +1206,7 @@ void code_tools_kill_detached(void) {
         pid_t p = atomic_exchange(&tracked_groups[i], 0);
         if (p > 0) kill_tree(p);
     }
+    code_mcp_kill_signal_safe(); // the MCP servers' process groups too (stdio.ts's exit hook)
 }
 
 static double ms_since(uint64_t t0) { return (double)(now_ns() - t0) / 1e6; }
@@ -1249,6 +1251,33 @@ static const char *shell_path(void) {
     if (exists("/bin/bash")) return "/bin/bash";
     if (on_path("bash")) return "bash";
     return "sh";
+}
+
+// emitOutputUpdate: the output so far as a partial result (a throwaway arena: one per update).
+static void bash_update(const CodeEnv *env, Acc *acc, bool empty) {
+    if (!env->on_partial) return;
+    Arena t = {0};
+    JValue *r = json_new(&t, J_OBJECT);
+    JValue *content = json_new(&t, J_ARRAY);
+    if (!empty) {
+        Arena *keep = acc->a;
+        acc->a = &t; // the snapshot's text lives in the throwaway arena (the temp file's path stays in the run's)
+        bool had_path = acc->tmp_path != NULL;
+        Trunc tr = acc_snapshot(&t, acc);
+        acc->a = keep;
+        if (!had_path && acc->tmp_path) acc->tmp_path = arena_strdup(keep, acc->tmp_path);
+        JValue *b = json_new(&t, J_OBJECT);
+        jput(&t, b, "type", jstr(&t, S("text")));
+        jput(&t, b, "text", jstr(&t, tr.content));
+        json_push(&t, content, b);
+        jput(&t, r, "content", content);
+        JValue *d = json_new(&t, J_OBJECT);
+        if (tr.truncated) jput(&t, d, "truncation", trunc_json(&t, &tr));
+        if (acc->tmp_path) jput(&t, d, "fullOutputPath", jstr(&t, str(acc->tmp_path)));
+        jput(&t, r, "details", d);
+    } else jput(&t, r, "content", content);
+    env->on_partial(env->partial_ctx, r);
+    arena_reset(&t);
 }
 
 static void tool_bash(Arena *a, const CodeEnv *env, const JValue *args, ToolOut *o) {
@@ -1325,6 +1354,10 @@ static void tool_bash(Arena *a, const CodeEnv *env, const JValue *args, ToolOut 
             int fds[2] = {out[0], err[0]};
             int nopen = 2;
             uint64_t t0 = now_ns();
+            // the live output (scheduleOutputUpdate): an empty update at once, then at most every 100 ms
+            bash_update(env, &acc, true);
+            uint64_t last_update = 0;
+            bool update_dirty = false;
             double exited_at = exited ? 0 : -1, idle_until = exited ? 100 : -1;
             char buf[65536];
             while (!werr) {
@@ -1344,6 +1377,14 @@ static void tool_bash(Arena *a, const CodeEnv *env, const JValue *args, ToolOut 
                 if (has_to && !timed_out) wait = timeout_ms - now;
                 if (exited && (wait < 0 || idle_until - now < wait)) wait = idle_until - now;
                 if (ab && !aborted && (wait < 0 || wait > ABORT_POLL_MS)) wait = ABORT_POLL_MS;
+                if (update_dirty) {
+                    double due = 100 - (double)(now_ns() - last_update) / 1e6;
+                    if (due <= 0) {
+                        bash_update(env, &acc, false);
+                        last_update = now_ns();
+                        update_dirty = false;
+                    } else if (wait < 0 || wait > due) wait = due;
+                }
                 struct timespec ts, *tsp = NULL;
                 if (wait >= 0) {
                     ts.tv_sec = (time_t)(wait / 1000);
@@ -1378,9 +1419,11 @@ static void tool_bash(Arena *a, const CodeEnv *env, const JValue *args, ToolOut 
                         continue;
                     }
                     acc_append(&acc, buf, (size_t)r);
+                    update_dirty = env->on_partial != NULL;
                     if (exited) idle_until = ms_since(t0) + 100;
                 }
             }
+            if (update_dirty) bash_update(env, &acc, false); // finishOutput's last update
             if (!exited) { // the wait failed: never leave the group running or a zombie behind
                 kill_tree(pid);
                 if (!reap(pid, &st) && !werr) werr = arena_printf(a, "waitpid %s", errno_code(errno));
@@ -2600,10 +2643,11 @@ static ptrdiff_t tool_index(Str name) {
 }
 
 JValue *code_tool_schemas(Arena *a, const char *const *tools, size_t ntools) {
-    JValue *arr = json_new(a, J_ARRAY);
+    JValue *arr = json_new(a, J_ARRAY), *mcp;
     for (size_t i = 0; i < ntools; i++) {
         ptrdiff_t k = tool_index(str(tools[i]));
         if (k >= 0) json_push(a, arr, tool_schema(a, (size_t)k));
+        else if ((mcp = code_mcp_tool_schema(a, str(tools[i])))) json_push(a, arr, mcp); // an MCP tool (code_mcp.c)
     }
     return arr;
 }
@@ -2912,19 +2956,21 @@ Err code_tool_run(Arena *a, const CodeEnv *env, const JValue *call, JValue **res
     bool executed = false;
     double duration = 0;
     ptrdiff_t k = tool_index(name);
-    if (k < 0) o.thrown = arena_printf(a, "Tool %.*s not found", (int)name.len, name.ptr);
+    JValue *mcp_params = k < 0 ? code_mcp_tool_parameters(a, name) : NULL; // an MCP tool (code_mcp.c)
+    if (k < 0 && !mcp_params) o.thrown = arena_printf(a, "Tool %.*s not found", (int)name.len, name.ptr);
     else {
-        const char *tname = TOOLS[k].name;
+        const char *tname = k >= 0 ? TOOLS[k].name : str_z(a, name);
         JValue *prepared = !strcmp(tname, "edit") ? prepare_edit(a, args) : args;
         const JValue *ae = json_get(call, "argumentsError");
         JValue *valid = NULL;
         if (json_is(ae, J_STRING)) o.thrown = arena_printf(a, "Invalid arguments for tool \"%s\": %.*s", tname, (int)ae->s.len, ae->s.ptr);
-        else valid = validate(a, tname, json_get(json_get(tool_schema(a, (size_t)k), "function"), "parameters"), prepared, &o.thrown);
+        else valid = validate(a, tname, k < 0 ? mcp_params : json_get(json_get(tool_schema(a, (size_t)k), "function"), "parameters"), prepared, &o.thrown);
         if (valid && env->abort && *env->abort) o.thrown = "Operation aborted"; // prepareToolCall's signal check
         else if (valid) {
             executed = true;
             uint64_t t0 = now_ns();
-            TOOLS[k].run(a, env, valid, &o);
+            if (k >= 0) TOOLS[k].run(a, env, valid, &o);
+            else code_mcp_tool_call(a, env, name, valid, &o.content, &o.details, &o.structured, &o.is_error, &o.thrown);
             duration = round(ms_since(t0));
         }
     }

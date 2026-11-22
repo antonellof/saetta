@@ -850,15 +850,10 @@ static void share_done(int status) {
         Str id = str_sub(url, s, url.len);
         if (!url.len || !id.len) G.show_error("Failed to parse gist ID from gh output");
         else {
-            const char *base = getenv("PI_SHARE_VIEWER_URL");
-            if (!base || !*base) base = "https://pi.dev/session/";
-            Buf preview = {0};
-            buf_printf(&preview, "%s#%.*s", base, (int)id.len, id.ptr);
-            // hyperlink(text, url): OSC 8
-            buf_printf(&m, "Share URL: \x1b]8;;%s\x1b\\%s\x1b]8;;\x1b\\\nGist: \x1b]8;;%.*s\x1b\\%.*s\x1b]8;;\x1b\\", preview.ptr,
-                       preview.ptr, (int)url.len, url.ptr, (int)url.len, url.ptr);
+            // the gist alone: pi also prints a link to its session viewer at pi.dev, which Saetta Code
+            // has no counterpart for (accepted difference)
+            buf_printf(&m, "Gist: \x1b]8;;%.*s\x1b\\%.*s\x1b]8;;\x1b\\", (int)url.len, url.ptr, (int)url.len, url.ptr);
             G.show_status(m.ptr);
-            buf_free(&preview);
         }
     }
     buf_free(&m);

@@ -4651,7 +4651,7 @@ static const SlashCmd builtin_cmds[] = {
     {"scoped-models", "Enable/disable models for Ctrl+P cycling", NULL},
     {"export", "Export session (HTML default, or specify path: .html/.jsonl)", NULL},
     {"import", "Import a JSONL session, preserving its ID and working directory", NULL},
-    {"share", "Share session via a Radius artifact or a GitHub gist", NULL},
+    {"share", "Share session as a secret GitHub gist", NULL},
     {"copy", "Copy last agent message to clipboard", NULL},
     {"name", "Set session display name", NULL},
     {"session", "Show session info and stats", NULL},

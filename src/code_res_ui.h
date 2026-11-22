@@ -46,10 +46,11 @@ void code_changelog_command(void); // /changelog
 void code_startup_notices(bool resumed);
 // renderProjectTrustWarningIfNeeded
 void code_trust_warning(void);
-// Whether cwd's project is trusted: the current runtime's decision for its folder, else the one
-// made for cwd this session, else what the store and settings say (never a prompt). For what the
-// UI itself runs in a folder (the footer's git).
-bool code_trust_folder(const char *cwd);
+// Whether cwd's trust is an explicit decision: a "trusted" entry in the trust store (at or above
+// it), the user's approval in a prompt of this session, or --approve (never a prompt, never the
+// default for a folder without project resources). For what the UI itself runs in a folder that
+// reads the repository's own configuration (the footer's git status).
+bool code_trust_explicit(const char *cwd);
 // maybeSaveImplicitProjectTrustAfterReload: true when it saved the trust.
 bool code_trust_after_reload(const CodeEnv *env);
 

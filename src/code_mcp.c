@@ -807,6 +807,7 @@ typedef struct Pending {
 } Pending;
 
 typedef struct Client Client;
+typedef struct HttpX HttpX;
 typedef struct Conn Conn;
 
 typedef struct {
@@ -834,6 +835,8 @@ struct Client {
     size_t nhdr;
     char *session_id, *protocol_version;
     volatile int http_cancel; // set by close(): the requests in flight are cancelled
+    struct HttpX *http_live;  // the POSTs in flight (g_mu), each cancellable on its own
+    int http_detached;        // the detached POST threads running (g_mu), at most MAX_HTTP_DETACHED
     // the client
     bool closed, closing, connected;
     Pending *pending;
@@ -1035,13 +1038,25 @@ static void bg_end(void) {
     pthread_mutex_unlock(&g_mu);
 }
 
-static void spawn_detached(void *(*fn)(void *), void *arg) {
+// false when the thread could not be created (the caller undoes what it set up for it)
+static bool spawn_detached(void *(*fn)(void *), void *arg) {
     pthread_t t;
     pthread_attr_t at;
     pthread_attr_init(&at);
     pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
-    pthread_create(&t, &at, fn, arg);
+    int rc = pthread_create(&t, &at, fn, arg);
     pthread_attr_destroy(&at);
+    return rc == 0;
+}
+
+// spawn_detached for a background task counted in G.bg (g_mu held, bg_begin_l done): on failure
+// the count is given back and the failure noted.
+static bool spawn_bg_l(void *(*fn)(void *), void *arg) {
+    if (spawn_detached(fn, arg)) return true;
+    G.bg--;
+    pthread_cond_broadcast(&g_cv);
+    notify_l(2, strdup("MCP: could not start a background thread"));
+    return false;
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1161,8 +1176,18 @@ static void unlink_pending_l(Client *c, Pending *p) {
 
 static char *http_send(Client *c, const char *json, bool is_request, int64_t id);
 static void http_send_detached(Client *c, const char *json, double idle_s);
+static void http_cancel_l(Client *c, int64_t id);
 
 enum { MAX_OUTQ_BYTES = 64 * 1024 * 1024 };
+
+// What was written dropped from the queue (g_mu held), so the buffer holds only what is still
+// to write and its whole length is what MAX_OUTQ_BYTES caps.
+static void outq_compact_l(Client *c) {
+    if (!c->outq_off) return;
+    memmove(c->outq.ptr, c->outq.ptr + c->outq_off, c->outq.len - c->outq_off);
+    c->outq.len -= c->outq_off;
+    c->outq_off = 0;
+}
 
 // The queued bytes written as far as stdin takes them now (g_mu held): never blocks (stdin is
 // O_NONBLOCK). A write error drops the queue (the reader sees the server go).
@@ -1177,6 +1202,7 @@ static void outq_flush_l(Client *c) {
         c->outq_off += (size_t)w;
     }
     if (c->outq_off == c->outq.len) c->outq.len = c->outq_off = 0;
+    else if (c->outq_off > c->outq.len / 2) outq_compact_l(c); // most of it written: dropped
 }
 
 // transport.send: one line on the server's stdin (or one POST). Returns NULL or the error. A
@@ -1189,7 +1215,8 @@ static char *client_send(Client *c, const char *json, bool is_request, int64_t i
     size_t n = strlen(json);
     pthread_mutex_lock(&g_mu);
     if (c->in_fd < 0 || c->closing) err = strdup("MCP connection closed");
-    else if (c->outq.len - c->outq_off + n + 1 > MAX_OUTQ_BYTES) err = strdup("MCP server is not reading its input");
+    else if (c->outq.len + n + 1 > MAX_OUTQ_BYTES && (outq_compact_l(c), c->outq.len + n + 1 > MAX_OUTQ_BYTES))
+        err = strdup("MCP server is not reading its input");
     else {
         buf_add(&c->outq, json, n);
         buf_addc(&c->outq, '\n');
@@ -1490,7 +1517,22 @@ static char *client_spawn(Client *c, char **argv, char **envp, const char *cwd) 
     live_add(pid);
     client_ref_l(c); // the reader's
     pthread_mutex_unlock(&g_mu);
-    spawn_detached(reader_main, c);
+    if (!spawn_detached(reader_main, c)) {
+        // no reader: the server stopped and reaped here, the client closed
+        kill(-pid, SIGKILL);
+        int st;
+        while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+        pthread_mutex_lock(&g_mu);
+        live_del(pid);
+        close(c->in_fd);
+        close(c->out_fd);
+        close(c->err_fd);
+        c->in_fd = c->out_fd = c->err_fd = -1;
+        c->exited = c->closed = true;
+        client_unref_l(c);
+        pthread_mutex_unlock(&g_mu);
+        return mfmt("spawn %s %s", argv[0], errno_code(EAGAIN));
+    }
     return NULL;
 }
 
@@ -1512,6 +1554,7 @@ static void client_close(Client *c) {
         // the requests in flight cancelled, then a DELETE ends the session (StreamableHttpTransport.close)
         c->http_cancel = 1;
         pthread_mutex_lock(&g_mu);
+        http_cancel_l(c, INT64_MIN);
         bool session = c->session_id != NULL;
         pthread_mutex_unlock(&g_mu);
         if (session) free(http_send(c, NULL, false, -1));
@@ -1611,6 +1654,7 @@ static char *client_request(Client *c, const char *method, const JValue *params,
         uint64_t now = now_ns();
         if (abort && *abort) {
             unlink_pending_l(c, &p);
+            http_cancel_l(c, p.id); // its POST stopped (the request's abort signal ends the fetch)
             pthread_mutex_unlock(&g_mu);
             if (p.cancellable) send_cancelled(c, p.id, "AbortError: This operation was aborted");
             vec_free(&p.progress);
@@ -1619,6 +1663,7 @@ static char *client_request(Client *c, const char *method, const JValue *params,
         }
         if (p.deadline_ns && now >= p.deadline_ns) {
             unlink_pending_l(c, &p);
+            http_cancel_l(c, p.id);
             pthread_mutex_unlock(&g_mu);
             if (p.cancellable) send_cancelled(c, p.id, "Request timed out");
             vec_free(&p.progress);
@@ -1719,7 +1764,11 @@ end:
 // McpSessionExpiredError, and the network failures and statuses worth another attempt
 enum { ERR_AUTH = -1, ERR_SESSION_EXPIRED = -2, ERR_TRANSIENT = -3 };
 
-typedef struct {
+enum { MAX_HTTP_DETACHED = 8 };
+
+struct HttpX {
+    struct HttpX *next_live; // c->http_live (g_mu)
+    volatile int cancel;     // this POST stopped: its request aborted or timed out, or the client closed
     Client *c;
     char *json; // the message, NULL for the session's DELETE
     bool is_request;
@@ -1732,7 +1781,7 @@ typedef struct {
     char event[64];
     bool has_event;
     bool too_big, captured;
-} HttpX;
+};
 
 static void http_header(void *ctx, const char *name, const char *value) {
     HttpX *h = ctx;
@@ -1818,7 +1867,7 @@ static int http_data(void *ctx, int status, const void *p, size_t n) {
     if (ok && h->is_request && !strcmp(h->ctype, "text/event-stream")) sse_feed(h, p, n, false);
     else if (h->body.len < (ok ? (size_t)MAX_MESSAGE_BYTES : 8 * 1024)) buf_add(&h->body, p, n);
     else if (ok) h->too_big = true;
-    return h->c->http_cancel ? 1 : 0;
+    return h->c->http_cancel || h->cancel ? 1 : 0;
 }
 
 // describeHttpFailure
@@ -1849,12 +1898,13 @@ static char *http_exchange(HttpX *h, int *kind) {
     volatile int never = 0;
     int rc = sx_http_ex(h->json ? "POST" : "DELETE", c->url, hs.ptr, hs.len, h->json, h->json ? strlen(h->json) : 0,
                         h->idle_s > 0 ? h->idle_s : h->json ? 300 : 1,
-                        http_header, http_data, h, &status, err, sizeof err, h->json ? &c->http_cancel : &never);
+                        http_header, http_data, h, &status, err, sizeof err, h->json ? &h->cancel : &never);
     vec_free(&hs);
     char *e = NULL;
     if (rc) {
         // fetch's TypeError (a network failure), or the transport closed meanwhile
         if (c->http_cancel) e = strdup("MCP connection closed");
+        else if (h->cancel) e = strdup("MCP request aborted");
         else {
             e = strdup("fetch failed");
             *kind = ERR_TRANSIENT;
@@ -1920,6 +1970,29 @@ out:
     return e;
 }
 
+// A POST put in c->http_live (g_mu held): cancelled at once when the client is closing.
+static void http_live_add_l(HttpX *h) {
+    h->next_live = h->c->http_live;
+    h->c->http_live = h;
+    if (h->c->http_cancel) h->cancel = 1;
+}
+
+static void http_live_del(HttpX *h) {
+    pthread_mutex_lock(&g_mu);
+    for (HttpX **pp = &h->c->http_live; *pp; pp = &(*pp)->next_live)
+        if (*pp == h) {
+            *pp = h->next_live;
+            break;
+        }
+    pthread_mutex_unlock(&g_mu);
+}
+
+// The POST of request id stopped (INT64_MIN: every POST of the client), g_mu held.
+static void http_cancel_l(Client *c, int64_t id) {
+    for (HttpX *h = c->http_live; h; h = h->next_live)
+        if (id == INT64_MIN || (h->is_request && h->id == id)) h->cancel = 1;
+}
+
 static void http_free(HttpX *h) {
     free(h->json);
     free(h->session);
@@ -1948,6 +2021,7 @@ static void *http_request_main(void *arg) {
     HttpX *h = arg;
     int kind = 0;
     char *e = http_exchange(h, &kind);
+    http_live_del(h);
     // the answer went through client_message; an error (or a stream without the answer) fails it
     if (e) fail_request(h->c, h->id, e, kind);
     free(e);
@@ -1960,7 +2034,11 @@ static void *http_detached_main(void *arg) {
     HttpX *h = arg;
     int kind = 0;
     free(http_exchange(h, &kind));
-    client_unref(h->c);
+    http_live_del(h);
+    pthread_mutex_lock(&g_mu);
+    h->c->http_detached--;
+    client_unref_l(h->c);
+    pthread_mutex_unlock(&g_mu);
     http_free(h);
     return NULL;
 }
@@ -1968,16 +2046,31 @@ static void *http_detached_main(void *arg) {
 // A notification or a response POSTed on a thread of its own, its error dropped: the cancellation
 // of an aborted or timed-out request (at most idle_s of silence) and the answers to the server's
 // requests, so neither the agent nor a response stream waits on the POST.
+// At most MAX_HTTP_DETACHED run at once: a server flooding requests gets the rest dropped (their
+// POST never sent, as when it fails), and a thread that cannot be created drops its message too.
 static void http_send_detached(Client *c, const char *json, double idle_s) {
+    pthread_mutex_lock(&g_mu);
+    if (c->http_detached >= MAX_HTTP_DETACHED || c->closing) {
+        pthread_mutex_unlock(&g_mu);
+        return;
+    }
     HttpX *h = xcalloc(1, sizeof *h);
     h->c = c;
     h->json = dupz(json);
     h->id = -1;
     h->idle_s = idle_s;
-    pthread_mutex_lock(&g_mu);
     client_ref_l(c);
+    c->http_detached++;
+    http_live_add_l(h);
     pthread_mutex_unlock(&g_mu);
-    spawn_detached(http_detached_main, h);
+    if (!spawn_detached(http_detached_main, h)) {
+        http_live_del(h);
+        pthread_mutex_lock(&g_mu);
+        c->http_detached--;
+        client_unref_l(c);
+        pthread_mutex_unlock(&g_mu);
+        http_free(h);
+    }
 }
 
 // A request's POST runs on its own thread (its answer may stream for long; the caller waits with
@@ -1991,9 +2084,14 @@ static char *http_send(Client *c, const char *json, bool is_request, int64_t id)
     if (is_request) {
         pthread_mutex_lock(&g_mu);
         client_ref_l(c);
+        http_live_add_l(h);
         pthread_mutex_unlock(&g_mu);
-        spawn_detached(http_request_main, h);
-        return NULL;
+        if (spawn_detached(http_request_main, h)) return NULL;
+        // no thread for the POST: the request fails at once
+        http_live_del(h);
+        client_unref(c);
+        http_free(h);
+        return strdup("fetch failed");
     }
     int kind = 0;
     char *e = http_exchange(h, &kind);
@@ -2075,7 +2173,10 @@ static void conn_tools_changed(Client *cl) {
         r->client = cl;
         client_ref_l(cl);
         bg_begin_l();
-        spawn_detached(refresh_main, r);
+        if (!spawn_bg_l(refresh_main, r)) {
+            client_unref_l(cl);
+            free(r);
+        }
     }
     pthread_mutex_unlock(&g_mu);
 }
@@ -2975,7 +3076,11 @@ static void start_connection_l(Server *s, bool startup) {
     a->startup = startup;
     s->inflight++;
     bg_begin_l();
-    spawn_detached(start_main, a);
+    if (!spawn_bg_l(start_main, a)) {
+        s->inflight--;
+        if (startup && --G.startup_left == 0 && !G.shutdown) report_problems_l(NULL, 0);
+        free(a);
+    }
 }
 
 void code_mcp_start(const CodeEnv *env, bool enabled, const char *const *allow, size_t nallow, bool allow_given) {
@@ -3879,7 +3984,11 @@ void code_mcp_run_action(const char *name, const char *action) {
         a->name = strdup(name);
         a->action = strdup(action);
         bg_begin_l();
-        spawn_detached(action_main, a);
+        if (!spawn_bg_l(action_main, a)) {
+            free(a->name);
+            free(a->action);
+            free(a);
+        }
         changed_l();
     }
     pthread_mutex_unlock(&g_mu);
@@ -4157,7 +4266,10 @@ char **code_mcp_subcommand(const char *args, size_t *npick) {
             ReconnectArg *a = xcalloc(1, sizeof *a);
             a->name = strdup(s->name);
             bg_begin_l();
-            spawn_detached(reconnect_cmd_main, a);
+            if (!spawn_bg_l(reconnect_cmd_main, a)) {
+                free(a->name);
+                free(a);
+            }
         }
     } else notify_l(1, strdup(usage));
     pthread_mutex_unlock(&g_mu);

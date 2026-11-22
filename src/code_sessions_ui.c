@@ -1670,12 +1670,17 @@ typedef struct {
     bool stay;
 } PendingSwitch;
 
-static void switch_trusted(void *p) {
+static void switch_dropped(void *p) {
     PendingSwitch *w = p;
-    switch_now(w->path, w->stay, w->status);
     free(w->path);
     free(w->status);
     free(w);
+}
+
+static void switch_trusted(void *p) {
+    PendingSwitch *w = p;
+    switch_now(w->path, w->stay, w->status);
+    switch_dropped(w);
 }
 
 // switchSession with projectTrustContextFactory: the new folder's project trust asked first when
@@ -1696,7 +1701,7 @@ static void switch_to(const char *path, bool stay, const char *status) {
         w->path = strdup(path);
         w->status = strdup(status);
         w->stay = stay;
-        code_trust_switch_ask(cwd, switch_trusted, w);
+        code_trust_switch_ask(cwd, switch_trusted, switch_dropped, w);
     }
     arena_reset(&a);
     if (!ask) switch_now(path, stay, status);

@@ -729,7 +729,10 @@ static bool status_code(const char *m) {
     return false;
 }
 
-static bool retryable(const JValue *msg) {
+// agent-session.ts _isRetryableError: a context overflow goes to compaction, never to a retry;
+// else isRetryableAssistantError. window: the model's contextWindow (_modelForMessage ?? model).
+static bool retryable(const JValue *msg, uint64_t window) {
+    if (code_context_overflow(msg, window)) return false;
     if (!str_eqz(json_strs(json_get(msg, "stopReason")), "error")) return false;
     const char *m = json_str(json_get(msg, "errorMessage"));
     if (!m || !*m) return false;
@@ -882,7 +885,7 @@ static Err run_agent(Run *r, bool started) {
         const char *last_id = NULL;
         TRY(run_turns(r, &last, &last_id));
         bool again = false;
-        if (last && retryable(last) && g_retry.enabled && !g_abort && r->retry_attempt < g_retry.max_retries) {
+        if (last && retryable(last, r->model.context_window) && g_retry.enabled && !g_abort && r->retry_attempt < g_retry.max_retries) {
             int64_t attempt = ++r->retry_attempt;
             // baseDelayMs * 2^(attempt-1), capped (and never shifted past the cap)
             int64_t delay = g_retry.base_ms;
@@ -1203,8 +1206,8 @@ static void host_compact(CodeUiHost *h, const char *instructions) {
     JValue *ev = ev_new(a, "compaction_start");
     json_put(a, ev, S("reason"), json_string(a, S("manual")));
     code_ui_event(ev);
-    JValue *settings = read_json(a, path_join(a, r->env.agent_dir, "settings.json"));
-    int64_t keep = (int64_t)juint(json_get(json_get(settings, "compaction"), "keepRecentTokens"), 20000);
+    // settingsManager.getCompactionKeepRecentTokens(model): the merged settings, the model's override
+    int64_t keep = code_compaction_settings(code_settings_merged(a, &r->env), r->model.provider, r->model.id).keep_recent_tokens;
     const JValue *entry = NULL;
     const char *err = code_sessions_compact(a, r->session, &r->model, &r->env, instructions && *instructions ? instructions : NULL, keep, &entry);
     bool aborted = g_abort || (err && !strcmp(err, "aborted"));
@@ -1362,6 +1365,9 @@ static void restart_on(Run *r) {
     code_tools_kill_detached();
     fflush(NULL);
     execv(self, (char *const *)v.ptr);
+    int e = errno;
+    code_trust_cancel_restart();
+    errno = e;
     fprintf(stderr, "saetta code: cannot start again on %s/%s: %s\n", r->restart_provider, r->restart_id, strerror(errno));
     (void)a;
     vec_free(&v);
@@ -1382,9 +1388,11 @@ static const CodeUiModel *host_reload_models(CodeUiHost *h, size_t *n) {
     return m;
 }
 
+// Each Esc counts (any nonzero value aborts): an automatic compaction gives back only the presses
+// that stopped it (code_autocompact.c run_auto), so a later one still stops the run.
 static void host_abort(CodeUiHost *h) {
     (void)h;
-    g_abort = 1;
+    __atomic_fetch_add(&g_abort, 1, __ATOMIC_SEQ_CST);
 }
 
 // ---- for /export, /share and /import (code_cmds.c) ---------------------------------------------------

@@ -1503,16 +1503,40 @@ static _Atomic int g_git_wake = -1;
 static pthread_t g_git_th;
 static bool g_git_started;
 
-// A .git (folder, or a worktree's file) in the workspace or a folder above it (footer-data-provider.ts
-// findGitPaths): git runs only then.
-static bool in_git_repo(const char *cwd) {
+// footer-data-provider.ts findGitPaths: the HEAD file of the repository holding cwd (a .git
+// folder, or a worktree's .git file "gitdir: <path>"), walking up; false when there is none.
+static bool find_git_head(const char *cwd, char *head, size_t cap) {
     char dir[4096];
     snprintf(dir, sizeof dir, "%s", cwd);
     for (;;) {
         char gp[4200];
-        snprintf(gp, sizeof gp, "%s/.git", dir);
+        snprintf(gp, sizeof gp, "%s/.git", dir[1] ? dir : "");
         struct stat st;
-        if (stat(gp, &st) == 0) return true;
+        if (stat(gp, &st) == 0) {
+            if (S_ISREG(st.st_mode)) {
+                char buf[4200];
+                FILE *f = fopen(gp, "r");
+                if (!f) return false;
+                size_t n = fread(buf, 1, sizeof buf - 1, f);
+                fclose(f);
+                buf[n] = 0;
+                char *t = buf;
+                while (*t && isspace((unsigned char)*t)) t++;
+                size_t l = strlen(t);
+                while (l && isspace((unsigned char)t[l - 1])) t[--l] = 0;
+                if (!strncmp(t, "gitdir: ", 8)) {
+                    char *g = t + 8;
+                    while (*g && isspace((unsigned char)*g)) g++;
+                    // resolve(dir, gitdir) + "/HEAD"
+                    if (g[0] == '/') snprintf(head, cap, "%s/HEAD", g);
+                    else snprintf(head, cap, "%s/%s/HEAD", dir[1] ? dir : "", g);
+                    return access(head, F_OK) == 0;
+                }
+            } else if (S_ISDIR(st.st_mode)) {
+                snprintf(head, cap, "%s/HEAD", gp);
+                return access(head, F_OK) == 0;
+            }
+        }
         char *sl = strrchr(dir, '/');
         if (!sl) return false;
         if (sl == dir) {
@@ -1533,6 +1557,48 @@ static bool run_out(const char *const *argv, Buf *out) { return tui_run((char *c
 #define GIT_SAFE "git", "--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-c", \
                  "core.pager=cat", "-c", "log.showSignature=false", "-c", "status.submoduleSummary=false"
 
+// footer-data-provider.ts resolveGitBranchSync: "ref: refs/heads/<branch>" is the branch (the
+// reftable placeholder ".invalid" asks `git symbolic-ref`, which runs no filter or hook); any other
+// HEAD is detached, shown as its commit's short id when HEAD holds one, else "detached".
+static void head_branch(const char *head, GitState *g) {
+    char buf[512] = {0};
+    FILE *f = fopen(head, "r");
+    if (!f) return;
+    size_t n = fread(buf, 1, sizeof buf - 1, f);
+    fclose(f);
+    buf[n] = 0;
+    char *t = buf;
+    while (*t && isspace((unsigned char)*t)) t++;
+    size_t l = strlen(t);
+    while (l && isspace((unsigned char)t[l - 1])) t[--l] = 0;
+    // the file is the repository's, not git's checked output: a control character (an escape
+    // sequence for the terminal) is never drawn
+    for (size_t i = 0; i < l; i++)
+        if ((unsigned char)t[i] < 0x20 || t[i] == 0x7f) {
+            snprintf(g->branch, sizeof g->branch, "detached");
+            return;
+        }
+    if (!strncmp(t, "ref: refs/heads/", 16)) {
+        if (strcmp(t + 16, ".invalid")) {
+            snprintf(g->branch, sizeof g->branch, "%s", t + 16);
+            return;
+        }
+        static const char *const sr[] = {GIT_SAFE, "symbolic-ref", "--quiet", "--short", "HEAD", NULL};
+        Buf o = {0};
+        if (run_out(sr, &o)) {
+            Str b = str_trim(buf_str(&o));
+            if (b.len) snprintf(g->branch, sizeof g->branch, "%.*s", (int)b.len, b.ptr);
+        }
+        buf_free(&o);
+        if (!g->branch[0]) snprintf(g->branch, sizeof g->branch, "detached");
+        return;
+    }
+    size_t hex = 0;
+    while (isxdigit((unsigned char)t[hex])) hex++;
+    if (hex >= 40 && !t[hex]) snprintf(g->branch, sizeof g->branch, "%.7s", t);
+    else snprintf(g->branch, sizeof g->branch, "detached");
+}
+
 static void *git_main(void *arg) {
     (void)arg;
     for (;;) {
@@ -1544,9 +1610,16 @@ static void *git_main(void *arg) {
             GitState g = {0};
             Buf o = {0};
             static const char *const st[] = {GIT_SAFE, "status", "--porcelain=v2", "--branch", "--ignore-submodules=all", NULL};
-            // git only in a folder whose project trust holds (code_trust.c): an untrusted folder's
-            // repository is never looked at
-            bool repo = in_git_repo(g_git_cwd) && code_trust_folder(g_git_cwd);
+            char head[4300];
+            bool found = find_git_head(g_git_cwd, head, sizeof head);
+            // git status refreshes the index, which runs the repository's own filter drivers
+            // (.git/config, .gitattributes): only in a folder trusted by an explicit decision
+            // (code_trust.c). Elsewhere the branch alone, read from HEAD as pi's footer does.
+            bool repo = found && code_trust_explicit(g_git_cwd);
+            if (found && !repo) {
+                head_branch(head, &g);
+                g.repo = true;
+            }
             bool ran = repo && run_out(st, &o);
             if (repo && !ran) { // a timeout or a failure: what is known stays
                 buf_free(&o);
@@ -4040,6 +4113,13 @@ static int doc_rows(int width, int from, int to, Lines *out) {
     return row;
 }
 
+// settings fullscreenCopyOnSelect (default true): a selection is copied when the mouse is released;
+// off, Ctrl+X copies it (tui-alt-screen.ts getCopyOnSelect)
+static bool copy_on_select(void) {
+    const JValue *v = json_get(U->cfg->settings, "fullscreenCopyOnSelect");
+    return json_is(v, J_BOOL) ? v->b : true;
+}
+
 static void copy_selection(int width) {
     int r0, c0, r1, c1;
     sel_bounds(&r0, &c0, &r1, &c1);
@@ -4238,7 +4318,7 @@ static void handle_mouse(const Key *k) {
         request_render();
     } else if (k->release && v->sel_press) {
         v->sel_press = false;
-        if (v->sel_drag) copy_selection(U->scr.cols);
+        if (v->sel_drag && copy_on_select()) copy_selection(U->scr.cols);
     }
 }
 
@@ -5606,6 +5686,14 @@ void uix_working(const char *message) {
     editor_set_working(U->ed, message);
     if (!U->working) g_last_spin = now_ns();
     U->working = true;
+}
+
+// handleCopyCommand's preferSelection: !getCopyOnSelect() && hasActiveSelection() copies the
+// selection (copyActiveSelectionToClipboard); false when there is none to copy.
+bool uix_copy_selection(void) {
+    if (copy_on_select() || !g_view.sel_on) return false;
+    copy_selection(U->scr.cols);
+    return true;
 }
 
 void uix_abort(void) {

@@ -41,6 +41,23 @@ static pthread_mutex_t g_tmu = PTHREAD_MUTEX_INITIALIZER;
 static VEC(CwdTrust) g_by_cwd;
 static char *g_cur_cwd;
 static int g_trusted = -1;
+// The folders (real paths) the user trusted in this session through a prompt (or the restart's
+// hand-off of one): with the trust store's own "trusted" entries, the folders whose repository the
+// footer may look into (code_trust_explicit).
+static VEC(char *) g_approved;
+
+// g_tmu held
+static void approve_l(const char *real) {
+    for (size_t i = 0; i < g_approved.len; i++)
+        if (!strcmp(g_approved.ptr[i], real)) return;
+    vec_push(&g_approved, strdup(real));
+}
+
+static bool approved_l(const char *real) {
+    for (size_t i = 0; i < g_approved.len; i++)
+        if (!strcmp(g_approved.ptr[i], real)) return true;
+    return false;
+}
 
 // projectTrustByCwd.get: -1 for none (g_tmu held)
 static int cached_l(const char *cwd) {
@@ -456,6 +473,11 @@ static bool resolve(Arena *a, const CodeEnv *env, const char *cwd, bool interact
     p.n = trust_options(a, cwd, true, p.opts);
     int sel = run_prompt(&p, json_str(json_get(settings, "theme")));
     if (sel < 0) return false;
+    if (p.opts[sel].trusted) {
+        pthread_mutex_lock(&g_tmu);
+        approve_l(norm_cwd(a, cwd));
+        pthread_mutex_unlock(&g_tmu);
+    }
     if (p.opts[sel].nupdates) {
         const char *err = store_set_many(a, agent_dir, p.opts[sel].updates, p.opts[sel].nupdates);
         if (err) fprintf(stderr, "%s\n", err);
@@ -497,24 +519,36 @@ static void set_current(const char *cwd, bool trusted) {
 // inherits it. --approve would trust every folder of the next process.
 #define TRUST_ENV "SAETTA_CODE_PROJECT_TRUST"
 
+// "2:" is a trust the user approved in this session (a prompt): the next process keeps it as such.
 void code_trust_export_restart(const CodeEnv *env) {
     Arena a = {0};
     bool t = code_trust_trusted(env);
     const char *cwd = code_path_resolve(&a, "/", env->cwd);
-    setenv(TRUST_ENV, arena_printf(&a, "%d:%s", t, cwd), 1);
+    pthread_mutex_lock(&g_tmu);
+    bool approved = t && approved_l(norm_cwd(&a, cwd));
+    pthread_mutex_unlock(&g_tmu);
+    setenv(TRUST_ENV, arena_printf(&a, "%d:%s", approved ? 2 : t, cwd), 1);
     arena_reset(&a);
 }
 
+void code_trust_cancel_restart(void) { unsetenv(TRUST_ENV); }
+
 void code_trust_resolve(const CodeEnv *env, bool interactive) {
-    const char *handed = getenv(TRUST_ENV);
-    if (handed && (handed[0] == '0' || handed[0] == '1') && handed[1] == ':' && handed[2] == '/') {
-        pthread_mutex_lock(&g_tmu);
-        cache_l(handed + 2, handed[0] == '1');
-        pthread_mutex_unlock(&g_tmu);
-    }
-    unsetenv(TRUST_ENV);
     Arena a = {0};
     const char *cwd = code_path_resolve(&a, "/", env->cwd);
+    const char *handed = getenv(TRUST_ENV);
+    // the hand-off applies to its own folder only: the real paths compared (a symbolic link, or
+    // a ".." in either, names the same folder; another folder never inherits it)
+    if (handed && handed[0] >= '0' && handed[0] <= '2' && handed[1] == ':' && handed[2] == '/') {
+        const char *real = norm_cwd(&a, cwd);
+        if (!strcmp(norm_cwd(&a, handed + 2), real)) {
+            pthread_mutex_lock(&g_tmu);
+            cache_l(cwd, handed[0] != '0');
+            if (handed[0] == '2') approve_l(real);
+            pthread_mutex_unlock(&g_tmu);
+        }
+    }
+    unsetenv(TRUST_ENV);
     // autoTrustOnReloadCwd: the session's first folder, when it has no project resources
     if (g_override < 0 && !code_trust_has_project_resources(&a, cwd, env->home)) {
         free(g_auto_cwd);
@@ -555,24 +589,22 @@ static bool current_trusted(void) {
     return t;
 }
 
-bool code_trust_folder(const char *cwd) {
+// Whether the UI may run git's index refresh in cwd (the footer's git status): the trust store's
+// nearest decision for it is "trusted", the user trusted it in this session through a prompt, or
+// --approve. Never by default: a folder without project resources is trusted for pi's resources,
+// yet its .git/config (filter drivers, ...) is the repository's own code.
+bool code_trust_explicit(const char *cwd) {
     const CodeUiConfig *cfg = code_ui_config();
+    if (g_override >= 0) return g_override;
     Arena a = {0};
     const char *c = code_path_resolve(&a, "/", cwd);
+    const char *real = norm_cwd(&a, c);
     pthread_mutex_lock(&g_tmu);
-    int t = g_cur_cwd && !strcmp(g_cur_cwd, c) ? g_trusted : cached_l(c);
+    bool ok = approved_l(real);
     pthread_mutex_unlock(&g_tmu);
-    if (t < 0) {
-        // what createRuntime would decide there, without asking and without remembering it
-        CodeEnv env = {.cwd = c, .agent_dir = cfg->agent_dir, .home = cfg->home};
-        if (g_override >= 0) t = g_override;
-        else if (!code_trust_has_project_resources(&a, c, cfg->home)) {
-            int stored = store_get(&a, code_path_resolve(&a, c, cfg->agent_dir), c);
-            t = stored >= 0 ? stored : 1;
-        } else t = resolve(&a, &env, c, false, NULL);
-    }
+    if (!ok) ok = store_get(&a, code_path_resolve(&a, c, cfg->agent_dir), c) == 1;
     arena_reset(&a);
-    return t > 0;
+    return ok;
 }
 
 // ---- the question on a session switch (AgentSessionRuntime.switchSession with
@@ -599,7 +631,9 @@ typedef struct {
     Prompt p;
     const char *cwd, *agent_dir;
     void (*done)(void *);
+    void (*dropped)(void *); // the panel closed without an answer (replaced, or the UI ending)
     void *ctx;
+    bool answered;
 } SwitchAsk;
 
 static void ask_render(void *ctx, int width, Lines *out) {
@@ -609,6 +643,8 @@ static void ask_render(void *ctx, int width, Lines *out) {
 
 static void ask_destroy(void *ctx) {
     SwitchAsk *s = ctx;
+    // no answer: the switch is not made, its context freed
+    if (!s->answered && s->dropped) s->dropped(s->ctx);
     prompt_free(&s->p);
     arena_reset(&s->a);
     free(s);
@@ -635,10 +671,12 @@ static void ask_key(void *ctx, const Key *k) {
         }
         pthread_mutex_lock(&g_tmu);
         cache_l(s->cwd, trusted);
+        if (trusted) approve_l(norm_cwd(&s->a, s->cwd));
         pthread_mutex_unlock(&g_tmu);
         char *errc = err ? strdup(err) : NULL;
         void (*done)(void *) = s->done;
         void *dctx = s->ctx;
+        s->answered = true;
         code_ui_panel_close(); // frees s
         if (errc) code_ui_warning(errc);
         free(errc);
@@ -646,13 +684,14 @@ static void ask_key(void *ctx, const Key *k) {
     }
 }
 
-void code_trust_switch_ask(const char *cwd, void (*done)(void *), void *ctx) {
+void code_trust_switch_ask(const char *cwd, void (*done)(void *), void (*dropped)(void *), void *ctx) {
     const CodeUiConfig *cfg = code_ui_config();
     SwitchAsk *s = xcalloc(1, sizeof *s);
     Arena *a = &s->a;
     s->cwd = code_path_resolve(a, "/", cwd);
     s->agent_dir = code_path_resolve(a, s->cwd, cfg->agent_dir);
     s->done = done;
+    s->dropped = dropped;
     s->ctx = ctx;
     s->p.title = trust_title(a, s->cwd);
     s->p.n = trust_options(a, s->cwd, true, s->p.opts);

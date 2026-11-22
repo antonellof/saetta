@@ -207,8 +207,19 @@ static void clipboard_paste(void) {
         editor_insert_text(ed, buf_str(&ins));
         buf_free(&ins);
         buf_free(&paths);
-    } else if (got[0] == 'I' || got[0] == 'T') {
+    } else if (got[0] == 'I') {
         if (body.len) editor_insert_text(ed, body);
+    } else if (got[0] == 'T') {
+        // the clipboard's text without its control characters (tabs and line breaks kept), as the
+        // bracketed paste filters it (code_tui_editor.c paste): pi inserts it raw, so an escape
+        // sequence copied from a web page would reach the terminal through the editor
+        Buf clean = {0};
+        for (size_t i = 0; i < body.len; i++) {
+            unsigned char ch = (unsigned char)body.ptr[i];
+            if (ch >= 0x20 || ch == '\n' || ch == '\r' || ch == '\t') buf_addc(&clean, (char)ch);
+        }
+        if (clean.len) editor_insert_text(ed, buf_str(&clean));
+        buf_free(&clean);
     }
     free(got);
     uix_request_render();
@@ -223,7 +234,7 @@ bool uik_key(const Key *k) {
         return true;
     }
     if (k->ch == 'x') { // app.message.copy: handleCopyCommand({flashConfirmation, preferSelection})
-        cmds_copy(flash_copied);
+        if (!uix_copy_selection()) cmds_copy(flash_copied);
         return true;
     }
     return false;

@@ -942,6 +942,30 @@ void comp_clear(Comp *container) {
     k->kids.len = 0;
 }
 
+// TruncatedText(text, paddingX, 0): the first line, cut to the width.
+static void trunc_render(Comp *c, int width, Lines *out) {
+    TextComp *t = (TextComp *)c;
+    Str s = buf_str(&t->text);
+    ptrdiff_t nl = str_find_char(s, '\n', 0);
+    if (nl >= 0) s.len = (size_t)nl;
+    Buf l = {0};
+    tui_spaces(&l, t->pad_x);
+    tui_truncate(&l, s, MAX(1, width - t->pad_x * 2), "...", false);
+    tui_spaces(&l, t->pad_x);
+    tui_spaces(&l, width - tui_width(buf_str(&l)));
+    lines_addb(out, &l);
+}
+
+static const CompVt trunc_vt = {trunc_render, text_destroy};
+
+Comp *comp_truncated(Str text, int pad_x) {
+    TextComp *t = xcalloc(1, sizeof *t);
+    t->base.vt = &trunc_vt;
+    buf_addstr(&t->text, text);
+    t->pad_x = pad_x;
+    return &t->base;
+}
+
 typedef struct {
     Comp base;
     void (*fn)(void *ctx, int width, Lines *out);

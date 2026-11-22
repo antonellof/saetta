@@ -67,6 +67,30 @@ void code_ui_event(const JValue *event) {
 
 static void q_post(const char *json) { q_push(strdup(json), false); }
 
+// The messages typed while a run goes on (pi's steering and follow-up queues): the agent thread
+// takes them at its turn boundaries (code_ui_take_queued).
+typedef struct {
+    char *text;
+    bool steer;
+} Queued;
+static pthread_mutex_t g_mlock = PTHREAD_MUTEX_INITIALIZER;
+static VEC(Queued) g_msgq;
+
+char *code_ui_take_queued(bool steering_only) {
+    char *t = NULL;
+    pthread_mutex_lock(&g_mlock);
+    for (size_t i = 0; i < g_msgq.len; i++)
+        if (g_msgq.ptr[i].steer || !steering_only) {
+            t = g_msgq.ptr[i].text;
+            memmove(g_msgq.ptr + i, g_msgq.ptr + i + 1, (g_msgq.len - i - 1) * sizeof(Queued));
+            g_msgq.len--;
+            break;
+        }
+    pthread_mutex_unlock(&g_mlock);
+    if (t) q_post("{\"type\":\"queue_update\"}");
+    return t;
+}
+
 // ---- small helpers ---------------------------------------------------------------------------------
 
 static char *dupz(const char *s) { return s ? strdup(s) : NULL; }
@@ -155,7 +179,6 @@ typedef struct {
     pthread_cond_t cond;
     char *job;
     bool thread_quit;
-    VEC(char *) queued; // prompts typed while a turn runs
     char *default_thinking;
     // the current model (/model changes it) and the settings the UI uses
     CodeUiModel model;
@@ -833,100 +856,6 @@ static bool parse_diff_line(Str l, char *prefix, Str *num, Str *content) {
     return true;
 }
 
-typedef struct {
-    Str s;
-    bool ws;
-} Word;
-typedef VEC(Word) WordVec;
-
-static void split_words(Str s, WordVec *out) {
-    for (size_t i = 0; i < s.len;) {
-        size_t j = i;
-        bool ws = isspace((unsigned char)s.ptr[i]);
-        bool word = isalnum((unsigned char)s.ptr[i]) || s.ptr[i] == '_' || (unsigned char)s.ptr[i] >= 0x80;
-        if (ws)
-            while (j < s.len && isspace((unsigned char)s.ptr[j])) j++;
-        else if (word)
-            while (j < s.len && (isalnum((unsigned char)s.ptr[j]) || s.ptr[j] == '_' || (unsigned char)s.ptr[j] >= 0x80)) j++;
-        else j++;
-        vec_push(out, ((Word){str_sub(s, i, j), ws}));
-        i = j;
-    }
-}
-
-static void intra_line(Str old, Str nw, Buf *rem, Buf *add) {
-    size_t ci = 0;
-    while (ci < old.len && ci < nw.len && old.ptr[ci] == nw.ptr[ci] && isspace((unsigned char)old.ptr[ci])) ci++;
-    buf_addstr(rem, str_sub(old, 0, ci));
-    buf_addstr(add, str_sub(nw, 0, ci));
-    WordVec a = {0}, b = {0};
-    split_words(str_sub(old, ci, old.len), &a);
-    split_words(str_sub(nw, ci, nw.len), &b);
-    // longest common subsequence of words
-    size_t n = a.len, m = b.len;
-    uint16_t *dp = xcalloc((n + 1) * (m + 1), sizeof *dp);
-    for (size_t i = n; i-- > 0;)
-        for (size_t j = m; j-- > 0;)
-            dp[i * (m + 1) + j] = str_eq(a.ptr[i].s, b.ptr[j].s) ? dp[(i + 1) * (m + 1) + j + 1] + 1
-                                                                  : MAX(dp[(i + 1) * (m + 1) + j], dp[i * (m + 1) + j + 1]);
-    bool first_rem = true, first_add = true;
-    size_t i = 0, j = 0;
-    Buf rr = {0}, aa = {0};
-#define FLUSH_REM()                                                                    \
-    do {                                                                               \
-        if (rr.len) {                                                                  \
-            Str v_ = buf_str(&rr);                                                     \
-            if (first_rem) {                                                           \
-                size_t k_ = 0;                                                         \
-                while (k_ < v_.len && isspace((unsigned char)v_.ptr[k_])) k_++;        \
-                buf_addstr(rem, str_sub(v_, 0, k_));                                   \
-                v_ = str_sub(v_, k_, v_.len);                                          \
-                first_rem = false;                                                     \
-            }                                                                          \
-            if (v_.len) th_inverse(rem, v_);                                           \
-            rr.len = 0;                                                                \
-        }                                                                              \
-    } while (0)
-#define FLUSH_ADD()                                                                    \
-    do {                                                                               \
-        if (aa.len) {                                                                  \
-            Str v_ = buf_str(&aa);                                                     \
-            if (first_add) {                                                           \
-                size_t k_ = 0;                                                         \
-                while (k_ < v_.len && isspace((unsigned char)v_.ptr[k_])) k_++;        \
-                buf_addstr(add, str_sub(v_, 0, k_));                                   \
-                v_ = str_sub(v_, k_, v_.len);                                          \
-                first_add = false;                                                     \
-            }                                                                          \
-            if (v_.len) th_inverse(add, v_);                                           \
-            aa.len = 0;                                                                \
-        }                                                                              \
-    } while (0)
-    while (i < n || j < m) {
-        if (i < n && j < m && str_eq(a.ptr[i].s, b.ptr[j].s)) {
-            FLUSH_REM();
-            FLUSH_ADD();
-            buf_addstr(rem, a.ptr[i].s);
-            buf_addstr(add, b.ptr[j].s);
-            i++;
-            j++;
-        } else if (j < m && (i >= n || dp[i * (m + 1) + j + 1] >= dp[(i + 1) * (m + 1) + j])) {
-            buf_addstr(&aa, b.ptr[j++].s);
-        } else {
-            buf_addstr(&rr, a.ptr[i++].s);
-        }
-    }
-    FLUSH_REM();
-    FLUSH_ADD();
-#undef FLUSH_REM
-#undef FLUSH_ADD
-    free(dp);
-    vec_free(&a);
-    vec_free(&b);
-    buf_free(&rr);
-    buf_free(&aa);
-}
-
 static void render_diff(Str diff, Buf *out) {
     VEC(Str) ls = {0};
     for (size_t i = 0;;) {
@@ -967,7 +896,7 @@ static void render_diff(Str diff, Buf *out) {
                 Buf ro = {0}, ao = {0}, rt = {0}, at = {0}, rl = {0}, al = {0};
                 replace_tabs(&ro, rc.ptr[0]);
                 replace_tabs(&ao, ac.ptr[0]);
-                intra_line(buf_str(&ro), buf_str(&ao), &rt, &at);
+                tui_intra_line(buf_str(&ro), buf_str(&ao), &rt, &at);
                 buf_printf(&rl, "-%.*s ", (int)rn.ptr[0].len, rn.ptr[0].ptr);
                 buf_addstr(&rl, buf_str(&rt));
                 buf_printf(&al, "+%.*s ", (int)an.ptr[0].len, an.ptr[0].ptr);
@@ -2772,7 +2701,10 @@ static void start_prompt(const char *text) {
 
 // ---- events (handleEvent) -------------------------------------------------------------------------------------
 
+static uint64_t g_last_spin;
+
 static void set_working(bool on) {
+    if (on && !U->working) g_last_spin = now_ns(); // the spinner starts at its first frame
     U->working = on;
     editor_set_working(U->ed, on ? "Working" : NULL);
 }
@@ -2817,6 +2749,8 @@ static bool retryable_error(const char *m) {
     return false;
 }
 
+static void pending_display(void);
+
 static void handle_event(const JValue *ev) {
     Str type = json_strs(json_get(ev, "type"));
     if (str_eqz(type, "ui_idle")) {
@@ -2827,11 +2761,8 @@ static void handle_event(const JValue *ev) {
             free(U->pending_thinking);
             U->pending_thinking = NULL;
         }
-        if (U->queued.len) {
-            char *next = U->queued.ptr[0];
-            memmove(U->queued.ptr, U->queued.ptr + 1, (U->queued.len - 1) * sizeof(char *));
-            U->queued.len--;
-            comp_clear(U->pending);
+        char *next = code_ui_take_queued(false);
+        if (next) {
             start_prompt(next);
             free(next);
         }
@@ -2841,7 +2772,9 @@ static void handle_event(const JValue *ev) {
         show_error(json_str(json_get(ev, "message")) ? json_str(json_get(ev, "message")) : "error");
         return;
     }
-    if (str_eqz(type, "agent_start")) {
+    if (str_eqz(type, "queue_update")) {
+        pending_display();
+    } else if (str_eqz(type, "agent_start")) {
         U->pending_tools.len = 0;
     } else if (str_eqz(type, "turn_start")) {
         if (!U->working) set_working(true);
@@ -2936,6 +2869,7 @@ static void handle_event(const JValue *ev) {
         buf_printf(&m, "Retrying (%g/%g) in %.0fs... (escape to cancel)", jnum(json_get(ev, "attempt")), jnum(json_get(ev, "maxAttempts")),
                    ceil(jnum(json_get(ev, "delayMs")) / 1000));
         editor_set_working(U->ed, m.ptr);
+        if (!U->working) g_last_spin = now_ns();
         U->working = true;
         buf_free(&m);
     } else if (str_eqz(type, "auto_retry_end")) {
@@ -2981,6 +2915,31 @@ static const SlashCmd builtin_cmds[] = {
     {"mcp", "Manage MCP servers: sign in, reconnect, enable or disable, and change exposure", NULL},
 };
 
+static bool arg_items(void *ctx, const char *cmd, SelectList *all, Lines *search) {
+    (void)ctx;
+    if (!strcmp(cmd, "thinking")) {
+        for (size_t i = 0; i < available_levels(); i++) {
+            sel_add(all, level_names[i], level_names[i], NULL);
+            lines_addz(search, level_names[i]);
+        }
+        return true;
+    }
+    if (!strcmp(cmd, "model")) {
+        for (size_t i = 0; i < U->cfg->nmodels; i++) {
+            const CodeUiModel *m = &U->cfg->models[i];
+            Buf v = {0}, h = {0};
+            buf_printf(&v, "%s/%s", m->provider, m->id);
+            buf_printf(&h, "%s %s %s/%s %s %s%s%s", m->id, m->provider, m->provider, m->id, m->provider, m->id, m->name ? " " : "",
+                       m->name ? m->name : "");
+            sel_add(all, v.ptr, m->id, m->provider);
+            lines_addb(search, &h);
+            buf_free(&v);
+        }
+        return true;
+    }
+    return false;
+}
+
 static void new_session(void) {
     if (U->busy) return;
     if (U->ops->new_session) U->ops->new_session(U->host);
@@ -2997,6 +2956,59 @@ static void unsupported(const char *cmd) {
     buf_printf(&b, "/%s is not available in Saetta Code yet.", cmd);
     show_warning(b.ptr);
     buf_free(&b);
+}
+
+static bool g_follow_up; // the text being submitted is a follow-up (Alt+Enter), not a steering message
+
+// updatePendingMessagesDisplay: the queued messages above the editor.
+static void pending_display(void) {
+    comp_clear(U->pending);
+    pthread_mutex_lock(&g_mlock);
+    if (g_msgq.len) {
+        comp_add(U->pending, comp_spacer(1));
+        for (int pass = 0; pass < 2; pass++)
+            for (size_t i = 0; i < g_msgq.len; i++) {
+                if (g_msgq.ptr[i].steer != (pass == 0)) continue;
+                Buf m = {0}, l = {0};
+                buf_printf(&m, "%s: %s", pass == 0 ? "Steering" : "Follow-up", g_msgq.ptr[i].text);
+                th_fg(&l, T_DIM, buf_str(&m));
+                comp_add(U->pending, comp_truncated(buf_str(&l), 1));
+                buf_free(&m);
+                buf_free(&l);
+            }
+        Buf h = {0};
+        th_fgz(&h, T_DIM, "\xe2\x86\xb3 alt+up to edit all queued messages");
+        comp_add(U->pending, comp_truncated(buf_str(&h), 1));
+        buf_free(&h);
+    }
+    pthread_mutex_unlock(&g_mlock);
+}
+
+// restoreQueuedMessagesToEditor: every queued message back in the editor, before what it holds.
+static size_t restore_queued(void) {
+    pthread_mutex_lock(&g_mlock);
+    Buf all = {0};
+    size_t n = g_msgq.len;
+    for (int pass = 0; pass < 2; pass++)
+        for (size_t i = 0; i < g_msgq.len; i++) {
+            if (g_msgq.ptr[i].steer != (pass == 0)) continue;
+            if (all.len) buf_adds(&all, "\n\n");
+            buf_adds(&all, g_msgq.ptr[i].text);
+            free(g_msgq.ptr[i].text);
+        }
+    g_msgq.len = 0;
+    pthread_mutex_unlock(&g_mlock);
+    if (n) {
+        Str cur = editor_text(U->ed);
+        if (str_trim(cur).len) {
+            if (all.len) buf_adds(&all, "\n\n");
+            buf_addstr(&all, cur);
+        }
+        editor_set_text(U->ed, buf_str(&all));
+    }
+    buf_free(&all);
+    pending_display();
+    return n;
 }
 
 static void submit(char *text) {
@@ -3079,19 +3091,10 @@ static void submit(char *text) {
     }
     editor_add_history(U->ed, str(s));
     if (U->busy) {
-        vec_push(&U->queued, strdup(s));
-        comp_clear(U->pending);
-        comp_add(U->pending, comp_spacer(1));
-        for (size_t i = 0; i < U->queued.len; i++) {
-            Buf m = {0}, l = {0};
-            buf_printf(&m, "Follow-up: %s", U->queued.ptr[i]);
-            th_fg(&l, T_DIM, buf_str(&m));
-            char *line = tui_truncatez(buf_str(&l), U->scr.cols - 2, "...", false);
-            comp_add(U->pending, comp_text(str(line), 1, 0));
-            free(line);
-            buf_free(&m);
-            buf_free(&l);
-        }
+        pthread_mutex_lock(&g_mlock);
+        vec_push(&g_msgq, ((Queued){strdup(s), !g_follow_up}));
+        pthread_mutex_unlock(&g_mlock);
+        pending_display();
     } else start_prompt(s);
     free(s);
 }
@@ -3162,23 +3165,7 @@ static void handle_key(const Key *k) {
     if (k->kind == K_ESC && !editor_autocomplete_open(U->ed)) {
         if (U->busy) {
             // restoreQueuedMessagesToEditor({abort: true})
-            if (U->queued.len) {
-                Buf all = {0};
-                for (size_t i = 0; i < U->queued.len; i++) {
-                    if (all.len) buf_adds(&all, "\n\n");
-                    buf_adds(&all, U->queued.ptr[i]);
-                    free(U->queued.ptr[i]);
-                }
-                U->queued.len = 0;
-                Str cur = editor_text(U->ed);
-                if (str_trim(cur).len) {
-                    buf_adds(&all, "\n\n");
-                    buf_addstr(&all, cur);
-                }
-                editor_set_text(U->ed, buf_str(&all));
-                buf_free(&all);
-                comp_clear(U->pending);
-            }
+            restore_queued();
             U->ops->abort(U->host);
         }
         return;
@@ -3218,8 +3205,21 @@ static void handle_key(const Key *k) {
         if (t.len) {
             char *s = strndup(t.ptr, t.len);
             editor_set_text(U->ed, S(""));
+            g_follow_up = true;
             submit(s);
+            g_follow_up = false;
             free(s);
+        }
+        return;
+    }
+    if (k->kind == K_ALT_UP) { // app.message.dequeue
+        size_t n = restore_queued();
+        if (!n) show_status("No queued messages to restore");
+        else {
+            Buf m = {0};
+            buf_printf(&m, "Restored %zu queued message%s to editor", n, n > 1 ? "s" : "");
+            show_status(m.ptr);
+            buf_free(&m);
         }
         return;
     }
@@ -3262,6 +3262,7 @@ Err code_ui_run(const CodeUiConfig *cfg, const CodeUiOps *ops, CodeUiHost *host,
     ui.status = comp_container();
     ui.ed = editor_new(cfg->cwd, cfg->fd_path);
     editor_set_commands(ui.ed, builtin_cmds, COUNT(builtin_cmds));
+    editor_set_arg_completer(ui.ed, arg_items, NULL);
     editor_set_border(ui.ed, th_thinking_color(ui.thinking));
     sel_init(&ui.list, 5, 32, 32);
     pthread_mutex_init(&ui.lock, NULL);
@@ -3280,7 +3281,7 @@ Err code_ui_run(const CodeUiConfig *cfg, const CodeUiOps *ops, CodeUiHost *host,
     for (size_t i = 0; i < ninitial; i++) submit((char *)initial[i]);
     char in[65536];
     size_t inlen = 0;
-    uint64_t last_draw = 0, last_spin = now_ns();
+    uint64_t last_draw = 0;
     g_dirty = true;
     while (!ui.quit) {
         struct pollfd fds[2] = {{0, POLLIN, 0}, {g_wake[0], POLLIN, 0}};
@@ -3334,9 +3335,9 @@ Err code_ui_run(const CodeUiConfig *cfg, const CodeUiOps *ops, CodeUiHost *host,
         inlen -= off;
         if (inlen == sizeof in) inlen = 0; // a runaway sequence
         uint64_t now = now_ns();
-        if (ui.working && now - last_spin >= 80000000ull) {
+        if (ui.working && now - g_last_spin >= 80000000ull) {
             editor_spin(ui.ed);
-            last_spin = now;
+            g_last_spin = now;
             g_dirty = true;
         }
         if (g_dirty && now - last_draw >= 8000000ull) {
@@ -3385,8 +3386,10 @@ Err code_ui_run(const CodeUiConfig *cfg, const CodeUiOps *ops, CodeUiHost *host,
     buf_free(&ui.search.value);
     vec_free(&ui.stats);
     vec_free(&ui.pending_tools);
-    for (size_t i = 0; i < ui.queued.len; i++) free(ui.queued.ptr[i]);
-    vec_free(&ui.queued);
+    pthread_mutex_lock(&g_mlock);
+    for (size_t i = 0; i < g_msgq.len; i++) free(g_msgq.ptr[i].text);
+    vec_free(&g_msgq);
+    pthread_mutex_unlock(&g_mlock);
     free(ui.thinking);
     free(ui.default_thinking);
     free((char *)ui.model.provider);

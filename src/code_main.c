@@ -727,15 +727,8 @@ static void sleep_abortable(int64_t ms) {
     }
 }
 
-// One prompt: agent_start, the turns, agent_end (agentLoop + AgentSession.prompt).
-static Err prompt(Run *r, const char *text) {
-    Arena *a = r->a;
-    r->new_messages = json_new(a, J_ARRAY);
-    emit(r, ev_new(a, "agent_start"));
-    emit(r, ev_new(a, "turn_start"));
-    JValue *sys;
-    TRY(pending_system(r, code_session_messages(r->session), &sys));
-    if (sys) TRY(add_message(r, sys));
+// A user message of this text, as pi records it.
+static JValue *user_message(Arena *a, const char *text) {
     JValue *user = json_new(a, J_OBJECT);
     json_put(a, user, S("role"), json_string(a, S("user")));
     JValue *content = json_new(a, J_ARRAY);
@@ -745,7 +738,19 @@ static Err prompt(Run *r, const char *text) {
     json_push(a, content, block);
     json_put(a, user, S("content"), content);
     json_put(a, user, S("timestamp"), json_int(a, (int64_t)wall_ms()));
-    TRY(add_message(r, user));
+    return user;
+}
+
+// One prompt: agent_start, the turns, agent_end (agentLoop + AgentSession.prompt).
+static Err prompt(Run *r, const char *text) {
+    Arena *a = r->a;
+    r->new_messages = json_new(a, J_ARRAY);
+    emit(r, ev_new(a, "agent_start"));
+    emit(r, ev_new(a, "turn_start"));
+    JValue *sys;
+    TRY(pending_system(r, code_session_messages(r->session), &sys));
+    if (sys) TRY(add_message(r, sys));
+    TRY(add_message(r, user_message(a, text)));
     return run_agent(r, true);
 }
 
@@ -833,8 +838,10 @@ static void finish_agent(Run *r, bool will_retry, const JValue *last) {
 // The turns of one agent run (runLoop): *last the final assistant message and its entry id.
 static Err run_turns(Run *r, JValue **last_out, const char **last_id) {
     Arena *a = r->a;
+    bool turn_started = false;
     for (bool first = true;; first = false) {
-        if (!first) emit(r, ev_new(a, "turn_start"));
+        if (!first && !turn_started) emit(r, ev_new(a, "turn_start"));
+        turn_started = false;
         JValue *msg;
         TRY(stream_assistant(r, &msg));
         *last_out = msg;
@@ -852,7 +859,20 @@ static Err run_turns(Run *r, JValue **last_out, const char **last_id) {
         json_put(a, te, S("message"), msg);
         json_put(a, te, S("toolResults"), results);
         emit(r, te);
-        if (!more || g_abort) break;
+        if (g_abort || str_eqz(stop, "error") || str_eqz(stop, "aborted")) break;
+        // the interactive mode's queues (runLoop's getSteeringMessages, then getFollowUpMessages
+        // when the run would end): the message joins the run before its next turn
+        char *queued = r->ui ? code_ui_take_queued(true) : NULL;
+        if (!queued && !more && r->ui) queued = code_ui_take_queued(false);
+        if (!more && !queued) break;
+        if (queued) {
+            emit(r, ev_new(a, "turn_start"));
+            JValue *user = user_message(a, queued);
+            free(queued);
+            TRY(add_message(r, user));
+            turn_started = true;
+            continue;
+        }
     }
     return OK;
 }

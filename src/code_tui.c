@@ -94,7 +94,7 @@ void screen_draw(Screen *s, Lines *frame, bool force) {
 static KeyKind csi_key(char final, int p1, int mod) {
     bool ctrl = mod > 0 && ((mod - 1) & 4), alt = mod > 0 && ((mod - 1) & 2);
     switch (final) {
-    case 'A': return K_UP;
+    case 'A': return alt ? K_ALT_UP : K_UP;
     case 'B': return K_DOWN;
     case 'C': return ctrl ? K_CTRL_RIGHT : alt ? K_ALT_RIGHT : K_RIGHT;
     case 'D': return ctrl ? K_CTRL_LEFT : alt ? K_ALT_LEFT : K_LEFT;

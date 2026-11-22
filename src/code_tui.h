@@ -55,6 +55,10 @@ size_t tui_js_len(Str s);
 // \s as JavaScript defines it, for one code point.
 bool tui_is_space(uint32_t cp);
 
+// The changed words of one edited line in inverse (pi's renderIntraLineDiff over jsdiff's
+// diffWords; code_ui_diff.c).
+void tui_intra_line(Str old_line, Str new_line, Buf *removed, Buf *added);
+
 // ---- theme (pi's "system" theme as a terminal that reports no colors gets it) --------------------
 
 typedef enum {
@@ -97,6 +101,8 @@ void comp_free(Comp *c);
 // Text(text, paddingX, paddingY): wrapped, padded to the width.
 Comp *comp_text(Str text, int pad_x, int pad_y);
 void comp_text_set(Comp *c, Str text);
+// TruncatedText(text, paddingX, 0): one line, cut to the width.
+Comp *comp_truncated(Str text, int pad_x);
 // Spacer(n)
 Comp *comp_spacer(int n);
 // Container: children in order.
@@ -149,7 +155,7 @@ void sel_down(SelectList *s);
 typedef enum {
     K_NONE, K_CHAR, K_ENTER, K_TAB, K_SHIFT_TAB, K_BACKSPACE, K_DELETE, K_ESC, K_UP, K_DOWN, K_LEFT, K_RIGHT,
     K_HOME, K_END, K_PGUP, K_PGDN, K_CTRL, K_ALT, K_PASTE, K_ALT_LEFT, K_ALT_RIGHT, K_CTRL_LEFT, K_CTRL_RIGHT,
-    K_SHIFT_ENTER, K_ALT_ENTER, K_ALT_BACKSPACE, K_CTRL_BACKSPACE,
+    K_SHIFT_ENTER, K_ALT_ENTER, K_ALT_BACKSPACE, K_CTRL_BACKSPACE, K_ALT_UP,
 } KeyKind;
 typedef struct {
     KeyKind kind;
@@ -169,6 +175,11 @@ typedef struct {
 Editor *editor_new(const char *cwd, const char *fd_path);
 void editor_free(Editor *e);
 void editor_set_commands(Editor *e, const SlashCmd *cmds, size_t n);
+// Argument completions of a "/" command ("/thinking hi", "/model gpt"): fill all with every
+// candidate and search with one text per candidate to match the argument against; return false
+// when the command takes none.
+typedef bool (*EditorArgFn)(void *ctx, const char *command, SelectList *all, Lines *search);
+void editor_set_arg_completer(Editor *e, EditorArgFn fn, void *ctx);
 void editor_set_border(Editor *e, ThemeColor c);
 void editor_set_rows(Editor *e, int terminal_rows);
 void editor_render(Editor *e, int width, Lines *out);
@@ -244,5 +255,8 @@ Err code_ui_run(const CodeUiConfig *cfg, const CodeUiOps *ops, CodeUiHost *host,
 // An agent event (pi's AgentSessionEvent as JSON, json mode's shape; message_update carries the
 // partial message as "message"), from the agent thread.
 void code_ui_event(const JValue *event);
+// A message the user queued while the run goes on (malloc'd), or NULL: a steering message only
+// when steering_only (between tool calls), else a follow-up too (when the run would end).
+char *code_ui_take_queued(bool steering_only);
 
 #endif

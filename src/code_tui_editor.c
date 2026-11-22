@@ -32,6 +32,8 @@ struct Editor {
     char *ac_prefix;
     SlashCmd *cmds;
     size_t ncmds;
+    EditorArgFn arg_fn;
+    void *arg_ctx;
     char *cwd, *fd;
     // history (newest first)
     StrVec hist;
@@ -122,6 +124,11 @@ void editor_set_commands(Editor *e, const SlashCmd *cmds, size_t n) {
     e->cmds = xmalloc((n + 1) * sizeof *cmds);
     memcpy(e->cmds, cmds, n * sizeof *cmds);
     e->ncmds = n;
+}
+
+void editor_set_arg_completer(Editor *e, EditorArgFn fn, void *ctx) {
+    e->arg_fn = fn;
+    e->arg_ctx = ctx;
 }
 
 void editor_set_border(Editor *e, ThemeColor c) { e->border = c; }
@@ -1060,7 +1067,26 @@ static char *suggestions(Editor *e, bool force, SelectList *list) {
             if (!list->n) return NULL;
             return strndup(cmd.ptr, cmd.len);
         }
-        return NULL; // argument completion: none
+        // the command's argument completions
+        Str name = str_sub(cmd, 1, (size_t)sp);
+        Str arg = str_sub(cmd, (size_t)sp + 1, cmd.len);
+        if (!e->arg_fn) return NULL;
+        char *cname = strndup(name.ptr, name.len);
+        SelectList all;
+        sel_init(&all, 5, 32, 32);
+        Lines search = {0};
+        bool has = e->arg_fn(e->arg_ctx, cname, &all, &search);
+        free(cname);
+        if (has && all.n) {
+            size_t *idx = xmalloc((all.n + 1) * sizeof *idx);
+            size_t m = fuzzy_filter((const char *const *)search.v, all.n, arg, idx);
+            for (size_t k = 0; k < m; k++) sel_add(list, all.items[idx[k]].value, all.items[idx[k]].label, all.items[idx[k]].description);
+            free(idx);
+        }
+        sel_free(&all);
+        lines_free(&search);
+        if (!list->n) return NULL;
+        return strndup(arg.ptr, arg.len);
     }
     Str pp;
     if (!path_prefix(before, force, &pp)) return NULL;
@@ -1078,7 +1104,7 @@ static void request_ac(Editor *e, bool force) {
         Str cmd = before;
         while (cmd.len && (cmd.ptr[0] == ' ' || cmd.ptr[0] == '\t')) cmd = str_sub(cmd, 1, cmd.len);
         Str ap;
-        slash = !at_prefix(before, &ap) && cmd.len && cmd.ptr[0] == '/';
+        slash = !at_prefix(before, &ap) && cmd.len && cmd.ptr[0] == '/' && !memchr(cmd.ptr, ' ', cmd.len);
     }
     sel_init(&list, 5, slash ? 12 : 32, 32);
     char *prefix = suggestions(e, force, &list);

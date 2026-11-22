@@ -659,6 +659,7 @@ static void lex_list(Arena *a, Str s, size_t *pos, BlockVec *out) {
         size_t item_start = p;
         p = nx;
         blank_between = false;
+        size_t blank_start = p;
         bool item_blank = false;
         while (p < s.len) {
             Str ln = line_at(s, p, &nx);
@@ -680,6 +681,7 @@ static void lex_list(Arena *a, Str s, size_t *pos, BlockVec *out) {
                     continue;
                 }
                 blank_between = true;
+                blank_start = p;
                 p = nx;
                 // blank lines before the next item stay with the list
                 while (p < s.len) {
@@ -735,17 +737,9 @@ static void lex_list(Arena *a, Str s, size_t *pos, BlockVec *out) {
             bool o4;
             long n4;
             char b4;
-            if (p >= s.len || !list_marker(pl, &o4, &n4, &b4) || o4 != ordered || b4 != bullet) {
-                // the blank lines end the list: give them back to a space token
-                size_t back = p;
-                while (back > item_start) {
-                    size_t k = back - 1;
-                    while (k > item_start && s.ptr[k - 1] != '\n') k--;
-                    Str bl2 = str_sub(s, k, back);
-                    if (!blank(str_trim(bl2)) && bl2.len) break;
-                    back = k;
-                }
-                p = back;
+            if (p >= s.len || !list_marker(pl, &o4, &n4, &b4) || o4 != ordered || b4 != bullet || indent_of(pl) > 3) {
+                // the blank lines end the list: they and the last line's newline become a space token
+                p = blank_start > 0 && s.ptr[blank_start - 1] == '\n' ? blank_start - 1 : blank_start;
                 blank_between = false;
                 break;
             }

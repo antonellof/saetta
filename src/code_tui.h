@@ -201,6 +201,7 @@ typedef enum {
     K_REPLY_KITTY, // the terminal's Kitty keyboard flags (ch)
     K_REPLY_DA,    // device attributes (the query's sentinel)
     K_REPLY_COLOR, // an OSC 10/11/4 color reply: ch 10, 11 or 100 + palette index; rgb in button, mx, my (release: unparsable)
+    K_ALT_DOWN,
 } KeyKind;
 typedef struct {
     KeyKind kind;
@@ -348,6 +349,16 @@ typedef struct {
     // /model's list again, after /model changed models.json (they stay valid to the end of the
     // run); NULL keeps the list the UI started with.
     const CodeUiModel *(*reload_models)(CodeUiHost *h, size_t *n);
+    // For /export, /share and /import (code_cmds.c): the session file (NULL in memory), the folder
+    // sessions are kept in, the working directory the session runs in, the current system prompt
+    // and the tools' declarations ([{name, description, parameters}]), and a switch to another
+    // session file run in cwd (its id and entries kept; non-zero when it cannot be opened).
+    const char *(*session_file)(CodeUiHost *h);
+    const char *(*session_dir)(CodeUiHost *h);
+    const char *(*session_cwd)(CodeUiHost *h);
+    const char *(*system_prompt)(CodeUiHost *h);
+    const JValue *(*tool_decls)(CodeUiHost *h);
+    Err (*open_session)(CodeUiHost *h, const char *path, const char *cwd);
 } CodeUiOps;
 typedef struct {
     const char *cwd, *home, *agent_dir;

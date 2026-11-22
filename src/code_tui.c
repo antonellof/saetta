@@ -304,7 +304,7 @@ static KeyKind csi_key(char final, int p1, int mods) {
     bool ctrl = mods & 4, alt = mods & 2;
     switch (final) {
     case 'A': return ctrl ? K_CTRL_UP : alt ? K_ALT_UP : K_UP;
-    case 'B': return ctrl ? K_CTRL_DOWN : K_DOWN;
+    case 'B': return ctrl ? K_CTRL_DOWN : alt ? K_ALT_DOWN : K_DOWN;
     case 'C': return ctrl ? K_CTRL_RIGHT : alt ? K_ALT_RIGHT : K_RIGHT;
     case 'D': return ctrl ? K_CTRL_LEFT : alt ? K_ALT_LEFT : K_LEFT;
     case 'H': return ctrl ? K_CTRL_HOME : K_HOME;

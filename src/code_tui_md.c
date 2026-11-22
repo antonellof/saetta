@@ -1077,6 +1077,12 @@ static void lex_blocks(Arena *a, Str s, BlockVec *out, bool top) {
                     break;
                 }
                 if (interrupts(pl)) break;
+                // a table interrupts a paragraph (GFM)
+                if (pn < s.len) {
+                    size_t pn2;
+                    Str d = line_at(s, pn, &pn2);
+                    if ((memchr(pl.ptr, '|', pl.len) || memchr(d.ptr, '|', d.len)) && table_delim(d) && memchr(d.ptr, '-', d.len)) break;
+                }
                 end = p + pl.len;
                 p = pn;
             }

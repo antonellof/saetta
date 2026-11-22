@@ -27,6 +27,12 @@ void sx_prefetch(const void *addr, size_t len);
 // Unicode NFC of UTF-8 text (Foundation). Writes up to cap bytes to out and returns the
 // full NFC length; returns (size_t)-1 when the input is not valid UTF-8.
 size_t sx_nfc(const char *in, size_t len, char *out, size_t cap);
+// The same for NFD and NFKC (JavaScript's String.prototype.normalize("NFD"), ("NFKC")).
+size_t sx_nfd(const char *in, size_t len, char *out, size_t cap);
+size_t sx_nfkc(const char *in, size_t len, char *out, size_t cap);
+// Compares two UTF-8 strings as JavaScript's a.toLowerCase().localeCompare(b.toLowerCase())
+// does under an en-US ICU locale: <0, 0 or >0.
+int sx_locale_compare_lower(const char *a, size_t alen, const char *b, size_t blen);
 
 // Thermal state of the machine (NSProcessInfo.thermalState): 0 nominal, 1 fair, 2 serious,
 // 3 critical.

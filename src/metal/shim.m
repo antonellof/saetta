@@ -52,6 +52,36 @@ size_t sx_nfc(const char *in, size_t len, char *out, size_t cap) {
     }
 }
 
+static size_t sx_norm(const char *in, size_t len, char *out, size_t cap, int form) {
+    @autoreleasepool {
+        NSString *s = [[NSString alloc] initWithBytes:in length:len encoding:NSUTF8StringEncoding];
+        if (s == nil) return (size_t)-1;
+        NSString *n = form == 0 ? [s decomposedStringWithCanonicalMapping] : [s precomposedStringWithCompatibilityMapping];
+        NSData *d = [n dataUsingEncoding:NSUTF8StringEncoding];
+        memcpy(out, d.bytes, d.length < cap ? d.length : cap);
+        return d.length;
+    }
+}
+
+size_t sx_nfd(const char *in, size_t len, char *out, size_t cap) { return sx_norm(in, len, out, cap, 0); }
+size_t sx_nfkc(const char *in, size_t len, char *out, size_t cap) { return sx_norm(in, len, out, cap, 1); }
+
+int sx_locale_compare_lower(const char *a, size_t alen, const char *b, size_t blen) {
+    @autoreleasepool {
+        NSString *x = [[NSString alloc] initWithBytes:a length:alen encoding:NSUTF8StringEncoding];
+        NSString *y = [[NSString alloc] initWithBytes:b length:blen encoding:NSUTF8StringEncoding];
+        if (x == nil || y == nil) {
+            int c = memcmp(a, b, alen < blen ? alen : blen);
+            return c ? c : (alen < blen ? -1 : alen > blen);
+        }
+        x = [x lowercaseString];
+        y = [y lowercaseString];
+        static NSLocale *loc;
+        if (!loc) loc = [NSLocale localeWithLocaleIdentifier:@"en_US"];
+        return (int)[x compare:y options:0 range:NSMakeRange(0, x.length) locale:loc];
+    }
+}
+
 sx_device *sx_device_create(void) {
     id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
     if (!dev) return NULL;

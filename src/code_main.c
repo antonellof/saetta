@@ -578,6 +578,11 @@ Err code_run(const char *const *args, size_t n, int *code) {
         json_put(a, f, S("thinkingLevel"), json_string(a, str(level)));
         if ((e = code_session_append(r.session, "thinking_level_change", f))) goto done;
     }
+    r.env.session_id = json_str(json_get(code_session_header(r.session), "id"));
+    r.env.session_file = code_session_path(r.session);
+    r.env.provider = r.model.provider;
+    r.env.model = r.model.id;
+    r.env.thinking = level;
     if (r.json) emit(&r, (JValue *)code_session_header(r.session));
     for (size_t i = 0; i < o.prompts.len && !e; i++) e = prompt(&r, o.prompts.ptr[i]);
     if (e) goto done;

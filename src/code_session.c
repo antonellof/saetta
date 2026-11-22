@@ -273,6 +273,8 @@ const JValue *code_session_last(const CodeSession *s, const char *type, const ch
     return NULL;
 }
 
+const char *code_session_path(const CodeSession *s) { return s->path; }
+
 bool code_session_is_new(const CodeSession *s) { return s->entries->arr.len == 1; }
 
 Err code_session_append(CodeSession *s, const char *type, JValue *fields) {

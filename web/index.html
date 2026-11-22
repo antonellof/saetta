@@ -311,18 +311,19 @@ logits       max rel err 6.7e-7</pre>
         <h2>Pick by your Mac's memory</h2>
         <div class="table">
           <table>
-            <thead><tr><th>Pack</th><th>Model</th><th>On disk</th><th>Mac memory</th></tr></thead>
+            <thead><tr><th>Pack</th><th>Model</th><th>On disk</th><th>Mac memory</th><th>SWE-bench</th><th>Terminal-Bench 2.1</th></tr></thead>
             <tbody>
-              <tr><td><code>coder</code></td><td>Qwen3.8-Flash-Next, 256 experts pruned for code, the fastest for agents</td><td class="num">76 GB</td><td><span class="tagm">96 GB</span></td></tr>
-              <tr><td><code>full</code></td><td>Qwen3.8-Flash-Next, all 512 experts</td><td class="num">105 GB</td><td><span class="tagm">128 GB</span></td></tr>
-              <tr><td><code>27b-turbo</code></td><td>Qwen3.8-27B TURBO fine-tune, shorter thinking, with its draft head</td><td class="num">20 GB</td><td><span class="tagm">36 GB</span></td></tr>
-              <tr><td><code>27b-fable5</code></td><td>Qwen3.8-27B Fable-5 coding distill, with its draft head</td><td class="num">20 GB</td><td><span class="tagm">36 GB</span></td></tr>
-              <tr><td><code>27b-coder390</code></td><td>Qwen3.8-27B Coder390, SFT and RL on code, with its draft head</td><td class="num">23 GB</td><td><span class="tagm">48 GB</span></td></tr>
-              <tr><td><code>27b-8bit</code></td><td>Qwen3.8-27B, 8-bit, takes LoRA adapters</td><td class="num">29 GB</td><td><span class="tagm">48 GB</span></td></tr>
-              <tr><td><code>27b-4bit</code></td><td>Qwen3.8-27B, 4-bit, the smallest</td><td class="num">16 GB</td><td><span class="tagm">32 GB</span></td></tr>
+              <tr><td><code>coder</code></td><td>Qwen3.8-Flash-Next, 256 experts pruned for code, the fastest for agents</td><td class="num">76 GB</td><td><span class="tagm">96 GB</span></td><td class="num">Verified 79.2</td><td class="num">n/p</td></tr>
+              <tr><td><code>full</code></td><td>Qwen3.8-Flash-Next, all 512 experts</td><td class="num">105 GB</td><td><span class="tagm">128 GB</span></td><td class="num">Pro 62.5, Verified 82.8</td><td class="num">n/p</td></tr>
+              <tr><td><code>27b-turbo</code></td><td>Qwen3.8-27B TURBO fine-tune, shorter thinking, with its draft head</td><td class="num">20 GB</td><td><span class="tagm">36 GB</span></td><td class="num">n/p</td><td class="num">n/p</td></tr>
+              <tr><td><code>27b-fable5</code></td><td>Qwen3.8-27B Fable-5 coding distill, with its draft head</td><td class="num">20 GB</td><td><span class="tagm">36 GB</span></td><td class="num">n/p</td><td class="num">n/p</td></tr>
+              <tr><td><code>27b-coder390</code></td><td>Qwen3.8-27B Coder390, SFT and RL on code, with its draft head</td><td class="num">23 GB</td><td><span class="tagm">48 GB</span></td><td class="num">n/p</td><td class="num">n/p</td></tr>
+              <tr><td><code>27b-8bit</code></td><td>Qwen3.8-27B, 8-bit, takes LoRA adapters</td><td class="num">29 GB</td><td><span class="tagm">48 GB</span></td><td class="num">Pro 61.7</td><td class="num">73.0</td></tr>
+              <tr><td><code>27b-4bit</code></td><td>Qwen3.8-27B, 4-bit, the smallest</td><td class="num">16 GB</td><td><span class="tagm">32 GB</span></td><td class="num">Pro 61.7</td><td class="num">73.0</td></tr>
             </tbody>
           </table>
         </div>
+        <p class="note">SWE-bench and Terminal-Bench are the publishers' scores for the full-precision model, each with its own harness, not measured by Saetta: <a href="https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF">ISTA-DASLab</a> (SWE-bench Verified) and <a href="https://huggingface.co/Qwen/Qwen3.8-27B">Qwen</a> (SWE-bench Pro, Terminal-Bench 2.1). n/p: not published.</p>
         <p class="note"><code>saetta download</code> picks the largest that fits. Weights come from Hugging Face at pinned revisions and are never part of the repository.</p>
       </div>
     </section>

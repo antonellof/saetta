@@ -12,19 +12,16 @@
 //   cwd (first of AGENTS.override.md, AGENTS.md, AGENTS.MD, CLAUDE.md, CLAUDE.MD), deduped by
 //   path, skipping the main repo's file when cwd is in a git worktree nested inside it. They
 //   load whether or not the project is trusted.
-// - Skills: project .pi/skills and .agents/skills (cwd up to the git root), only when the project
-//   is trusted, then agent_dir/skills and ~/.agents/skills; the first skill of a name wins.
-// - Trust: a project with trust-requiring resources (.pi/{settings.json,mcp.json,extensions,
-//   skills,prompts,themes,SYSTEM.md,APPEND_SYSTEM.md}, or .agents/skills in cwd or an ancestor)
-//   is trusted only by agent_dir/trust.json or settings defaultProjectTrust "always"; print
-//   mode never asks. A project without them is trusted unless trust.json says otherwise.
-// Not ported: settings "skills"/"packages" entries and package skills, --skill paths,
-// --no-skills, --no-context-files, --approve, extensions (their prompt sections, tools,
-// project_trust event, before_agent_start forced prompts). The YAML frontmatter parser covers
-// top-level scalars (plain, quoted, block) and treats collections as non-strings; the ignore
+// - Skills: the ones code_skills.c loads (settings "skills" entries, --skill, --no-skills, the
+//   auto-discovered folders, project ones only when the project is trusted).
+// - Trust: code_trust.c (trust.json, defaultProjectTrust, --approve, the interactive prompt).
+// Not ported: settings "packages" entries and package skills, --no-context-files, extensions
+// (their prompt sections, tools, project_trust event, before_agent_start forced prompts). The
+// YAML frontmatter parser covers top-level scalars (plain, quoted, block) and treats
+// collections as non-strings; the ignore
 // files (.gitignore, .ignore, .fdignore) in skill folders are matched with fnmatch, close to
 // but not exactly the `ignore` package.
-#include "code.h"
+#include "code_res.h"
 
 #include <dirent.h>
 #include <fnmatch.h>
@@ -321,7 +318,7 @@ static bool ig_ignores(const Ignore *ig, const char *rel, bool is_dir) {
 
 // ---- skill discovery (package-manager.ts collectSkillEntries) --------------------------
 
-typedef VEC(char *) VecPath;
+typedef CodePaths VecPath;
 
 static const char *rel_to(const char *root, const char *full) {
     size_t n = strlen(root);
@@ -840,67 +837,13 @@ static bool js_blank(Str s) {
     return true;
 }
 
-static bool load_skill_file(Arena *a, const char *path, Skill *out) {
-    Str raw;
-    if (!read_text(a, path, &raw)) return false;
-    Frontmatter fm;
-    if (!parse_frontmatter(a, raw, &fm)) return false;
-    bool has_desc = fm.description.kind == FM_STRING && !js_blank(fm.description.s);
-    if (!has_desc) return false;
-    Str name = fm.name.kind == FM_STRING && fm.name.s.len ? fm.name.s : str(pbasename(pdirname(a, path)));
-    *out = (Skill){name, fm.description.s, path, fm.disable.kind == FM_OTHER && fm.disable.btrue};
-    return true;
-}
-
-// The skills pi loads, in pi's order: the resolved auto-discovered paths, deduped by real path,
-// each loaded, the first of a name winning.
-static void load_skills(Arena *a, const char *cwd, const char *agent_dir, const char *home, bool trusted, VecSkill *out) {
-    VecPath paths = {0};
-    char *user_agents = pjoin(a, home, ".agents/skills");
-    if (trusted) {
-        collect_skill_entries(a, pjoin(a, cwd, ".pi/skills"), false, NULL, NULL, &paths);
-        // collectAncestorAgentsSkillDirs: cwd up to the git repo root (or the filesystem root)
-        char *git_root = NULL;
-        for (char *d = arena_strdup(a, cwd);;) {
-            if (p_exists(pjoin(a, d, ".git"))) {
-                git_root = d;
-                break;
-            }
-            char *p = pdirname(a, d);
-            if (strcmp(p, d) == 0) break;
-            d = p;
-        }
-        for (char *d = arena_strdup(a, cwd);;) {
-            char *sd = pjoin(a, d, ".agents/skills");
-            if (strcmp(sd, user_agents) != 0) collect_skill_entries(a, sd, true, NULL, NULL, &paths);
-            if (git_root && strcmp(d, git_root) == 0) break;
-            char *p = pdirname(a, d);
-            if (strcmp(p, d) == 0) break;
-            d = p;
-        }
+// The skills pi loads (code_skills.c, the resource loader's), in its order.
+static void load_skills(const CodeEnv *env, VecSkill *out) {
+    const CodeResources *res = code_resources(env);
+    for (size_t i = 0; i < res->nskills; i++) {
+        const CodeSkill *k = &res->skills[i];
+        vec_push(out, ((Skill){k->name, k->description, k->file, k->disable}));
     }
-    collect_skill_entries(a, pjoin(a, agent_dir, "skills"), false, NULL, NULL, &paths);
-    collect_skill_entries(a, user_agents, true, NULL, NULL, &paths);
-
-    // the package manager keeps the first of a path, toResolvedPaths the first of a real path;
-    // loadSkills then loads each (a file here), the first of a name winning
-    VecPath reals = {0};
-    for (size_t i = 0; i < paths.len; i++) {
-        const char *p = paths.ptr[i];
-        char *real = p_real(a, p);
-        bool dup = false;
-        for (size_t k = 0; k < reals.len; k++) dup |= strcmp(reals.ptr[k], real) == 0;
-        if (dup) continue;
-        vec_push(&reals, real);
-        Skill s;
-        size_t pl = strlen(p);
-        if (!p_isfile(p) || pl < 3 || strcmp(p + pl - 3, ".md") != 0 || !load_skill_file(a, p, &s)) continue;
-        bool collide = false;
-        for (size_t k = 0; k < out->len; k++) collide |= str_eq(out->ptr[k].name, s.name);
-        if (!collide) vec_push(out, s);
-    }
-    vec_free(&reals);
-    vec_free(&paths);
 }
 
 static void xml_escape(Buf *b, Str s) {
@@ -941,55 +884,11 @@ static void format_skills(Buf *b, const VecSkill *skills, const char *reader) {
     buf_adds(b, "</available_skills>");
 }
 
-// ---- project trust (trust-manager.ts, project-trust.ts, main.ts) -----------------------
-
-static bool has_trust_requiring_resources(Arena *a, const char *cwd, const char *home) {
-    static const char *const entries[] = {"settings.json", "mcp.json", "extensions", "skills",
-                                          "prompts", "themes", "SYSTEM.md", "APPEND_SYSTEM.md"};
-    char *user_agents = pjoin(a, p_real(a, path_resolve(a, cwd, home)), ".agents/skills");
-    char *dir = p_real(a, cwd);
-    char *cfg = pjoin(a, dir, ".pi");
-    for (size_t i = 0; i < COUNT(entries); i++)
-        if (p_exists(pjoin(a, cfg, entries[i]))) return true;
-    for (;;) {
-        char *sd = pjoin(a, dir, ".agents/skills");
-        if (strcmp(sd, user_agents) != 0 && p_exists(sd)) return true;
-        char *p = pdirname(a, dir);
-        if (strcmp(p, dir) == 0) return false;
-        dir = p;
-    }
-}
-
 static JValue *read_json(Arena *a, const char *path) {
     Str t;
     JValue *v;
     if (!p_exists(path) || !read_text(a, path, &t) || json_parse(a, t, false, &v)) return NULL;
     return json_is(v, J_OBJECT) ? v : NULL;
-}
-
-// ProjectTrustStore.get: the nearest trust.json entry at or above the real cwd; -1 for none
-static int trust_store_get(Arena *a, const char *cwd, const char *agent_dir) {
-    JValue *t = read_json(a, pjoin(a, agent_dir, "trust.json"));
-    if (!t) return -1;
-    for (char *d = p_real(a, cwd);;) {
-        for (size_t i = 0; i < t->obj.len; i++) {
-            JValue *v = t->obj.items[i].val;
-            if (json_is(v, J_BOOL) && strcmp(path_resolve(a, "/", t->obj.items[i].key.ptr), d) == 0) return v->b;
-        }
-        char *p = pdirname(a, d);
-        if (strcmp(p, d) == 0) return -1;
-        d = p;
-    }
-}
-
-static bool project_trusted(Arena *a, const char *cwd, const char *agent_dir, const char *home) {
-    int stored = trust_store_get(a, cwd, agent_dir);
-    if (!has_trust_requiring_resources(a, cwd, home)) return stored != 0;
-    if (stored >= 0) return stored;
-    JValue *settings = read_json(a, pjoin(a, agent_dir, "settings.json"));
-    const char *def = json_str(json_get(settings, "defaultProjectTrust"));
-    // "never", and "ask" without a UI (print mode), are untrusted
-    return def && strcmp(def, "always") == 0;
 }
 
 // resolvePromptInput: a file's text when the input names one, else the input; NULL for none
@@ -1088,13 +987,12 @@ static void put_section(Arena *a, JValue *sections, const char *name, Str body) 
 Err code_system_message(Arena *a, const CodeEnv *env, const char *const *tools, size_t ntools, JValue **out) {
     const char *cwd = path_resolve(a, "/", env->cwd);
     const char *agent_dir = path_resolve(a, cwd, env->agent_dir);
-    const char *home = path_resolve(a, cwd, env->home);
-    bool trusted = project_trusted(a, cwd, agent_dir, home);
+    bool trusted = code_trust_trusted(env);
 
     VecCtx ctx = {0};
     load_context_files(a, cwd, agent_dir, &ctx);
     VecSkill skills = {0};
-    load_skills(a, cwd, agent_dir, home, trusted, &skills);
+    load_skills(env, &skills);
 
     // the custom prompt: --system-prompt, else .pi/SYSTEM.md (trusted), else agent_dir/SYSTEM.md
     const char *sys_src = env->system_prompt;
@@ -1221,4 +1119,118 @@ Str code_system_text(Arena *a, const JValue *system) {
     buf_free(&b);
     buf_free(&content);
     return out;
+}
+
+// ---- shared with code_skills.c, code_trust.c and code_changelog.c (code_res.h) ----------------
+
+char *code_path_resolve(Arena *a, const char *base, const char *p) { return path_resolve(a, base, p); }
+char *code_path_join(Arena *a, const char *x, const char *y) { return pjoin(a, x, y); }
+char *code_path_dirname(Arena *a, const char *p) { return pdirname(a, p); }
+const char *code_path_basename(const char *p) { return pbasename(p); }
+bool code_path_exists(const char *p) { return p_exists(p); }
+bool code_path_isfile(const char *p) { return p_isfile(p); }
+bool code_path_isdir(const char *p) {
+    struct stat st;
+    return stat(p, &st) == 0 && S_ISDIR(st.st_mode);
+}
+char *code_path_real(Arena *a, const char *p) { return p_real(a, p); }
+bool code_path_within(const char *parent, const char *child) { return p_within(parent, child); }
+bool code_read_text(Arena *a, const char *p, Str *out) { return read_text(a, p, out); }
+JValue *code_read_json_object(Arena *a, const char *p) { return read_json(a, p); }
+bool code_js_blank(Str s) { return js_blank(s); }
+
+// String.prototype.trim(): JavaScript's whitespace (ASCII, NBSP, the BOM, U+1680, U+2000..U+200A,
+// U+2028, U+2029, U+202F, U+205F, U+3000) cut from both ends.
+static size_t js_ws_len(Str s, size_t i, bool back) {
+    static const char *const ws[] = {"\xC2\xA0", "\xEF\xBB\xBF", "\xE1\x9A\x80", "\xE2\x80\xA8", "\xE2\x80\xA9", "\xE2\x80\xAF",
+                                     "\xE2\x81\x9F", "\xE3\x80\x80"};
+    unsigned char c = (unsigned char)(back ? s.ptr[i - 1] : s.ptr[i]);
+    if (c == ' ' || (c >= '\t' && c <= '\r')) return 1;
+    for (size_t k = 0; k < COUNT(ws); k++) {
+        size_t n = strlen(ws[k]);
+        if (back ? i >= n && !memcmp(s.ptr + i - n, ws[k], n) : i + n <= s.len && !memcmp(s.ptr + i, ws[k], n)) return n;
+    }
+    // U+2000..U+200A: E2 80 80..8A
+    if (back ? i >= 3 && (unsigned char)s.ptr[i - 3] == 0xE2 && (unsigned char)s.ptr[i - 2] == 0x80 && (unsigned char)s.ptr[i - 1] <= 0x8A
+             : i + 3 <= s.len && (unsigned char)s.ptr[i] == 0xE2 && (unsigned char)s.ptr[i + 1] == 0x80 && (unsigned char)s.ptr[i + 2] >= 0x80 &&
+                   (unsigned char)s.ptr[i + 2] <= 0x8A)
+        return 3;
+    return 0;
+}
+
+Str code_js_trim(Str s) {
+    size_t a = 0, b = s.len, n;
+    while (a < b && (n = js_ws_len(s, a, false))) a += n;
+    while (b > a && (n = js_ws_len(s, b, true))) b -= n;
+    return str_sub(s, a, b);
+}
+
+void code_collect_skill_entries(Arena *a, const char *dir, bool mode_agents, CodePaths *out) {
+    VecPath v = {0};
+    collect_skill_entries(a, dir, mode_agents, NULL, NULL, &v);
+    for (size_t i = 0; i < v.len; i++) vec_push(out, v.ptr[i]);
+    vec_free(&v);
+}
+
+bool code_frontmatter(Arena *a, Str content, CodeFrontmatter *out) {
+    Frontmatter fm;
+    *out = (CodeFrontmatter){0};
+    if (!parse_frontmatter(a, content, &fm)) return false;
+    out->has_name = fm.name.kind == FM_STRING;
+    out->name = fm.name.s;
+    out->has_description = fm.description.kind == FM_STRING;
+    out->description = fm.description.s;
+    out->disable = fm.disable.kind == FM_OTHER && fm.disable.btrue;
+    return true;
+}
+
+// frontmatter.ts extractFrontmatter's body: after the closing "---" line, trimmed; the whole
+// (normalized) text without a frontmatter.
+bool code_frontmatter_body(Arena *a, Str content, Str *body) {
+    Frontmatter fm;
+    if (!parse_frontmatter(a, content, &fm)) return false;
+    Buf n = {0};
+    size_t from = str_starts(content, S("\xEF\xBB\xBF")) ? 3 : 0;
+    for (size_t i = from; i < content.len; i++) {
+        char c = content.ptr[i];
+        if (c == '\r') {
+            buf_addc(&n, '\n');
+            if (i + 1 < content.len && content.ptr[i + 1] == '\n') i++;
+        } else
+            buf_addc(&n, c);
+    }
+    Str t = {arena_strndup(a, n.ptr ? n.ptr : "", n.len), n.len};
+    buf_free(&n);
+    ptrdiff_t end = str_starts(t, S("---")) ? str_find(t, S("\n---"), 3) : -1;
+    if (end < 0) *body = t;
+    else *body = code_js_trim(str_sub(t, (size_t)end + 4, t.len));
+    return true;
+}
+
+// resource-loader.ts: getSystemPromptSource (an existing file only), getAppendSystemPromptSources
+// (the existing ones), then the context files, as the startup listing shows them.
+void code_prompt_context_paths(Arena *a, const CodeEnv *env, bool trusted, CodePaths *out) {
+    const char *cwd = path_resolve(a, "/", env->cwd);
+    const char *agent_dir = path_resolve(a, cwd, env->agent_dir);
+    const char *sys_src = env->system_prompt;
+    if (!sys_src) {
+        char *pp = pjoin(a, cwd, ".pi/SYSTEM.md"), *gp = pjoin(a, agent_dir, "SYSTEM.md");
+        sys_src = trusted && p_exists(pp) ? pp : p_exists(gp) ? gp : NULL;
+    }
+    if (sys_src && p_exists(path_resolve(a, cwd, sys_src))) vec_push(out, path_resolve(a, cwd, sys_src));
+    const char *const *srcs = env->append_system_prompt;
+    size_t nsrc = env->nappend_system_prompt;
+    const char *found = NULL;
+    if (!nsrc) {
+        char *pp = pjoin(a, cwd, ".pi/APPEND_SYSTEM.md"), *gp = pjoin(a, agent_dir, "APPEND_SYSTEM.md");
+        found = trusted && p_exists(pp) ? pp : p_exists(gp) ? gp : NULL;
+        srcs = &found;
+        nsrc = found ? 1 : 0;
+    }
+    for (size_t i = 0; i < nsrc; i++)
+        if (p_exists(path_resolve(a, cwd, srcs[i]))) vec_push(out, path_resolve(a, cwd, srcs[i]));
+    VecCtx ctx = {0};
+    load_context_files(a, cwd, agent_dir, &ctx);
+    for (size_t i = 0; i < ctx.len; i++) vec_push(out, (char *)ctx.ptr[i].path);
+    vec_free(&ctx);
 }

@@ -3,7 +3,7 @@
 </p>
 
 <h3 align="center">Local coding models at lightning speed.</h3>
-<p align="center">Qwen3.8 for Claude Code, pi and opencode on Apple Silicon Macs: Qwen3.8-27B from 32 GB of memory, Qwen3.8-Flash-Next from 96 GB. An inference engine in C and hand-written Metal, built for coding agents. <a href="https://saetta.dev">saetta.dev</a></p>
+<p align="center">Qwen3.8 on Apple Silicon Macs, with a coding agent built in: Qwen3.8-27B from 32 GB of memory, Qwen3.8-Flash-Next from 96 GB. An inference engine in C and hand-written Metal, and Saetta Code, an agent with the model running inside it; or Claude Code, pi and opencode on the same engine. <a href="https://saetta.dev">saetta.dev</a></p>
 
 <p align="center">
   <a href="#install"><b>Install</b></a> · <a href="#models">Models</a> · <a href="#coding-agents">Coding agents</a> ·

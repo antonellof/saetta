@@ -12,6 +12,7 @@
 #include "code_cfg.h"
 #include "code_oai.h"
 #include "code_monitor.h"
+#include "code_res_ui.h"
 #include "download.h"
 
 #include <ctype.h>
@@ -236,7 +237,7 @@ typedef struct {
 typedef struct ToolView ToolView;
 typedef struct AsstView AsstView;
 
-typedef enum { SEL_NONE, SEL_THINKING, SEL_MODEL, SEL_SETTINGS, SEL_TREE, SEL_CONFIRM, SEL_THEME } SelKind;
+typedef enum { SEL_NONE, SEL_THINKING, SEL_MODEL, SEL_SETTINGS, SEL_TREE, SEL_CONFIRM, SEL_THEME, SEL_PANEL } SelKind;
 
 typedef struct {
     Buf value;
@@ -417,6 +418,7 @@ static void header_render(void *ctx, int width, Lines *out) {
     lines_addz(out, "");
     comp_free(c);
     buf_free(&t);
+    code_res_render(width, U->header_expanded, out); // the loaded resources (code_skills.c)
 }
 
 // ---- assistant messages (assistant-message.ts) ------------------------------------------------------
@@ -1986,6 +1988,32 @@ static void close_selector(void) {
     buf_free(&U->search.value);
     U->search.cursor = 0;
 }
+
+// ---- calls from the feature files (code_res_ui.h) ------------------------------------------------------
+
+static CodeUiPanel g_panel;
+
+void code_ui_panel_open(CodeUiPanel p) {
+    close_selector();
+    g_panel = p;
+    U->sel = SEL_PANEL;
+    U->sel_data = p.ctx;
+    U->sel_free = p.destroy;
+    request_render();
+}
+
+void code_ui_panel_close(void) {
+    if (U->sel == SEL_PANEL) close_selector();
+    request_render();
+}
+
+void code_ui_status(const char *msg) { show_status(msg); }
+void code_ui_warning(const char *msg) { show_warning(msg); }
+void code_ui_chat_add(Comp *c) { chat_add(c); }
+size_t code_ui_chat_len(void) { return comp_children(U->chat)->len; }
+bool code_ui_expanded(void) { return U && U->tools_expanded; }
+bool code_ui_busy(void) { return U->busy; }
+const CodeUiConfig *code_ui_config(void) { return U->cfg; }
 
 static void set_thinking(const char *level) {
     free(U->thinking);
@@ -3786,6 +3814,7 @@ static void tree_key(const Key *k) {
         if (U->ops->set_leaf) U->ops->set_leaf(U->host, target);
         free(target);
         render_history();
+        code_trust_warning(); // code_trust.c
         if (user) editor_set_text(U->ed, buf_str(&text));
         buf_free(&text);
     } else if (k->kind == K_BACKSPACE && t->query.len) {
@@ -3866,6 +3895,7 @@ static void render_dock(int width, Lines *out) {
     else if (U->sel == SEL_TREE) tree_render(width, out);
     else if (U->sel == SEL_CONFIRM) confirm_render(width, out);
     else if (U->sel == SEL_THEME) theme_render(width, out);
+    else if (U->sel == SEL_PANEL) g_panel.render(g_panel.ctx, width, out);
     else editor_render(U->ed, width, out);
     footer_render(NULL, width, out);
 }
@@ -4424,7 +4454,16 @@ static void add_user(const JValue *m) {
             if (str_eqz(json_strs(json_get(c->arr.items[i], "type")), "text")) buf_addstr(&t, json_strs(json_get(c->arr.items[i], "text")));
     if (t.len) {
         if (comp_children(U->chat)->len) chat_add(comp_spacer(1));
-        chat_add(comp_markdown(buf_str(&t), 1, 1, &md_user));
+        Str rest;
+        Comp *skill = code_skill_block_comp(buf_str(&t), &rest); // a /skill:name block (code_skills.c)
+        if (skill) {
+            chat_add(skill);
+            if (rest.len) {
+                chat_add(comp_spacer(1));
+                chat_add(comp_markdown(rest, 1, 1, &md_user));
+            }
+        } else
+            chat_add(comp_markdown(buf_str(&t), 1, 1, &md_user));
     }
     buf_free(&t);
 }
@@ -4652,6 +4691,14 @@ static bool arg_items(void *ctx, const char *cmd, SelectList *all, Lines *search
     return false;
 }
 
+void code_ui_refresh_commands(void) {
+    size_t n;
+    const SlashCmd *cmds = code_skill_commands(builtin_cmds, COUNT(builtin_cmds), &n); // with skill:<name> (code_skills.c)
+    editor_set_commands(U->ed, cmds, n);
+}
+
+void code_ui_rebuild_chat(void) { render_history(); }
+
 static void new_session(void) {
     if (U->busy) return;
     if (U->ops->new_session) U->ops->new_session(U->host);
@@ -4799,9 +4846,24 @@ static void submit(char *text) {
             free(s);
             return;
         }
+        if (!strcmp(c, "trust")) { // code_trust.c
+            code_trust_command();
+            free(s);
+            return;
+        }
+        if (!strcmp(c, "changelog")) { // code_changelog.c
+            code_changelog_command();
+            free(s);
+            return;
+        }
+        if (!strcmp(c, "reload")) { // code_skills.c
+            code_reload_command();
+            free(s);
+            return;
+        }
         static const char *const known[] = {"scoped-models", "export", "import", "share", "copy",
-                                            "name", "session", "changelog", "hotkeys", "fork", "clone", "trust",
-                                            "compact", "resume", "reload", "mcp"};
+                                            "name", "session", "hotkeys", "fork", "clone",
+                                            "compact", "resume", "mcp"};
         for (size_t i = 0; i < COUNT(known); i++) {
             size_t kl = strlen(known[i]);
             if (!strncmp(c, known[i], kl) && (c[kl] == 0 || c[kl] == ' ')) {
@@ -4852,6 +4914,10 @@ static void cycle_thinking(void) {
 }
 
 static void selector_key(const Key *k) {
+    if (U->sel == SEL_PANEL) {
+        g_panel.key(g_panel.ctx, k);
+        return;
+    }
     if (U->sel == SEL_CONFIRM && U->confirm_switch) {
         if (k->kind == K_ENTER) {
             U->sel = SEL_NONE;
@@ -5137,7 +5203,7 @@ Err code_ui_run(const CodeUiConfig *cfg, const CodeUiOps *ops, CodeUiHost *host,
     ui.pending = comp_container();
     ui.status = comp_container();
     ui.ed = editor_new(cfg->cwd, cfg->fd_path);
-    editor_set_commands(ui.ed, builtin_cmds, COUNT(builtin_cmds));
+    code_ui_refresh_commands();
     editor_set_arg_completer(ui.ed, arg_items, NULL);
     editor_set_border(ui.ed, th_thinking_color(ui.thinking));
     sel_init(&ui.list, 5, 32, 32);
@@ -5171,6 +5237,7 @@ Err code_ui_run(const CodeUiConfig *cfg, const CodeUiOps *ops, CodeUiHost *host,
     else theme_use(ui.theme, NULL, ui.mac_appearance);
     screen_start(&ui.scr);
     if (cfg->resumed) render_history();
+    code_startup_notices(cfg->resumed); // the changelog notice and the trust warning (code_changelog.c)
     draw(true);
     if (ninitial) {
         ui.initial = xcalloc(ninitial, sizeof *ui.initial);

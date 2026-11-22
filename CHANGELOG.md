@@ -1,0 +1,114 @@
+# Changelog
+
+All notable changes to saetta and Saetta Code (`saetta code`), newest first. The format follows
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are saetta's.
+
+## [0.15.0] - 2026-11-22
+
+### Added
+
+- Saetta Code, a minimal coding agent built into `saetta`, in C: a port of pi 1.5.2 that behaves as pi does (the same tools, system prompt, AGENTS.md / CLAUDE.md files, skills and session files, so pi and Saetta Code continue each other's sessions).
+- `saetta start code` runs the model inside Saetta Code, with no server and no HTTP in between (or joins a running Saetta server). `saetta code --pack coder` does the same by hand.
+- `saetta code -p "..."` and `--mode json` are pi's print and JSON modes; `-c` continues the folder's last session; piped input is read as pi reads it.
+- The guided start (`saetta`) offers Saetta Code next to Claude Code, pi and opencode.
+- The models table (README, saetta.dev) lists each model's published SWE-bench and Terminal-Bench scores.
+
+### Notes
+
+- Saetta Code's requests, session files and output match pi's byte for byte on 47 recorded scenarios.
+- pi's TypeScript extensions are not supported.
+
+## [0.14.0] - 2026-11-22
+
+### Added
+
+- `saetta download 27b-coder390`: nerkyor's Coder390 EfficientThink fine-tune of Qwen3.8-27B (SFT and RL on code), converted from its GGUF file with its MTP draft head, 23 GB, Macs with 48 GB or more. `27b-coder390-8bit`: 31 GB, 48 GB.
+- `saetta download 27b-fable5`: khazarai's Fable-5 Coding Distilled fine-tune of Qwen3.8-27B (mradermacher's imatrix Q4_K_M), with its MTP draft head, 20 GB, Macs with 36 GB or more. `27b-fable5-8bit`: 31 GB, 48 GB.
+- The guided start (`saetta`) lists the new models.
+
+## [0.13.2] - 2026-11-21
+
+### Fixed
+
+- The installer (`curl -fsSL https://saetta.dev/install.sh | sh`) no longer ends with "SAETTA_MODELS: unbound variable" after a successful install.
+
+### Changed
+
+- The installer's closing message leads with `saetta`, the guided start.
+- Install from saetta.dev; the README and the GitHub page point there.
+
+## [0.13.1] - 2026-11-21
+
+### Fixed
+
+- The guided start (`saetta`, `saetta auto`) in a terminal narrower than a model row: rows are cut to the terminal's width, the list scrolls inside a short terminal, and each model's status (downloaded, recommended, or why it does not fit) has its own column.
+
+## [0.13.0] - 2026-11-21
+
+### Added
+
+- `saetta` (or `saetta auto`) in a terminal is a guided start: it shows this Mac's chip, memory and free disk, lists the models best first, downloads the one you pick, finds Claude Code, pi and opencode, offers the official installer for a missing one, and starts it.
+
+### Changed
+
+- Qwen3.8-27B reads prompts a little faster (16K prompts about 2% faster; the long-prompt attention kernel 7 to 8% faster per layer), with the same output.
+- The KV cache keeps a small tail so the attention kernel never reads past it.
+
+## [0.12.0] - 2026-11-21
+
+### Added
+
+- Runs on any Apple Silicon Mac (M1 or later) with 32 GB of memory or more. Tuned and measured on an M5 Max; M1 to M4 run the same kernels on their GPU cores and are not yet tested on those chips.
+- `saetta download` with no name picks the model that fits this Mac: `coder` with 96 GB or more, `27b-turbo` with 36 GB, `27b-4bit` with 32 GB.
+- `SAETTA_NO_ACCEL=1` runs without the tensor-op (neural accelerator) kernels: same output, slower prompt reading.
+
+### Changed
+
+- A pack too large for this Mac's memory is refused (`SAETTA_IGNORE_MEMORY=1` overrides).
+- The server caps the context to what memory holds and reports it (`max_model_len` in `/v1/models`); `saetta start` tells the agent the real context and picks a downloaded pack that fits.
+- The binary is built for every Apple Silicon CPU (`-mcpu=apple-m1`).
+
+## [0.11.0] - 2026-11-21
+
+### Added
+
+- `saetta help` lists every command.
+
+### Changed
+
+- `SAETTA_CTX` and `--ctx` are rounded to a multiple of 128 and checked against the model's limit (1,024 to 262,144).
+- Requests with `max_tokens` below 1 or above 2^30, or `top_p` above 1, are rejected with a 400.
+- Qwen3.8-27B: faster long-prompt attention (64K prompts 758 -> 787 tokens/s), same output.
+
+### Fixed
+
+- Deeply nested JSON, out-of-range numbers, oversized or malformed requests and slow clients get an error instead of crashing or blocking the server; errors after a stream has started end it with an SSE error event; a client that disconnects from a non-streamed request stops it; replies are always valid UTF-8; streamed output no longer leaks the start of a stop string; a `count_tokens` request whose body arrives after its headers is answered.
+
+## [0.9.0] - 2026-11-20
+
+### Added
+
+- DeepSeek-V4-Flash-0731 (preview), from its official checkpoint read in place, with `saetta info`, `saetta generate` and the checks (`make verify-dsv4`).
+- Streamed experts: a model whose routed experts do not fit in memory keeps the hot ones in a GPU-visible cache and reads the rest from the SSD on demand (`SAETTA_EXPERT_CACHE_GB` for Flash-Next, as an experiment).
+
+### Changed
+
+- Flash-Next and Qwen3.8-27B behave exactly as in 0.8.1.
+
+## [0.8.1] - 2026-11-20
+
+### Added
+
+- Packs and adapters by name: `saetta serve coder`, `saetta serve 27b-8bit --lora-modules qwen3.8-pi=27b-pi`, `saetta start pi --pack 27b-8bit --lora qwen3.8-pi=27b-pi`. Names resolve under your models folder (`~/Models`, or `SAETTA_MODELS`).
+
+### Changed
+
+- The curl installer stops when Homebrew already has saetta and names any other copy on the PATH; `saetta update` leaves a Homebrew install to `brew upgrade saetta`.
+
+## [0.8.0] - 2026-11-20
+
+### Added
+
+- Qwen3.8-27B (dense) in the same `saetta` binary: `saetta download 27b-8bit` or `27b-4bit`.
+- LoRA adapters at run time, with vLLM's flags (`--lora-modules`, `--default-chat-template-kwargs`); prompt caches are kept per adapter.
+- pi with the harness-hub pi adapter in one command: `saetta start pi --pack 27b-8bit --lora qwen3.8-pi=harness-hub/Qwen3.8-27B-pi-adapted`.

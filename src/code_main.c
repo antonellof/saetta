@@ -11,6 +11,7 @@
 #include "code.h"
 #include "code_cfg.h"
 #include "code_oai.h"
+#include "code_res.h"
 #include "code_tui.h"
 #include "code_monitor.h"
 #include "download.h"
@@ -38,7 +39,9 @@ static const char *const default_tools[] = {"read", "bash", "edit", "write"};
 
 typedef struct {
     const char *provider, *model, *thinking, *mode, *system_prompt, *tools, *pack, *ctx, *session;
-    bool print, cont, no_session, no_tools;
+    bool print, cont, no_session, no_tools, no_skills;
+    int approve; // --approve 1, --no-approve 0, else -1
+    VEC(const char *) skills;
     VEC(const char *) prompts;
     VEC(const char *) append;
 } Args;
@@ -111,6 +114,10 @@ static Err parse_args(const char *const *v, size_t n, Args *o) {
         else if (!strcmp(x, "--ctx") && more) o->ctx = v[++i];
         else if (!strcmp(x, "--session") && more) o->session = v[++i];
         else if (!strcmp(x, "--no-tools") || !strcmp(x, "-nt")) o->no_tools = true;
+        else if (!strcmp(x, "--skill") && more) vec_push(&o->skills, v[++i]);
+        else if (!strcmp(x, "--no-skills") || !strcmp(x, "-ns")) o->no_skills = true;
+        else if (!strcmp(x, "--approve") || !strcmp(x, "-a")) o->approve = 1;
+        else if (!strcmp(x, "--no-approve") || !strcmp(x, "-na")) o->approve = 0;
         else if (!strcmp(x, "--help") || !strcmp(x, "-h")) {
             printf("usage: saetta code [options] [prompt ...]\n"
                    "\n"
@@ -129,6 +136,9 @@ static Err parse_args(const char *const *v, size_t n, Args *o) {
                    "  --thinking LEVEL         off, minimal, low, medium, high, xhigh, max\n"
                    "  --tools a,b,c | --no-tools   the tool set\n"
                    "  --system-prompt T, --append-system-prompt T   text or a file\n"
+                   "  --skill PATH             load a skill file or folder (can be repeated)\n"
+                   "  --no-skills, -ns         no skill discovery (--skill paths still load)\n"
+                   "  --approve, -a            trust this project for the session (--no-approve, -na: do not)\n"
                    "  --pack P                 run the model in this process (a download name such as coder, or a\n"
                    "                           folder): no server, no HTTP; the requests are the same\n"
                    "  --ctx N                  with --pack: the context in tokens (default 204800, as saetta start;\n"
@@ -797,7 +807,7 @@ static Err prompt(Run *r, const char *text) {
     JValue *sys;
     TRY(pending_system(r, code_session_messages(r->session), &sys));
     if (sys) TRY(add_message(r, sys));
-    TRY(add_message(r, user_message(a, text)));
+    TRY(add_message(r, user_message(a, code_skill_expand(a, &r->env, text, NULL)))); // /skill:name
     return run_agent(r, true);
 }
 
@@ -941,7 +951,7 @@ static Err run_turns(Run *r, JValue **last_out, const char **last_id) {
         if (!more && !queued) break;
         if (queued) {
             emit(r, ev_new(a, "turn_start"));
-            JValue *user = user_message(a, queued);
+            JValue *user = user_message(a, code_skill_expand(a, &r->env, queued, NULL));
             free(queued);
             TRY(add_message(r, user));
             turn_started = true;
@@ -1129,7 +1139,7 @@ static void restart_on(Run *r) {
         bool more = i + 1 < r->argc;
         bool takes = !strcmp(x, "--provider") || !strcmp(x, "--model") || !strcmp(x, "--pack") || !strcmp(x, "--thinking") ||
                      !strcmp(x, "--mode") || !strcmp(x, "--system-prompt") || !strcmp(x, "--append-system-prompt") ||
-                     !strcmp(x, "--tools") || !strcmp(x, "--ctx") || !strcmp(x, "--session");
+                     !strcmp(x, "--tools") || !strcmp(x, "--ctx") || !strcmp(x, "--session") || !strcmp(x, "--skill");
         if (takes && more) {
             if (strcmp(x, "--provider") && strcmp(x, "--model") && strcmp(x, "--pack") && strcmp(x, "--session")) {
                 vec_push(&v, x);
@@ -1148,6 +1158,8 @@ static void restart_on(Run *r) {
         vec_push(&v, "--model");
         vec_push(&v, r->restart_id);
     }
+    // the session's project trust, decided once (pi keeps it per folder across its runtimes)
+    vec_push(&v, code_trust_trusted(&r->env) ? "--approve" : "--no-approve");
     // the conversation goes on in this session's own file (never "the latest in the folder"); one
     // not written yet (no conversation) starts fresh; --no-session stays as it was
     if (code_session_written(r->session)) {
@@ -1514,7 +1526,7 @@ Err code_run(const char *const *args, size_t n, int *code) {
     *code = 1;
     Arena arena = {0};
     Arena *a = &arena;
-    Args o = {0};
+    Args o = {.approve = -1};
     Err e = parse_args(args, n, &o);
     if (e) goto done;
     Run r = {.a = a, .json = o.mode && !strcmp(o.mode, "json"), .pack = o.pack, .argv = args, .argc = n};
@@ -1624,6 +1636,11 @@ Err code_run(const char *const *args, size_t n, int *code) {
     r.env.provider = r.model.provider;
     r.env.model = r.model.id;
     r.env.thinking = level;
+    // project trust (the startup prompt in the interactive mode), then the skills and context files
+    code_skills_options(o.no_skills, o.skills.ptr, o.skills.len);
+    code_trust_override(o.approve);
+    code_trust_resolve(&r.env, tty);
+    (void)code_resources(&r.env);
     if (!o.print && !piped && !r.json && isatty(0) && isatty(1)) {
         e = interactive(&r, &o, settings);
         if (!e) *code = 0;
@@ -1661,6 +1678,7 @@ done:
     code_tools_kill_detached();
     vec_free(&o.prompts);
     vec_free(&o.append);
+    vec_free(&o.skills);
     arena_reset(a);
     return e;
 }

@@ -28,7 +28,7 @@ const pad = (s, n) => s + " ".repeat(Math.max(0, n - s.length));
 let run = 0; // bumped on tab change: an older replay stops at its next step
 
 const models = [["coder", "downloaded, recommended"], ["full", "105 GB"], ["27b-turbo", "20 GB"], ["27b-8bit", "29 GB"], ["27b-4bit", "16 GB"]];
-const agents = [["Claude Code", "installed"], ["pi", "installed"], ["opencode", "not installed"]];
+const agents = [["Saetta Code", "built in, recommended"], ["Claude Code", "installed"], ["pi", "installed"], ["opencode", "not installed"]];
 const menu = (title, rows, sel) =>
   `${title}\n` + rows.map(([a, b], i) => i === sel
     ? `  <span class="sel"><span class="a">&gt;</span> ${pad(a, 16)}${b} </span>`
@@ -57,10 +57,9 @@ async function auto(id) {
   for (const s of [0, 1, 2, 1, 0]) if (!(await show(id, intro + menu("Choose a model", models, s), s ? 380 : 1100))) return;
   const m = intro + 'Choose a model: <span class="g">coder</span> (downloaded)\n\n';
   if (!(await show(id, m + menu("Choose a coding agent", agents, 0), 1300))) return;
-  const s = m + "Starting Claude Code on coder (next time: saetta start claude --pack coder)\n\n" +
-    "saetta: loading Qwen3.8-Flash-Next-GSQ-RCO-Coder-MLX (context 204800 tokens)...\n";
+  const s = m + "Starting Saetta Code on coder (next time: saetta start code --pack coder)\n\n";
   if (!(await show(id, s + '<span class="cursor"></span>', 1400))) return;
-  await show(id, s + '<span class="g">saetta: ready at http://127.0.0.1:8080 (6.8 s)</span>\n\n' +
+  await show(id, s + '<span class="d">the model loads inside Saetta Code: no server, no HTTP</span>\n\n' +
     '<span class="a">&gt;</span> fix the failing test<span class="cursor"></span>', 4000);
 }
 

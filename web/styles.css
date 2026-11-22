@@ -93,6 +93,17 @@ h1 { font-size: clamp(40px, 6.4vw, 66px); line-height: 1.04; letter-spacing: -0.
 .btn:hover { background: var(--card-2); }
 .btn.primary { background: var(--btn-bg); color: var(--btn-fg); border-color: var(--btn-bg); }
 .btn.primary:hover { opacity: 0.9; }
+.lede code { font-size: 0.9em; color: var(--fg); }
+.hero-cmd { max-width: 620px; margin: 0 0 10px; }
+.hero-cmd pre { font-size: 13.5px; }
+.hint { color: var(--muted); font-size: 14px; max-width: 620px; margin: 0 0 24px; }
+.hint code { font-size: 0.9em; color: var(--fg); }
+.hero-demo { margin-top: 48px; }
+.demo figcaption code { font-size: 11.5px; color: var(--fg); }
+.sub a { text-decoration: underline; text-underline-offset: 3px; text-decoration-color: var(--border); }
+.qs-code { margin-top: 16px; }
+.cap-card p code { font-size: 12.5px; color: var(--fg); }
+.footer .wrap > span:first-child a { text-decoration: underline; text-underline-offset: 3px; text-decoration-color: var(--border); }
 
 /* terminal replay card */
 .replay { margin-top: 56px; border: 1px solid var(--border); border-radius: 10px; background: var(--card); overflow: hidden; }
@@ -206,7 +217,8 @@ td.num { font-family: var(--mono); font-size: 13px; white-space: nowrap; }
 .code .c { color: var(--dim); }
 .copy { font: 500 11px var(--sans); color: var(--muted); background: none; border: 1px solid var(--border); border-radius: 5px; padding: 2px 8px; cursor: pointer; }
 .copy:hover { color: var(--fg); }
-.agents { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-top: 16px; }
+.agents { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin: 0 0 16px; }
+#agents .replay { margin-top: 16px; }
 .agent { border: 1px solid var(--border); border-radius: 10px; padding: 16px; }
 .agent .k { font-weight: 600; font-size: 15px; margin-bottom: 8px; }
 .agent code { font-size: 12.5px; color: var(--accent); }
@@ -251,5 +263,6 @@ td.num { font-family: var(--mono); font-size: 13px; white-space: nowrap; }
   .replay-foot > div + div { border-left: 0; border-top: 1px solid var(--border); }
   .row { grid-template-columns: 88px 1fr; }
   .screen { font-size: 11.5px; }
+  .hero-cmd pre { font-size: 11.5px; padding: 14px 12px; }
 }
 @media (prefers-reduced-motion: reduce) { .cursor { animation: none; } html { scroll-behavior: auto; } }

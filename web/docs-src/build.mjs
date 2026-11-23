@@ -153,7 +153,13 @@ function describe(md) {
 
 // ---- the site's header and footer -------------------------------------------------------------
 
-const indexHtml = fs.readFileSync(path.join(WEB, "index.html"), "utf8");
+// The release version (SAETTA_VERSION in src/main.c) on the home page: the badge next to the logo
+// and the structured data; the docs pages copy the header, so they follow.
+const VERSION = fs.readFileSync(path.join(ROOT, "src", "main.c"), "utf8").match(/#define SAETTA_VERSION "([^"]+)"/)[1];
+const indexHtml = fs
+  .readFileSync(path.join(WEB, "index.html"), "utf8")
+  .replace(/(<span class="ver">)v[^<]*(<\/span>)/, `$1v${VERSION}$2`)
+  .replace(/("softwareVersion": ")[^"]*(")/, `$1${VERSION}$2`);
 const absolute = (html) => html.replace(/href="#top"/g, 'href="/"').replace(/href="#([^"]+)"/g, 'href="/#$1"');
 const headerHtml = absolute(indexHtml.match(/<header class="nav">[\s\S]*?<\/header>/)[0]).replace(
   /<a href="\/docs\/">Docs<\/a>/,
@@ -294,6 +300,7 @@ function sitemap() {
 const outputs = new Map();
 pages.forEach((p, i) => outputs.set(path.join(OUT, p.out), pageHtml(p, i)));
 outputs.set(path.join(WEB, "sitemap.xml"), sitemap());
+outputs.set(path.join(WEB, "index.html"), indexHtml);
 
 function walk(dir) {
   if (!fs.existsSync(dir)) return [];

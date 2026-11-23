@@ -581,3 +581,104 @@ TEST(qgen_accelerator_prompt_kernels) {
     dbg("qgen qmmh_g_gen: max rel err %s vs f32 weights, %s vs half-rounded weights\n", fmt_e(a, sizeof a, gr_f32), fmt_e(b, sizeof b, gr_h));
     arena_reset(&arena);
 }
+
+static bool all_finite(const float *p, size_t n) {
+    for (size_t i = 0; i < n; i++)
+        if (!isfinite(p[i])) return false;
+    return true;
+}
+
+// The plain-path prompt matmuls (qmm_plain.metal, GPUs without tensor ops), every variant against
+// the scalar reference on the kernel's own roundings: activations and dequantized weights rounded
+// to half (the float-fragment variants keep both in f32), products summed in f64. Shapes cover
+// ragged rows and tokens on both tilings and the full-tile direct store; the error against the
+// unrounded f32 reference is printed (what half inputs cost).
+TEST(qgen_plain_prompt_matmuls) {
+    Arena arena = {0};
+    QgenCtx x;
+    EXPECT_OK(qgen_ctx_init(&arena, &x));
+    static const struct {
+        const char *dense, *grouped;
+        uint32_t rows;
+        bool half;
+    } vs[6] = {{"qmmp_l_gen", "qmmp_g_l_gen", 64, true},    {"qmmp_ldb_gen", "qmmp_g_ldb_gen", 64, true},
+               {"qmmp_lf_gen", "qmmp_g_lf_gen", 64, false}, {"qmmp_lfdb_gen", "qmmp_g_lfdb_gen", 64, false},
+               {"qmmp_m_gen", "qmmp_g_m_gen", 32, true},    {"qmmp_mdb_gen", "qmmp_g_mdb_gen", 32, true}};
+    // in, out, T: ragged rows and tokens on both tilings; full tiles of both (direct stores)
+    static const size_t shapes[3][3] = {{256, 100, 70}, {384, 128, 64}, {128, 40, 9}};
+    float worst[6] = {0}, worst_f32[6] = {0};
+    for (size_t ci = 0; ci < NCONFIGS; ci++) {
+        const uint32_t *cfg = configs[ci];
+        for (size_t si = 0; si < 3; si++) {
+            const size_t in = shapes[si][0], out = shapes[si][1], T = shapes[si][2];
+            OFFS(o, ci, 22 + si);
+            MAT(m, 1, out, in, cfg, o);
+            FLOATS(xb, T * in, -1, 1);
+            NEWBUF(yb, T * out * 4);
+            const float *xf = gpu_floats(xb);
+            float *xh = alloc_f(&x, T * in), *rh = alloc_f(&x, T * out), *rf = alloc_f(&x, T * out), *wr = alloc_f(&x, in);
+            for (size_t i = 0; i < T * in; i++) xh[i] = (float)(_Float16)xf[i];
+            for (size_t r = 0; r < out; r++) {
+                qgen_mat_row_plain(&m, 0, r, wr);
+                for (size_t t = 0; t < T; t++) rh[t * out + r] = dot_ref(wr, xh + t * in, in);
+                qgen_mat_row(&m, 0, r, wr);
+                for (size_t t = 0; t < T; t++) rf[t * out + r] = dot_ref(wr, xf + t * in, in);
+            }
+            sx_arg a[3];
+            qgen_mat_args(&m, a);
+            uint32_t d[3] = {(uint32_t)in, (uint32_t)out, (uint32_t)T};
+            uint32_t q[2] = {m.bits, m.group};
+            sx_arg args[] = {a[0], a[1], a[2], BUF(xb), BUF(yb), BYTES(&d), BYTES(&m.sh), BYTES(&q)};
+            for (size_t v = 0; v < 6; v++) {
+                memset(sx_buffer_contents(yb), 0xff, T * out * 4); // NaN: an unwritten output fails
+                RUN(qgen_plain_src, vs[v].dense, args, (out + vs[v].rows - 1) / vs[v].rows, (T + 31) / 32, 128);
+                EXPECT(all_finite(gpu_floats(yb), T * out));
+                CHECK(worst[v], vs[v].dense, cfg, gpu_floats(yb), vs[v].half ? rh : rf, T * out, TOL_QMM_REL);
+                worst_f32[v] = fmaxf(worst_f32[v], ops_max_rel_err(gpu_floats(yb), rf, T * out));
+            }
+            qgen_mat_deinit(&m);
+        }
+        { // grouped: 3 experts, tiles of at most 32 rows, one grid row past ntiles
+            enum { in = 256, out = 72, E = 3, M = 50 };
+            OFFS(o, ci, 25);
+            MAT(m, E, out, in, cfg, o);
+            FLOATS(xb, M * in, -1, 1);
+            NEWBUF(yb, M * out * 4);
+            const uint32_t tiles[3][4] = {{2, 0, 20, 0}, {0, 20, 37, 0}, {1, 37, 50, 0}};
+            NEWBUF(tb, sizeof tiles);
+            memcpy(sx_buffer_contents(tb), tiles, sizeof tiles);
+            NEWBUF(nt, 4);
+            *(uint32_t *)sx_buffer_contents(nt) = 3;
+            const float *xf = gpu_floats(xb);
+            float *xh = alloc_f(&x, M * in), *rh = alloc_f(&x, M * out), *rf = alloc_f(&x, M * out), *wr = alloc_f(&x, in);
+            for (size_t i = 0; i < M * in; i++) xh[i] = (float)(_Float16)xf[i];
+            for (size_t ti = 0; ti < 3; ti++)
+                for (size_t r = 0; r < out; r++) {
+                    qgen_mat_row_plain(&m, tiles[ti][0], r, wr);
+                    for (size_t row = tiles[ti][1]; row < tiles[ti][2]; row++) rh[row * out + r] = dot_ref(wr, xh + row * in, in);
+                    qgen_mat_row(&m, tiles[ti][0], r, wr);
+                    for (size_t row = tiles[ti][1]; row < tiles[ti][2]; row++) rf[row * out + r] = dot_ref(wr, xf + row * in, in);
+                }
+            sx_arg a[3];
+            qgen_mat_args(&m, a);
+            uint32_t d[3] = {in, out, 0};
+            uint32_t st[2] = {(uint32_t)qgen_mat_w_stride(&m), (uint32_t)qgen_mat_s_stride(&m)};
+            uint32_t q[2] = {m.bits, m.group};
+            sx_arg args[] = {a[0], a[1], a[2], BUF(xb), BUF(yb), BYTES(&d), BYTES(&m.sh), BUF(tb), BUF(nt), BYTES(&st), BYTES(&q)};
+            for (size_t v = 0; v < 6; v++) {
+                memset(sx_buffer_contents(yb), 0xff, M * out * 4);
+                RUN(qgen_plain_src, vs[v].grouped, args, (out + vs[v].rows - 1) / vs[v].rows, 3 + 1, 128);
+                EXPECT(all_finite(gpu_floats(yb), M * out));
+                CHECK(worst[v], vs[v].grouped, cfg, gpu_floats(yb), vs[v].half ? rh : rf, M * out, TOL_QMM_REL);
+                worst_f32[v] = fmaxf(worst_f32[v], ops_max_rel_err(gpu_floats(yb), rf, M * out));
+            }
+            qgen_mat_deinit(&m);
+        }
+    }
+    for (size_t v = 0; v < 6; v++) {
+        char a[32], b[32];
+        dbg("qgen %s (+ grouped): max rel err %s vs its roundings, %s vs the f32 reference\n", vs[v].dense,
+            fmt_e(a, sizeof a, worst[v]), fmt_e(b, sizeof b, worst_f32[v]));
+    }
+    arena_reset(&arena);
+}

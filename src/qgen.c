@@ -10,6 +10,8 @@ static const char *fx(char *buf, size_t cap, double x, int prec) {
 
 #include <assert.h>
 #include <math.h>
+#include <stdlib.h>
+#include <string.h>
 
 #include "attn27.h"
 #include "dsv4_moe.h"
@@ -25,6 +27,24 @@ const char qgen_mpp_src[] = {
     , '\n',
 #embed "kernels/qgen_mpp.metal"
     , 0};
+const char qgen_plain_src[] = {
+#embed "kernels/qgen_common.metal"
+    , '\n',
+#embed "kernels/qmm_plain.metal"
+    , 0};
+
+QmmpVariant qgen_plain_variant(void) {
+    static const char *const names[6][2] = {{"qmmp_l_gen", "qmmp_g_l_gen"},       {"qmmp_ldb_gen", "qmmp_g_ldb_gen"},
+                                            {"qmmp_lf_gen", "qmmp_g_lf_gen"},     {"qmmp_lfdb_gen", "qmmp_g_lfdb_gen"},
+                                            {"qmmp_m_gen", "qmmp_g_m_gen"},       {"qmmp_mdb_gen", "qmmp_g_mdb_gen"}};
+    static const char *const keys[6] = {"l", "ldb", "lf", "lfdb", "m", "mdb"};
+    const char *v = getenv("SAETTA_QMMP");
+    if (v && strcmp(v, "off") == 0) return (QmmpVariant){"", "", 0};
+    for (int i = 0; i < 6; i++)
+        if (v && strcmp(v, keys[i]) == 0) return (QmmpVariant){names[i][0], names[i][1], i < 4 ? 64u : 32u};
+    return (QmmpVariant){names[0][0], names[0][1], 64};
+}
+
 static const char qmatvec_src[] = {
 #embed "kernels/qmatvec.metal"
     , 0};
@@ -132,6 +152,19 @@ void qgen_mat_row_half(const QgenMat *m, size_t e, size_t r, float *out) {
         _Float16 sh = (_Float16)bf16(s, g);
         _Float16 bh = (_Float16)bf16(b, g);
         out[i] = (float)__builtin_fmaf16(q, sh, bh);
+    }
+}
+
+void qgen_mat_row_plain(const QgenMat *m, size_t e, size_t r, float *out) {
+    size_t rb = m->in * m->bits / 8;
+    const uint8_t *w = qgen_mat_bytes(m, 0) + e * qgen_mat_w_stride(m) + r * rb;
+    size_t groups = m->in / m->group;
+    const uint8_t *s = qgen_mat_bytes(m, 1) + e * qgen_mat_s_stride(m);
+    const uint8_t *b = qgen_mat_bytes(m, 2) + e * qgen_mat_s_stride(m);
+    for (size_t i = 0; i < m->in; i++) {
+        size_t g = r * groups + i / m->group;
+        float q = (float)qgen_unpack(w, rb, i, m->bits);
+        out[i] = (float)(_Float16)fmaf(q, bf16(s, g), bf16(b, g));
     }
 }
 
@@ -336,6 +369,20 @@ static void gr_run(const void *ctx, sx_cmd *cmd) {
     sx_cmd_dispatch(cmd, r->p, args, r->gen ? 11 : 10, r->m->out / 64, r->ntiles, 128);
 }
 
+// The same with 32 output rows per threadgroup (qmm_grouped_gen, qmmp_g_m*_gen).
+static void gr_run32(const void *ctx, sx_cmd *cmd) {
+    const GrRun *r = ctx;
+    sx_arg a[3];
+    qgen_mat_args(r->m, a);
+    uint32_t d[3] = {(uint32_t)r->m->in, (uint32_t)r->m->out, (uint32_t)r->M};
+    uint32_t st[2] = {(uint32_t)qgen_mat_w_stride(r->m), (uint32_t)qgen_mat_s_stride(r->m)};
+    uint32_t q[2] = {r->m->bits, r->m->group};
+    sx_arg args[11] = {a[0], a[1], a[2], gpu_buf_arg(r->xb), gpu_buf_arg(r->yb), gpu_bytes_arg(d, 12),
+                       gpu_bytes_arg(r->m->sh, 12), gpu_buf_arg(r->tb), gpu_buf_arg(r->nt), gpu_bytes_arg(st, 8),
+                       gpu_bytes_arg(q, 8)};
+    sx_cmd_dispatch(cmd, r->p, args, 11, r->m->out / 32, r->ntiles, 128);
+}
+
 // DeepSeek-V4-Flash routed experts (src/kernels/dsv4_moe.metal): act_quant, gate + up and the
 // summed down projection of T rows, 6 distinct experts per row, reps per command buffer, each
 // rep on other slots of a cache larger than the system cache.
@@ -401,6 +448,108 @@ static Err dsv4_bench(QgenCtx *x, FILE *out) {
     return OK;
 }
 
+typedef struct {
+    sx_pipeline *p;
+    const QgenMat *m;
+    sx_buffer *xb, *yb;
+    size_t T, rows;
+} PlRun;
+
+static void pl_run(const void *ctx, sx_cmd *cmd) {
+    const PlRun *r = ctx;
+    sx_arg a[3];
+    qgen_mat_args(r->m, a);
+    uint32_t d[3] = {(uint32_t)r->m->in, (uint32_t)r->m->out, (uint32_t)r->T};
+    uint32_t q[2] = {r->m->bits, r->m->group};
+    sx_arg args[8] = {a[0], a[1], a[2], gpu_buf_arg(r->xb), gpu_buf_arg(r->yb), gpu_bytes_arg(d, 12),
+                      gpu_bytes_arg(r->m->sh, 12), gpu_bytes_arg(q, 8)};
+    sx_cmd_dispatch(cmd, r->p, args, 8, (r->m->out + r->rows - 1) / r->rows, (r->T + 31) / 32, 128);
+}
+
+// Prompt matmuls on GPUs without tensor ops (qmm_plain.metal, every variant) against the f32
+// kernels they replace (qmm_gen, qmm_grouped_gen), f32 activations in and f32 out as the engine
+// calls them, TFLOP/s. Shapes: Qwen3.8-27B 4/64 gate (17408 x 5120) and down (5120 x 17408) at
+// T = 2048; Flash-Next routed experts 4/32 [512][2048] (32 experts, 2048 rows in 32-row tiles)
+// and an 8/64 projection (8192 x 2048). The matching ceiling is the simdgroup-matrix f16 rate of
+// the GPU cores, not F_f16 (that is the tensor-op rate): docs/ceiling.md has no figure for it.
+static Err plain_bench(QgenCtx *x, FILE *out) {
+    static const char *const vk[7] = {"f32", "l", "ldb", "lf", "lfdb", "m", "mdb"};
+    static const char *const vd[7] = {"qmm_gen", "qmmp_l_gen", "qmmp_ldb_gen", "qmmp_lf_gen", "qmmp_lfdb_gen", "qmmp_m_gen", "qmmp_mdb_gen"};
+    static const char *const vg[7] = {"qmm_grouped_gen", "qmmp_g_l_gen", "qmmp_g_ldb_gen", "qmmp_g_lf_gen",
+                                      "qmmp_g_lfdb_gen", "qmmp_g_m_gen", "qmmp_g_mdb_gen"};
+    static const size_t vrows[7] = {32, 64, 64, 64, 64, 32, 32};
+    static const struct {
+        const char *what;
+        size_t out, in;
+        uint32_t bits, group;
+    } dn[3] = {{"27B gate", 17408, 5120, 4, 64}, {"27B down", 5120, 17408, 4, 64}, {"flash proj", 8192, 2048, 8, 64}};
+    enum { T = 2048 };
+    sx_buffer *xb, *yb;
+    TRY(qgen_ctx_floats(x, (size_t)T * 17408, -1, 1, &xb));
+    TRY(gpu_new_buffer(&x->g, (size_t)T * 17408 * 4, &yb));
+    sx_pipeline *p;
+    double s;
+    for (size_t si = 0; si < 3; si++) {
+        QgenMat m;
+        static const uint32_t offs[3] = {3, 5, 7};
+        const uint32_t cfg[2] = {dn[si].bits, dn[si].group};
+        TRY(qgen_ctx_mat(x, 1, dn[si].out, dn[si].in, cfg, offs, &m));
+        const double flop = 2.0 * T * (double)dn[si].out * (double)dn[si].in;
+        Err e = OK;
+        for (size_t v = 0; v < 7 && !e; v++) {
+            e = qgen_ctx_pipe(x, v ? qgen_plain_src : qgen_src, vd[v], &p);
+            PlRun r = {p, &m, xb, yb, T, vrows[v]};
+            if (!e) e = timed(&x->g, &r, pl_run, &s);
+            if (!e) {
+                fprintf(out, "plain prompt %-10s %5zux%5zu %u/%-3u T=%d %-15s %8s us  %6s TFLOP/s\n", dn[si].what, dn[si].out,
+                        dn[si].in, cfg[0], cfg[1], T, vk[v], FX(s * 1e6, 1), FX(flop / s / 1e12, 2));
+                fflush(out);
+            }
+        }
+        qgen_mat_deinit(&m);
+        TRY(e);
+    }
+    { // routed experts, 32-row tiles
+        enum { E = 32, M = 2048, K = 2048, N = 512, NT = M / 32 };
+        sx_buffer *tb, *nt;
+        uint32_t tiles[NT][4];
+        for (uint32_t i = 0; i < NT; i++) {
+            tiles[i][0] = i % E;
+            tiles[i][1] = i * 32;
+            tiles[i][2] = i * 32 + 32;
+            tiles[i][3] = 0;
+        }
+        TRY(gpu_new_buffer(&x->g, sizeof tiles, &tb));
+        memcpy(sx_buffer_contents(tb), tiles, sizeof tiles);
+        TRY(gpu_new_buffer(&x->g, 4, &nt));
+        *(uint32_t *)sx_buffer_contents(nt) = NT;
+        QgenMat m;
+        static const uint32_t offs[3] = {3, 5, 7};
+        static const uint32_t cfg[2] = {4, 32};
+        TRY(qgen_ctx_mat(x, E, N, K, cfg, offs, &m));
+        const double flop = 2.0 * M * K * N;
+        Err e = OK;
+        for (size_t v = 0; v < 7 && !e; v++) {
+            e = qgen_ctx_pipe(x, v ? qgen_plain_src : qgen_src, vg[v], &p);
+            GrRun r = {p, &m, xb, yb, tb, nt, NT, M, true};
+            // gr_run's grid has out / 64 columns; the 32-row kernels take gr_run32's out / 32
+            if (!e) e = timed(&x->g, &r, vrows[v] == 64 ? gr_run : gr_run32, &s);
+            if (!e) {
+                fprintf(out, "plain prompt experts     2048x512x2048 x32 4/32  %-15s %8s us  %6s TFLOP/s\n", vk[v],
+                        FX(s * 1e6, 1), FX(flop / s / 1e12, 2));
+                fflush(out);
+            }
+        }
+        qgen_mat_deinit(&m);
+        sx_buffer_release(tb);
+        sx_buffer_release(nt);
+        TRY(e);
+    }
+    sx_buffer_release(xb);
+    sx_buffer_release(yb);
+    return OK;
+}
+
 // Decode matvecs: 24 distinct copies of the matrix per command buffer (more than the system
 // cache), GB/s of weights + scales + biases. Expert matvec: 10 slots x 24 reps over 240
 // distinct experts [640][2560]. Prompt grouped expert matmul (accelerators): 2048 rows over
@@ -408,6 +557,9 @@ static Err dsv4_bench(QgenCtx *x, FILE *out) {
 Err qgen_bench(Arena *a, FILE *out) {
     QgenCtx x;
     TRY(qgen_ctx_init(a, &x));
+    // SAETTA_QGEN_BENCH=plain: only the prompt matmuls of GPUs without tensor ops
+    const char *only = getenv("SAETTA_QGEN_BENCH");
+    if (only && strcmp(only, "plain") == 0) return plain_bench(&x, out);
     static const uint32_t cfgs[3][2] = {{4, 32}, {4, 64}, {5, 64}};
     static const size_t shapes[2][2] = {{6144, 2560}, {2560, 10240}}; // out x in
     sx_buffer *xb, *yb;
@@ -536,5 +688,6 @@ Err qgen_bench(Arena *a, FILE *out) {
     }
     TRY(dsv4_bench(&x, out));
     TRY(attn27_bench(a, out, NULL, 0)); // Qwen3.8-27B prompt attention (src/attn27.h)
+    TRY(plain_bench(&x, out));          // prompt matmuls without tensor ops
     return OK;
 }

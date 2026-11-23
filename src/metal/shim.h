@@ -64,6 +64,15 @@ size_t sx_buffer_length(const sx_buffer *b);
 sx_pipeline *sx_pipeline_from_source(sx_device *d, const char *source, const char *name, char *err, size_t err_cap);
 void sx_pipeline_release(sx_pipeline *p);
 uint32_t sx_pipeline_thread_width(const sx_pipeline *p);
+// The largest threadgroup the pipeline can run (maxTotalThreadsPerThreadgroup). It depends on the
+// kernel's register use and the GPU: on M1 and M2 it can be below 1024 (Strata saw 448 for a
+// 512-thread kernel on an M2 Max). SAETTA_METAL_MAX_THREADS_CAP=N lowers it to N (test hook).
+// Metal skips a dispatch above it without any error, so every dispatch here is checked: one that
+// does not fit is not encoded, its message (naming the kernel) goes to stderr, and
+// sx_dispatch_sync, sx_cmd_finish, sx_cmd_finish_timed and sx_cmd_wait then fail with it.
+uint32_t sx_pipeline_max_threads(const sx_pipeline *p);
+// The kernel's function name (the pipeline's label), NUL terminated, truncated to cap.
+void sx_pipeline_name(const sx_pipeline *p, char *buf, size_t cap);
 
 typedef struct {
     sx_buffer *buffer;  // NULL for an inline-bytes argument

@@ -3,6 +3,17 @@
 All notable changes to saetta and Saetta Code (`saetta code`), newest first. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are saetta's.
 
+## [0.18.0] - 2026-11-23
+
+### Added
+
+- Inkling 2 Mini (Thinking Machines, 26B mixture of experts, 3.4B active), first version: `saetta download inkling` (17 GB, from 32 GB of memory), served with its chat template and JSON tool calls. Checked layer by layer against a numpy reference built from the same weights. Not yet: speculative decoding, the M5's neural accelerators, reuse of a conversation that does not simply extend the last one.
+- M1 to M4: prompt reading with half-precision kernels of their own (simdgroup matrices, from MLX's and llama.cpp's designs) and prompt attention that shares each key and value block across tokens (from sushi's). Measured on an M5 Max forced onto that path: the 27B reads prompts 68% faster, the Coder 52%; not yet measured on an M1 to M4.
+
+### Fixed
+
+- A kernel asking for more threads than the GPU allows now fails with its name instead of returning garbage (Metal skips such a dispatch silently; M1 and M2 allow fewer threads for kernels with many registers).
+
 ## [0.17.1] - 2026-11-23
 
 ### Fixed

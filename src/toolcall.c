@@ -256,13 +256,12 @@ static Str arena_str(Arena *a, const Buf *b) {
     return str_n(d, b->len);
 }
 
-InkParsed toolcall_inkling(Arena *a, Str t, bool final) {
-    InkParsed r = {0};
-    Buf reasoning = {0}, content = {0};
-    VEC(Call) calls = {0};
-    InkMode mode = IM_IDLE;
-    size_t hdr = 0; // start of the pending header (IM_HEADER)
-    size_t p = 0;
+void toolcall_inkling_scan(Arena *a, InkScan *s, Str t, bool final) {
+    if (s->done) return;
+    s->in_call = false;
+    size_t p = s->p, hdr = s->hdr;
+    InkMode mode = (InkMode)s->mode;
+    Buf *reasoning = &s->reasoning, *content = &s->content;
     while (p < t.len) {
         if (mode == IM_TOOL) {
             // {"name":...,"args":{...}}, then optional whitespace and the block end; read
@@ -285,8 +284,12 @@ InkParsed toolcall_inkling(Arena *a, Str t, bool final) {
             bool closed = (m.len && (str_eq(m, ink_end) || str_eq(m, ink_end_sampling))) || (final && oe && e == t.len);
             Call c;
             if (closed && ink_call(a, str_sub(t, q, oe), &c)) {
-                vec_push(&calls, c);
-                if (str_eq(m, ink_end_sampling)) r.ended = true;
+                if (s->n_calls == s->cap_calls) {
+                    s->cap_calls = s->cap_calls ? 2 * s->cap_calls : 4;
+                    s->calls = xrealloc(s->calls, s->cap_calls * sizeof(Call));
+                }
+                s->calls[s->n_calls++] = c;
+                if (str_eq(m, ink_end_sampling)) s->ended = true;
                 p = e + m.len;
                 mode = IM_IDLE;
                 continue;
@@ -296,25 +299,25 @@ InkParsed toolcall_inkling(Arena *a, Str t, bool final) {
             if (closed) {
                 end = e;
                 after = e + m.len;
-                if (str_eq(m, ink_end_sampling)) r.ended = true;
+                if (str_eq(m, ink_end_sampling)) s->ended = true;
             } else {
                 ptrdiff_t be = str_find(t, ink_end, oe ? oe : p), bs = str_find(t, ink_end_sampling, oe ? oe : p);
                 ptrdiff_t bx = be < 0 ? bs : bs < 0 ? be : MIN(be, bs);
                 if (bx >= 0 && !open) {
                     end = (size_t)bx;
                     after = end + (bx == be ? ink_end.len : ink_end_sampling.len);
-                    if (bx != be) r.ended = true;
+                    if (bx != be) s->ended = true;
                 } else if (!final) {
-                    r.in_call = true; // still being written, or its end is not known yet
+                    s->in_call = true; // still being written, or its end is not known yet
                     break;
                 } else if (bx >= 0) {
                     end = (size_t)bx; // cut off: the first block end
                     after = end + (bx == be ? ink_end.len : ink_end_sampling.len);
-                    if (bx != be) r.ended = true;
+                    if (bx != be) s->ended = true;
                 }
             }
-            buf_add(&content, t.ptr + p, end - p);
-            r.bad_call = true;
+            buf_add(content, t.ptr + p, end - p);
+            s->bad_call = true;
             p = after;
             mode = IM_IDLE;
             continue;
@@ -322,7 +325,7 @@ InkParsed toolcall_inkling(Arena *a, Str t, bool final) {
         Str m = ink_marker_at(t, p);
         if (m.len == 0 && !final && ink_partial_marker(t, p)) break; // wait for the next token
         bool block_end = m.len && (str_eq(m, ink_end) || str_eq(m, ink_end_sampling));
-        if (block_end && str_eq(m, ink_end_sampling)) r.ended = true;
+        if (block_end && str_eq(m, ink_end_sampling)) s->ended = true;
         if (mode == IM_TEXT || mode == IM_REASONING) {
             if (block_end) {
                 mode = IM_IDLE;
@@ -332,14 +335,14 @@ InkParsed toolcall_inkling(Arena *a, Str t, bool final) {
             // text up to the next possible marker start
             size_t e = p + 1;
             while (e < t.len && t.ptr[e] != '<') e++;
-            buf_add(mode == IM_TEXT ? &content : &reasoning, t.ptr + p, e - p);
+            buf_add(mode == IM_TEXT ? content : reasoning, t.ptr + p, e - p);
             p = e;
             continue;
         }
         // IM_IDLE or IM_HEADER: a marker opens, closes or starts a message
         if (m.len) {
             if (mode == IM_HEADER && (block_end || str_eq(m, ink_model)))
-                buf_add(&content, t.ptr + hdr, p - hdr); // a header with no content is text
+                buf_add(content, t.ptr + hdr, p - hdr); // a header with no content is text
             p += m.len;
             if (str_eq(m, ink_model)) {
                 mode = IM_HEADER;
@@ -357,20 +360,36 @@ InkParsed toolcall_inkling(Arena *a, Str t, bool final) {
         }
         size_t e = p + 1;
         while (e < t.len && t.ptr[e] != '<') e++;
-        if (mode == IM_IDLE) buf_add(&content, t.ptr + p, e - p);
+        if (mode == IM_IDLE) buf_add(content, t.ptr + p, e - p);
         p = e; // header bytes stay in t until the header resolves
     }
-    if (mode == IM_HEADER && final) buf_add(&content, t.ptr + hdr, t.len - hdr);
+    if (mode == IM_HEADER && final) buf_add(content, t.ptr + hdr, t.len - hdr);
+    s->p = p;
+    s->hdr = hdr;
+    s->mode = (int)mode;
+    s->done = final;
+}
+
+void toolcall_inkling_free(InkScan *s) {
+    buf_free(&s->reasoning);
+    buf_free(&s->content);
+    free(s->calls);
+    *s = (InkScan){0};
+}
+
+size_t toolcall_utf8_whole(Str s) { return utf8_whole(s); }
+
+InkParsed toolcall_inkling(Arena *a, Str t, bool final) {
+    InkScan s = {0};
+    toolcall_inkling_scan(a, &s, t, final);
+    InkParsed r = {.in_call = s.in_call, .bad_call = s.bad_call, .ended = s.ended, .n_calls = s.n_calls};
     if (!final) {
-        reasoning.len = utf8_whole(buf_str(&reasoning));
-        content.len = utf8_whole(buf_str(&content));
+        s.reasoning.len = utf8_whole(buf_str(&s.reasoning));
+        s.content.len = utf8_whole(buf_str(&s.content));
     }
-    r.reasoning = arena_str(a, &reasoning);
-    r.content = arena_str(a, &content);
-    r.n_calls = calls.len;
-    if (calls.len) r.calls = arena_dup(a, calls.ptr, calls.len * sizeof(Call));
-    vec_free(&calls);
-    buf_free(&reasoning);
-    buf_free(&content);
+    r.reasoning = arena_str(a, &s.reasoning);
+    r.content = arena_str(a, &s.content);
+    if (s.n_calls) r.calls = arena_dup(a, s.calls, s.n_calls * sizeof(Call));
+    toolcall_inkling_free(&s);
     return r;
 }

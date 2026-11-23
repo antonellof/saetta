@@ -109,6 +109,12 @@ struct ArenaChunk {
 
 #define ARENA_CHUNK (64u << 10)
 
+size_t arena_size(const Arena *a) {
+    size_t n = 0;
+    for (const ArenaChunk *c = a->head; c; c = c->next) n += c->cap;
+    return n;
+}
+
 void *arena_alloc(Arena *a, size_t n) {
     n = ALIGN_UP(n ? n : 1, 16);
     ArenaChunk *c = a->head;

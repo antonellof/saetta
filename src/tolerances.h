@@ -155,4 +155,20 @@
 // bounded so a wrong assumption shared by kernel and mirror still fails the test.
 #define TOL_ATTN27_EXACT_REL 1e-2
 
+
+// Inkling 2 Mini kernels (src/kernels/inkling_*.metal) against their scalar references (f32
+// values, f64 sums) on random data: max |gpu - ref| / max |ref| per output. f32 sums of up to
+// 2304 terms in a different order.
+#define TOL_INK_KERNEL_REL 2e-5f // f32
+// Inkling verify: a router whose own top-8 differs from the oracle's where the oracle's 8th - 9th
+// biased-score margin exceeds this is a bug, not rounding (f32 scores of these sizes differ from
+// f64 by about 1e-6; measured near ties are 3e-7 to 1e-6).
+#define TOL_INK_ROUTE_MARGIN 1e-4f // f32
+// The share of positions whose greedy argmax is skipped as a near tie (TOL_ARGMAX_MARGIN) may not
+// exceed this (measured 3 of 8329, 0.04%).
+#define TOL_INK_ARGMAX_SKIP_FRAC 0.005 // f64
+// Own routing, at the dumped positions before the first position where any visit's router
+// differs from the oracle's: the same per-visit bound as on the oracle's experts.
+#define TOL_INK_OWN_LAYER_REL 5e-5f // f32
+
 #endif

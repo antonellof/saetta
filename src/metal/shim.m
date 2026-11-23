@@ -160,9 +160,56 @@ sx_pipeline *sx_pipeline_from_source(sx_device *d, const char *source, const cha
     if (!lib) { copy_err(err, err_cap, e.localizedDescription); return NULL; }
     id<MTLFunction> fn = [lib newFunctionWithName:[NSString stringWithUTF8String:name]];
     if (!fn) { copy_err(err, err_cap, [NSString stringWithFormat:@"no function %s", name]); return NULL; }
-    id<MTLComputePipelineState> p = [dev newComputePipelineStateWithFunction:fn error:&e];
+    // labelled with the function name, so a dispatch that does not fit can name its kernel
+    MTLComputePipelineDescriptor *pd = [MTLComputePipelineDescriptor new];
+    pd.computeFunction = fn;
+    pd.label = [NSString stringWithUTF8String:name];
+    id<MTLComputePipelineState> p = [dev newComputePipelineStateWithDescriptor:pd
+                                                                       options:MTLPipelineOptionNone
+                                                                    reflection:nil
+                                                                         error:&e];
     if (!p) { copy_err(err, err_cap, e.localizedDescription); return NULL; }
     return (__bridge_retained sx_pipeline *)p;
+}
+
+// SAETTA_METAL_MAX_THREADS_CAP=N: every pipeline reports at most N (read once; a test hook).
+static uint32_t threads_cap(void) {
+    static uint32_t cap = 0;
+    if (cap == 0) {
+        const char *v = getenv("SAETTA_METAL_MAX_THREADS_CAP");
+        long n = v ? strtol(v, NULL, 10) : 0;
+        cap = n > 0 ? (uint32_t)n : UINT32_MAX;
+    }
+    return cap;
+}
+
+uint32_t sx_pipeline_max_threads(const sx_pipeline *p) {
+    uint32_t n = (uint32_t)((__bridge id<MTLComputePipelineState>)(void *)p).maxTotalThreadsPerThreadgroup;
+    uint32_t cap = threads_cap();
+    return n < cap ? n : cap;
+}
+
+void sx_pipeline_name(const sx_pipeline *p, char *buf, size_t cap) {
+    NSString *l = ((__bridge id<MTLComputePipelineState>)(void *)p).label;
+    copy_err(buf, cap, l ? l : @"(unnamed)");
+}
+
+// 0 when a threadgroup of `threads` threads fits p, else 1 with the message in err (and on stderr).
+static int check_fit(const sx_pipeline *p, size_t threads, char *err, size_t err_cap) {
+    uint32_t max = sx_pipeline_max_threads(p);
+    if (threads <= max) return 0;
+    char name[128];
+    sx_pipeline_name(p, name, sizeof name);
+    char msg[256];
+    snprintf(msg, sizeof msg,
+             "kernel %s: threadgroup of %zu threads exceeds its maxTotalThreadsPerThreadgroup %u on this GPU; not run",
+             name, threads, max);
+    fprintf(stderr, "saetta: %s\n", msg);
+    if (err && err_cap) {
+        strncpy(err, msg, err_cap - 1);
+        err[err_cap - 1] = 0;
+    }
+    return 1;
 }
 
 void sx_pipeline_release(sx_pipeline *p) { if (p) (void)(__bridge_transfer id)(void *)p; }
@@ -173,6 +220,7 @@ uint32_t sx_pipeline_thread_width(const sx_pipeline *p) {
 
 int sx_dispatch_sync(sx_device *d, sx_pipeline *p, const sx_arg *args, size_t nargs,
                      size_t groups, size_t threads, char *err, size_t err_cap) {
+    if (check_fit(p, threads, err, err_cap)) return 1;
     id<MTLCommandQueue> q = (__bridge id<MTLCommandQueue>)d->queue;
     id<MTLCommandBuffer> cb = [q commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
@@ -194,7 +242,30 @@ int sx_dispatch_sync(sx_device *d, sx_pipeline *p, const sx_arg *args, size_t na
 struct sx_cmd {
     void *cb;   // id<MTLCommandBuffer>, retained
     void *enc;  // id<MTLComputeCommandEncoder>, retained
+    int unfit;  // a dispatch did not fit its pipeline (not encoded); finish and wait fail
+    char unfit_msg[256];
 };
+
+// A dispatch whose threadgroup exceeds the pipeline's limit is not encoded (Metal would skip it
+// without an error and leave its outputs stale); the first one is recorded for finish and wait.
+static int cmd_unfit(sx_cmd *c, const sx_pipeline *p, size_t threads) {
+    if (threads <= sx_pipeline_max_threads(p)) return 0;
+    char tmp[256];
+    check_fit(p, threads, tmp, sizeof tmp);
+    if (!c->unfit) {
+        c->unfit = 1;
+        memcpy(c->unfit_msg, tmp, sizeof tmp);
+    }
+    return 1;
+}
+static int cmd_unfit_err(const sx_cmd *c, char *err, size_t err_cap) {
+    if (!c->unfit) return 0;
+    if (err && err_cap) {
+        strncpy(err, c->unfit_msg, err_cap - 1);
+        err[err_cap - 1] = 0;
+    }
+    return 1;
+}
 
 sx_cmd *sx_cmd_begin(sx_device *d) {
     id<MTLCommandQueue> q = (__bridge id<MTLCommandQueue>)d->queue;
@@ -208,6 +279,7 @@ sx_cmd *sx_cmd_begin(sx_device *d) {
 
 void sx_cmd_dispatch(sx_cmd *c, sx_pipeline *p, const sx_arg *args, size_t nargs,
                      size_t groups_x, size_t groups_y, size_t threads) {
+    if (cmd_unfit(c, p, threads)) return;
     id<MTLComputeCommandEncoder> enc = (__bridge id<MTLComputeCommandEncoder>)c->enc;
     [enc setComputePipelineState:(__bridge id<MTLComputePipelineState>)(void *)p];
     for (size_t i = 0; i < nargs; i++) {
@@ -242,7 +314,9 @@ int sx_cmd_finish(sx_cmd *c, char *err, size_t err_cap) {
     [enc endEncoding];
     [cb commit];
     wait_cb(cb);
+    int unfit = cmd_unfit_err(c, err, err_cap);
     free(c);
+    if (unfit) return 1;
     if (cb.error) { copy_err(err, err_cap, cb.error.localizedDescription); return 1; }
     return 0;
 }
@@ -258,7 +332,9 @@ void sx_cmd_commit(sx_cmd *c) {
 int sx_cmd_wait(sx_cmd *c, char *err, size_t err_cap) {
     id<MTLCommandBuffer> cb = CFBridgingRelease(c->cb);
     wait_cb(cb);
+    int unfit = cmd_unfit_err(c, err, err_cap);
     free(c);
+    if (unfit) return 1;
     if (cb.error) { copy_err(err, err_cap, cb.error.localizedDescription); return 1; }
     return 0;
 }
@@ -277,14 +353,17 @@ int sx_cmd_finish_timed(sx_cmd *c, double *gpu_seconds, char *err, size_t err_ca
     [enc endEncoding];
     [cb commit];
     [cb waitUntilCompleted];
+    int unfit = cmd_unfit_err(c, err, err_cap);
     free(c);
     *gpu_seconds = cb.GPUEndTime - cb.GPUStartTime;
+    if (unfit) return 1;
     if (cb.error) { copy_err(err, err_cap, cb.error.localizedDescription); return 1; }
     return 0;
 }
 
 void sx_cmd_dispatch3(sx_cmd *c, sx_pipeline *p, const sx_arg *args, size_t nargs,
                       size_t groups_x, size_t groups_y, size_t groups_z, size_t threads) {
+    if (cmd_unfit(c, p, threads)) return;
     id<MTLComputeCommandEncoder> enc = (__bridge id<MTLComputeCommandEncoder>)c->enc;
     [enc setComputePipelineState:(__bridge id<MTLComputePipelineState>)(void *)p];
     for (size_t i = 0; i < nargs; i++) {

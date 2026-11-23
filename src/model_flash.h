@@ -179,6 +179,16 @@ struct Model {
     // Prefill 4-bit matmuls on the accelerators in half precision (8-bit router and gates stay
     // f32). Off with SAETTA_PREFILL_F32=1 (exact f32 path) or when the kernels do not compile.
     bool fast_prefill;
+    // GPUs without tensor ops (mpp NULL): prompt matmuls on half tiles (src/kernels/qmm_plain.metal,
+    // dense and grouped experts, qmmp_rows output rows per threadgroup; the routers stay f32);
+    // NULL with SAETTA_QMMP=off. plain_half: they serve the prompt chunks (off with
+    // SAETTA_PREFILL_F32=1; verify turns it off for the exact path, as fast_prefill).
+    sx_pipeline *qmmp, *qmmp_g;
+    uint32_t qmmp_rows;
+    bool plain_half;
+    // Prompt-chunk attention without tensor ops (src/attn_sg.h) for the plain path; NULL when it
+    // does not load or with SAETTA_ATTN_SG_OLD=1 (attn_split_gh then serves every chunk).
+    sx_pipeline *attn_sg;
     Layer *layers; // num_hidden_layers
     Residual mixer;
     Linear embed, lm_head;

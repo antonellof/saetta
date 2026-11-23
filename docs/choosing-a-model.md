@@ -25,6 +25,7 @@ When no pack is named, `saetta start` uses the first downloaded pack that fits t
 | `27b-coder390-8bit` (with MTP) | the same, from its Q8_0 GGUF | 31 GB | 48 GB | n/p | n/p |
 | `27b-fable5` (with MTP) | [Fable-5 Coding Distilled](https://huggingface.co/khazarai/Qwen3.8-27B-Fable-5-Coding-Distilled), a Qwen3.8-27B coding distill, from [mradermacher's](https://huggingface.co/mradermacher/Qwen3.8-27B-Fable-5-Coding-Distilled-i1-GGUF) imatrix Q4_K_M GGUF | 20 GB | 36 GB | n/p | n/p |
 | `27b-fable5-8bit` (with MTP) | the same, from its Q8_0 GGUF | 31 GB | 48 GB | n/p | n/p |
+| `inkling` | [Inkling 2 Mini](https://huggingface.co/mlx-community/Inkling-2-Mini-4bit) (Thinking Machines), 128 experts, 8 active, dense layers 4-bit, experts NVFP4 / MXFP8 | 17 GB | 32 GB | Verified 79.2 ⁴ | 71.6 ⁴ |
 
 SWE-bench and Terminal-Bench are the publishers' scores for the full-precision model, each with its own harness, not measured by Saetta on these packs:
 

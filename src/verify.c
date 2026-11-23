@@ -3,8 +3,10 @@
 
 #include <math.h>
 #include <stdlib.h>
+#include <unistd.h>
 
 #include "gpu.h"
+#include "inkling.h"
 #include "json.h"
 #include "model.h"
 #include "tolerances.h"
@@ -307,6 +309,253 @@ static Err verify_dsv4(Arena *a, FILE *out, const Pack *pack, const char *pack_d
     return OK;
 }
 
+// ---- Inkling 2 Mini ----------------------------------------------------------------------------
+//
+// Its 48 visits route every token to 8 of 128 experts by a hard top-8, and over a long prompt
+// some tokens' 8th and 9th scores sit within f32 rounding of each other (measured: a gap of
+// 3.2e-7 at one token of the 1815-token golden, gaps under 1e-6 in most visits at 8329 tokens):
+// the oracle and the engine's paths can pick different experts there, and one such token's
+// difference reaches every later token through the convs and attention. The golden holds the
+// oracle's choices and their margins (routes.u8, margins.f32; src/inkling.h), so:
+// - on the oracle's experts (INK_ROUTES_REPLAY; the weights stay the engine's): decode token by
+//   token, the chunked prefill (PCH tokens) and the prefill in 200-token chunks (the ring wraps
+//   inside a chunk), each with the generic bounds on every dumped visit and the logits, greedy
+//   argmax outside near ties; every router's own top-8 is compared with the oracle's, and a
+//   difference where the oracle's margin exceeds TOL_INK_ROUTE_MARGIN fails;
+// - on its own experts, as served: decode's per-visit bound (TOL_INK_OWN_LAYER_REL) at the dumped
+//   positions before its first difference from the oracle's routes, greedy argmax at every
+//   position outside near ties (at most TOL_INK_ARGMAX_SKIP_FRAC of them skipped), KL at the
+//   dumped positions; the chunked prefill's last-token KL and argmax (TOL_PREFILL_FAST_KL); a
+//   verification chunk.
+// Goldens longer than a prompt chunk are run in pieces (the prefill trace of a piece only).
+
+#define INK_PIECE 1024
+
+typedef struct {
+    float worst_logits;
+    double worst_kl;
+    size_t aok, askip, abad;
+} InkDec;
+
+// Decode over the golden: err [npos][L] the per-visit error at each dumped position.
+static Err ink_decode(Arena *a, FILE *out, Model *m, Session *s, const DsGolden *G, const uint32_t *tokens, const size_t *pidx,
+                      float *err, InkDec *r) {
+    const size_t L = G->layers, W = G->width, V = G->vocab;
+    float *trace = ARENA_ARRAY(a, float, L * W);
+    *r = (InkDec){0};
+    session_reset(s);
+    char b1[64];
+    for (size_t t = 0; t < G->ntok; t++) {
+        const size_t pi = pidx[t];
+        s->trace = pi < G->npos ? trace : NULL;
+        s->trace_len = pi < G->npos ? L * W : 0;
+        float *logits;
+        Err e = model_step(m, s, tokens[t], &logits);
+        if (e) {
+            s->trace = NULL;
+            return e;
+        }
+        if (pi < G->npos) {
+            for (size_t li = 0; li < L; li++) err[pi * L + li] = rel(trace + li * W, G->xs + (pi * L + li) * W, W);
+            r->worst_logits = fmaxf(r->worst_logits, rel(logits, G->ls + pi * V, V));
+            r->worst_kl = fmax(r->worst_kl, kl(G->ls + pi * V, logits, V));
+        }
+        const JValue *ref = G->top2->arr.items[t];
+        const size_t best = argmax_scan(logits, V), want = (size_t)json_get(ref, "argmax")->i;
+        const double margin = jf(json_get(ref, "top1")) - jf(json_get(ref, "top2"));
+        if (best == want)
+            r->aok++;
+        else if (margin < TOL_ARGMAX_MARGIN)
+            r->askip++;
+        else {
+            r->abad++;
+            fmt_fixed(b1, sizeof b1, margin, 4);
+            fprintf(out, "argmax differs at position %zu: engine %zu, reference %zu (margin %s)\n", t, best, want, b1);
+        }
+    }
+    s->trace = NULL;
+    s->trace_len = 0;
+    return OK;
+}
+
+// The prefill over the golden in pieces: per-visit worst at the dumped positions; the last
+// logits in *plog.
+static Err ink_prefill(Model *m, Session *s, sx_buffer *tb, const DsGolden *G, const uint32_t *tokens, const size_t *pidx,
+                       float *pw, float **plog) {
+    const size_t L = G->layers, W = G->width, N = G->ntok;
+    for (size_t li = 0; li < L; li++) pw[li] = 0;
+    session_reset(s);
+    for (size_t t0 = 0; t0 < N; t0 += INK_PIECE) {
+        const size_t n = MIN((size_t)INK_PIECE, N - t0);
+        TRY(model_prefill(m, s, tokens + t0, n, tb, plog));
+        const float *tr = gpu_floats(tb);
+        for (size_t t = t0; t < t0 + n; t++) {
+            const size_t pi = pidx[t];
+            if (pi == G->npos) continue;
+            for (size_t li = 0; li < L; li++) pw[li] = fmaxf(pw[li], rel(tr + (li * n + t - t0) * W, G->xs + (pi * L + li) * W, W));
+        }
+    }
+    return OK;
+}
+
+// The routers' own top-8 against the oracle's over the last run: a difference at a clear margin fails.
+static bool ink_routes_ok(FILE *out, Model *m, const char *what, InkRouteStats *st) {
+    *st = inkling_route_stats(m);
+    char b1[64];
+    verify_fmt_e(b1, sizeof b1, TOL_INK_ROUTE_MARGIN, true, -1);
+    fprintf(out, "  %s: own top-8 differs from the oracle's at %u (visit, token) pairs with margin over %s%s, %u at near ties\n", what,
+            st->flips_sure, b1, st->flips_sure ? "  FAIL" : "", st->flips_near);
+    return st->flips_sure == 0;
+}
+
+static Err verify_inkling(Arena *a, FILE *out, const Pack *pack, const char *pack_dir, const DsGolden *G, bool *okp) {
+    if (access(path_join(a, G->dir, "routes.u8"), R_OK) != 0 || access(path_join(a, G->dir, "margins.f32"), R_OK) != 0)
+        return "GoldenWithoutRoutes";
+    setenv("SAETTA_INK_ROUTES", G->dir, 1);
+    Gpu g;
+    Err err = gpu_init(a, pack, &g);
+    if (err) {
+        unsetenv("SAETTA_INK_ROUTES");
+        return err;
+    }
+    Model *m;
+    Session *s;
+    err = model_load(a, pack, &g, &m);
+    unsetenv("SAETTA_INK_ROUTES");
+    const ModelInfo *mi = err ? NULL : model_info(m);
+    if (!err && (G->layers != mi->layers || G->width != mi->width || G->vocab != mi->vocab)) err = "GoldenShapeMismatch";
+    if (!err && !inkling_has_routes(m)) err = "GoldenWithoutRoutes";
+    if (!err) err = session_create_kv(m, &g, false, &s);
+    if (!err && s->cap < G->ntok) err = "GoldenLongerThanContext";
+    if (err) {
+        gpu_deinit(&g);
+        return err;
+    }
+    const size_t L = G->layers, W = G->width, V = G->vocab, N = G->ntok, P = G->npos;
+    fprintf(out, "model: %s, pack %s, %zu tokens, %zu dumped positions\n", mi->name, pack_dir, N, P);
+    char b1[64], b2[64], b3[64], b4[64];
+    uint32_t *tokens = ARENA_ARRAY(a, uint32_t, N);
+    for (size_t t = 0; t < N; t++) tokens[t] = (uint32_t)G->toks->arr.items[t]->i;
+    size_t *pidx = ARENA_ARRAY(a, size_t, N); // position -> dump index, or npos
+    for (size_t t = 0; t < N; t++) pidx[t] = P;
+    for (size_t i = 0; i < P; i++) pidx[(size_t)G->poss->arr.items[i]->i] = i;
+    const float *last = G->ls + (P - 1) * V;
+    const size_t want_last = (size_t)top2_argmax(G->top2, N - 1);
+    bool ok = true;
+    float *derr = ARENA_ARRAY(a, float, P * L), *pw = ARENA_ARRAY(a, float, L);
+    sx_buffer *tb = NULL;
+    InkDec dr;
+    InkRouteStats rs;
+
+    // on the oracle's experts
+    inkling_set_routes(m, INK_ROUTES_REPLAY);
+    err = ink_decode(a, out, m, s, G, tokens, pidx, derr, &dr);
+    if (!err) {
+        fprintf(out, "decode, the oracle's experts: visit  max rel err (hidden states, %zu positions)\n", P);
+        for (size_t li = 0; li < L; li++) {
+            float w = 0;
+            for (size_t i = 0; i < P; i++) w = fmaxf(w, derr[i * L + li]);
+            const bool bad = w > TOL_LAYER_REL;
+            ok = ok && !bad;
+            fprintf(out, "%5zu  %s%s\n", li, e3(b1, w), bad ? "  FAIL" : "");
+        }
+        const bool lbad = dr.worst_logits > TOL_LOGITS_REL;
+        ok = ok && !lbad && dr.abad == 0;
+        fprintf(out, "decode, the oracle's experts: logits max rel err %s%s; greedy argmax %zu equal, %zu near ties skipped, %zu different%s\n",
+                e3(b1, dr.worst_logits), lbad ? "  FAIL" : "", dr.aok, dr.askip, dr.abad, dr.abad ? "  FAIL" : "");
+        ok = ink_routes_ok(out, m, "decode routers", &rs) && ok;
+    }
+    float *plog = NULL;
+    if (!err) err = gpu_new_buffer(&g, L * INK_PIECE * W * 4, &tb);
+    static const char *const chunks[2] = {NULL, "200"};
+    for (int k = 0; k < 2 && !err; k++) {
+        if (chunks[k]) setenv("SAETTA_INK_PCH", chunks[k], 1);
+        err = ink_prefill(m, s, tb, G, tokens, pidx, pw, &plog);
+        unsetenv("SAETTA_INK_PCH");
+        if (err) break;
+        float pmax = 0;
+        for (size_t li = 0; li < L; li++) pmax = fmaxf(pmax, pw[li]);
+        const float lr = rel(plog, last, V);
+        const bool eq = argmax_scan(plog, V) == want_last;
+        bool pok = lr <= TOL_LOGITS_REL && eq && pmax <= TOL_LAYER_REL;
+        ok = ok && pok;
+        fprintf(out, "prefill (%s-token chunks), the oracle's experts: worst visit rel err %s, last-token logits %s, argmax %s%s\n",
+                chunks[k] ? chunks[k] : "256", e3(b1, pmax), e3(b2, lr), eq ? "equal" : "DIFFERENT", pok ? "" : "  FAIL");
+        for (size_t li = 0; li < L; li++)
+            if (pw[li] > TOL_LAYER_REL) fprintf(out, "  visit %zu: %s  FAIL\n", li, e3(b1, pw[li]));
+        ok = ink_routes_ok(out, m, "prefill routers", &rs) && ok;
+    }
+
+    // on its own experts
+    inkling_set_routes(m, INK_ROUTES_OWN);
+    if (!err) err = ink_decode(a, out, m, s, G, tokens, pidx, derr, &dr);
+    if (!err) {
+        rs = inkling_route_stats(m);
+        float before = 0, after = 0;
+        size_t nbefore = 0;
+        for (size_t i = 0; i < P; i++) {
+            const size_t pos = (size_t)G->poss->arr.items[i]->i;
+            for (size_t li = 0; li < L; li++) {
+                if (pos < rs.first_flip) before = fmaxf(before, derr[i * L + li]);
+                else after = fmaxf(after, derr[i * L + li]);
+            }
+            nbefore += pos < rs.first_flip;
+        }
+        const bool skip_bad = (double)dr.askip > TOL_INK_ARGMAX_SKIP_FRAC * (double)N;
+        const bool dok = before <= TOL_INK_OWN_LAYER_REL && dr.abad == 0 && !skip_bad && dr.worst_kl <= TOL_PREFILL_FAST_KL;
+        ok = ok && dok;
+        if (rs.first_flip == UINT32_MAX) snprintf(b3, sizeof b3, "none");
+        else snprintf(b3, sizeof b3, "position %u", rs.first_flip);
+        fprintf(out,
+                "decode, its own experts: first route different from the oracle's: %s; worst visit rel err %s at the %zu dumped "
+                "positions before it, %s after it (not gated); max KL(ref||engine) %s; greedy argmax %zu equal, %zu near ties "
+                "skipped, %zu different%s\n",
+                b3, e3(b1, before), nbefore, e3(b2, after), e3d(b4, dr.worst_kl), dr.aok, dr.askip, dr.abad, dok ? "" : "  FAIL");
+    }
+    if (!err) err = ink_prefill(m, s, tb, G, tokens, pidx, pw, &plog);
+    if (!err) {
+        (void)inkling_route_stats(m);
+        float pmax = 0;
+        for (size_t li = 0; li < L; li++) pmax = fmaxf(pmax, pw[li]);
+        const double k = kl(last, plog, V);
+        const bool eq = argmax_scan(plog, V) == want_last, pok = k <= TOL_PREFILL_FAST_KL && eq;
+        ok = ok && pok;
+        fprintf(out, "prefill (chunks), its own experts: worst visit rel err %s (not gated), last-token KL(ref||engine) %s, argmax %s%s\n",
+                e3(b1, pmax), e3d(b2, k), eq ? "equal" : "DIFFERENT", pok ? "" : "  FAIL");
+    }
+    if (tb) sx_buffer_release(tb);
+
+    // a verification chunk: every position's logits from one chunk
+    if (!err) {
+        session_reset(s);
+        const size_t nv = MIN(N, (size_t)KMAX);
+        float *vl;
+        err = model_verify_chunk(m, s, tokens, nv, &vl);
+        if (!err) {
+            size_t vbad = 0;
+            double vkl = 0;
+            for (size_t t = 0; t < nv; t++) {
+                vbad += argmax_scan(vl + t * V, V) != (size_t)top2_argmax(G->top2, t);
+                if (pidx[t] < P) vkl = fmax(vkl, kl(G->ls + pidx[t] * V, vl + t * V, V));
+            }
+            const bool vok = vbad == 0 && vkl <= TOL_PREFILL_FAST_KL;
+            ok = ok && vok;
+            fprintf(out, "verify chunk (%zu tokens, all logits): greedy %zu/%zu equal, max KL %s%s\n", nv, nv - vbad, nv, e3d(b1, vkl),
+                    vok ? "" : "  FAIL");
+        }
+    }
+    verify_fmt_e(b1, sizeof b1, TOL_LAYER_REL, true, -1);
+    verify_fmt_e(b2, sizeof b2, TOL_LOGITS_REL, true, -1);
+    verify_fmt_e(b3, sizeof b3, TOL_PREFILL_FAST_KL, false, -1);
+    if (!err)
+        fprintf(out, "verify: %s (tolerances: visit %s, logits %s on the oracle's experts; KL %s on the engine's own)\n",
+                ok ? "PASS" : "FAIL", b1, b2, b3);
+    gpu_deinit(&g);
+    if (err) return err;
+    *okp = ok;
+    return OK;
+}
+
 Err verify_run(Arena *a, FILE *out, const char *pack_dir, const char *golden, bool *okp) {
     JValue *man;
     TRY(read_json(a, golden, "manifest.json", &man));
@@ -332,6 +581,12 @@ Err verify_run(Arena *a, FILE *out, const char *pack_dir, const char *golden, bo
     if (pre && strcmp(pre->model_type, "deepseek_v4") == 0) {
         DsGolden dg = {golden, toks, poss, top2, xs, ls, ntok, npos, layers, width, vocab};
         Err e = verify_dsv4(a, out, &pack, pack_dir, &dg, okp);
+        pack_close(&pack);
+        return e;
+    }
+    if (pre && strcmp(pre->model_type, "inkling2_loop_text") == 0) {
+        DsGolden dg = {golden, toks, poss, top2, xs, ls, ntok, npos, layers, width, vocab};
+        Err e = verify_inkling(a, out, &pack, pack_dir, &dg, okp);
         pack_close(&pack);
         return e;
     }
@@ -440,9 +695,11 @@ Err verify_run(Arena *a, FILE *out, const char *pack_dir, const char *golden, bo
         }
     if (plogit > TOL_LOGITS_REL || pbest != plast) ok = false;
 
-    // accelerator prefill (half inputs): quality gate on KL of the last-token distribution
-    if (fast_available) {
-        model_set_fast_prefill(m, true);
+    // default prefill on the f16 KV cache (the accelerator half-input matmuls when they load, else
+    // the plain path and its prompt attention): quality gate on KL of the last-token distribution
+    {
+        model_set_fast_prefill(m, true); // stays off without the accelerator kernels
+        const char *fpath = fast_available ? "accelerator half-input matmuls" : "plain path, f32 matmuls";
         Session *sf;
         FAIL_CLOSE(session_create_kv(m, &g, true, &sf)); // the default: f16 KV cache
         float *flog;
@@ -462,9 +719,8 @@ Err verify_run(Arena *a, FILE *out, const char *pack_dir, const char *golden, bo
         bool fok = fkl <= TOL_PREFILL_FAST_KL && fbest == plast && fworst <= TOL_PREFILL_FAST_LAYER_REL;
         ok = ok && fok;
         fprintf(out,
-                "prefill, default (accelerator half-input matmuls, f16 KV): worst layer rel err %s, last-token "
-                "KL(ref||engine) %s, argmax %s%s\n",
-                e3(b1, fworst), e3d(b2, fkl), fbest == plast ? "equal" : "DIFFERENT", fok ? "" : "  FAIL");
+                "prefill, default (%s, f16 KV): worst layer rel err %s, last-token KL(ref||engine) %s, argmax %s%s\n",
+                fpath, e3(b1, fworst), e3d(b2, fkl), fbest == plast ? "equal" : "DIFFERENT", fok ? "" : "  FAIL");
         // default decode: step by step on an f16-KV session, every greedy token and the last KL
         model_set_fast_prefill(m, fast_available);
         Session *sd;
@@ -501,8 +757,7 @@ Err verify_run(Arena *a, FILE *out, const char *pack_dir, const char *golden, bo
         ok = ok && vok;
         fprintf(out, "verify chunk (%zu tokens, all logits): greedy %zu/%zu equal, max KL %s%s\n", nv, nv - vbad, nv,
                 e3d(b1, vkl), vok ? "" : "  FAIL");
-    } else
-        fprintf(out, "prefill, accelerators: not available, skipped\n");
+    }
     fprintf(out, "decode:\nlayer  max rel err (residual streams, %zu positions)\n", npos);
     for (size_t li = 0; li < layers; li++) {
         bool bad = worst_layer[li] > TOL_LAYER_REL;

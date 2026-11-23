@@ -6,6 +6,7 @@
 static Str sp_text(const Splitter *sp) { return buf_str(&sp->text); }
 
 Str split_reasoning(const Splitter *sp) {
+    if (sp->inkling) return str_trim(buf_str(&sp->ink.reasoning));
     if (!sp->thinking) return S("");
     Str t = sp_text(sp);
     ptrdiff_t end = str_find(t, S("</think>"), 0);
@@ -14,13 +15,51 @@ Str split_reasoning(const Splitter *sp) {
 
 Str split_answer(const Splitter *sp) {
     Str t = sp_text(sp);
+    if (sp->inkling) return buf_str(&sp->ink.content);
     if (!sp->thinking) return t;
     ptrdiff_t e = str_find(t, S("</think>"), 0);
     if (e < 0) return S("");
     return str_sub(t, (size_t)e + 8, t.len);
 }
 
+void split_finish(Splitter *sp) {
+    if (sp->inkling) toolcall_inkling_scan(sp->arena, &sp->ink, sp_text(sp), true);
+}
+
+void split_free(Splitter *sp) {
+    buf_free(&sp->text);
+    toolcall_inkling_free(&sp->ink);
+}
+
+// Inkling: stop strings in the answer (the scan's content), searched in its new bytes only; a
+// hit cuts the content there and ends the scan.
+static const Str *ink_cut_stop(Splitter *sp) {
+    if (sp->ink.done || sp->n_stops == 0) return NULL;
+    toolcall_inkling_scan(sp->arena, &sp->ink, sp_text(sp), false);
+    Str c = buf_str(&sp->ink.content);
+    size_t longest = 0;
+    for (size_t i = 0; i < sp->n_stops; i++) longest = MAX(longest, sp->stops[i].len);
+    const size_t from = sp->stop_from > longest ? sp->stop_from - longest : 0;
+    const Str *hit = NULL;
+    size_t at = c.len;
+    for (size_t i = 0; i < sp->n_stops; i++) {
+        if (sp->stops[i].len == 0) continue;
+        ptrdiff_t k = str_find(c, sp->stops[i], from);
+        if (k >= 0 && (size_t)k < at) {
+            at = (size_t)k;
+            hit = &sp->stops[i];
+        }
+    }
+    sp->stop_from = c.len;
+    if (hit) {
+        sp->ink.content.len = at;
+        sp->ink.done = true;
+    }
+    return hit;
+}
+
 const Str *split_cut_stop(Splitter *sp) {
+    if (sp->inkling) return ink_cut_stop(sp);
     for (size_t i = 0; i < sp->n_stops; i++) {
         Str st = sp->stops[i];
         Str ans = split_answer(sp);
@@ -77,6 +116,28 @@ size_t split_stable(Str s, Str tag, const Str *stops, size_t n_stops) {
 SplitPoll split_poll(Splitter *sp, bool final) {
     Str t = sp_text(sp);
     SplitPoll r = {S(""), S("")};
+    if (sp->inkling) {
+        // the scan of a growing reply only appends; the reasoning's leading whitespace is left
+        // out as in the Qwen split
+        toolcall_inkling_scan(sp->arena, &sp->ink, t, final);
+        final = final || sp->ink.done;
+        Str ir = buf_str(&sp->ink.reasoning), ic = buf_str(&sp->ink.content);
+        Str rs = str_sub(ir, lead_ws(ir), ir.len);
+        size_t nr = final ? trim_end_len(rs) : split_stable(rs, S(""), NULL, 0);
+        if (nr > sp->sent_reasoning) {
+            r.reasoning = str_sub(rs, sp->sent_reasoning, nr);
+            sp->sent_reasoning = nr;
+        }
+        Str cs = str_sub(ic, lead_ws(ic), ic.len);
+        size_t hold = 0;
+        for (size_t i = 0; i < sp->n_stops && !final; i++) hold = MAX(hold, prefix_tail(cs, sp->stops[i]));
+        size_t nc = final ? trim_end_len(cs) : split_stable(str_sub(cs, 0, cs.len - hold), S(""), NULL, 0);
+        if (nc > sp->sent_content) {
+            r.content = str_sub(cs, sp->sent_content, nc);
+            sp->sent_content = nc;
+        }
+        return r;
+    }
     if (sp->thinking) {
         ptrdiff_t closed = str_find(t, S("</think>"), 0);
         Str raw = str_sub(t, 0, closed < 0 ? t.len : (size_t)closed);

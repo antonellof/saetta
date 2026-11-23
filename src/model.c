@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <time.h>
 
+#include "attn_sg.h"
 #include "ops.h"
 #include "qgen.h"
 // The streamed-expert cache of the loaded model, for model_prof_report (one model per process).
@@ -276,7 +277,7 @@ Err model_load(Arena *arena, const Pack *pack, Gpu *g, Model **out) {
             *mpp = mp;
         }
     }
-    if (mpp == NULL) dbg("model: accelerator matmul kernels unavailable, prefill stays f32\n");
+    if (mpp == NULL) dbg("model: accelerator matmul kernels unavailable, prompt matmuls on half tiles (qmm_plain; f32 with SAETTA_QMMP=off)\n");
     sx_pipeline *rows_p[2][SMALL + 1], *rows1_p[2][SMALL + 1];
     for (int t = 1; t <= SMALL; t++) {
         char nm[64];
@@ -304,6 +305,24 @@ Err model_load(Arena *arena, const Pack *pack, Gpu *g, Model **out) {
     m->p = pipes;
     m->mpp = mpp;
     m->fast_prefill = mpp != NULL && getenv("SAETTA_PREFILL_F32") == NULL;
+    if (mpp == NULL) {
+        // no tensor ops (M1 to M4, or SAETTA_NO_ACCEL=1): half-tile prompt matmuls
+        QmmpVariant v = qgen_plain_variant();
+        if (v.rows) {
+            TRY(gpu_pipeline(g, qgen_plain_src, v.dense, &m->qmmp));
+            TRY(gpu_pipeline(g, qgen_plain_src, v.grouped, &m->qmmp_g));
+            m->qmmp_rows = v.rows;
+            m->plain_half = getenv("SAETTA_PREFILL_F32") == NULL;
+        }
+    }
+    // the kernels dispatched above 384 threads (the M1/M2 floor at high register use)
+    sx_pipeline *const big[] = {pipes.ix_select, pipes.ix_select_rx, pipes.ix_select_t, pipes.moe_group, pipes.hc_add_norm};
+    for (size_t i = 0; i < COUNT(big); i++) TRY(gpu_require_threads(big[i], 1024));
+    TRY(gpu_require_threads(pipes.moe_topk, CONFIG_NUM_EXPERTS)); // one thread per expert (trunk and MTP head)
+    if (getenv("SAETTA_ATTN_SG_OLD") == NULL && attn_sg_load_fn(g, &m->attn_sg)) {
+        dbg("model: simdgroup prompt attention unavailable, attn_split_gh serves every chunk\n");
+        m->attn_sg = NULL;
+    }
     m->layers = ARENA_ARRAY(arena, Layer, NLAYERS);
     TRY(gpu_new_buffer(g, (size_t)64 << 20, &m->params.buf));
     TRY(gpu_new_buffer(g, S_total * 4, &m->scratch));
@@ -547,6 +566,7 @@ static struct {
     uint64_t count[NPIPES];
     double mpp_secs[3];
     uint64_t mpp_count[3];
+    bool mpp_plain; // the mpp buckets hold the plain-path half matmuls (qmmp)
     uint64_t other_bytes;
 } prof;
 
@@ -589,6 +609,12 @@ static void prof_add(Model *m, sx_pipeline *p, double s) {
             prof.mpp_count[k] += 1;
             return;
         }
+    } else if (m->qmmp && (p == m->qmmp || p == m->qmmp_g)) {
+        int k = p == m->qmmp ? 0 : 1;
+        prof.mpp_plain = true;
+        prof.mpp_secs[k] += s;
+        prof.mpp_count[k] += 1;
+        return;
     }
     if (m->gen) {
         int i = gen_index(m->gen, p);
@@ -633,10 +659,11 @@ void model_prof_report(size_t tokens) {
     fmt_fixed(a, sizeof a, total * 1e3 / (double)tokens, 2);
     dbg("profile: GPU time per token by kernel (%zu tokens), total %s ms/token\n", tokens, a);
     static const char *const mpp_names[3] = {"mpp dense", "mpp grouped", "to_half"};
+    static const char *const plain_names[3] = {"qmmp dense", "qmmp grouped", ""};
     for (int i = 0; i < 3; i++)
         if (prof.mpp_count[i] > 0) {
             fmt_fixed(a, sizeof a, prof.mpp_secs[i] * 1e3 / (double)tokens, 3);
-            dbg("  %14s %8s ms/token  %5llu dispatches/token\n", mpp_names[i], a,
+            dbg("  %14s %8s ms/token  %5llu dispatches/token\n", (prof.mpp_plain ? plain_names : mpp_names)[i], a,
                 (unsigned long long)(prof.mpp_count[i] / tokens));
         }
     for (size_t i = 0; i < NPIPES; i++)
@@ -1195,6 +1222,13 @@ static void enc_mm_grouped(Enc *e, const Linear *l, sx_arg x, sx_arg y, size_t T
     sx_arg args[11] = {XARGS(l, sh), x, y,
                        gpu_bytes_arg(dims, 12), gpu_bytes_arg(sh, 12), barg(b, B_gtiles), barg(b, B_gnt),
                        gpu_bytes_arg(stride, 8)};
+    if (m->plain_half) {
+        // no tensor ops: half tiles over moe_group's 32-row tile table, any (bits, group)
+        uint32_t q[2] = {l->bits, l->group_size};
+        args[10] = BYTES(q);
+        enc_d(e, m->qmmp_g, args, 11, (dims[1] + m->qmmp_rows - 1) / m->qmmp_rows, (T * TOPK + 31) / 32 + NE, 128);
+        return;
+    }
     if (!is4_32(l)) {
         uint32_t q[2] = {l->bits, l->group_size};
         args[10] = BYTES(q);
@@ -1282,6 +1316,16 @@ static void enc_mm(Enc *e, const Linear *l, sx_arg x, sx_arg y, size_t T) {
         } else
             enc_d(e, mp->dense, args, 7, (dims[1] + 63) / 64, (T + 63) / 64, 128);
         enc_out_writes_range(e, y, T * dims[1]);
+        return;
+    }
+    if (m->plain_half && !router_like) {
+        // no tensor ops: half tiles on simdgroup matrices, any (bits, group); routers stay f32
+        uint32_t dims[3] = {(uint32_t)l->in_features, (uint32_t)l->out_features, (uint32_t)T};
+        uint32_t q[2] = {l->bits, l->group_size};
+        uint32_t shg[3];
+        sx_arg ga[] = {TARG(l->weight, &shg[0]), TARG(l->scales, &shg[1]), TARG(l->biases, &shg[2]), x, y,
+                       gpu_bytes_arg(dims, 12), gpu_bytes_arg(shg, 12), BYTES(q)};
+        D(e, m->qmmp, ga, (dims[1] + m->qmmp_rows - 1) / m->qmmp_rows, (T + 31) / 32, 128);
         return;
     }
     if (!fast_q(l)) {
@@ -1435,6 +1479,14 @@ static void enc_attn_t_at(Enc *e, const Attn *A, Session *s, size_t T, size_t po
         sx_arg c[] = {barg(b, B_qh), kv_arg(s, kbase), kv_arg(s, vbase), barg(b, B_sel), barg(b, B_cnt), barg(b, B_att),
                       gpu_bytes_arg(tp, 16), barg(b, B_qg)};
         D(e, tr, c, NKV, T, 256);
+    } else if (m->attn_sg != NULL && s->kv_half && T > SMALL) {
+        // prompt chunks without tensor ops (attn_sg.metal attn_sg_fn): one token's 12 heads of a
+        // kv head share each gathered K / V tile in simdgroup matrix products, gate fused
+        static_assert(NQ == ATTN_SG_NQ && NKV == 2 && HD == ATTN_SG_HD); // attn_sg_fn shape
+        AttnSgP p = {(uint32_t)pos0, (uint32_t)T, 1, (uint32_t)TOPB, (uint32_t)BLOCK, (uint32_t)(MAXSEL + 13)};
+        sx_arg c[] = {barg(b, B_qn), kv_arg(s, kbase), kv_arg(s, vbase), barg(b, B_qg + HD), barg(b, B_att), BYTES(p),
+                      barg(b, B_sel), barg(b, B_cnt)};
+        enc_d3(e, m->attn_sg, c, COUNT(c), NKV, T, 1, ATTN_SG_FN_THREADS);
     } else
         enc_attn_batch(e, s, barg(b, B_qn), kv_arg(s, kbase), kv_arg(s, vbase), barg(b, B_sel), barg(b, B_cnt),
                        barg(b, B_qg + HD), barg(b, B_att), pos0, T);
@@ -2872,9 +2924,13 @@ const char *model_lora_name(const Model *m, size_t i) {
 // ---- the table model_api.c dispatches through ----------------------------------------------
 
 bool model_has_mtp(const Model *m) { return m->mtp != NULL; }
-bool model_fast_prefill(const Model *m) { return m->fast_prefill; }
-bool model_fast_prefill_available(const Model *m) { return m->mpp != NULL; }
-void model_set_fast_prefill(Model *m, bool on) { m->fast_prefill = on && m->mpp != NULL; }
+// The half prompt path: the accelerator kernels, or on GPUs without tensor ops the half tiles.
+bool model_fast_prefill(const Model *m) { return m->fast_prefill || m->plain_half; }
+bool model_fast_prefill_available(const Model *m) { return m->mpp != NULL || m->qmmp != NULL; }
+void model_set_fast_prefill(Model *m, bool on) {
+    m->fast_prefill = on && m->mpp != NULL;
+    m->plain_half = on && m->mpp == NULL && m->qmmp != NULL;
+}
 
 typedef struct {
     const char *module;

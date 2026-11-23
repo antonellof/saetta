@@ -3,7 +3,7 @@
 </p>
 
 <h3 align="center">Saetta: a local coding agent with the model built in.</h3>
-<p align="center">Qwen3.8 runs inside the agent on its own inference engine, with no server in between, and the same engine serves Claude Code, opencode and pi. A 1:1 port of pi: its tools, sessions and terminal UI. Written in C and hand-written Metal for Apple Silicon Macs. Qwen3.8-27B from 32 GB of memory, Flash-Next from 96 GB. <a href="https://saetta.dev">saetta.dev</a></p>
+<p align="center">Two families of open coding models, Qwen3.8 and Inkling 2 Mini, run inside the agent on its own inference engine, with no server in between. The same engine serves Claude Code, opencode and pi. A 1:1 port of pi: its tools, sessions and terminal UI. Written in C and hand-written Metal for Apple Silicon Macs, from 32 GB of memory. <a href="https://saetta.dev">saetta.dev</a></p>
 
 <p align="center">
   <a href="#install"><b>Install</b></a> · <a href="#saetta-code"><b>Coding agent</b></a> · <a href="#other-coding-agents">Other agents</a> ·
@@ -17,13 +17,21 @@
   <img src="https://img.shields.io/badge/Apple%20Silicon-M1%20to%20M5%2C%2032%20GB%2B-111" alt="Apple Silicon M1 to M5, 32 GB or more">
 </p>
 
-Saetta runs Qwen3.8 coding models on any Apple Silicon Mac with 32 GB of memory or more. Its kernels are written for coding agents: long shared-prefix prompts (20K to 200K tokens), short answers, tool calls. It picks the model that fits your Mac. It is tuned and measured on an M5 Max with 128 GB, whose neural accelerators read prompts fastest; M1 to M4 run the same kernels on their GPU cores (not yet tested on those chips: reports welcome).
+Saetta puts the strongest open coding models that fit on a Mac inside a coding agent. Its kernels are written for agent work: long prompts that share a prefix (20K to 200K tokens), short answers, tool calls. It picks the model that fits your Mac, downloads it and starts.
+
+| model | from | what it is | SWE-bench |
+|---|---|---|---|
+| [Qwen3.8-Flash-Next](#models) | 96 GB | Qwen's mixture of experts; the `coder` pack keeps the 256 experts that matter for code. The fastest here | Verified 82.8 (full), 79.2 (Coder) |
+| [Qwen3.8-27B](#models) | 32 GB | dense, 4-bit or 8-bit, with LoRA adapters and coding fine-tunes (TURBO, Coder390, Fable-5) | Pro 61.7 |
+| [Inkling 2 Mini](#models) | 32 GB | Thinking Machines' 26B mixture of experts with 3.4B active per token: a small model that scores like a large one. First version in Saetta | Verified 79.2 |
+
+Scores are the publishers', for the full-precision models ([sources](#models)).
 
 - On an M5 Max, Flash-Next reads prompts at 1,600 to 1,950 tokens/s and answers at 66 to 85 tokens/s, with speculative decoding.
 - Follow-up turns read only what is new: a second turn on a 16K conversation answers in 0.2 s.
 - Saetta Code, Claude Code, pi and opencode each start with one command. OpenAI- and Anthropic-compatible APIs serve any other client.
-- LoRA adapters and GGUF fine-tunes on Qwen3.8-27B.
-- Every model is checked layer by layer against numpy references. One binary, no Python.
+- Every model is checked layer by layer against numpy references built from the same weights. One binary, no Python.
+- Tuned and measured on an M5 Max with 128 GB, whose neural accelerators read prompts fastest. M1 to M4 read prompts with half-precision kernels of their own on their GPU cores (not yet measured on those chips: reports welcome).
 
 ## Install
 
@@ -39,9 +47,9 @@ saetta download          # the model that fits this Mac, into ~/Models, resumabl
 saetta start code        # or: saetta start claude, saetta start pi, saetta start opencode
 ```
 
-`saetta download` picks by memory: `coder` (Flash-Next, 76 GB) with 96 GB or more, `27b-turbo` (Qwen3.8-27B fine-tune, 20 GB, converted from its GGUF: about 40 GB free disk while it runs) with 36 GB, `27b-4bit` (16 GB) with 32 GB. Any pack can be named instead (table below); one that cannot run on this Mac is refused, and the context shrinks to what memory holds.
+`saetta download` picks by memory: `coder` (Flash-Next, 76 GB) with 96 GB or more, `27b-turbo` (Qwen3.8-27B fine-tune, 20 GB, converted from its GGUF: about 40 GB free disk while it runs) with 36 GB, `27b-4bit` (16 GB) with 32 GB. Any pack can be named instead (table below), for example `saetta download inkling` for Inkling 2 Mini (17 GB, from 32 GB) and then `saetta start code --pack inkling`. A pack that cannot run on this Mac is refused, and the context shrinks to what memory holds.
 
-Needs an Apple Silicon Mac (M1 or later) with 32 GB of memory or more, and macOS 26 or later. Update with `saetta update`. `SAETTA_PREFIX` changes the install folder, `SAETTA_VERSION=0.16.0` pins a release, `HF_TOKEN` raises Hugging Face's limits.
+Needs an Apple Silicon Mac (M1 or later) with 32 GB of memory or more, and macOS 26 or later. Update with `saetta update`. `SAETTA_PREFIX` changes the install folder, `SAETTA_VERSION=0.17.1` pins a release, `HF_TOKEN` raises Hugging Face's limits.
 
 The documentation is at [saetta.dev/docs](https://saetta.dev/docs/) (source in [`docs/`](docs)): the agent's commands, sessions, skills and MCP servers, the other agents, the HTTP API and every option.
 
@@ -97,7 +105,7 @@ The interactive view is pi's terminal UI ported to C: differential rendering, an
 
 MCP servers come from pi's `mcp.json` (global, or `.pi/mcp.json` in a trusted project), over stdio or Streamable HTTP. Their tools are offered to the model as `mcp__server__tool`, along with tools to read the servers' resources. `/mcp` reconnects, enables or disables a server and changes its exposure; `--no-mcp` turns them all off.
 
-### Models
+### Which model it uses
 
 By default the model runs inside the agent. It can also use a running Saetta server, or any OpenAI-compatible chat completions server listed in `models.json`; `/model` adds one. LoRA adapters need the server: `saetta start code --lora name=adapter` starts one. Next: sessions kept on disk with the engine's state, and prompts read while tools run.
 
@@ -139,8 +147,12 @@ Without `saetta start`, point any agent at `http://127.0.0.1:8080/v1` (OpenAI) o
 
 | name | model | on disk | Mac memory | SWE-bench | Terminal-Bench 2.1 |
 |---|---|---|---|---|---|
+| **Inkling 2 Mini** | | | | | |
+| **`inkling`** · 3.4B active | [Inkling 2 Mini](https://huggingface.co/mlx-community/Inkling-2-Mini-4bit) (Thinking Machines), 128 experts, 8 active, dense layers 4-bit, experts NVFP4 / MXFP8; first version | 17 GB | 32 GB | Verified 79.2 ⁴ | 71.6 ⁴ |
+| **Qwen3.8-Flash-Next** | | | | | |
 | **`coder`** · for agents | [Flash-Next](https://huggingface.co/mbrown-uno/Qwen3.8-Flash-Next-GSQ-RCO-Coder-MLX), 256 experts pruned for code, mixed 4/5/6/8-bit | 76 GB | 96 GB | Verified 79.2 ¹ | n/p |
 | `full` | [Flash-Next](https://huggingface.co/mlx-community/Qwen3.8-Flash-Next-4bit-mtp), all 512 experts, 4-bit | 105 GB | 128 GB | Pro 62.5 ², Verified 82.8 ¹ | n/p |
+| **Qwen3.8-27B** | | | | | |
 | `27b-8bit` · with adapters | [Qwen3.8-27B](https://huggingface.co/mlx-community/Qwen3.8-27B-8bit), dense, 8-bit | 29 GB | 48 GB | Pro 61.7 ² | 73.0 ² |
 | `27b-4bit` | [Qwen3.8-27B](https://huggingface.co/mlx-community/Qwen3.8-27B-4bit), dense, 4-bit | 16 GB | 32 GB | Pro 61.7 ² | 73.0 ² |
 | `27b-pi` | [the pi LoRA adapter](https://huggingface.co/harness-hub/Qwen3.8-27B-pi-adapted) for Qwen3.8-27B | 0.6 GB | | Pro hard-51 64.7 ³ | 55.8 ³ |
@@ -151,11 +163,15 @@ Without `saetta start`, point any agent at `http://127.0.0.1:8080/v1` (OpenAI) o
 | `27b-fable5` · with MTP | [Fable-5 Coding Distilled](https://huggingface.co/khazarai/Qwen3.8-27B-Fable-5-Coding-Distilled), a Qwen3.8-27B coding distill, from [mradermacher's](https://huggingface.co/mradermacher/Qwen3.8-27B-Fable-5-Coding-Distilled-i1-GGUF) imatrix Q4_K_M GGUF | 20 GB | 36 GB | n/p | n/p |
 | `27b-fable5-8bit` · with MTP | the same, from its Q8_0 GGUF | 31 GB | 48 GB | n/p | n/p |
 
-SWE-bench and Terminal-Bench are the publishers' scores for the full-precision model, each with its own harness, not measured by Saetta on these packs: ¹ [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF) (SWE-bench Verified, xhigh reasoning; the Coder against the full model), ² [Qwen](https://huggingface.co/Qwen/Qwen3.8-27B) ([Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next); SWE-bench Pro with Claude Code, Terminal-Bench 2.1 with Terminus), ³ [harness-hub](https://huggingface.co/harness-hub/Qwen3.8-27B-pi-adapted) (the adapter under pi, SWE-bench Pro's hard 51 tasks; the base model scores 39.2 and 39.5 there). n/p: not published (Qwen publishes no Terminal-Bench score for Flash-Next; the fine-tunes publish none for either).
+SWE-bench and Terminal-Bench are the publishers' scores for the full-precision model, each with its own harness, not measured by Saetta on these packs: ¹ [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF) (SWE-bench Verified, xhigh reasoning; the Coder against the full model), ² [Qwen](https://huggingface.co/Qwen/Qwen3.8-27B) ([Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next); SWE-bench Pro with Claude Code, Terminal-Bench 2.1 with Terminus), ³ [harness-hub](https://huggingface.co/harness-hub/Qwen3.8-27B-pi-adapted) (the adapter under pi, SWE-bench Pro's hard 51 tasks; the base model scores 39.2 and 39.5 there). ⁴ [Thinking Machines](https://huggingface.co/thinkingmachines/Inkling-2-Mini) (SWE-bench Verified with bash only, Terminal-Bench 2.1 with pi). n/p: not published (Qwen publishes no Terminal-Bench score for Flash-Next; the fine-tunes publish none for either).
 
 With less memory the context is smaller: about 37K tokens with `27b-4bit` on 32 GB. `SAETTA_IGNORE_MEMORY=1` skips the memory checks.
 
-Licenses: Flash-Next Qwen Community License 1.0, Qwen3.8-27B, the pi adapter, TURBO, Coder390 and Fable-5 Apache-2.0; no weights are part of this repository.
+### Inkling 2 Mini
+
+[Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) is Thinking Machines' coding model: 26B parameters in a mixture of 128 experts, 8 used per token, so each token costs about as much as a 3.4B dense model while it scores 79.2 on SWE-bench Verified. Its 24 layers run as 48 (a block of 12 is looped three times), with sliding-window attention and its own JSON tool-call format, which Saetta translates to the OpenAI and Anthropic APIs. The MLX pack keeps Thinking Machines' NVFP4 and MXFP8 experts as published. This is a first version: no speculative decoding yet, prompts on the GPU cores rather than the M5's neural accelerators, and a follow-up turn reuses the conversation only when it appends to it.
+
+Licenses: Flash-Next Qwen Community License 1.0; Qwen3.8-27B, the pi adapter, TURBO, Coder390, Fable-5 and Inkling 2 Mini Apache-2.0. No weights are part of this repository.
 
 ### GGUF fine-tunes of Qwen3.8-27B
 
@@ -181,7 +197,7 @@ SAETTA_CTX=204800 saetta serve coder     # loads in 5 to 10 s, one request at a 
 saetta monitor | status | stop           # live view, state, stop
 ```
 
-Endpoints: `POST /v1/chat/completions` (streaming, `tool_calls`, `reasoning_content`; `enable_thinking`, `reasoning_effort` in `chat_template_kwargs`), `POST /v1/messages` and `/v1/messages/count_tokens` (Anthropic), `GET /v1/models`, `GET /health`. Model ids: `qwen3.8-flash-next`, `qwen3.8-27b`.
+Endpoints: `POST /v1/chat/completions` (streaming, `tool_calls`, `reasoning_content`; `enable_thinking`, `reasoning_effort` in `chat_template_kwargs`), `POST /v1/messages` and `/v1/messages/count_tokens` (Anthropic), `GET /v1/models`, `GET /health`. Model ids: `qwen3.8-flash-next`, `qwen3.8-27b`, `inkling-2-mini`.
 
 | variable | default | effect |
 |---|---|---|
@@ -189,7 +205,7 @@ Endpoints: `POST /v1/chat/completions` (streaming, `tool_calls`, `reasoning_cont
 | `SAETTA_SPEC` / `SAETTA_MTP` | 1 / 1 | `0` turns speculative decoding / the MTP head off |
 | `SAETTA_KV_F32` | unset | f32 KV cache |
 | `SAETTA_IGNORE_MEMORY` | unset | `1` loads or downloads a pack this Mac's memory is too small for, and keeps the asked context |
-| `SAETTA_NO_ACCEL` | unset | `1` runs without the tensor-op (neural accelerator) kernels, for a Mac where they misbehave (slower prompt reading, same output) |
+| `SAETTA_NO_ACCEL` | unset | `1` runs without the tensor-op (neural accelerator) kernels on an M5 (M1 to M4 never use them; `SAETTA_ACCEL=1` forces them there, for testing) |
 | `SAETTA_EXPERT_CACHE_GB` | unset | experimental: keep this many GB of experts in memory, read the rest from the SSD (Flash-Next: slower than resident, same output) |
 
 `saetta monitor` shows the server live: model state, speed, GPU load, memory, prompt cache, speculation, sessions and recent requests. `/monitor` shows the same view inside Saetta Code.
@@ -214,6 +230,10 @@ Flash-Next on an M5 Max with 128 GB, a six-request coding-agent workload through
 
 Prompts at 1,620 to 1,930 tokens/s; answers at 78 to 85 (full) and 66 to 75 (Coder) tokens/s, 142 and 139 tokens/s on the edit with speculation. Qwen3.8-27B: prompts at 940 tokens/s (4K) to 787 (64K); answers at 31 ms/token on the 4-bit pack, 19 ms/token on `27b-turbo` with its MTP head (short prompts; 25 ms/token at 16K).
 
+Inkling 2 Mini, first build, 4K prompt: about 430 tokens/s reading and 58 tokens/s answering, without speculative decoding (not yet re-measured after its last fixes).
+
+M1 to M4 are not measured yet. On the M5 Max forced onto their prompt kernels, the 27B reads a 4K prompt at 256 tokens/s and the Coder at 742, against 961 and 1,538 with the neural accelerators on the same prompt.
+
 ## Build from source
 
 Needs full Xcode with the Metal Toolchain (`xcodebuild -downloadComponent MetalToolchain`) and Apple clang 21 or later (C23).
@@ -225,8 +245,8 @@ make test                               # unit tests (SAETTA_PACK=<pack> for rea
 make verify GOLDEN=<dir>/golden         # development: against reference outputs (not in this repository)
 ```
 
-`src/`: `model.c` (Flash-Next), `dense.c` (27B), `model_api.c` picks one per pack; `kernels/` Metal; `server.c`, `tokenizer.c`, `chat.c`, `toolcall.c`; `code*.c` Saetta Code. `saetta help` lists every command.
+`src/`: `model.c` (Flash-Next), `dense.c` (27B), `inkling.c` (Inkling 2 Mini), `model_api.c` picks one per pack; `kernels/` Metal; `server.c`, `tokenizer.c`, `chat.c`, `toolcall.c`; `code*.c` Saetta Code. `saetta help` lists every command.
 
 ## License
 
-[MIT](LICENSE). The engine adapts parts of the MIT-licensed projects sushi, qwental, Strata, ds4 and llama.cpp. Saetta Code is a port of pi (MIT) and adapts parts of the libraries pi builds on (jsdiff, TypeBox, openai-node, highlight.js, marked, OpenTUI). Each adapted file names its source, and every notice is in [LICENSE](LICENSE).
+[MIT](LICENSE). The engine adapts parts of the MIT-licensed projects sushi, qwental, Strata, ds4, llama.cpp and MLX. Saetta Code is a port of pi (MIT) and adapts parts of the libraries pi builds on (jsdiff, TypeBox, openai-node, highlight.js, marked, OpenTUI). Each adapted file names its source, and every notice is in [LICENSE](LICENSE).

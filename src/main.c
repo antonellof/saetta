@@ -34,6 +34,7 @@
 #include "monitor.h"
 #include "ops.h"
 #include "attn27.h"
+#include "attn_sg.h"
 #include "lora.h"
 #include "qgen.h"
 #include "safetensors.h"
@@ -44,7 +45,7 @@
 #include "weights.h"
 
 // Release version; keep equal to the git tag (v<version>).
-#define SAETTA_VERSION "0.17.1"
+#define SAETTA_VERSION "0.18.0"
 
 #define CFG_IN_MAX ((size_t)16384)
 #define CFG_OUT_MAX ((size_t)262144)
@@ -606,6 +607,12 @@ static Err run(Arena *arena, int argc, char **argv) {
     if (argc >= 2 && eq(cmd, "attn-bench")) {
         // Qwen3.8-27B prompt attention, old against new kernel, one layer (src/attn27.h)
         TRY(attn27_bench(arena, out, (const char *const *)argv + 2, (size_t)argc - 2));
+        fflush(out);
+        return OK;
+    }
+    if (argc >= 2 && eq(cmd, "attn-sg-bench")) {
+        // prompt attention without tensor ops, old against new kernels, one layer (src/attn_sg.h)
+        TRY(attn_sg_bench(arena, out));
         fflush(out);
         return OK;
     }

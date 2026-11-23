@@ -16,6 +16,18 @@
 // NUL terminated.
 extern const char qgen_src[];
 extern const char qgen_mpp_src[];
+// qgen_common.metal + "\n" + qmm_plain.metal: the prompt matmuls for GPUs without tensor ops
+// (half tiles on simdgroup matrices), NUL terminated.
+extern const char qgen_plain_src[];
+
+// The plain-path prompt matmul variant: kernels qmmp_<v>_gen and qmmp_g_<v>_gen, rows per
+// threadgroup (64 for the L tilings, 32 for M). v from SAETTA_QMMP (l, ldb, lf, lfdb, m, mdb),
+// default l; "" when SAETTA_QMMP=off (the f32 kernels then serve every prompt chunk).
+typedef struct {
+    const char *dense, *grouped;
+    uint32_t rows;
+} QmmpVariant;
+QmmpVariant qgen_plain_variant(void);
 
 // MvP of the model with the quantization of each matrix appended (buffer 17 of
 // qmv_multi_l*_gen). Layout matches the kernel's constant struct.
@@ -32,8 +44,9 @@ uint32_t qgen_unpack(const uint8_t *row, size_t row_len, size_t i, size_t bits);
 // `saetta qgen-bench`: the generic kernels at 4/32, 4/64 and 5/64 against the templated 4/32
 // kernel, on random packs (no model needed), then the DeepSeek-V4-Flash FP4 routed experts
 // (dsv4_moe.h, T = 1 and 4, GB/s of expert weights and scales), then the Qwen3.8-27B prompt
-// attention (attn27_bench, src/attn27.h). Prints its table to out
-// (flushed per line).
+// attention (attn27_bench, src/attn27.h), then the prompt matmuls of GPUs without tensor ops
+// (every qmm_plain.metal variant against the f32 kernels; SAETTA_QGEN_BENCH=plain runs only
+// these). Prints its table to out (flushed per line).
 Err qgen_bench(Arena *a, FILE *out);
 
 // ---- helpers for the unit tests and the bench -----------------------------------------------
@@ -64,6 +77,9 @@ uint8_t *qgen_mat_bytes(const QgenMat *m, int k); // tensor k (0 weight, 1 scale
 void qgen_mat_row(const QgenMat *m, size_t e, size_t r, float *out);
 // The same rounded like the accelerator kernels: half(q) * half(s) + half(b) in half (fma).
 void qgen_mat_row_half(const QgenMat *m, size_t e, size_t r, float *out);
+// The same rounded like the plain-path kernels (qmm_plain.metal): half(fma(q, scale, bias)) with
+// q, scale and bias in f32.
+void qgen_mat_row_plain(const QgenMat *m, size_t e, size_t r, float *out);
 void qgen_mat_args(const QgenMat *m, sx_arg out[3]);
 void qgen_mat_deinit(const QgenMat *m);
 

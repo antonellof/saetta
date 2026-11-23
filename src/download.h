@@ -31,12 +31,12 @@ typedef struct {
     unsigned disk_gb;    // free disk the download needs at its peak (a GGUF import holds the GGUF and the pack)
 } DownloadPack;
 
-#define DOWNLOAD_NPACKS 11
+#define DOWNLOAD_NPACKS 12
 // The first DOWNLOAD_NFLASH are the Flash-Next packs ("all"); saetta start's default is the
 // first downloaded pack that fits this Mac (launch.c pack_for).
 #define DOWNLOAD_NFLASH 2
 extern const DownloadPack download_packs[DOWNLOAD_NPACKS]; // coder, full, 27b-8bit, 27b-4bit, 27b-pi, 27b-turbo, 27b-turbo-8bit,
-// 27b-coder390, 27b-coder390-8bit, 27b-fable5, 27b-fable5-8bit
+// 27b-coder390, 27b-coder390-8bit, 27b-fable5, 27b-fable5-8bit, inkling
 
 // The pack named `name`, or NULL.
 const DownloadPack *download_find(const char *name);

@@ -1,6 +1,6 @@
 # Saetta documentation
 
-Saetta runs Qwen3.8 coding models on any Apple Silicon Mac with 32 GB of memory or more. It is one binary, `saetta`, with three parts:
+Saetta runs Qwen3.8 and Inkling 2 Mini coding models on any Apple Silicon Mac with 32 GB of memory or more. It is one binary, `saetta`, with three parts:
 
 - Saetta Code, a coding agent in C that runs the model in its own process. It is a port of [pi](https://pi.dev) 1.5.2 and shares pi's settings, sessions, skills and MCP servers.
 - An inference engine in C and hand-written Metal, tuned for coding agents: long shared-prefix prompts (20K to 200K tokens), short answers, tool calls.

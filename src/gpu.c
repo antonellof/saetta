@@ -269,6 +269,16 @@ Err gpu_pipeline(Gpu *g, const char *source, const char *name, sx_pipeline **out
     return OK;
 }
 
+Err gpu_require_threads(const sx_pipeline *p, size_t threads) {
+    uint32_t max = sx_pipeline_max_threads(p);
+    if (threads <= max) return OK;
+    char name[128];
+    sx_pipeline_name(p, name, sizeof name);
+    fprintf(stderr, "saetta: kernel %s needs threadgroups of %zu threads; this GPU runs at most %u for it\n", name,
+            threads, max);
+    return "ThreadgroupTooLarge";
+}
+
 Err gpu_add_file(Gpu *g, Arena *a, sx_buffer *b, uint16_t *index) {
     sx_buffer **n = ARENA_ARRAY(a, sx_buffer *, g->nfile_buffers + 1);
     if (g->nfile_buffers) memcpy(n, g->file_buffers, g->nfile_buffers * sizeof *n);

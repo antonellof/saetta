@@ -203,7 +203,7 @@ Err model_load(Arena *arena, const Pack *pack, Gpu *g, Model **out) {
             *mpp = mp;
         }
     }
-    if (mpp == NULL) dbg("model: accelerator matmul kernels unavailable, prefill stays f32\n");
+    if (mpp == NULL) dbg("model: accelerator matmul kernels unavailable, prompt matmuls on half tiles (qmm_plain; f32 with SAETTA_QMMP=off)\n");
     Model *m = ARENA_NEW(arena, Model);
     *m = (Model){0};
     m->arch = &dense_arch;
@@ -228,6 +228,20 @@ Err model_load(Arena *arena, const Pack *pack, Gpu *g, Model **out) {
     m->p = pipes;
     m->mpp = mpp;
     m->fast_prefill = mpp != NULL && getenv("SAETTA_PREFILL_F32") == NULL;
+    if (mpp == NULL) {
+        // no tensor ops (M1 to M4, or SAETTA_NO_ACCEL=1): half-tile prompt matmuls
+        QmmpVariant v = qgen_plain_variant();
+        if (v.rows) {
+            TRY(gpu_pipeline(g, qgen_plain_src, v.dense, &m->qmmp));
+            m->qmmp_rows = v.rows;
+            m->plain_half = getenv("SAETTA_PREFILL_F32") == NULL;
+        }
+    }
+    TRY(gpu_require_threads(pipes.add_rmsnorm, 1024));
+    if (!env_on("SAETTA_ATTN_SG_OLD") && attn_sg_load_27(g, &m->sg27)) {
+        dbg("model: simdgroup prompt attention unavailable, attn_full_6h serves every chunk\n");
+        m->sg27 = (AttnSg27){0};
+    }
     m->lora_on = -1;
     // the packs are 4-bit and 8-bit with group 64: the run-time (bits, group) kernels serve
     // every matrix outside the 4/32 and 8/64 templated ones
@@ -321,9 +335,10 @@ static inline sx_arg offa(sx_arg a, size_t floats) {
 // ---- profiling (SAETTA_PROFILE=1: every dispatch in its own command buffer) -----------------
 
 // the pipelines outside m->p, named in the report (the rest of them stay "other")
-enum { PROF_NX = 10 };
+enum { PROF_NX = 11 };
 static const char *const prof_x_names[PROF_NX] = {"qmmh_4_32", "to_half", "dq_f16_4_32", "mmh_dense", "dq_bf16_f16",
-                                                  "attn_fl_q6h", "attn_fl_6_q8", "dq_f16_gen", "qmmh_gen", "qmm_gen"};
+                                                  "attn_fl_q6h", "attn_fl_6_q8", "dq_f16_gen", "qmmh_gen", "qmm_gen",
+                                                  "qmmp"};
 
 static struct {
     bool on;
@@ -358,7 +373,7 @@ static void prof_add(Model *m, sx_pipeline *p, double s) {
     const sx_pipeline *xs[PROF_NX] = {mp ? mp->dense : NULL, mp ? mp->to_half : NULL, mp ? mp->dq : NULL,
                                       mp ? mp->mmh : NULL,   mp ? mp->dq_bf16 : NULL, mp ? mp->attn_q6h : NULL,
                                       mp ? mp->attn_fl : NULL, m->gen ? m->gen->dq : NULL,
-                                      m->gen ? m->gen->qmmh : NULL, m->gen ? m->gen->qmm : NULL};
+                                      m->gen ? m->gen->qmmh : NULL, m->gen ? m->gen->qmm : NULL, m->qmmp};
     for (size_t i = 0; i < PROF_NX; i++)
         if (xs[i] && xs[i] == p) {
             prof.x_secs[i] += s;
@@ -668,6 +683,14 @@ static void enc_mm(Enc *e, const Linear *l, sx_arg x, sx_arg y, size_t T) {
         }
     }
     uint32_t sh[3];
+    if (m->plain_half) {
+        // no tensor ops: half tiles on simdgroup matrices, any (bits, group)
+        uint32_t q[2] = {l->bits, l->group_size};
+        sx_arg ga[] = {TARG(l->weight, &sh[0]), TARG(l->scales, &sh[1]), TARG(l->biases, &sh[2]), x, y,
+                       gpu_bytes_arg(dims, 12), gpu_bytes_arg(sh, 12), BYTES(q)};
+        D(e, m->qmmp, ga, (dims[1] + m->qmmp_rows - 1) / m->qmmp_rows, (T + 31) / 32, 128);
+        return;
+    }
     if (!fast_q(l)) {
         uint32_t q[2] = {l->bits, l->group_size};
         sx_arg ga[] = {TARG(l->weight, &sh[0]), TARG(l->scales, &sh[1]), TARG(l->biases, &sh[2]), x, y,
@@ -777,6 +800,25 @@ static void enc_attn_full(Enc *e, Session *s, sx_arg q, sx_arg kc, sx_arg vc, sx
         D1(e, mp->attn_q6h, a, (size_t)NKV * p.tq * (NQ / NKV) * HD / 4);
         sx_arg b[] = {qh, kc, vc, gate, att, BYTES(p)};
         D(e, mp->attn_fl, b, NKV, p.tq / mp->attn_qb, mp->attn_qb * 32);
+        return;
+    }
+    if (T > KMAX && s->kv_half && m->sg27.dir != NULL) {
+        // prompt chunks without tensor ops (src/kernels/attn_sg.metal): each row block of a kv
+        // head (tokens x 6 heads) shares its K / V tiles in simdgroup matrix products, gate fused;
+        // a chunk too small to fill the GPU splits its keys, merged by attn_merge
+        static_assert(NQ == ATTN_SG_NQ && NKV == 4 && HD == ATTN_SG_HD); // attn_sg_27 shape
+        const size_t nsg = m->sg27.nsg;
+        const size_t ns = attn_sg_nsplit(T, NQ / NKV, NKV, nsg, pos0 + T, AB, NSPLIT_PRE);
+        AttnSgP p = {(uint32_t)pos0, (uint32_t)T, (uint32_t)ns, 0, 1, 0};
+        sx_arg part = barg(m->bscratch, B_part);
+        sx_arg a[] = {q, kc, vc, gate, ns > 1 ? part : att, BYTES(p), att, att};
+        enc_d3(e, ns > 1 ? m->sg27.part : m->sg27.dir, a, COUNT(a), NKV, attn_sg_blocks(T, NQ / NKV, nsg), ns, nsg * 32);
+        if (ns > 1) {
+            AttnSP pm = {(uint32_t)pos0, 0, 1, (uint32_t)HD, (uint32_t)(NKV * HD), (uint32_t)(NQ / NKV), (uint32_t)(2 * HD),
+                         (uint32_t)NQ, (uint32_t)ns, 0, 1.0f / sqrtf((float)HD)};
+            sx_arg b[] = {part, gate, att, BYTES(pm)};
+            D(e, m->p.attn_merge, b, NQ, T, 256);
+        }
         return;
     }
     size_t nsplit = T <= KMAX ? NSPLIT_DEC : NSPLIT_PRE;
@@ -1650,9 +1692,13 @@ static void dequant_row(const Pack *pack, const Linear *l, size_t r, float *out)
 // ---- the table model_api.c dispatches through ----------------------------------------------
 
 bool model_has_mtp(const Model *m) { return m->mtp != NULL; }
-bool model_fast_prefill(const Model *m) { return m->fast_prefill; }
-bool model_fast_prefill_available(const Model *m) { return m->mpp != NULL; }
-void model_set_fast_prefill(Model *m, bool on) { m->fast_prefill = on && m->mpp != NULL; }
+// The half prompt path: the accelerator kernels, or on GPUs without tensor ops the half tiles.
+bool model_fast_prefill(const Model *m) { return m->fast_prefill || m->plain_half; }
+bool model_fast_prefill_available(const Model *m) { return m->mpp != NULL || m->qmmp != NULL; }
+void model_set_fast_prefill(Model *m, bool on) {
+    m->fast_prefill = on && m->mpp != NULL;
+    m->plain_half = on && m->mpp == NULL && m->qmmp != NULL;
+}
 
 size_t model_check_pack(Arena *a, const Pack *pack, FILE *out) {
     fprintf(out, "model: Qwen3.8-27B (%s), %zu layers, hidden %zu, dense MLP %zu\n", CONFIG_MODEL_TYPE, NLAYERS, H, FFN);

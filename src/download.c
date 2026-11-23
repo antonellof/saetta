@@ -76,6 +76,10 @@ const DownloadPack download_packs[DOWNLOAD_NPACKS] = {
      .gguf_file = "Qwen3.8-27B-Fable-5-Coding-Distilled.Q8_0.gguf",
      .dir = "khazarai/Qwen3.8-27B-Fable-5-Coding-Distilled-Q8_0",
      .note = "the same fine-tune, Q8_0 GGUF with MTP, imported, 31 GB"},
+    // Inkling 2 Mini (thinkingmachines, Apache-2.0): the MLX conversion, dense affine 4-bit
+    // with the official NVFP4 / MXFP8 experts; 17.3 GB of weights, so 32 GB Macs (fit.h)
+    {.name = "inkling", .title = "Inkling 2 Mini", .disk_gb = 18, .min_ram_gb = 32, .repo = "mlx-community/Inkling-2-Mini-4bit",
+     .rev = "9c0e2960609ba7cb40daf92c6f7bf8ed56e1dd62", .note = "Inkling 2 Mini, 26B MoE, 3.4B active, 17 GB"},
 };
 
 // Idle timeout of a transfer (between bytes); a stalled connection fails and is retried.
@@ -107,7 +111,7 @@ Err download_pack_dir(Arena *a, const DownloadPack *p, char **out) {
 }
 
 const char *download_usage(void) {
-    return "usage: saetta download [coder|full|all|27b-8bit|27b-4bit|27b-pi|27b-turbo|27b-turbo-8bit|27b-coder390|27b-coder390-8bit|27b-fable5|27b-fable5-8bit] [--jobs N]   (default: coder with 96 GB of memory or more, 27b-turbo with 36, 27b-4bit with 32; all = coder and "
+    return "usage: saetta download [coder|full|all|27b-8bit|27b-4bit|27b-pi|27b-turbo|27b-turbo-8bit|27b-coder390|27b-coder390-8bit|27b-fable5|27b-fable5-8bit|inkling] [--jobs N]   (default: coder with 96 GB of memory or more, 27b-turbo with 36, 27b-4bit with 32; all = coder and "
            "full; into $SAETTA_MODELS, default ~/Models)\n";
 }
 

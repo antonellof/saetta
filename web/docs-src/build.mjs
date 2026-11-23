@@ -12,6 +12,7 @@
 // absolute, so the docs keep the site's navigation and theme toggle.
 
 import fs from "node:fs";
+import { execFileSync } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Marked } from "marked";
@@ -32,7 +33,7 @@ const WEB = path.resolve(HERE, "..");
 const ROOT = path.resolve(WEB, "..");
 const DOCS = path.join(ROOT, "docs");
 const OUT = path.join(WEB, "docs");
-const SITE = "https://saetta.dev";
+const SITE = "https://www.saetta.dev"; // the served host (the apex redirects here)
 const REPO = "https://github.com/antonellof/saetta";
 const CHECK = process.argv.includes("--check");
 
@@ -273,9 +274,12 @@ ${html}      </article>
 // ---- sitemap ---------------------------------------------------------------------------------
 
 function sitemap() {
-  const current = fs.readFileSync(path.join(WEB, "sitemap.xml"), "utf8");
-  const rootLine = current.match(/^\s*<url><loc>https:\/\/saetta\.dev\/<\/loc>.*<\/url>$/m)?.[0].trim() ?? `<url><loc>${SITE}/</loc></url>`;
-  const lines = [rootLine, ...pages.map((p) => `<url><loc>${SITE}${p.route}</loc></url>`)];
+  // lastmod: the last commit that touched the source file, or today while it has uncommitted changes
+  const today = new Date().toISOString().slice(0, 10);
+  const git = (...a) => { try { return execFileSync("git", ["-C", ROOT, ...a], { encoding: "utf8" }).trim(); } catch { return ""; } };
+  const lastmod = (file) => (git("status", "--porcelain", "--", file) ? today : git("log", "-1", "--format=%cs", "--", file) || today);
+  const url = (loc, file) => `<url><loc>${SITE}${loc}</loc><lastmod>${lastmod(file)}</lastmod></url>`;
+  const lines = [url("/", "web/index.html"), ...pages.map((p) => url(p.route, p.file))];
   return `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n${lines.map((l) => "  " + l).join("\n")}\n</urlset>\n`;
 }
 

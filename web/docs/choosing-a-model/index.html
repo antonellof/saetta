@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Choosing a model · Saetta docs</title>
   <meta name="description" content="A pack is a model folder Saetta runs. saetta download &lt;name&gt; fetches one at a pinned revision into ~/Models (or SAETTAMODELS). Commands take a pack by name (saetta serve coder) or by folder.">
-  <link rel="canonical" href="https://saetta.dev/docs/choosing-a-model/">
+  <link rel="canonical" href="https://www.saetta.dev/docs/choosing-a-model/">
   <meta name="robots" content="index, follow">
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
   <meta property="og:type" content="article">
@@ -16,7 +16,7 @@
   <meta property="og:image:width" content="1200">
   <meta property="og:image:height" content="630">
   <meta property="og:image:alt" content="Saetta, local coding agent">
-  <meta property="og:url" content="https://saetta.dev/docs/choosing-a-model/">
+  <meta property="og:url" content="https://www.saetta.dev/docs/choosing-a-model/">
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="Choosing a model · Saetta docs">
   <meta name="twitter:description" content="A pack is a model folder Saetta runs. saetta download &lt;name&gt; fetches one at a pinned revision into ~/Models (or SAETTAMODELS). Commands take a pack by name (saetta serve coder) or by folder.">
@@ -92,7 +92,8 @@
 <tr><td><code>27b-coder390</code> (with MTP)</td><td><a href="https://huggingface.co/nerkyor/Qwen3.8-27B-Coder390-EfficientThink-Opus5.5-GPT6Astra-Grok4.7-DSV4Pro-K3-SFT-RLOO-GGUF-NInfer" rel="noopener">Coder390 EfficientThink</a>, a Qwen3.8-27B fine-tune (SFT and RL on code, shorter thinking), from its Q4 LynnStyle GGUF</td><td>23 GB</td><td>48 GB</td><td>n/p</td><td>n/p</td></tr>
 <tr><td><code>27b-coder390-8bit</code> (with MTP)</td><td>the same, from its Q8_0 GGUF</td><td>31 GB</td><td>48 GB</td><td>n/p</td><td>n/p</td></tr>
 <tr><td><code>27b-fable5</code> (with MTP)</td><td><a href="https://huggingface.co/khazarai/Qwen3.8-27B-Fable-5-Coding-Distilled" rel="noopener">Fable-5 Coding Distilled</a>, a Qwen3.8-27B coding distill, from <a href="https://huggingface.co/mradermacher/Qwen3.8-27B-Fable-5-Coding-Distilled-i1-GGUF" rel="noopener">mradermacher&#39;s</a> imatrix Q4_K_M GGUF</td><td>20 GB</td><td>36 GB</td><td>n/p</td><td>n/p</td></tr>
-<tr><td><code>27b-fable5-8bit</code> (with MTP)</td><td>the same, from its Q8_0 GGUF</td><td>31 GB</td><td>48 GB</td><td>n/p</td><td>n/p</td></tr></tbody></table></div>
+<tr><td><code>27b-fable5-8bit</code> (with MTP)</td><td>the same, from its Q8_0 GGUF</td><td>31 GB</td><td>48 GB</td><td>n/p</td><td>n/p</td></tr>
+<tr><td><code>inkling</code></td><td><a href="https://huggingface.co/mlx-community/Inkling-2-Mini-4bit" rel="noopener">Inkling 2 Mini</a> (Thinking Machines), 128 experts, 8 active, dense layers 4-bit, experts NVFP4 / MXFP8</td><td>17 GB</td><td>32 GB</td><td>Verified 79.2 ⁴</td><td>71.6 ⁴</td></tr></tbody></table></div>
 <p>SWE-bench and Terminal-Bench are the publishers&#39; scores for the full-precision model, each with its own harness, not measured by Saetta on these packs:</p>
 <ol>
 <li><a href="https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF" rel="noopener">ISTA-DASLab</a> (SWE-bench Verified, xhigh reasoning; the Coder against the full model).</li>

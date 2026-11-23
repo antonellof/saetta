@@ -176,3 +176,91 @@ TEST(split_whitespace_leading_stop_strings) {
         }
     }
 }
+
+// ---- Inkling 2 ----------------------------------------------------------------------------
+
+static size_t arena_bytes(const Arena *a) { return arena_size(a); }
+
+// A reply of blocks with markers cut at every byte: the streamed reasoning and content equal
+// the whole-text parse, the calls come out once at the end.
+TEST(split_inkling_streams_the_whole_parse) {
+    Str text = S("<|message_model|>model<|content_thinking|>think \xc3\xa9 first<|end_message|><|message_model|>model"
+                 "<|content_text|>The answer: 42 \xf0\x9f\x98\x80<|end_message|><|message_model|>bash<|content_invoke_tool_json|>"
+                 "{\"name\":\"bash\",\"args\":{\"command\":\"ls <|end_message|>\"}}<|end_message|>");
+    Arena a = {0};
+    InkParsed whole = toolcall_inkling(&a, text, true);
+    for (size_t i = 0; i <= text.len; i++) {
+        Splitter sp = {.inkling = true, .arena = &a};
+        Sent s = {0};
+        // pieces of 1 to 7 bytes, the pattern shifted by i
+        for (size_t k = 0, n = 0; k < text.len; k += n) {
+            n = 1 + (k + i) % 7;
+            feed(&sp, &s, str_sub(text, k, MIN(text.len, k + n)));
+        }
+        finish(&sp, &s);
+        split_finish(&sp);
+        EXPECT_STR(buf_str(&s.reasoning), str_trim(whole.reasoning));
+        EXPECT_STR(buf_str(&s.content), str_trim(whole.content));
+        EXPECT_EQ(sp.ink.n_calls, 1);
+        EXPECT_STR(sp.ink.calls[0].arguments, whole.calls[0].arguments);
+        buf_free(&s.reasoning);
+        buf_free(&s.content);
+        split_free(&sp);
+    }
+    arena_reset(&a);
+}
+
+// A 32K-token reply streamed token by token: the arena does not grow with it (the scan
+// allocates per tool call only) and each poll looks at the new bytes.
+TEST(split_inkling_long_reply_bounded_arena) {
+    Arena a = {0};
+    Splitter sp = {.inkling = true, .arena = &a};
+    Str stop = S("STOP-NEVER");
+    sp.stops = &stop;
+    sp.n_stops = 1;
+    Sent s = {0};
+    feed(&sp, &s, S("<|message_model|>model<|content_thinking|>"));
+    for (int i = 0; i < 16384; i++) feed(&sp, &s, S(" word"));
+    feed(&sp, &s, S("<|end_message|><|message_model|>model<|content_text|>"));
+    const size_t used = arena_bytes(&a);
+    for (int i = 0; i < 16384; i++) {
+        buf_addstr(&sp.text, S(" tok"));
+        EXPECT(split_cut_stop(&sp) == NULL);
+        SplitPoll d = split_poll(&sp, false);
+        buf_addstr(&s.content, d.content);
+    }
+    EXPECT(arena_bytes(&a) == used);
+    finish(&sp, &s);
+    EXPECT_EQ(s.reasoning.len, 16384 * 5 - 1);
+    EXPECT_EQ(s.content.len, 16384 * 4 - 1);
+    sent_free(&s, &sp);
+    split_free(&sp);
+    arena_reset(&a);
+}
+
+// A stop string in the answer cuts it there; the same string in the reasoning does not.
+TEST(split_inkling_stop_in_answer_only) {
+    Arena a = {0};
+    Splitter sp = {.inkling = true, .arena = &a};
+    Str stop = S("END");
+    sp.stops = &stop;
+    sp.n_stops = 1;
+    Sent s = {0};
+    const char *pieces[] = {"<|message_model|>model<|content_thinking|>", "no END here", "<|end_message|>", "<|message_model|>model",
+                            "<|content_text|>", "done E", "ND and more"};
+    const Str *hit = NULL;
+    for (size_t i = 0; i < COUNT(pieces) && !hit; i++) {
+        buf_addstr(&sp.text, str(pieces[i]));
+        hit = split_cut_stop(&sp);
+        SplitPoll d = split_poll(&sp, false);
+        buf_addstr(&s.reasoning, d.reasoning);
+        buf_addstr(&s.content, d.content);
+    }
+    EXPECT(hit == &stop);
+    finish(&sp, &s);
+    EXPECT_STR(buf_str(&s.reasoning), S("no END here"));
+    EXPECT_STR(buf_str(&s.content), S("done"));
+    sent_free(&s, &sp);
+    split_free(&sp);
+    arena_reset(&a);
+}

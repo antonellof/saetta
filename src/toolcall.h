@@ -62,4 +62,22 @@ typedef struct {
 // final, everything is resolved. Results live in the arena.
 InkParsed toolcall_inkling(Arena *a, Str text, bool final);
 
+// The same parse, incremental: each call consumes the bytes of text (the reply so far, which
+// only grows) from where the last stopped, appending to reasoning and content (whole bytes; a
+// caller trims a trailing partial UTF-8 character itself); final resolves the rest and ends the
+// scan. The arena holds only the calls' strings (one parse per call), so streaming a reply
+// allocates per tool call, not per token. toolcall_inkling is one scan on a fresh state.
+typedef struct {
+    int mode;
+    size_t hdr, p;
+    Buf reasoning, content;
+    Call *calls;
+    size_t n_calls, cap_calls;
+    bool in_call, bad_call, ended, done;
+} InkScan;
+void toolcall_inkling_scan(Arena *a, InkScan *s, Str text, bool final);
+void toolcall_inkling_free(InkScan *s);
+// Length of s without a trailing partial UTF-8 character.
+size_t toolcall_utf8_whole(Str s);
+
 #endif

@@ -9,6 +9,10 @@ GOLDENS_27B := golden-27b-4bit golden-27b-8bit golden-27b-4bit-pi golden-27b-4bi
 # the Coder variant's golden (its manifest names the pack without a folder); skipped when absent
 MODELS ?= $(or $(SAETTA_MODELS),$(HOME)/Models)
 CODER_PACK ?= $(MODELS)/mbrown-uno/Qwen3.8-Flash-Next-GSQ-RCO-Coder-MLX
+# Inkling 2 Mini's goldens beside GOLDEN (1815 tokens; 8329, past the log-scaling floor), on
+# INKLING_PACK; skipped when either is absent
+GOLDENS_INKLING := golden-inkling golden-inkling-long
+INKLING_PACK ?= $(MODELS)/mlx-community/Inkling-2-Mini-4bit
 
 # MCPU: the oldest CPU the binary runs on (every Apple Silicon Mac); -mcpu=native would let
 # the compiler use the build machine's newer instructions
@@ -55,8 +59,8 @@ $(OBJ)/metal/shim.o: src/metal/shim.m
 test: $(BUILD)/bin/saetta-test
 	$(BUILD)/bin/saetta-test $(T)
 
-# Flash-Next against GOLDEN, the Coder variant against golden-coder, then Qwen3.8-27B against
-# the goldens beside it that exist
+# Flash-Next against GOLDEN, the Coder variant against golden-coder, Qwen3.8-27B against the
+# goldens beside it that exist, then Inkling 2 Mini
 verify: $(BIN)
 	$(BIN) verify $(GOLDEN)
 	@d="$(dir $(abspath $(GOLDEN)))golden-coder"; \
@@ -64,6 +68,9 @@ verify: $(BIN)
 	  elif [ -d "$$d" ]; then echo "verify: no Coder pack at $(CODER_PACK), golden-coder skipped"; fi
 	@for g in $(GOLDENS_27B); do d="$(dir $(abspath $(GOLDEN)))$$g"; \
 	  if [ -d "$$d" ]; then echo "verify: $$d"; env -u SAETTA_PACK $(BIN) verify "$$d" || exit 1; fi; done
+	@for g in $(GOLDENS_INKLING); do d="$(dir $(abspath $(GOLDEN)))$$g"; \
+	  if [ -d "$$d" ] && [ -d "$(INKLING_PACK)" ]; then echo "verify: $$d"; SAETTA_PACK="$(INKLING_PACK)" $(BIN) verify "$$d" || exit 1; \
+	  elif [ -d "$$d" ]; then echo "verify: no Inkling pack at $(INKLING_PACK), $$g skipped"; fi; done
 
 # DeepSeek-V4-Flash against its goldens next to GOLDEN: the forced per-layer check on the
 # all-positions golden, then the functional check on the others (streamed experts, cache

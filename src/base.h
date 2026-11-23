@@ -51,6 +51,7 @@ char *arena_strndup(Arena *a, const char *s, size_t n); // NUL terminated copy
 char *arena_printf(Arena *a, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 char *arena_vprintf(Arena *a, const char *fmt, va_list ap);
 void arena_reset(Arena *a); // frees every chunk
+size_t arena_size(const Arena *a); // bytes held in chunks
 #define ARENA_NEW(a, T) ((T *)arena_alloc((a), sizeof(T)))
 #define ARENA_ARRAY(a, T, n) ((T *)arena_alloc((a), sizeof(T) * (size_t)(n)))
 

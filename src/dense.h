@@ -12,6 +12,7 @@
 // Residual width: one stream of hidden_size (Flash-Next has 4); verify's golden shapes use it.
 #define HCW CONFIG_HIDDEN_SIZE
 
+#include "attn_sg.h"
 #include "lora.h"
 
 typedef struct {
@@ -143,6 +144,16 @@ struct Model {
     sx_pipeline *rows1_p[2][MODEL_SMALL + 1];
     // Prompt matmuls on the accelerators in half precision; off with SAETTA_PREFILL_F32=1.
     bool fast_prefill;
+    // GPUs without tensor ops (mpp NULL): prompt matmuls on half tiles (src/kernels/qmm_plain.metal,
+    // qmmp_rows output rows per threadgroup); qmmp NULL with SAETTA_QMMP=off. plain_half: they
+    // serve the prompt chunks (off with SAETTA_PREFILL_F32=1; verify turns it off for the exact
+    // path, as fast_prefill).
+    sx_pipeline *qmmp;
+    uint32_t qmmp_rows;
+    bool plain_half;
+    // Prompt-chunk attention without tensor ops (src/attn_sg.h) for the plain path; dir NULL
+    // when it does not load or with SAETTA_ATTN_SG_OLD=1 (attn_full_6h then serves every chunk).
+    AttnSg27 sg27;
     Layer *layers; // num_hidden_layers
     Vec final_norm;
     Linear embed, lm_head;

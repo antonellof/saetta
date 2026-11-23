@@ -64,6 +64,12 @@ Err gpu_dispatch_cost(Gpu *g, size_t n, size_t serial_threads, double *secs);
 // prints "kernel <name>: <message>" to stderr and returns "CompileFailed".
 Err gpu_pipeline(Gpu *g, const char *source, const char *name, sx_pipeline **out);
 
+// The static half of the dispatch fit check (shim.h sx_pipeline_max_threads): fails when p cannot
+// run threadgroups of `threads` threads on this GPU, naming the kernel on stderr, so a model
+// whose large-threadgroup kernels do not fit (M1 or M2 at high register use) stops at load
+// instead of at its first prompt. Errors: "ThreadgroupTooLarge".
+Err gpu_require_threads(const sx_pipeline *p, size_t threads);
+
 // Registers a GPU buffer as one more "file", so tensors built in it at load (the MTP
 // head's weights requantized from BF16) bind through gpu_tensor_arg like pack tensors.
 // *index gets its file index. The old array is left in the arena.

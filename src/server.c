@@ -481,7 +481,7 @@ static Err count_tokens(Engine *e, Arena *a, Conn *c, Req *h, Str body, int *sta
     JValue *r;
     Str model, prompt;
     TRY(parse_request(a, body, FMT_ANTHROPIC, &r, &model));
-    TRY(chat_render(a, r, &prompt));
+    TRY(chat_render_as(a, model_info(e->m)->chat, r, &prompt));
     VecU32 ids = {0};
     Err err = tokenizer_encode(e->tok, prompt, &ids);
     size_t n = ids.len;
@@ -757,6 +757,8 @@ static Err generate_reply(Engine *e, Arena *a, Conn *c, Req *h, Work *w, JValue 
 
     Splitter *spl = &w->split;
     spl->thinking = thinking;
+    spl->inkling = model_info(e->m)->chat == CHAT_INKLING;
+    spl->arena = a;
     spl->stops = stops;
     spl->n_stops = n_stops;
     buf_addstr(&spl->text, forced); // the forced opening is part of the answer
@@ -767,7 +769,7 @@ static Err generate_reply(Engine *e, Arena *a, Conn *c, Req *h, Work *w, JValue 
     // greedy requests speculate with prompt lookup (src/spec.h); the accepted drafts are
     // already consumed by the model and come out of queue without another pass
     const char *sv = getenv("SAETTA_SPEC");
-    bool spec_on = sv ? sv[0] != '0' : true;
+    bool spec_on = (sv ? sv[0] != '0' : true) && !model_info(e->m)->no_spec;
     // speculation at any temperature: greedy verifies by argmax, sampling by SampleChooser
     bool greedy = sp.temperature <= 0;
     Lookup *lk = &w->lk;
@@ -866,7 +868,13 @@ static Err generate_reply(Engine *e, Arena *a, Conn *c, Req *h, Work *w, JValue 
     }
     int64_t pre_ms = (int64_t)(t1 - t0) / 1000000;
     int64_t dec_ms = (int64_t)(t2 - t1) / 1000000;
-    Parsed parsed = toolcall_parse(a, str_trim(split_answer(spl)), tools);
+    Parsed parsed;
+    if (spl->inkling) {
+        // Inkling 2: the JSON calls of its special-token blocks (toolcall_inkling)
+        split_finish(spl);
+        parsed = (Parsed){str_trim(buf_str(&spl->ink.content)), spl->ink.calls, spl->ink.n_calls};
+    } else
+        parsed = toolcall_parse(a, str_trim(split_answer(spl)), tools);
     if (parsed.n_calls > 0) finish = "tool_calls";
     dbg("request: %zu prompt tokens (%zu reused) in %lld ms, %zu generated in %lld ms (%s tok/s, %zu passes), finish %s%s, "
         "conversation %zu/%zu\n",
@@ -1082,9 +1090,10 @@ static Err handle(Engine *e, Arena *a, Conn *c, Req *h, Str body, Fmt fmt, Work 
         }
     }
     Str prompt;
-    TRY(chat_render(a, r, &prompt));
+    TRY(chat_render_as(a, model_info(e->m)->chat, r, &prompt));
     Str forced = S("");
-    if (choice == TC_REQUIRED || choice == TC_NAMED) {
+    // a required tool call is forced in Qwen's XML only (Inkling's calls are left to the model)
+    if ((choice == TC_REQUIRED || choice == TC_NAMED) && model_info(e->m)->chat == CHAT_QWEN) {
         if (str_ends(prompt, S("<think>\n"))) prompt = str(arena_printf(a, "%.*s\n</think>\n\n", (int)prompt.len, prompt.ptr));
         // with one declared tool, "required" means that tool
         JValue *tl = field(r, "tools");
@@ -1350,7 +1359,7 @@ static Err connection(Engine *e, int fd, bool guard, void (*authed)(void *), voi
             }
             vec_free(&w.ids);
             lookup_free(&w.lk);
-            buf_free(&w.split.text);
+            split_free(&w.split);
             buf_free(&w.out.ev);
         } else {
             ret = json_respond(c, &h, 404, S("{\"error\":{\"message\":\"not found\"}}"));
@@ -1486,7 +1495,7 @@ static Err engine_open(Arena *arena, const char *dir, const char *const *loras, 
     }
     e->tok = tok;
     qgen_prng_init(&e->rng, (uint64_t)(int64_t)wall_ns());
-    if (!tokenizer_token_id(tok, S("</think>"), &e->think_end)) return "BadTokenizer";
+    if (model_info(m)->chat == CHAT_QWEN && !tokenizer_token_id(tok, S("</think>"), &e->think_end)) return "BadTokenizer";
     e->gate = GATE_INIT;
     e->depth = DEPTH_INIT;
     e->n_conv = 1;
@@ -1558,7 +1567,7 @@ Err server_engine_chat(Engine *e, Str body, int (*sink)(void *ctx, int status, c
     }
     vec_free(&w.ids);
     lookup_free(&w.lk);
-    buf_free(&w.split.text);
+    split_free(&w.split);
     buf_free(&w.out.ev);
     arena_reset(&a);
     free(c);

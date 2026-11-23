@@ -44,7 +44,7 @@ The agent writes its own log to `~/.saetta/code.log`.
 
 ## Where the model runs
 
-By default the model runs inside the agent. It can also use a running Saetta server, or any OpenAI-compatible chat completions server listed in `models.json`; `/model` adds one. LoRA adapters need the server: `saetta start code --lora name=adapter` starts one. Only one model runs on the Mac at a time: while Saetta Code holds the model in its process, `saetta start` for another agent asks you to close it first, or to start a server that both use.
+By default the model runs inside the agent. It can also use a running Saetta server, or any OpenAI-compatible chat completions server listed in `models.json`; `/model` adds one. LoRA adapters need the server: `saetta start code --lora name=adapter` starts one. Only one model runs on the Mac at a time: further Saetta Code sessions use the model the first one loaded ([Parallel agents](parallel-agents.md)), while `saetta start` for another agent asks you to close it first, or to start a server that both use.
 
 ## Options
 
@@ -61,6 +61,8 @@ saetta code [options] [prompt ...]
   --thinking LEVEL         off, minimal, low, medium, high, xhigh, max
   --tools a,b,c | --no-tools   the tool set
   --no-mcp                 no MCP servers (pi's mcp.json) and no MCP tools
+  --subagents              offer the subagent tool: tasks handed to child agents that run in
+                           parallel (also "subagents": true in settings.json)
   --system-prompt T, --append-system-prompt T   text or a file
   --skill PATH             load a skill file or folder (can be repeated)
   --no-skills, -ns         no skill discovery (--skill paths still load)

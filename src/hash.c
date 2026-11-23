@@ -181,3 +181,22 @@ void hash_hex(const uint8_t *d, size_t n, char *out) {
     }
     out[2 * n] = 0;
 }
+
+void hmac_sha256(const void *key, size_t nkey, const void *msg, size_t nmsg, uint8_t out[SHA256_LEN]) {
+    uint8_t k[64] = {0}, ipad[64], opad[64], inner[SHA256_LEN];
+    if (nkey > 64) sha256(key, nkey, k);
+    else memcpy(k, key, nkey);
+    for (int i = 0; i < 64; i++) {
+        ipad[i] = k[i] ^ 0x36;
+        opad[i] = k[i] ^ 0x5c;
+    }
+    Sha256 s;
+    sha256_init(&s);
+    sha256_update(&s, ipad, 64);
+    sha256_update(&s, msg, nmsg);
+    sha256_final(&s, inner);
+    sha256_init(&s);
+    sha256_update(&s, opad, 64);
+    sha256_update(&s, inner, SHA256_LEN);
+    sha256_final(&s, out);
+}

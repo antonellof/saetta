@@ -7,6 +7,9 @@
 #include <signal.h>
 #include <stdlib.h>
 #include <sys/file.h>
+#include <libproc.h>
+#include <limits.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 static Err run_dir(Arena *a, char **out) {
@@ -88,6 +91,15 @@ static Err acquire_in(Arena *a, uint16_t port, int *out) {
 // ---- the in-process engine (Saetta Code with --pack): its own lock, so a second engine is not
 // loaded beside it -----------------------------------------------------------------------------
 
+static Err inproc_clients_dir(Arena *a, char **out);
+
+// This process as the in-process engine's holder (instance_inproc_acquire).
+static struct {
+    bool on, restarting;
+    int lock_fd;
+    char id[40], token[65], dir[1024];
+} g_holder = {.lock_fd = -1};
+
 static Err inproc_path(Arena *a, char **out) {
     char *d;
     TRY(run_dir(a, &d));
@@ -95,17 +107,64 @@ static Err inproc_path(Arena *a, char **out) {
     return OK;
 }
 
-Err instance_inproc_acquire(int *out) {
+// A process's start time in microseconds (0: no such process): with the pid, the holder's
+// identity, so a recycled pid is never taken for it (and no lock is probed to find it).
+static uint64_t proc_start_us(int pid) {
+    struct proc_bsdinfo bi;
+    if (pid <= 0 || proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &bi, sizeof bi) != (int)sizeof bi) return 0;
+    return (uint64_t)bi.pbi_start_tvsec * 1000000ull + bi.pbi_start_tvusec;
+}
+
+static bool read_record(Inproc *out);
+
+// The lock this image inherited from the one that exec'd it (a /model restart): its descriptor,
+// accepted only when it is that lock: the same file as ~/.saetta/run/inproc.lock (not a link),
+// held by it (a non-blocking exclusive flock succeeds only for the holder of that open file), and
+// the record says restarting, by this pid. Anything else is ignored (never written or closed).
+static int inherited_lock(void) {
+    const char *v = getenv("SAETTA_INPROC_LOCK_FD");
+    if (!v) return -1;
+    int fd = atoi(v);
+    unsetenv("SAETTA_INPROC_LOCK_FD");
+    struct stat fs, ps;
     Arena a = {0};
-    char *dir, *path;
-    Err e = run_dir(&a, &dir);
-    if (!e) e = mkdir_p(dir);
+    char *path;
+    bool ok = fd >= 3 && fcntl(fd, F_GETFD) >= 0 && fstat(fd, &fs) == 0 && !inproc_path(&a, &path) && lstat(path, &ps) == 0 &&
+              S_ISREG(ps.st_mode) && fs.st_dev == ps.st_dev && fs.st_ino == ps.st_ino && flock(fd, LOCK_EX | LOCK_NB) == 0;
+    arena_reset(&a);
+    Inproc in;
+    ok = ok && read_record(&in) && in.state == INPROC_RESTARTING && in.pid == getpid();
+    if (!ok) return -1;
+    fcntl(fd, F_SETFD, FD_CLOEXEC);
+    return fd;
+}
+static int g_inherited = -2; // -2: not looked at yet
+
+void instance_inproc_take_inherited(void) {
+    if (g_inherited == -2) g_inherited = inherited_lock();
+}
+
+static int take_inherited(void) {
+    instance_inproc_take_inherited();
+    int fd = g_inherited;
+    g_inherited = -1;
+    return fd;
+}
+
+Err instance_inproc_acquire(const char *dir, int *out) {
+    Arena a = {0};
+    char *rdir, *path;
+    Err e = run_dir(&a, &rdir);
+    if (!e) e = mkdir_p(rdir);
     if (!e) e = inproc_path(&a, &path);
     if (e) {
         arena_reset(&a);
         return e;
     }
-    int fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0666);
+    chmod(rdir, 0700); // the shared engine's record holds its token, and its socket is there
+    // a /model restart hands its lock over: this image is still the holder
+    int fd = take_inherited();
+    if (fd < 0) fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
     arena_reset(&a);
     if (fd < 0) return err_errno(errno);
     if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
@@ -119,29 +178,54 @@ Err instance_inproc_acquire(int *out) {
         close(fd);
         return "WriteFailed";
     }
+    // a new holder: its identity and token, and the record (loading, with its pack)
+    uint8_t raw[32];
+    arc4random_buf(raw, sizeof raw);
+    for (size_t i = 0; i < sizeof raw; i++) snprintf(g_holder.token + 2 * i, 3, "%02x", raw[i]);
+    snprintf(g_holder.id, sizeof g_holder.id, "%d-%llu", (int)getpid(), (unsigned long long)wall_ns());
+    char rp[PATH_MAX];
+    if (dir && realpath(dir, rp)) dir = rp;
+    snprintf(g_holder.dir, sizeof g_holder.dir, "%s", dir ? dir : "");
+    g_holder.on = true;
+    g_holder.lock_fd = fd;
+    Arena ca = {0};
+    char *cdir;
+    (void)inproc_clients_dir(&ca, &cdir); // made private before any session registers
+    arena_reset(&ca);
+    Err pe = instance_inproc_publish(INPROC_LOADING, 0, "", "");
+    if (pe) {
+        close(fd);
+        g_holder.on = false;
+        return pe;
+    }
     *out = fd;
     return OK;
 }
 
-bool instance_inproc_running(int *pid) {
+void instance_inproc_release_inherited(void) {
+    int fd = take_inherited();
+    if (fd < 0) return;
+    // restarted away from the model (a verified lock: inherited_lock): not a holder any more. The
+    // record goes first, then the lock: a session that looks in between finds no holder, tries to
+    // take the lock, and tries again a moment later
     Arena a = {0};
-    char *path;
-    if (inproc_path(&a, &path)) {
-        arena_reset(&a);
-        return false;
-    }
-    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    char *p;
+    if (!run_dir(&a, &p)) unlink(path_join(&a, p, "inproc.rec"));
     arena_reset(&a);
-    if (fd < 0) return false;
-    bool held = flock(fd, LOCK_SH | LOCK_NB) != 0 && errno == EWOULDBLOCK;
-    if (!held) flock(fd, LOCK_UN);
-    if (held && pid) {
-        char b[32] = {0};
-        ssize_t n = pread(fd, b, sizeof b - 1, 0);
-        *pid = n > 0 ? atoi(b) : 0;
-    }
     close(fd);
-    return held;
+}
+
+Err instance_inproc_restarting(const char *dir) {
+    if (!g_holder.on || g_holder.lock_fd < 0) return "NotHolder";
+    g_holder.restarting = true; // withdraw leaves this record as it is
+    snprintf(g_holder.dir, sizeof g_holder.dir, "%s", dir ? dir : "");
+    TRY(instance_inproc_publish(INPROC_RESTARTING, 0, "", ""));
+    // the lock goes on into the next image (it takes it from SAETTA_INPROC_LOCK_FD)
+    fcntl(g_holder.lock_fd, F_SETFD, 0);
+    char v[16];
+    snprintf(v, sizeof v, "%d", g_holder.lock_fd);
+    setenv("SAETTA_INPROC_LOCK_FD", v, 1);
+    return OK;
 }
 
 Err instance_acquire(uint16_t port, int *fd) {
@@ -327,4 +411,213 @@ size_t instance_unregister(void) {
 done:
     arena_reset(&a);
     return others;
+}
+
+
+// ---- sharing the in-process engine (code_share.c) ---------------------------------------------------
+// The record ~/.saetta/run/inproc.rec (0600, replaced by rename): "pid state port ctx holder\ntoken\n
+// model\ndir\n". Registration (a joiner's entry, the holder's last count and the record's
+// withdrawal) happens under the flock of ~/.saetta/run/inproc.reg, so no session joins after the
+// holder's final count.
+
+static Err rec_path(Arena *a, const char *name, char **out) {
+    char *d;
+    TRY(run_dir(a, &d));
+    *out = path_join(a, d, name);
+    return OK;
+}
+
+static int reg_lock(void) {
+    Arena a = {0};
+    char *p;
+    int fd = -1;
+    if (!rec_path(&a, "inproc.reg", &p)) {
+        fd = open(p, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+        if (fd >= 0) flock(fd, LOCK_EX);
+    }
+    arena_reset(&a);
+    return fd;
+}
+
+static void reg_unlock(int fd) {
+    if (fd >= 0) close(fd); // drops the flock
+}
+
+static const char *const state_names[] = {"loading", "serving", "private", "closing", "restarting"};
+
+Err instance_inproc_publish(InprocState st, uint32_t ctx, const char *model, const char *sock) {
+    if (!g_holder.on) return "NotHolder";
+    Arena a = {0};
+    char *path, *tmp;
+    Err e = rec_path(&a, "inproc.rec", &path);
+    if (!e) e = rec_path(&a, arena_printf(&a, "inproc.rec.%d", (int)getpid()), &tmp);
+    if (e) {
+        arena_reset(&a);
+        return e;
+    }
+    char rec[4096];
+    int n = snprintf(rec, sizeof rec, "%d %s %u %s %llu\n%s\n%s\n%s\n%s\n", (int)getpid(), state_names[st], ctx, g_holder.id,
+                     (unsigned long long)proc_start_us(getpid()), g_holder.token, model ? model : "", g_holder.dir, sock ? sock : "");
+    if (n < 0 || (size_t)n >= sizeof rec) {
+        arena_reset(&a);
+        return "NoSpaceLeft";
+    }
+    unlink(tmp);
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (fd < 0) e = err_errno(errno);
+    else {
+        e = pwrite_all(fd, rec, (size_t)n, 0);
+        close(fd);
+        if (!e && rename(tmp, path) != 0) e = err_errno(errno);
+        if (e) unlink(tmp);
+    }
+    arena_reset(&a);
+    return e;
+}
+
+const char *instance_inproc_token(void) { return g_holder.on ? g_holder.token : NULL; }
+
+// The record, if its holder is alive: the pid it names runs and started when the record says (no
+// lock is probed: a probe could make a real acquire fail).
+static bool read_record(Inproc *out) {
+    Arena a = {0};
+    char *path, *text = NULL;
+    size_t len = 0;
+    bool ok = false;
+    if (!rec_path(&a, "inproc.rec", &path) && !read_file(path, 8192, &text, &len)) {
+        Str s = str_n(text, len), line[5] = {0};
+        for (size_t k = 0, i = 0; k < 5 && i <= s.len; k++) {
+            ptrdiff_t nl = str_find_char(s, '\n', i);
+            size_t j = nl >= 0 ? (size_t)nl : s.len;
+            line[k] = str_sub(s, i, j);
+            i = j + 1;
+        }
+        Str t;
+        size_t pos = 0;
+        uint64_t v, start = 0;
+        int32_t pid;
+        *out = (Inproc){.state = INPROC_CLOSING};
+        if (next_tok(line[0], &pos, &t) && parse_i32(t, &pid) && next_tok(line[0], &pos, &t)) {
+            out->pid = pid;
+            for (int k = 0; k < 5; k++)
+                if (str_eqz(t, state_names[k])) out->state = (InprocState)k;
+            if (next_tok(line[0], &pos, &t) && !parse_u64(t, &v) && v <= UINT32_MAX) out->ctx = (uint32_t)v;
+            if (next_tok(line[0], &pos, &t)) snprintf(out->holder, sizeof out->holder, "%.*s", (int)t.len, t.ptr);
+            if (next_tok(line[0], &pos, &t)) (void)parse_u64(t, &start);
+            snprintf(out->token, sizeof out->token, "%.*s", (int)line[1].len, line[1].ptr);
+            snprintf(out->model, sizeof out->model, "%.*s", (int)line[2].len, line[2].ptr);
+            snprintf(out->dir, sizeof out->dir, "%.*s", (int)line[3].len, line[3].ptr);
+            snprintf(out->sock, sizeof out->sock, "%.*s", (int)line[4].len, line[4].ptr);
+            ok = start && proc_start_us(pid) == start;
+        }
+        free(text);
+    }
+    arena_reset(&a);
+    return ok;
+}
+
+bool instance_inproc_running(int *pid) {
+    Inproc in;
+    if (!read_record(&in)) return false;
+    if (pid) *pid = in.pid;
+    return true;
+}
+
+bool instance_inproc_info(Inproc *out) { return read_record(out); }
+
+static Err inproc_clients_dir(Arena *a, char **out) {
+    TRY(rec_path(a, "inproc-clients", out));
+    TRY(mkdir_p(*out));
+    chmod(*out, 0700);
+    return OK;
+}
+
+// The live entries of holder id (NULL: any), others' and dead ones removed.
+static size_t count_clients(const char *holder) {
+    Arena a = {0};
+    char *dir_path;
+    size_t n = 0;
+    if (inproc_clients_dir(&a, &dir_path)) goto done;
+    DIR *dir = opendir(dir_path);
+    if (!dir) goto done;
+    struct dirent *e;
+    while ((e = readdir(dir))) {
+        int32_t pid;
+        if (!parse_i32(str(e->d_name), &pid)) continue;
+        char *p = path_join(&a, dir_path, e->d_name), *text = NULL;
+        size_t len = 0;
+        // "<holder id> <the session's start time>": a session of this holder, alive, not a recycled pid
+        bool mine = false;
+        if (!read_file(p, 128, &text, &len) && holder) {
+            Str t = str_trim(str_n(text, len));
+            ptrdiff_t sp = str_find_char(t, ' ', 0);
+            uint64_t start = 0;
+            mine = sp > 0 && str_eq(str_sub(t, 0, (size_t)sp), str(holder)) && !parse_u64(str_sub(t, (size_t)sp + 1, t.len), &start) &&
+                   start && proc_start_us(pid) == start;
+        }
+        free(text);
+        if (mine) n++;
+        else unlink(p); // a session that died, or one of an earlier holder
+    }
+    closedir(dir);
+done:
+    arena_reset(&a);
+    return n;
+}
+
+bool instance_inproc_join(const Inproc *h) {
+    int lk = reg_lock();
+    Inproc now;
+    bool ok = instance_inproc_info(&now) && now.pid == h->pid && now.state == INPROC_SERVING && !strcmp(now.holder, h->holder);
+    if (ok) {
+        Arena a = {0};
+        char *dir;
+        ok = !inproc_clients_dir(&a, &dir);
+        if (ok) {
+            // written whole, then renamed into place (a count never sees half an entry)
+            char *p = arena_printf(&a, "%s/%d", dir, (int)getpid()), *tmp = arena_printf(&a, "%s/.%d.tmp", dir, (int)getpid());
+            unlink(tmp);
+            int fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+            char ent[96];
+            int el = snprintf(ent, sizeof ent, "%s %llu", h->holder, (unsigned long long)proc_start_us(getpid()));
+            ok = fd >= 0 && !pwrite_all(fd, ent, (size_t)el, 0);
+            if (fd >= 0) close(fd);
+            ok = ok && rename(tmp, p) == 0;
+            if (!ok) unlink(tmp);
+        }
+        arena_reset(&a);
+    }
+    reg_unlock(lk);
+    return ok;
+}
+
+void instance_inproc_leave(void) {
+    int lk = reg_lock();
+    Arena a = {0};
+    char *dir;
+    if (!inproc_clients_dir(&a, &dir)) unlink(arena_printf(&a, "%s/%d", dir, (int)getpid()));
+    arena_reset(&a);
+    reg_unlock(lk);
+}
+
+size_t instance_inproc_clients(void) {
+    if (!g_holder.on) return 0;
+    int lk = reg_lock(); // no entry is written or removed meanwhile
+    size_t n = count_clients(g_holder.id);
+    reg_unlock(lk);
+    return n;
+}
+
+size_t instance_inproc_withdraw(bool force) {
+    if (!g_holder.on) return 0;
+    int lk = reg_lock();
+    size_t n = force ? 0 : count_clients(g_holder.id);
+    if (!n) {
+        // the record says closing until the lock goes with this process: no session joins, and none
+        // tries to load the model while this one still holds it (a restart keeps its own record)
+        if (!g_holder.restarting) (void)instance_inproc_publish(INPROC_CLOSING, 0, "", "");
+        if (force) count_clients(g_holder.id);
+    }
+    reg_unlock(lk);
+    return n;
 }

@@ -42,6 +42,19 @@ struct Stats *server_engine_stats(Engine *e);
 // is also called with p NULL, n 0 to ask whether the caller is gone. Errors: harness failures
 // only (a failed request is an error answer through sink).
 Err server_engine_chat(Engine *e, Str body, int (*sink)(void *ctx, int status, const void *p, size_t n), void *ctx);
+// One HTTP connection on fd (accepted on a socket of the caller's) answered as server_serve
+// answers it: the same endpoints and request path. The request is read first (the head and body
+// deadlines; the caller sets the socket's send and receive timeouts: no connection guard here),
+// then it waits for the engine's turn (requests run one at a time, in arrival order, with
+// server_engine_chat's), sending a streamed request keep-alives meanwhile. Calls run on threads
+// of their own. The caller closes fd. A shared connection has 5 s for its head; authed(ctx) (may be
+// NULL) is called once its token is checked (code_share.c counts the connections not yet checked).
+// GET /saetta/whoami?n=<nonce> is answered without the token: HMAC-SHA256(token, nonce), in hex,
+// so a client can tell the holder from another program on its port before it sends the token.
+Err server_engine_connection(Engine *e, int fd, void (*authed)(void *ctx), void *ctx);
+// The token server_engine_connection requires (Authorization: Bearer <token>; a request with an
+// Origin header is refused too): 401 / 403 before the body is read. NULL or "": none.
+void server_engine_set_token(Engine *e, const char *token);
 
 // The error object a failed request is answered with (also the data of a stream's error
 // event): 4xx is the client's (invalid_request_error; Anthropic request_too_large for 413),

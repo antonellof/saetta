@@ -21,7 +21,7 @@
 
 // The model as pi's models.json describes it (the "openai-completions" api only), with the
 // provider's compat flags and the session's thinking level.
-typedef struct {
+typedef struct CodeModel {
     const char *provider;  // the provider key in models.json ("saetta")
     const char *id;        // the model id sent as "model"
     const char *name;
@@ -38,6 +38,13 @@ typedef struct {
     // The in-process engine (server.h server_engine_open), or NULL to call base_url over HTTP.
     // The request body and the answer are the same either way.
     struct Engine *engine;
+    // A check before each request (code_share.c, a model another Saetta Code serves): 1 send it,
+    // 2 busy (the answer is a retryable 503 error), 0 the server is not the one joined (the answer
+    // is a "Connection error" and nothing, the token least of all, is sent). NULL: none.
+    int (*verify)(const struct CodeModel *m);
+    // A model another Saetta Code serves: requests go over this Unix socket (src/unix_http.h), not
+    // to base_url. NULL: none.
+    const char *sock;
 } CodeModel;
 
 // saetta's version (main.c sets it), for Saetta Code's header.
@@ -90,6 +97,12 @@ JValue *code_tool_schemas(Arena *a, const char *const *tools, size_t ntools);
 // tool name is a result too). raw (may be NULL) gets the tool's own return value as json
 // mode's tool_execution_end prints it ({"content","details","structuredContent",...}).
 Err code_tool_run(Arena *a, const CodeEnv *env, const JValue *call, JValue **result, JValue **raw);
+// pi's truncateModelOutput (its subagent example): output cut to 2000 lines and 50 KB with a notice.
+Str code_tool_truncate_model_output(Arena *a, Str output);
+// The validation code_tool_run applies (prepareToolCall: an arguments parse error, then the
+// schema with pi's coercion), for a tool that runs elsewhere (code_subagent.c): the arguments to
+// run with, or NULL and *err, the text of the call's error result.
+JValue *code_tool_validate(Arena *a, const JValue *call, const JValue *params, const char **err);
 // pi's killTrackedDetachedChildren (utils/shell.ts): SIGKILLs the process group of every bash
 // command still running (pi tracks a group from spawn until its wait ends). Async-signal-safe,
 // for exit and the SIGTERM / SIGHUP handlers.

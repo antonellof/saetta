@@ -19,6 +19,7 @@
         { "slug": "context-and-skills", "title": "Context and skills" },
         { "slug": "mcp", "title": "MCP" },
         { "slug": "print-json-rpc", "title": "Print, JSON and RPC modes" },
+        { "slug": "parallel-agents", "title": "Parallel agents" },
         { "slug": "themes-and-settings", "title": "Themes and settings" },
         { "slug": "monitor", "title": "/monitor" }
       ]

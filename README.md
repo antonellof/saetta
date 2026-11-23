@@ -61,7 +61,10 @@ saetta code -c                          # continue this folder's last session (p
 saetta code -p "fix the failing test"   # print mode, as pi -p
 saetta code --mode json -p "..."        # pi's JSON event stream
 saetta code --mode rpc                  # pi's rpc protocol: JSON commands on stdin, events on stdout
+saetta code --subagents                 # a subagent tool: up to 3 child agents at once
 ```
+
+Several Saetta Code sessions share one model: a `saetta start code` in another terminal uses the model the first one loaded, each session in its own conversation. `--subagents` (or `"subagents": true` in `settings.json`) lets the model hand self-contained tasks to child agents that run in parallel; it is off by default, which keeps the prompt pi's. See [Parallel agents](docs/parallel-agents.md).
 
 ### Compatible with pi
 

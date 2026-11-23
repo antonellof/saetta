@@ -922,6 +922,10 @@ static const ToolPrompt TOOL_PROMPTS[] = {
     {"grep", "Search file contents for patterns (respects .gitignore)", {0}},
     {"find", "Find files by glob pattern (respects .gitignore)", {0}},
     {"ls", "List directory contents", {0}},
+    // Saetta Code's subagent tool (code_subagent.c; listed only when it is on)
+    {"subagent", "Hand a self-contained task to a subagent; several calls in one message run in parallel",
+     {"Use subagent for independent tasks that can run in parallel (searching, reading, checking); give each one a "
+      "complete prompt."}},
     {"powershell", "Execute PowerShell commands",
      {"You can inspect PI_* environment variables for current model and session details."}},
 };

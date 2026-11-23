@@ -541,6 +541,15 @@ static Err session(Arena *a, Session *ss, Agent agent, const char *pack_arg, uin
     }
     if (!joined) {
         int ipid = 0;
+        Inproc in;
+        if (agent == AGENT_CODE && !lora_arg && instance_inproc_info(&in)) {
+            // Saetta Code runs the model in its process (or is still loading it, or is exiting):
+            // this Saetta Code shares it, waits for it, or loads it after it (code_share.c; another
+            // pack asked for is refused there, at once: the record names the pack from the start)
+            const char *dir = in.dir[0] ? in.dir : NULL;
+            if (pack_arg || !dir) TRY(pack_for(a, pack_arg, &dir));
+            if (dir) return code_in_process(a, dir, ctx, extra, n_extra, code);
+        }
         if (instance_inproc_running(&ipid)) {
             dbg("saetta: Saetta Code (pid %d) is running the model in its own process; one model runs at a time. Close it "
                 "first, or run it against a server (start the server first, then saetta start code joins it).\n", ipid);

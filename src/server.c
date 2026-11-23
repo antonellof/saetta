@@ -28,6 +28,8 @@
 #include "stats.h"
 #include "tokenizer.h"
 #include "toolcall.h"
+#include "turns.h"
+#include "hash.h"
 #include "weights.h"
 
 // The served model id (the loaded model's, model_info) and the one the current request's
@@ -82,8 +84,20 @@ typedef struct Engine {
     // --default-chat-template-kwargs: an object whose keys fill in what a request leaves out
     JValue *kwargs_default;
     uint64_t opened_ns; // when engine_open began (the load time the server reports)
+    // One request at a time, in arrival order: the in-process caller (server_engine_chat, from
+    // any thread: Saetta Code's agent and its subagents) and the connections of the Saetta Codes
+    // that share this process's engine (server_engine_connection, one thread each) take tickets
+    // (turn_take) and run when theirs is served (turn_wait); a waiter that leaves gives its turn
+    // up (turn_leave). Only the engine work runs in a turn: requests are read before.
+    Turns turns;
+    // server_engine_set_token: the token every request of a shared connection must carry
+    char token[80];
 } Engine;
 
+static uint64_t turn_take(Engine *e) { return turns_take(&e->turns); }
+static bool turn_wait(Engine *e, uint64_t t, int ms) { return turns_wait(&e->turns, t, ms); }
+static void turn_done(Engine *e) { turns_done(&e->turns); }
+static void turn_leave(Engine *e, uint64_t t) { turns_leave(&e->turns, t); }
 // Makes conversation i the active one.
 static void activate(Engine *e, size_t i) {
     if (i == e->active) return;
@@ -705,7 +719,7 @@ static Err generate_reply(Engine *e, Arena *a, Conn *c, Req *h, Work *w, JValue 
     Out *out = NULL;
     if (stream) {
         if (c->sink) c->status = 200; // in process: no head
-        else {
+        else if (!c->head_sent) {
             TRY(http_write_expect_continue(c, h));
             TRY(conn_writes(c, "HTTP/1.1 200 OK\r\nconnection: close\r\ntransfer-encoding: chunked\r\ncontent-type: "
                                "text/event-stream\r\ncache-control: no-cache\r\n\r\n"));
@@ -1142,11 +1156,93 @@ static Err handle(Engine *e, Arena *a, Conn *c, Req *h, Str body, Fmt fmt, Work 
     return err;
 }
 
-static Err connection(Engine *e, int fd) {
+// A header of the request head (case-insensitive name), empty when absent.
+static Str head_field(const Conn *c, const char *name) {
+    Str hd = str_n(c->head, c->head_len);
+    size_t nl = strlen(name);
+    for (size_t i = 0; i < hd.len;) {
+        ptrdiff_t e = str_find_char(hd, '\n', i);
+        size_t j = e >= 0 ? (size_t)e : hd.len;
+        Str line = str_sub(hd, i, j);
+        if (line.len > nl && line.ptr[nl] == ':' && !strncasecmp(line.ptr, name, nl)) return str_trim(str_sub(line, nl + 1, line.len));
+        i = j + 1;
+    }
+    return S("");
+}
+
+// Equal strings, in a time that does not depend on where they differ.
+static bool same_secret(Str a, Str b) {
+    unsigned char d = a.len != b.len;
+    for (size_t i = 0; i < a.len && i < b.len; i++) d |= (unsigned char)(a.ptr[i] ^ b.ptr[i]);
+    return d == 0;
+}
+
+// The body asks for a stream ("stream": true at its top level).
+static bool body_streams(Arena *a, Str body) {
+    JValue *v;
+    if (json_parse(a, body, false, &v) || v->kind != J_OBJECT) return false;
+    const JValue *sv = json_get(v, "stream");
+    return sv && sv->kind == J_BOOL && sv->b;
+}
+
+// Waits for turn t while the client waits too: a streamed request gets its head and a keep-alive
+// comment every 5 s (so the client's idle timeout does not fire while others run), a non-streamed
+// one is checked for a client that left. False when the client left (the turn is given up).
+static bool wait_turn_keeping_alive(Engine *e, Arena *a, uint64_t t, Conn *c, Req *h, Fmt fmt, Str body, bool count) {
+    if (turn_wait(e, t, 0)) return true; // not contended (server_serve, mostly): nothing more to do
+    // count_tokens answers with one JSON body: never a stream head before it
+    bool stream = !count && body_streams(a, body);
+    while (!turn_wait(e, t, 5000)) {
+        bool left;
+        if (stream) {
+            Err err = OK;
+            if (!c->head_sent) {
+                err = conn_writes(c, "HTTP/1.1 200 OK\r\nconnection: close\r\ntransfer-encoding: chunked\r\ncontent-type: "
+                                     "text/event-stream\r\ncache-control: no-cache\r\n\r\n");
+                c->head_sent = true;
+            }
+            const char *ka = fmt == FMT_OPENAI ? ": queued\n\n" : "event: ping\ndata: {\"type\":\"ping\"}\n\n";
+            char hd[16];
+            snprintf(hd, sizeof hd, "%zx\r\n", strlen(ka));
+            if (!err) err = conn_writes(c, hd);
+            if (!err) err = conn_writes(c, ka);
+            if (!err) err = conn_writes(c, "\r\n");
+            if (!err) err = conn_flush(c);
+            left = err != OK;
+        } else left = conn_peer_gone(c);
+        (void)h;
+        if (left) {
+            turn_leave(e, t);
+            return false;
+        }
+    }
+    return true;
+}
+
+// The challenge a shared engine answers without the token (code_share.c verifies its holder before
+// it sends one): GET /saetta/whoami?n=<nonce> -> {"hmac": HMAC-SHA256(token, nonce) in hex}.
+static Err whoami(Engine *e, Conn *c, Req *h) {
+    Str target = h->target;
+    ptrdiff_t q = str_find(target, S("?n="), 0);
+    Str n = q >= 0 ? str_sub(target, (size_t)q + 3, target.len) : S("");
+    if (n.len < 32 || n.len > 128) return json_respond(c, h, 400, S("{\"error\":{\"message\":\"bad nonce\"}}"));
+    const char *key = e->token + 7; // after "Bearer "
+    uint8_t d[SHA256_LEN];
+    hmac_sha256(key, strlen(key), n.ptr, n.len, d);
+    char hex[2 * SHA256_LEN + 1];
+    hash_hex(d, SHA256_LEN, hex);
+    char body[96];
+    snprintf(body, sizeof body, "{\"hmac\":\"%s\"}", hex);
+    return json_respond(c, h, 200, str(body));
+}
+
+static Err connection(Engine *e, int fd, bool guard, void (*authed)(void *), void *actx) {
     Conn *c = xmalloc(sizeof(Conn));
     conn_init(c, fd);
-    c->deadline_ns = now_ns() + (uint64_t)HTTP_REQUEST_DEADLINE_MS * 1000000ull;
-    http_guard_attach(fd);
+    // a shared connection (no guard) has 5 s for its head: until its token is checked it holds
+    // nothing, and a slow one is dropped soon
+    c->deadline_ns = now_ns() + (uint64_t)(guard ? HTTP_REQUEST_DEADLINE_MS : 5000u) * 1000000ull;
+    if (guard) http_guard_attach(fd);
     Err ret = OK;
     Req h;
     Err he = http_receive_head(c, &h);
@@ -1160,6 +1256,24 @@ static Err connection(Engine *e, int fd) {
         }
         ret = status ? he : OK;
         goto done;
+    }
+    if (e->token[0] && h.method == M_GET && str_starts(h.target, S("/saetta/whoami"))) {
+        ret = whoami(e, c, &h);
+        goto done;
+    }
+    if (e->token[0]) {
+        // a shared engine (code_share.c): no browser page, and only the holder's sessions (the
+        // token of its record) are answered, before any body is read
+        Req none = {.method = M_GET};
+        int status = head_field(c, "origin").len ? 403
+                     : !same_secret(head_field(c, "authorization"), str(e->token)) ? 401 : 0;
+        if (status) {
+            if (!respond_error(c, &none, status, FMT_OPENAI, status == 403 ? "Forbidden" : "Unauthorized")) http_drain(c, 1u << 20, 1000);
+            ret = status == 403 ? "Forbidden" : "Unauthorized";
+            goto done;
+        }
+        c->deadline_ns = now_ns() + (uint64_t)HTTP_REQUEST_DEADLINE_MS * 1000000ull; // the body's, as server_serve's
+        if (authed) authed(actx);
     }
     {
         Arena a = {0};
@@ -1213,13 +1327,26 @@ static Err connection(Engine *e, int fd) {
             Str bs = str_n(arena_dup(&a, body.ptr ? body.ptr : "", body.len + 1), body.len);
             buf_free(&body);
             Work w = {.status = 400};
+            // the engine's turn: only now, with the whole request read
+            uint64_t t = turn_take(e);
+            if (!wait_turn_keeping_alive(e, &a, t, c, &h, fmt, bs, str_ends(path, S("/count_tokens")))) {
+                vec_free(&w.ids);
+                arena_reset(&a);
+                ret = "ClientGone";
+                goto done;
+            }
             Err err = str_ends(path, S("/count_tokens")) ? count_tokens(e, &a, c, &h, bs, &w.status) : handle(e, &a, c, &h, bs, fmt, &w);
+            turn_done(e);
             if (err) {
                 dbg("request failed: %s\n", err);
                 // a client that is gone gets nothing; a started stream ends with an error event
                 if (!strcmp(err, "WriteFailed") || !strcmp(err, "ClientGone")) ret = err;
                 else if (w.streaming) (void)out_error(&w.out, w.status, err);
-                else (void)respond_error(c, &h, w.status, fmt, err);
+                else if (c->head_sent) { // keep-alives went out while it waited: the error is a stream event
+                    Out o = {.a = &a, .fmt = fmt, .c = c, .last = now_ns()};
+                    (void)out_error(&o, w.status, err);
+                    buf_free(&o.ev);
+                } else (void)respond_error(c, &h, w.status, fmt, err);
             }
             vec_free(&w.ids);
             lookup_free(&w.lk);
@@ -1233,7 +1360,7 @@ static Err connection(Engine *e, int fd) {
     // one request per connection (connection: close): agent sessions sharing the server
     // take turns, and an idle keep-alive connection of one never holds up the others
 done:
-    http_guard_detach();
+    if (guard) http_guard_detach();
     free(c);
     return ret;
 }
@@ -1366,6 +1493,7 @@ static Err engine_open(Arena *arena, const char *dir, const char *const *loras, 
     e->active = 0;
     for (size_t i = 0; i < MAX_CONV; i++) e->conv_lora[i] = -1;
     e->kwargs_default = kwd;
+    turns_init(&e->turns);
     st->ctx = e->s->max_cap;
     e->opened_ns = t0;
     *out = e;
@@ -1381,7 +1509,7 @@ Err server_engine_open(Arena *arena, const char *dir, const char *kwargs_default
         return "EngineBusy";
     }
     int lock_fd;
-    Err le = instance_inproc_acquire(&lock_fd);
+    Err le = instance_inproc_acquire(dir, &lock_fd);
     if (le) {
         int pid = 0;
         instance_inproc_running(&pid);
@@ -1409,7 +1537,17 @@ Err server_engine_chat(Engine *e, Str body, int (*sink)(void *ctx, int status, c
     Arena a = {0};
     Str bs = str_n(arena_dup(&a, body.ptr ? body.ptr : "", body.len + 1), body.len);
     Work w = {.status = 400};
+    // the engine's turn; a caller that leaves meanwhile (Esc) gives it up
+    uint64_t t = turn_take(e);
+    while (!turn_wait(e, t, 100))
+        if (sink(ctx, 0, NULL, 0)) {
+            turn_leave(e, t);
+            arena_reset(&a);
+            free(c);
+            return OK;
+        }
     Err err = handle(e, &a, c, &h, bs, FMT_OPENAI, &w);
+    turn_done(e);
     Err ret = OK;
     if (err) {
         dbg("request failed: %s\n", err);
@@ -1425,6 +1563,13 @@ Err server_engine_chat(Engine *e, Str body, int (*sink)(void *ctx, int status, c
     arena_reset(&a);
     free(c);
     return ret;
+}
+
+Err server_engine_connection(Engine *e, int fd, void (*authed)(void *ctx), void *ctx) { return connection(e, fd, false, authed, ctx); }
+
+void server_engine_set_token(Engine *e, const char *token) {
+    snprintf(e->token, sizeof e->token, "Bearer %s", token ? token : "");
+    if (!token || !*token) e->token[0] = 0;
 }
 
 Err server_serve(Arena *arena, const char *dir, uint16_t port, const char *const *loras, size_t nloras,
@@ -1485,7 +1630,7 @@ Err server_serve(Arena *arena, const char *dir, uint16_t port, const char *const
             continue;
         }
         setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
-        Err err = connection(e, fd);
+        Err err = connection(e, fd, true, NULL, NULL);
         if (err) dbg("connection: %s\n", err);
         close(fd);
     }

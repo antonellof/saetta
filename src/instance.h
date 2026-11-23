@@ -22,11 +22,49 @@ typedef struct {
 // (message on stderr, error "AlreadyRunning"). *fd is the lock file: keep it open for the
 // life of the server (serve() never closes it).
 Err instance_acquire(uint16_t port, int *fd);
-// The in-process engine's lock (~/.saetta/run/inproc.lock, the holder's pid), held for the life
-// of a Saetta Code that runs the model in its own process. Errors: "EngineBusy" (another holds it).
-Err instance_inproc_acquire(int *fd);
-// True when a Saetta Code holds the model in its process (*pid its pid, may be NULL).
+// The in-process engine's lock (~/.saetta/run/inproc.lock), held for the life of a Saetta Code
+// that runs the model in its own process; taking it also makes this process the holder of a new
+// identity and token and writes the record (loading, the pack folder dir). A /model restart hands
+// the lock to the next image (instance_inproc_restarting). Errors: "EngineBusy" (another holds it).
+Err instance_inproc_acquire(const char *dir, int *fd);
+// True when a Saetta Code holds the model in its process (*pid its pid, may be NULL): its record
+// names a live process with the start time it had (no lock is probed).
 bool instance_inproc_running(int *pid);
+
+// Sharing that engine with other Saetta Codes (code_share.c). The holder's record
+// (~/.saetta/run/inproc.rec, 0600, replaced atomically) gives its state, the context, its identity
+// and start time, the token every request must carry, the model id, the pack folder and the Unix
+// socket it serves the server's HTTP API on. Each session that uses it registers in
+// ~/.saetta/run/inproc-clients/<pid> (0700 folder) with the holder's identity.
+typedef enum { INPROC_LOADING, INPROC_SERVING, INPROC_PRIVATE, INPROC_CLOSING, INPROC_RESTARTING } InprocState;
+typedef struct {
+    int32_t pid;
+    InprocState state; // CLOSING: no record (the holder is exiting); RESTARTING: a /model restart
+    uint32_t ctx;
+    char holder[40], token[65], model[256], dir[1024], sock[1024];
+} Inproc;
+Err instance_inproc_publish(InprocState st, uint32_t ctx, const char *model, const char *sock);
+const char *instance_inproc_token(void); // this holder's token, NULL when not the holder
+// The holder's record if its holder is alive (false otherwise).
+bool instance_inproc_info(Inproc *out);
+// A /model restart of the holder: the record says restarting (dir: the pack it restarts on, may
+// be empty), and the lock stays held across the exec (SAETTA_INPROC_LOCK_FD, which the next
+// image's instance_inproc_acquire takes). instance_inproc_release_inherited: an image that does
+// not load the model gives the inherited lock (and the record) up.
+Err instance_inproc_restarting(const char *dir);
+void instance_inproc_release_inherited(void);
+// Takes SAETTA_INPROC_LOCK_FD out of the environment (always) and keeps the lock it names when it
+// is the real one (code_run calls it first, so it never reaches a child).
+void instance_inproc_take_inherited(void);
+// Registers this process with holder h, under the registration lock, if h still serves: false
+// when it does not (it is closing, or another holder took its place).
+bool instance_inproc_join(const Inproc *h);
+void instance_inproc_leave(void);
+// The holder: the live sessions registered with it (stale entries are removed).
+size_t instance_inproc_clients(void);
+// The holder: under the registration lock, the count of its sessions; when none (or force), the
+// record is removed in the same step, so no session can join after it. Returns the count.
+size_t instance_inproc_withdraw(bool force);
 
 // The running server, if one holds the lock (false otherwise or on any error).
 bool instance_running(Server *out);

@@ -20,6 +20,10 @@ typedef struct {
     // the request head, copied out of rbuf (which the body reads refill): Req's strings
     // point here and stay valid for the whole request
     char head[HTTP_RBUF];
+    size_t head_len;
+    // The response's status line and headers are out (a streamed answer that sent keep-alives
+    // while it waited for the engine): later writes continue the chunked body.
+    bool head_sent;
     char wbuf[HTTP_WBUF];
     size_t wlen;
     bool wfail;

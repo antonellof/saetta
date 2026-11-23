@@ -17,6 +17,8 @@
 #include "code_cmds.h"
 #include "code_update.h"
 #include "code_ui_ext.h"
+#include "code_subagent.h"
+#include "code_share.h"
 #include "code_autocompact.h"
 #include "code_ui_keys.h"
 #include "download.h"
@@ -301,6 +303,7 @@ typedef struct {
     // a switch to another pack (or away from the engine) waiting for its confirmation
     bool confirm_switch;
     char *sw_provider, *sw_id, *sw_title;
+    size_t sw_others; // sessions sharing this process's model when the switch was asked (code_share.c)
     // the theme: the setting (NULL until chosen), the terminal's colors once reported, macOS's
     // appearance (1 dark, 2 light), and what /theme previews over
     char *theme;
@@ -1275,6 +1278,13 @@ static void tool_render(Comp *c, int width, Lines *out) {
                 buf_free(&e);
             }
         }
+        return;
+    }
+    if (!strcmp(n, SUBAGENT_TOOL) && json_get(v->args, "prompt")) { // a subagent (code_subagent_ui.c)
+        lines_addz(out, "");
+        code_subagent_ui_render(v->args, v->result, v->has_result, v->partial, v->is_error, v->expanded, cw, &kids);
+        box_lines(&kids, width, 1, 1, tool_bg(v), out);
+        lines_free(&kids);
         return;
     }
     if (!strncmp(n, "mcp__", 5)) { // an MCP tool (code_mcp_ui.c)
@@ -2787,6 +2797,16 @@ static void confirm_render(int width, Lines *out) {
         t.len = 0;
         th_fgz(&t, T_MUTED, "Saetta Code starts again on it; this conversation goes on there.");
         text_lines(buf_str(&t), 1, width, out);
+        size_t others = U->sw_others; // counted once, when the dialog opened
+        if (others) {
+            t.len = 0;
+            Buf w = {0};
+            buf_printf(&w, "%zu other session%s use%s this model: switching disconnects %s.", others, others == 1 ? "" : "s",
+                       others == 1 ? "s" : "", others == 1 ? "it" : "them");
+            th_fg(&t, T_WARNING, buf_str(&w));
+            buf_free(&w);
+            text_lines(buf_str(&t), 1, width, out);
+        }
         lines_addz(out, "");
         t.len = 0;
         th_fgz(&t, T_DIM, "Enter to switch \xc2\xb7 Escape to cancel");
@@ -2980,6 +3000,7 @@ static void choose_model(const CodeUiModel *m, bool persist) {
         U->sw_provider = strdup(m->provider);
         U->sw_id = strdup(m->id);
         U->sw_title = strdup(m->name ? m->name : m->id);
+        U->sw_others = code_share_clients(); // once: the dialog's drawing never counts (a lock, a folder scan)
         U->confirm_switch = true;
         U->sel = SEL_CONFIRM;
         return;
@@ -4662,6 +4683,10 @@ static void handle_event(const JValue *ev) {
             start_prompt(next);
             free(next);
         }
+        return;
+    }
+    if (str_eqz(type, "ui_warning")) { // a notice of the agent's side (code_share.c's, for one)
+        show_warning(json_str(json_get(ev, "message")) ? json_str(json_get(ev, "message")) : "");
         return;
     }
     if (str_eqz(type, "ui_error")) {

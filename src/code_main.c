@@ -15,6 +15,8 @@
 #include "code_oai.h"
 #include "code_res.h"
 #include "code_rpc.h"
+#include "code_share.h"
+#include "code_subagent.h"
 #include "code_sessions.h"
 #include "code_tui.h"
 #include "code_monitor.h"
@@ -44,7 +46,7 @@ static const char *const default_tools[] = {"read", "bash", "edit", "write"};
 
 typedef struct {
     const char *provider, *model, *thinking, *mode, *system_prompt, *tools, *pack, *ctx, *session;
-    bool print, cont, no_session, no_tools, no_skills, no_mcp;
+    bool print, cont, no_session, no_tools, no_skills, no_mcp, subagents;
     int approve; // --approve 1, --no-approve 0, else -1
     VEC(const char *) skills;
     VEC(const char *) prompts;
@@ -66,6 +68,8 @@ typedef struct {
     int64_t retry_attempt; // the retries of the current prompt so far (pi's _retryAttempt)
     JValue *new_messages; // this run's messages, for agent_end
     const char *pack;     // --pack as given (a download name or a folder), NULL over HTTP
+    const char *ctx;      // --ctx (a joined session that takes the model over loads it with this)
+    bool interactive;     // the screen (only it shares a model it loads: code_share.c)
     const char *const *argv; // the command line after "code", for a restart on another model
     size_t argc;
     const JValue *call;   // the tool call running (for its partial results)
@@ -137,6 +141,7 @@ static Err parse_args(const char *const *v, size_t n, Args *o) {
         else if (!strcmp(x, "--approve") || !strcmp(x, "-a")) o->approve = 1;
         else if (!strcmp(x, "--no-approve") || !strcmp(x, "-na")) o->approve = 0;
         else if (!strcmp(x, "--no-mcp")) o->no_mcp = true;
+        else if (!strcmp(x, "--subagents")) o->subagents = true;
         else if (!strcmp(x, "--help") || !strcmp(x, "-h")) {
             printf("usage: saetta code [options] [prompt ...]\n"
                    "\n"
@@ -156,6 +161,8 @@ static Err parse_args(const char *const *v, size_t n, Args *o) {
                    "  --thinking LEVEL         off, minimal, low, medium, high, xhigh, max\n"
                    "  --tools a,b,c | --no-tools   the tool set\n"
                    "  --no-mcp                 no MCP servers (pi's mcp.json) and no MCP tools\n"
+                   "  --subagents              offer the subagent tool: tasks handed to child agents that run in\n"
+                   "                           parallel (also \"subagents\": true in settings.json)\n"
                    "  --system-prompt T, --append-system-prompt T   text or a file\n"
                    "  --skill PATH             load a skill file or folder (can be repeated)\n"
                    "  --no-skills, -ns         no skill discovery (--skill paths still load)\n"
@@ -515,6 +522,61 @@ static void on_event(void *ctx, const JValue *event, const JValue *partial) {
 
 static const char *level_of(const Run *r) { return r->model.thinking ? r->model.thinking : "off"; }
 
+// A joined session's request that found no holder (code_share.c): the connection refused or cut,
+// and the holder no longer there (a reset with the same holder still answering is transient: the
+// retries resend it).
+static bool share_lost(const CodeModel *model, const JValue *msg) {
+    if (!code_share_joined() || !str_eqz(json_strs(json_get(msg, "stopReason")), "error")) return false;
+    Str m = json_strs(json_get(msg, "errorMessage"));
+    return (str_starts(m, S("Connection error")) || str_starts(m, S("terminated"))) && code_share_verify(model) == 0;
+}
+
+static Err open_engine(Arena *a, Run *r, const char *arg, const char *ctx, bool splash, bool interactive);
+
+// The model's holder is gone: for up to 30 s (backing off), join whoever holds it now (another
+// session may have taken it over), else load it in this process; a takeover lost to another
+// session (EngineBusy) tries again and then joins the winner.
+static bool g_share_recovering;
+static uint64_t g_share_deadline;
+static bool share_recover(Run *r) {
+    // the strings of a model joined now: an arena of its own, which the rpc thread never uses
+    static Arena joined_arena;
+    const uint64_t deadline = now_ns() + 30ull * 1000000000ull; // everything, the waits for a holder too
+    int delay = 200;
+    bool ok = false;
+    g_share_recovering = true;
+    g_share_deadline = deadline;
+    // every wait for a holder, here and in open_engine's join, lets the rpc lock go: the rpc
+    // commands go on meanwhile
+    if (r->rpc) code_share_set_wait_hooks(code_rpc_unlock, code_rpc_lock);
+    while (!ok && now_ns() < deadline && !(r->env.abort && *r->env.abort)) {
+        CodeModel m = r->model;
+        int j = code_share_rejoin(&joined_arena, &m, deadline, r->env.abort); // its waits let the rpc lock go
+        if (j > 0) {
+            m.thinking = r->model.thinking; // as the rpc mode may have set it meanwhile
+            r->model = m;
+            ok = true;
+            break;
+        }
+        if (j < 0) break; // refused (another pack, a holder that keeps the model, Esc): said once, no retry
+        dbg("saetta code: the session that held the model exited; loading it here\n");
+        Err e = open_engine(r->a, r, r->pack, r->ctx, false, r->interactive);
+        if (!e) ok = true;
+        else if (strcmp(e, "EngineBusy")) break;
+        else { // another session is taking it: join it once it is ready
+            if (r->rpc) code_rpc_unlock();
+            struct timespec ts = {delay / 1000, (long)(delay % 1000) * 1000000L};
+            nanosleep(&ts, NULL);
+            if (r->rpc) code_rpc_lock();
+            delay = MIN(delay * 2, 2000);
+        }
+    }
+    g_share_recovering = false;
+    code_share_set_wait_hooks(NULL, NULL);
+    if (ok) dbg("saetta code: the model is back (%s)\n", r->model.base_url);
+    return ok;
+}
+
 static Err stream_assistant(Run *r, JValue **out) {
     Arena *a = r->a;
     const JValue *all = code_session_messages(r->session);
@@ -536,6 +598,23 @@ static Err stream_assistant(Run *r, JValue **out) {
         e = code_oai_complete(r->io, &m, &env, buf_str(&body), &sink, &msg);
         code_rpc_lock();
     } else e = code_oai_complete(a, &r->model, &r->env, buf_str(&body), &sink, &msg);
+    if (!e && share_lost(&r->model, msg)) {
+        // the session that held the model exited: join the next holder or load the model here,
+        // then send the request once more when nothing of the answer was shown yet (else the
+        // error stays, and the retry sends it to the model's new place)
+        bool back = share_recover(r);
+        if (back && !st.started) {
+            if (r->rpc) {
+                CodeModel m = r->model;
+                CodeEnv env = r->env;
+                code_rpc_unlock();
+                e = code_oai_complete(r->io, &m, &env, buf_str(&body), &sink, &msg);
+                code_rpc_lock();
+            } else e = code_oai_complete(a, &r->model, &r->env, buf_str(&body), &sink, &msg);
+        }
+        if (!e && !back)
+            json_put(a, msg, S("errorMessage"), json_string(a, S("The session that held the model exited; restart to load it here")));
+    }
     buf_free(&body);
     TRY(e);
     json_put(a, msg, S("thinkingLevel"), json_string(a, str(level_of(r))));
@@ -676,9 +755,38 @@ static bool declared(const Run *r, Str name) {
     return false;
 }
 
+// A subagent's progress (code_subagent.c), from the children's threads one at a time while this
+// run's thread waits for them.
+static void subagent_emit(void *ctx, JValue *ev) {
+    Run *r = ctx;
+    if (r->rpc) code_rpc_lock(); // the run waits for its children without the rpc lock
+    emit(r, ev);
+    if (r->rpc) code_rpc_unlock();
+}
+
+// The children of this assistant message: the request the parent just sent (system message, tools,
+// the messages before this answer), so their requests start with the same prefix.
+static SubagentBatch *subagent_begin(Run *r) {
+    Arena *a = r->a;
+    const JValue *all = code_session_messages(r->session);
+    JValue *system = current_system(a, all);
+    JValue *prefix = json_new(a, J_ARRAY);
+    // the calling answer is the last message: the children's conversation stops before it
+    for (size_t i = 0; i + 1 < all->arr.len; i++)
+        if (!str_eqz(json_strs(json_get(all->arr.items[i], "role")), "system")) json_push(a, prefix, all->arr.items[i]);
+    const char **names = arena_alloc(a, (r->ntools + 1) * sizeof *names);
+    size_t nn = 0;
+    for (size_t i = 0; i < r->ntools; i++)
+        if (strcmp(r->tools[i], SUBAGENT_TOOL)) names[nn++] = r->tools[i];
+    SubagentParent p = {.model = &r->model, .env = &r->env, .system = system, .tools = current_tools(a, system), .prefix = prefix,
+                        .names = names, .nnames = nn, .emit = subagent_emit, .emit_ctx = r};
+    return code_subagent_begin(&p);
+}
+
 // executeToolCallsParallel: each call's tool_execution_start in order; a call that fails before
 // running (unknown tool, bad arguments: its result has no durationMs) ends at once, the executed
-// ones end after every start (failures first); then the results, in call order.
+// ones end after every start (failures first); then the results, in call order. Subagent calls
+// (code_subagent.c) run together once every call has started, on threads of their own.
 static Err run_tools(Run *r, const JValue *assistant, JValue *results) {
     Arena *a = r->a;
     const JValue *content = json_get(assistant, "content");
@@ -689,6 +797,7 @@ static Err run_tools(Run *r, const JValue *assistant, JValue *results) {
     JValue **raws = arena_alloc(a, (calls.len + 1) * sizeof *raws);
     Err err = OK;
     size_t started = 0;
+    SubagentBatch *sb = NULL;
     for (size_t i = 0; i < calls.len && !err; i++) {
         // aborted: no further call starts (executeToolCallsParallel breaks out of its loop)
         if (g_abort && i > 0) break;
@@ -701,6 +810,25 @@ static Err run_tools(Run *r, const JValue *assistant, JValue *results) {
             emit_tool_end(r, calls.ptr[i], msgs[i], raws[i]);
             continue;
         }
+        if (str_eqz(name, SUBAGENT_TOOL) && code_subagent_enabled()) {
+            // its arguments checked as any tool's: a failure ends the call at once
+            const char *verr;
+            JValue *valid = code_tool_validate(a, calls.ptr[i], json_get(json_get(code_subagent_schema(a), "function"), "parameters"), &verr);
+            if (!valid) {
+                error_result(a, calls.ptr[i], verr, &msgs[i], &raws[i]);
+                emit_tool_end(r, calls.ptr[i], msgs[i], raws[i]);
+                continue;
+            }
+            // the validated arguments go to the tool; the message keeps the model's (agent-loop.ts)
+            JValue *run = json_new(a, J_OBJECT);
+            for (size_t k = 0; k < calls.ptr[i]->obj.len; k++) {
+                const JMember *mb = &calls.ptr[i]->obj.items[k];
+                json_put(a, run, mb->key, str_eqz(mb->key, "arguments") ? valid : mb->val);
+            }
+            if (!sb) sb = subagent_begin(r);
+            code_subagent_add(sb, r->rpc ? r->io : a, run, &msgs[i], &raws[i]); // rpc: built without its lock
+            continue;
+        }
         prepare_edit_in_place(a, calls.ptr[i]);
         r->call = calls.ptr[i];
         if (r->rpc) {
@@ -711,6 +839,12 @@ static Err run_tools(Run *r, const JValue *assistant, JValue *results) {
         } else err = code_tool_run(a, &r->env, calls.ptr[i], &msgs[i], &raws[i]);
         r->call = NULL;
         if (!err && !json_get(msgs[i], "durationMs")) emit_tool_end(r, calls.ptr[i], msgs[i], raws[i]);
+    }
+    if (sb) {
+        if (r->rpc) code_rpc_unlock();
+        Err se = code_subagent_wait(sb);
+        if (r->rpc) code_rpc_lock();
+        if (!err) err = se;
     }
     // pi runs the executed calls concurrently and ends each as it settles; a call that throws
     // (a missing file, say) settles before one that completes its I/O, so errors end first
@@ -1419,6 +1553,19 @@ static void restart_on(Run *r) {
     }
     vec_push(&v, NULL);
     code_tools_kill_detached();
+    // the holder keeps the lock across the exec: the record says restarting (with the pack's folder)
+    // before the sessions that use it are let go, so no other session loads a model in between;
+    // the next image takes the lock, or gives it up
+    if (code_share_holding()) {
+        char *dir = NULL;
+        if (!strcmp(r->restart_provider, "saetta")) {
+            const DownloadPack *pk = download_find(r->restart_id);
+            char rp[PATH_MAX];
+            if (!pk || download_pack_dir(a, pk, &dir)) dir = realpath(r->restart_id, rp) ? arena_strdup(a, rp) : (char *)r->restart_id;
+        }
+        (void)instance_inproc_restarting(dir ? dir : "");
+    }
+    code_share_end(true); // a shared model: this session leaves it, or (its holder) lets the others go (confirmed)
     fflush(NULL);
     execv(self, (char *const *)v.ptr);
     int e = errno;
@@ -1647,6 +1794,15 @@ static Err rpc_mode(Run *r) {
     return code_rpc_run(&ops, &host);
 }
 
+// code_share.c's messages while the screen is up: a warning there.
+static void share_notice(const char *msg) {
+    Arena t = {0};
+    JValue *ev = ev_new(&t, "ui_warning");
+    json_put(&t, ev, S("message"), json_string(&t, str(msg)));
+    code_ui_event(ev);
+    arena_reset(&t);
+}
+
 static Err interactive(Run *r, const Args *o, const JValue *settings) {
     Arena *a = r->a;
     r->ui = true;
@@ -1677,7 +1833,7 @@ static Err interactive(Run *r, const Args *o, const JValue *settings) {
         .resumed = (o->cont || o->session) && code_session_messages(r->session)->arr.len > 0,
         .version = code_version,
     };
-    cfg.engine = r->model.engine != NULL;
+    cfg.engine = r->model.engine != NULL || code_share_holding(); // (the tests' stand-in holds no engine)
     cfg.self_exe = self_exe(a);
     CodeUiOps ops = {host_prompt, host_new_session, host_set_thinking, host_entries, host_messages,
                      host_set_leaf, host_set_model, host_abort, host_restart, host_reload_models,
@@ -1694,8 +1850,10 @@ static Err interactive(Run *r, const Args *o, const JValue *settings) {
         splash_stop(sp);
     }
     code_monitor_set_model(r->model.engine, r->model.provider, r->model.base_url);
+    code_share_set_notice(share_notice); // the shared model's messages on the screen, never stderr under it
     Err e = code_ui_run(&cfg, &ops, &host, o->prompts.ptr, o->prompts.len);
     g_tty_saved = 0;
+    code_share_set_notice(NULL);
     if (e && !strcmp(e, "AgentBusy")) {
         // the run ignored the abort: leave without touching what it uses
         code_tools_kill_detached();
@@ -1742,7 +1900,7 @@ static const char *find_pi_docs(Arena *a) {
 // --pack: the engine in this process, described as `saetta start pi` describes the server to pi
 // (launch.c pi_setup), so the requests stay byte for byte the same. The engine's own log lines
 // go to ~/.saetta/code.log.
-static Err open_engine(Arena *a, Run *r, const char *arg, const char *ctx, bool splash) {
+static Err open_engine(Arena *a, Run *r, const char *arg, const char *ctx, bool splash, bool interactive) {
     const DownloadPack *pk = download_find(arg);
     char *dir = (char *)arg;
     if (pk) TRY(download_pack_dir(a, pk, &dir));
@@ -1762,6 +1920,12 @@ static Err open_engine(Arena *a, Run *r, const char *arg, const char *ctx, bool 
         setvbuf(log, NULL, _IOLBF, 0);
         dbg_out = log;
     }
+    // another Saetta Code runs the engine on this Mac: this one uses it (code_share.c)
+    int joined = g_share_recovering ? code_share_join_until(a, dir, &r->model, g_share_deadline, r->env.abort)
+                                    : code_share_join(a, dir, &r->model);
+    if (joined) return joined > 0 ? OK : "EngineBusy";
+    Err stub_err;
+    if (code_share_stub(a, dir, &r->model, interactive, &stub_err)) return stub_err; // the tests' stand-in
     // the context saetta start gives a server (204800 tokens), unless --ctx or SAETTA_CTX says
     // otherwise; the engine lowers it to what this Mac's memory holds
     if (ctx) setenv("SAETTA_CTX", ctx, 1);
@@ -1769,11 +1933,16 @@ static Err open_engine(Arena *a, Run *r, const char *arg, const char *ctx, bool 
     uint64_t t0 = now_ns();
     // the loader while the engine loads (interactive runs only); the load itself runs here at full speed
     Splash *sp = splash ? splash_start(arena_printf(a, "Loading %s ...", pk && pk->title ? pk->title : (strrchr(arg, '/') && strrchr(arg, '/')[1] ? strrchr(arg, '/') + 1 : arg))) : NULL;
-    if (!sp && isatty(2)) fprintf(stderr, "saetta code: loading %s ...\r", pk ? arg : dir);
+    if (!sp && !interactive && isatty(2)) fprintf(stderr, "saetta code: loading %s ...\r", pk ? arg : dir);
     Engine *e;
     Err err = server_engine_open(a, dir, NULL, &e);
     splash_stop(sp);
-    if (!sp && isatty(2)) fprintf(stderr, "\x1b[K");
+    if (!sp && !interactive && isatty(2)) fprintf(stderr, "\x1b[K");
+    if (err && !strcmp(err, "EngineBusy") && g_share_recovering) return err; // another session took the model: join it
+    if (err && g_share_recovering && interactive) { // under the screen: no stderr
+        dbg("saetta code: cannot load %s: %s\n", dir, err);
+        return err;
+    }
     if (err && !strcmp(err, "EngineBusy")) {
         Server srv;
         int pid = 0;
@@ -1791,25 +1960,11 @@ static Err open_engine(Arena *a, Run *r, const char *arg, const char *ctx, bool 
     }
     dbg("saetta code: %s loaded in process in %llu ms\n", dir, (unsigned long long)((now_ns() - t0) / 1000000));
     CodeModel *m = &r->model;
+    code_share_describe(a, m, server_engine_model(e), server_engine_context(e), "in-process");
     m->engine = e;
-    m->provider = "saetta";
-    m->id = server_engine_model(e);
-    m->name = m->id;
-    m->base_url = "in-process";
-    m->api_key = "saetta";
-    m->reasoning = true;
-    m->context_window = server_engine_context(e);
-    m->max_tokens = 32768;
-    m->supports_developer_role = m->supports_store = m->supports_reasoning_effort = false;
-    m->max_tokens_field = "max_tokens";
-    m->thinking_format = "qwen-chat-template";
-    JValue *compat = json_new(a, J_OBJECT);
-    json_put(a, compat, S("supportsDeveloperRole"), json_bool(a, false));
-    json_put(a, compat, S("supportsStore"), json_bool(a, false));
-    json_put(a, compat, S("supportsReasoningEffort"), json_bool(a, false));
-    json_put(a, compat, S("maxTokensField"), json_string(a, S("max_tokens")));
-    json_put(a, compat, S("thinkingFormat"), json_string(a, S("qwen-chat-template")));
-    m->compat = compat;
+    // other Saetta Codes started later use this engine (code_share.c): from an interactive run only
+    Err se = code_share_serve(m, interactive);
+    if (se) dbg("saetta code: the model is not shared with other sessions: %s\n", se);
     return OK;
 }
 
@@ -1969,12 +2124,17 @@ static bool first_run(Arena *a, const char *agent_dir, bool server_down, const c
 }
 
 Err code_run(const char *const *args, size_t n, int *code) {
+    // first of all: a lock handed over by a /model restart, out of the environment (no child ever
+    // sees it), kept only when it checks out (instance.c)
+    instance_inproc_take_inherited();
     *code = 1;
     Arena arena = {0};
     Arena *a = &arena;
     Args o = {.approve = -1};
     Err e = parse_args(args, n, &o);
     if (e) goto done;
+    // a /model restart of the holder handed its lock over: kept with --pack, given up without
+    if (!o.pack) instance_inproc_release_inherited();
     Run r = {.a = a, .json = o.mode && !strcmp(o.mode, "json"), .pack = o.pack, .argv = args, .argc = n};
     char cwd[PATH_MAX];
     if (!getcwd(cwd, sizeof cwd)) {
@@ -2001,6 +2161,26 @@ Err code_run(const char *const *args, size_t n, int *code) {
     r.env.on_partial = on_tool_partial;
     r.env.partial_ctx = &r;
     JValue *settings = read_json(a, path_join(a, r.env.agent_dir, "settings.json"));
+    // subagents (code_subagent.c): off unless asked for; the tool joins the built-in ones
+    code_subagent_enable(o.subagents || jbool(json_get(settings, "subagents"), false));
+    if (!code_subagent_enabled()) {
+        // off: not a tool at all, even when --tools names it (pi's prompt and tools)
+        size_t k = 0;
+        const char **t = arena_alloc(a, (r.ntools + 1) * sizeof *t);
+        for (size_t i = 0; i < r.ntools; i++)
+            if (strcmp(r.tools[i], SUBAGENT_TOOL)) t[k++] = r.tools[i];
+        r.tools = t;
+        r.ntools = k;
+    } else if (!o.no_tools) {
+        bool have = false;
+        for (size_t i = 0; i < r.ntools; i++) have |= !strcmp(r.tools[i], SUBAGENT_TOOL);
+        if (!have) {
+            const char **t = arena_alloc(a, (r.ntools + 1) * sizeof *t);
+            memcpy(t, r.tools, r.ntools * sizeof *t);
+            t[r.ntools++] = SUBAGENT_TOOL;
+            r.tools = t;
+        }
+    }
     const JValue *rs = json_get(settings, "retry");
     g_retry.enabled = jbool(json_get(rs, "enabled"), true);
     g_retry.max_retries = (int64_t)juint(json_get(rs, "maxRetries"), 3);
@@ -2045,7 +2225,9 @@ Err code_run(const char *const *args, size_t n, int *code) {
         }
     }
     if (o.pack) {
-        e = open_engine(a, &r, o.pack, o.ctx, tty);
+        r.ctx = o.ctx;
+        r.interactive = tty;
+        e = open_engine(a, &r, o.pack, o.ctx, tty, tty);
         if (e) goto done;
         if (o.thinking) r.model.thinking = o.thinking;
     }
@@ -2130,6 +2312,7 @@ Err code_run(const char *const *args, size_t n, int *code) {
         }
     }
 done:
+    code_share_end(false);
     code_mcp_shutdown();
     code_tools_kill_detached();
     vec_free(&o.prompts);

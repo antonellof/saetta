@@ -16,6 +16,7 @@
 // U+FFFD), so byte counts match Buffer.byteLength of pi's decoded text.
 #include "code.h"
 #include "code_mcp.h"
+#include "code_subagent.h"
 #include "metal/shim.h"
 
 #include <dirent.h>
@@ -2746,6 +2747,7 @@ JValue *code_tool_schemas(Arena *a, const char *const *tools, size_t ntools) {
     for (size_t i = 0; i < ntools; i++) {
         ptrdiff_t k = tool_index(str(tools[i]));
         if (k >= 0) json_push(a, arr, tool_schema(a, (size_t)k));
+        else if (!strcmp(tools[i], SUBAGENT_TOOL) && code_subagent_enabled()) json_push(a, arr, code_subagent_schema(a)); // code_subagent.c
         else if ((mcp = code_mcp_tool_schema(a, str(tools[i])))) json_push(a, arr, mcp); // an MCP tool (code_mcp.c)
     }
     return arr;
@@ -3046,6 +3048,31 @@ static JValue *validate(Arena *a, const char *name, const JValue *params, JValue
 // ---------------------------------------------------------------------------------------
 // the call (agent-loop.ts prepareToolCall, executePreparedToolCall, createToolResultMessage)
 // ---------------------------------------------------------------------------------------
+
+Str code_tool_truncate_model_output(Arena *a, Str output) {
+    // truncateModelOutput (examples/extensions/subagent/index.ts): truncateHead's 2000 lines and
+    // 50 KB, the notice in the room kept for it
+    Trunc initial = truncate_head(output, 2000, 50 * 1024);
+    if (!initial.truncated) return output;
+    Trunc body = truncate_head(output, 2000 - 2, 50 * 1024 - 256);
+    char *notice = arena_printf(a, "[Output truncated: %.0f bytes omitted. Full output preserved in tool details.]",
+                                initial.total_bytes - body.output_bytes);
+    if (!body.content.len) return str(notice);
+    return str(arena_printf(a, "%.*s\n\n%s", (int)body.content.len, body.content.ptr, notice));
+}
+
+JValue *code_tool_validate(Arena *a, const JValue *call, const JValue *params, const char **err) {
+    *err = NULL;
+    Str name = json_strs(json_get(call, "name"));
+    JValue *args = json_get(call, "arguments");
+    if (!args) args = json_new(a, J_OBJECT);
+    const JValue *ae = json_get(call, "argumentsError");
+    if (json_is(ae, J_STRING)) {
+        *err = arena_printf(a, "Invalid arguments for tool \"%.*s\": %.*s", (int)name.len, name.ptr, (int)ae->s.len, ae->s.ptr);
+        return NULL;
+    }
+    return validate(a, str_z(a, name), params, args, err);
+}
 
 Err code_tool_run(Arena *a, const CodeEnv *env, const JValue *call, JValue **result, JValue **raw) {
     Str id = json_strs(json_get(call, "id")), name = json_strs(json_get(call, "name"));

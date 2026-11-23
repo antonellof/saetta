@@ -84,6 +84,8 @@ void conn_init(Conn *c, int fd) {
     c->wfail = false;
     c->deadline_ns = 0;
     c->timed_out = false;
+    c->head_len = 0;
+    c->head_sent = false;
     c->sink = NULL; // a socket; server_engine_chat sets an in-process sink after this
     c->sink_ctx = NULL;
     c->status = 0;
@@ -301,6 +303,7 @@ Err http_receive_head(Conn *c, Req *h) {
         else if (b >= 0) end = (size_t)b + 2;
         if (end > 0) {
             memcpy(c->head, buf.ptr, end);
+            c->head_len = end;
             c->rpos += end;
             return http_parse_head((Str){c->head, end}, h);
         }

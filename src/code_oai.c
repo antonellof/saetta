@@ -16,6 +16,7 @@
 // (needs pi's session id), sampling parameters and thinkingLevelMap (not in models.json for
 // saetta), model cost rates (cost is 0), OpenRouter reported cost, session affinity headers.
 #include "code_oai.h"
+#include "unix_http.h"
 #include "metal/shim.h"
 #include "server.h"
 
@@ -2507,6 +2508,13 @@ static Err complete_in_process(Arena *a, const CodeModel *m, CodeOaiStream *s, c
 Err code_oai_complete(Arena *a, const CodeModel *m, const CodeEnv *env, Str body, const CodeSink *sink, JValue **assistant) {
     CodeOaiStream *s = code_oai_stream_new(a, m, env, sink);
     if (m->engine) return complete_in_process(a, m, s, env, body, assistant);
+    if (m->verify) {
+        int v = m->verify(m);
+        if (v != 1) {
+            *assistant = code_oai_stream_end(s, v == 2 ? "503 the model's session is busy" : "Connection error.: the session that held the model is gone");
+            return OK;
+        }
+    }
     if (!m->api_key || !*m->api_key) {
         *assistant = code_oai_stream_end(s, arena_printf(a, "No API key for provider: %s", m->provider ? m->provider : ""));
         return OK;
@@ -2524,7 +2532,9 @@ Err code_oai_complete(Arena *a, const CodeModel *m, const CodeEnv *env, Str body
     int status = 0;
     char err[512] = "";
     // 300 s without a byte: pi's timeout (http-dispatcher.ts, passed as the SDK timeout in sdk.ts)
-    int rc = sx_http_cancellable("POST", url, h, nh, body.ptr, body.len, 300, on_http, &hc, &status, err, sizeof err, hc.abort);
+    int rc = m->sock ? unix_http(m->sock, "POST", "/v1/chat/completions", h, nh, body.ptr, body.len, 300, on_http, &hc, &status, err,
+                                 sizeof err, hc.abort)
+                     : sx_http_cancellable("POST", url, h, nh, body.ptr, body.len, 300, on_http, &hc, &status, err, sizeof err, hc.abort);
     if (s->failed) {
         *assistant = code_oai_stream_end(s, NULL);
     } else if (rc != 0 && hc.ok_status && hc.abort && *hc.abort) {

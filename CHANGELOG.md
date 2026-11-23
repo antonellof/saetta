@@ -3,6 +3,23 @@
 All notable changes to saetta and Saetta Code (`saetta code`), newest first. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are saetta's.
 
+## [0.17.0] - 2026-11-23
+
+### Added
+
+- Parallel agents: several Saetta Code sessions share one model. A `saetta start code` in another terminal uses the model the first one loaded, each session in its own conversation, over a private Unix socket. `--subagents` gives the model a tool that hands self-contained tasks to up to 3 child agents running at once.
+- RPC mode (`saetta code --mode rpc`): pi's JSON protocol on stdin and stdout, every command of pi's rpc client, compared with pi on 12 recorded scenarios.
+- OAuth sign-in for MCP servers over HTTP, as pi does it (discovery, dynamic registration, PKCE with a loopback callback).
+- Documentation on saetta.dev/docs.
+
+### Changed
+
+- macOS 26 or later is enough (it was 27.2): nothing saetta uses needs a newer release.
+
+### Notes
+
+- Requests, session files and output match pi's byte for byte on 63 recorded print and JSON scenarios; the interactive screens on 75.
+
 ## [0.16.0] - 2026-11-22
 
 ### Added

@@ -41,7 +41,7 @@ saetta start code        # or: saetta start claude, saetta start pi, saetta star
 
 `saetta download` picks by memory: `coder` (Flash-Next, 76 GB) with 96 GB or more, `27b-turbo` (Qwen3.8-27B fine-tune, 20 GB, converted from its GGUF: about 40 GB free disk while it runs) with 36 GB, `27b-4bit` (16 GB) with 32 GB. Any pack can be named instead (table below); one that cannot run on this Mac is refused, and the context shrinks to what memory holds.
 
-Needs an Apple Silicon Mac (M1 or later) with 32 GB of memory or more, and macOS 27.2 or later. Update with `saetta update`. `SAETTA_PREFIX` changes the install folder, `SAETTA_VERSION=0.16.0` pins a release, `HF_TOKEN` raises Hugging Face's limits.
+Needs an Apple Silicon Mac (M1 or later) with 32 GB of memory or more, and macOS 26 or later. Update with `saetta update`. `SAETTA_PREFIX` changes the install folder, `SAETTA_VERSION=0.16.0` pins a release, `HF_TOKEN` raises Hugging Face's limits.
 
 The documentation is at [saetta.dev/docs](https://saetta.dev/docs/) (source in [`docs/`](docs)): the agent's commands, sessions, skills and MCP servers, the other agents, the HTTP API and every option.
 
@@ -70,7 +70,7 @@ Several Saetta Code sessions share one model: a `saetta start code` in another t
 
 It is a port of the [pi](https://pi.dev) coding agent 1.5.2 (MIT). It has pi's tools (read, bash, edit, write; grep, find and ls with `--tools`), its system prompt, `AGENTS.md` and `CLAUDE.md` context files, skills (and `/skill:name`), prompt files and session files. It reads and writes pi's `settings.json`, `models.json`, `trust.json` and `mcp.json` in `~/.pi/agent`, so the two share one setup, and each continues the other's sessions, compacted ones included.
 
-Its requests and session files match pi's byte for byte on 54 recorded print and JSON scenarios (tool errors, edits, truncation, sessions, compaction, retries, skills), apart from its own system prompt preamble. Its interactive screens are compared with pi's on 61 recorded scenarios, and its rpc mode with pi's, driven by pi's own rpc client, on 12. pi's TypeScript extensions and packages are not supported, and there is no image input.
+Its requests and session files match pi's byte for byte on 63 recorded print and JSON scenarios (tool errors, edits, truncation, sessions, compaction, retries, skills), apart from its own system prompt preamble. Its interactive screens are compared with pi's on 75 recorded scenarios, and its rpc mode with pi's, driven by pi's own rpc client, on 12. pi's TypeScript extensions and packages are not supported, and there is no image input.
 
 ### The terminal UI
 

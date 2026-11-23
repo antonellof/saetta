@@ -13,11 +13,11 @@ CODER_PACK ?= $(MODELS)/mbrown-uno/Qwen3.8-Flash-Next-GSQ-RCO-Coder-MLX
 # MCPU: the oldest CPU the binary runs on (every Apple Silicon Mac); -mcpu=native would let
 # the compiler use the build machine's newer instructions
 MCPU    ?= apple-m1
-CFLAGS  := -std=c23 -O3 -ffp-contract=off -mcpu=$(MCPU) -mmacosx-version-min=27.2 \
+CFLAGS  := -std=c23 -O3 -ffp-contract=off -mcpu=$(MCPU) -mmacosx-version-min=26.0 \
            -Wall -Wextra -Wno-unused-parameter
-OBJCFLAGS := -fobjc-arc -O2 -mcpu=$(MCPU) -mmacosx-version-min=27.2 -Wall -Wextra -Wno-unused-parameter
+OBJCFLAGS := -fobjc-arc -O2 -mcpu=$(MCPU) -mmacosx-version-min=26.0 -Wall -Wextra -Wno-unused-parameter
 DEPFLAGS = -MMD -MP
-LDFLAGS := -mmacosx-version-min=27.2
+LDFLAGS := -mmacosx-version-min=26.0
 LDLIBS  := -framework Metal -framework Foundation -framework Accelerate -lpthread
 
 OBJ  := $(BUILD)/obj

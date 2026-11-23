@@ -27,6 +27,6 @@ The second command picks the model that fits this Mac, downloads it and opens th
 
 ## Requirements
 
-An Apple Silicon Mac (M1 or later) with 32 GB of memory or more, and macOS 27.2 or later. The model runs on the Mac: prompts and code stay local. The network is used to download the weights from Hugging Face, for the agent's update check at start, and for what you ask for (`/share`, a remote model, an MCP server you configure).
+An Apple Silicon Mac (M1 or later) with 32 GB of memory or more, and macOS 26 or later. The model runs on the Mac: prompts and code stay local. The network is used to download the weights from Hugging Face, for the agent's update check at start, and for what you ask for (`/share`, a remote model, an MCP server you configure).
 
 Saetta is open source under the [MIT license](../LICENSE). The models keep their own licenses.

@@ -18,7 +18,7 @@ Yes. `saetta start claude` runs Claude Code against Saetta's Anthropic-compatibl
 
 ## Which Mac do I need?
 
-Any Apple Silicon Mac (M1 or later) with 32 GB of memory or more and macOS 27.2. 32 GB runs Qwen3.8-27B in 4-bit, 36 GB the 27B TURBO or Fable-5 coding fine-tunes, 48 GB the Coder390 fine-tune, 96 GB Qwen3.8-Flash-Next Coder and 128 GB the full Flash-Next. Saetta picks the one that fits. See [Choosing a model](choosing-a-model.md).
+Any Apple Silicon Mac (M1 or later) with 32 GB of memory or more and macOS 26 or later. 32 GB runs Qwen3.8-27B in 4-bit, 36 GB the 27B TURBO or Fable-5 coding fine-tunes, 48 GB the Coder390 fine-tune, 96 GB Qwen3.8-Flash-Next Coder and 128 GB the full Flash-Next. Saetta picks the one that fits. See [Choosing a model](choosing-a-model.md).
 
 ## Does my code leave my machine?
 

@@ -21,7 +21,7 @@ Saetta Code is a port of the [pi](https://pi.dev) coding agent 1.5.2 (MIT). It h
 - `settings.json`, `models.json`, `trust.json` and `mcp.json`, read and written as pi does.
 - Print, JSON and rpc modes.
 
-Its requests and session files match pi's byte for byte on 54 recorded print and JSON scenarios (tool errors, edits, truncation, sessions, compaction, retries, skills), apart from its own system prompt preamble. Its interactive screens are compared with pi's on 61 recorded scenarios, and its rpc mode with pi's, driven by pi's own rpc client, on 12.
+Its requests and session files match pi's byte for byte on 63 recorded print and JSON scenarios (tool errors, edits, truncation, sessions, compaction, retries, skills), apart from its own system prompt preamble. Its interactive screens are compared with pi's on 75 recorded scenarios, and its rpc mode with pi's, driven by pi's own rpc client, on 12.
 
 pi's TypeScript extensions and packages are not supported, and there is no image input.
 

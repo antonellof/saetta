@@ -6,7 +6,7 @@ Saetta is one binary for Apple Silicon Macs. The install script puts it in `~/.l
 curl -fsSL https://saetta.dev/install.sh | sh
 ```
 
-It needs an Apple Silicon Mac (M1 or later) with 32 GB of memory or more, and macOS 27.2 or later. Make sure `~/.local/bin` is on your `PATH`.
+It needs an Apple Silicon Mac (M1 or later) with 32 GB of memory or more, and macOS 26 or later. Make sure `~/.local/bin` is on your `PATH`.
 
 ## Options
 

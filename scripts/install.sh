@@ -18,8 +18,8 @@ die() { printf 'saetta: %s\n' "$*" >&2; exit 1; }
 os=$(sw_vers -productVersion)
 major=${os%%.*}; rest=${os#*.}; minor=${rest%%.*}
 [ "$rest" = "$os" ] && minor=0
-if [ "$major" -lt 27 ] || { [ "$major" -eq 27 ] && [ "$minor" -lt 2 ]; }; then
-  die "needs macOS 27.2 or later (this is $os)."
+if [ "$major" -lt 26 ]; then
+  die "needs macOS 26 or later (this is $os)."
 fi
 mem=$(( $(sysctl -n hw.memsize) / 1073741824 ))
 if [ "$mem" -lt 32 ]; then

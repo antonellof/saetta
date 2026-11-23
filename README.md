@@ -3,7 +3,7 @@
 </p>
 
 <h3 align="center">Saetta: a local coding agent with the model built in.</h3>
-<p align="center">Two families of open coding models, Qwen3.8 and Inkling 2 Mini, run inside the agent on its own inference engine, with no server in between. The same engine serves Claude Code, opencode and pi. A 1:1 port of pi: its tools, sessions and terminal UI. Written in C and hand-written Metal for Apple Silicon Macs, from 32 GB of memory. <a href="https://saetta.dev">saetta.dev</a></p>
+<p align="center">Two families of open coding models, Qwen3.8 and Inkling 2 Mini, run inside the agent on its own inference engine, with no server in between. A 1:1 port of Pi: its tools, sessions and terminal UI. Written in C and hand-written Metal for Apple Silicon Macs, from 32 GB of memory. <a href="https://saetta.dev">saetta.dev</a></p>
 
 <p align="center">
   <a href="#install"><b>Install</b></a> · <a href="#saetta-code"><b>Coding agent</b></a> · <a href="#other-coding-agents">Other agents</a> ·

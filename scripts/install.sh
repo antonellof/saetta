@@ -64,8 +64,9 @@ fi
 cat <<'MSG'
 
 Next:
-  saetta                          # pick a model that fits this Mac and a coding agent, then it starts
+  saetta start code               # Saetta Code: the coding agent with the model inside it
+  saetta                          # or pick a model and an agent (Claude Code, pi, opencode)
   saetta download                 # or by hand: the model that fits, into ~/Models (SAETTA_MODELS)
   saetta start claude             #   then: saetta start claude, pi or opencode
-Docs: https://saetta.dev
+Docs: https://saetta.dev/docs
 MSG

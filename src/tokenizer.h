@@ -1,10 +1,11 @@
-// Byte-level BPE tokenizer for Qwen3.8-Flash-Next, read from the pack's tokenizer.json.
+// Byte-level BPE tokenizer for the Qwen models and Inkling 2, read from the pack's tokenizer.json.
 // Adapted from sushi src/tokenizer.zig (MIT, Copyright (c) 2026 Theinruj Toranavikrai, David Dalcu; d5e876e):
 // the hand-written pre-tokenizer state machine and the heap BPE with versioned
-// candidates. Narrowed to the one grammar this model uses, which is checked at load
-// instead of chosen at run time, and with generated Unicode classes (src/unicode.h).
-// NFC normalization (tokenizer.json `normalizer`) goes through Foundation, only for
-// text that has a non-ASCII byte.
+// candidates. Narrowed to the two grammars these models use (Qwen's split regex, and
+// o200k for Inkling 2), recognized at load from the tokenizer.json regex, and with
+// generated Unicode classes (src/unicode.h). NFC normalization (tokenizer.json
+// `normalizer`, Qwen only) goes through Foundation, only for text that has a non-ASCII
+// byte. `ignore_merges` (Inkling 2): a piece that is a vocab token is that token.
 #ifndef SAETTA_TOKENIZER_H
 #define SAETTA_TOKENIZER_H
 
@@ -16,7 +17,12 @@ typedef struct {
     uint32_t id;
 } Special;
 
+typedef enum { PRE_QWEN, PRE_O200K } PreTokenizer;
+
 typedef struct {
+    PreTokenizer pre;
+    bool nfc;              // normalizer NFC
+    bool ignore_merges;    // model.ignore_merges
     StrMap vocab;          // token text -> id (value is the id cast to a pointer)
     // "left right" -> rank. Byte-level tokens never contain a space (it maps to U+0120).
     StrMap merges;
@@ -31,7 +37,7 @@ typedef struct {
 
 // Loads <dir>/tokenizer.json into t. Strings and tables live in the arena (the two maps
 // are malloc'd and live as long as the process). Errors: file errors, "BadTokenizer",
-// "UnsupportedPreTokenizer", "UnsupportedModel", JSON errors.
+// "UnsupportedPreTokenizer", "UnsupportedNormalizer", "UnsupportedModel", JSON errors.
 Err tokenizer_load(Arena *a, const char *dir, Tokenizer *t);
 // Same from the bytes of a tokenizer.json (they must outlive t).
 Err tokenizer_from_json(Arena *a, Str bytes, Tokenizer *t);
@@ -48,7 +54,9 @@ Err tokenizer_encode_text(const Tokenizer *t, Str raw, VecU32 *out);
 // Appends the bytes of token `id` to out (nothing for an id out of range).
 void tokenizer_decode_append(const Tokenizer *t, uint32_t id, Buf *out);
 
-// End of the pre-tokenizer piece that starts at byte i < s.len (exposed for tests).
+// End of the pre-tokenizer piece that starts at byte i < s.len, for Qwen's regex and for
+// o200k (exposed for tests).
 size_t tokenizer_next_piece(Str s, size_t i);
+size_t tokenizer_next_piece_o200k(Str s, size_t i);
 
 #endif

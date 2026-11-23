@@ -14,6 +14,9 @@
 // applied.
 static const char qwen_split_mlx[] = "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
 static const char qwen_split[] = "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
+// The o200k split regex (GPT-4o), as Inkling 2's tokenizer.json (HF thinkingmachines/Inkling-2-Mini
+// b85c3cf) spells it; llama.cpp calls it LLAMA_VOCAB_PRE_TYPE_GPT4O.
+static const char o200k_split[] = "[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
 
 // ---- UTF-8 helpers, as std.unicode ------------------------------------------------
 
@@ -119,12 +122,32 @@ Err tokenizer_from_json(Arena *a, Str bytes, Tokenizer *t) {
     JValue *rxv = json_get(pat, "Regex");
     if (!rxv || rxv->kind != J_STRING) return "BadTokenizer";
     Str rx = rxv->s;
-    if (seqv->arr.len != 2 || !(str_eq(rx, S(qwen_split)) || str_eq(rx, S(qwen_split_mlx)))) return "UnsupportedPreTokenizer";
+    if (seqv->arr.len != 2) return "UnsupportedPreTokenizer";
+    PreTokenizer kind;
+    if (str_eq(rx, S(qwen_split)) || str_eq(rx, S(qwen_split_mlx))) kind = PRE_QWEN;
+    else if (str_eq(rx, S(o200k_split))) kind = PRE_O200K;
+    else return "UnsupportedPreTokenizer";
+    // the second step maps bytes to code points and nothing else
+    JValue *bl = seqv->arr.items[1];
+    if (!str_eqz(json_strs(json_get(bl, "type")), "ByteLevel")) return "UnsupportedPreTokenizer";
+    JValue *ur = json_get(bl, "use_regex"), *aps = json_get(bl, "add_prefix_space");
+    // HF's defaults: use_regex true (a second GPT-2 split) and add_prefix_space true when missing
+    if (!(ur && ur->kind == J_BOOL && !ur->b) || (aps && aps->kind == J_BOOL && aps->b)) return "UnsupportedPreTokenizer";
+    JValue *norm = json_get(root, "normalizer");
+    bool nfc = false;
+    if (norm && norm->kind != J_NULL) {
+        if (!str_eqz(json_strs(json_get(norm, "type")), "NFC")) return "UnsupportedNormalizer";
+        nfc = true;
+    }
     JValue *model = json_get(root, "model");
     if (!model || model->kind != J_OBJECT) return "BadTokenizer";
     if (!str_eqz(json_strs(json_get(model, "type")), "BPE")) return "UnsupportedModel";
+    JValue *im = json_get(model, "ignore_merges");
 
     memset(t, 0, sizeof *t);
+    t->pre = kind;
+    t->nfc = nfc;
+    t->ignore_merges = im && im->kind == J_BOOL && im->b;
     bytes_to_unicode(t->byte_cp);
     for (int k = 0; k < 512; k++) t->cp_byte[k] = -1;
     for (int b = 0; b < 256; b++) t->cp_byte[t->byte_cp[b]] = (int16_t)b;
@@ -294,6 +317,11 @@ static void push(const Tokenizer *t, VecCand *heap, Str w, const Node *nodes, ui
 
 // Lowest-rank adjacent pair first, leftmost on ties, until no pair has a rank.
 static Err bpe(const Tokenizer *t, Str w, VecNode *nodes, VecCand *heap, VecU32 *out) {
+    uint32_t whole;
+    if (t->ignore_merges && vocab_get(&t->vocab, w, &whole)) {
+        vec_push(out, whole);
+        return OK;
+    }
     nodes->len = 0;
     heap->len = 0;
     size_t i = 0;
@@ -335,7 +363,7 @@ static bool all_ascii(Str s) {
 Err tokenizer_encode_text(const Tokenizer *t, Str raw, VecU32 *out) {
     char *nfc_buf = NULL;
     Str text = raw;
-    if (!all_ascii(raw)) {
+    if (t->nfc && !all_ascii(raw)) {
         // NFC can grow text by up to 3x in UTF-8; ask for the length, then fill.
         size_t n = sx_nfc(raw.ptr, raw.len, NULL, 0);
         if (n != SIZE_MAX) { // invalid UTF-8: encode the bytes as they are
@@ -350,7 +378,7 @@ Err tokenizer_encode_text(const Tokenizer *t, Str raw, VecU32 *out) {
     Err err = OK;
     size_t pos = 0;
     while (pos < text.len) {
-        size_t end = tokenizer_next_piece(text, pos);
+        size_t end = t->pre == PRE_O200K ? tokenizer_next_piece_o200k(text, pos) : tokenizer_next_piece(text, pos);
         word.len = 0;
         for (size_t k = pos; k < end; k++) {
             char b[4];
@@ -480,6 +508,125 @@ size_t tokenizer_next_piece(Str s, size_t i) {
         size_t e = i, prev = i;
         while (cp_at(s, e, &c)) {
             if (!unicode_space(c.cp)) break;
+            prev = e;
+            e += c.len;
+        }
+        if (e == s.len) return e;
+        if (prev > i) return prev;
+        return e;
+    }
+    return i + c0.len;
+}
+
+// ---- pre-tokenizer: o200k_split as a state machine ---------------------------------------
+// The alternatives, tried in order at i (a backtracking engine takes the first that matches;
+// some alternative always matches, so the pieces tile the text):
+//   A1 [^\r\n\p{L}\p{N}]? U* W+ C?    A2 [^\r\n\p{L}\p{N}]? U+ W* C?    A3 \p{N}{1,3}
+//   A4 ` ?[^\s\p{L}\p{N}]+[\r\n/]*`   A5 \s*[\r\n]+   A6 \s+(?!\S)   A7 \s+
+// with U = [\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}], W = [\p{Ll}\p{Lm}\p{Lo}\p{M}] and
+// C = (?i:'s|'t|'re|'ve|'m|'ll|'d). Under (?i) `s` also matches U+017F (long s), as the
+// tokenizers library does; no other letter of C has a case fold outside ASCII.
+
+static bool o_upper(uint32_t cp) {
+    Gc g = unicode_gc(cp);
+    return g == GC_LU || g == GC_LT || g == GC_LM || g == GC_LO || g == GC_M;
+}
+static bool o_lower(uint32_t cp) {
+    Gc g = unicode_gc(cp);
+    return g == GC_LL || g == GC_LM || g == GC_LO || g == GC_M;
+}
+// [^\r\n\p{L}\p{N}]: the optional first code point of A1 and A2
+static bool o_lead(uint32_t cp) { return !is_nl(cp) && !is_l(cp) && !is_n(cp); }
+// [^\s\p{L}\p{N}] (marks included, unlike Qwen's class)
+static bool o_punct(uint32_t cp) { return !unicode_space(cp) && !is_l(cp) && !is_n(cp); }
+
+// End of C at i, or i when no contraction starts there.
+static size_t o_contraction(Str s, size_t i) {
+    if (i + 1 >= s.len || s.ptr[i] != '\'') return i;
+    char a = to_lower(s.ptr[i + 1]);
+    if (a == 's' || a == 't' || a == 'm' || a == 'd') return i + 2;
+    if ((uint8_t)s.ptr[i + 1] == 0xC5 && i + 2 < s.len && (uint8_t)s.ptr[i + 2] == 0xBF) return i + 3; // 'ſ
+    if (i + 2 < s.len) {
+        char b = to_lower(s.ptr[i + 2]);
+        if ((a == 'r' && b == 'e') || (a == 'v' && b == 'e') || (a == 'l' && b == 'l')) return i + 3;
+    }
+    return i;
+}
+
+// U* W+ C? at p: the end, or 0 when W+ cannot match. U* is greedy and gives back code points
+// until a W follows: either the code point after the U run (then an Ll, the only W outside U),
+// or the last code point of the run that is also a W (Lm, Lo, M), which W+ then takes alone
+// (the U run continues with Lu or Lt after it, which W excludes).
+static size_t o_a1(Str s, size_t p) {
+    size_t e = p, last_w = SIZE_MAX, last_w_end = 0;
+    Cp c;
+    while (cp_at(s, e, &c) && o_upper(c.cp)) {
+        if (o_lower(c.cp)) {
+            last_w = e;
+            last_w_end = e + c.len;
+        }
+        e += c.len;
+    }
+    size_t w_end;
+    if (cp_at(s, e, &c) && o_lower(c.cp)) w_end = run_of(s, e, o_lower);
+    else if (last_w != SIZE_MAX) w_end = last_w_end;
+    else return 0;
+    return o_contraction(s, w_end);
+}
+
+// U+ W* C? at p: the end, or 0 when no U starts there.
+static size_t o_a2(Str s, size_t p) {
+    Cp c;
+    if (!cp_at(s, p, &c) || !o_upper(c.cp)) return 0;
+    size_t e = run_of(s, p, o_upper);
+    e = run_of(s, e, o_lower);
+    return o_contraction(s, e);
+}
+
+size_t tokenizer_next_piece_o200k(Str s, size_t i) {
+    Cp c0, c;
+    cp_at(s, i, &c0);
+    bool lead = o_lead(c0.cp);
+    size_t e;
+    // A1, A2: with the leading code point first, then without
+    if (lead && (e = o_a1(s, i + c0.len)) > 0) return e;
+    if ((e = o_a1(s, i)) > 0) return e;
+    if (lead && (e = o_a2(s, i + c0.len)) > 0) return e;
+    if ((e = o_a2(s, i)) > 0) return e;
+    // A3: \p{N}{1,3}
+    if (is_n(c0.cp)) {
+        e = i + c0.len;
+        for (int k = 1; k < 3 && cp_at(s, e, &c) && is_n(c.cp); k++) e += c.len;
+        return e;
+    }
+    // A4: ` ?[^\s\p{L}\p{N}]+[\r\n/]*`
+    {
+        size_t p = s.ptr[i] == ' ' ? i + 1 : i;
+        if (cp_at(s, p, &c) && o_punct(c.cp)) {
+            e = run_of(s, p, o_punct);
+            while (e < s.len && (s.ptr[e] == '\r' || s.ptr[e] == '\n' || s.ptr[e] == '/')) e += 1;
+            return e;
+        }
+    }
+    // A5: \s*[\r\n]+ (the regex backtracks to the last newline of the space run)
+    {
+        size_t last_nl = 0;
+        bool have_nl = false;
+        e = i;
+        while (cp_at(s, e, &c) && unicode_space(c.cp)) {
+            e += c.len;
+            if (is_nl(c.cp)) {
+                last_nl = e;
+                have_nl = true;
+            }
+        }
+        if (have_nl) return last_nl;
+    }
+    // A6: \s+(?!\S), then A7: \s+
+    if (unicode_space(c0.cp)) {
+        size_t prev = i;
+        e = i;
+        while (cp_at(s, e, &c) && unicode_space(c.cp)) {
             prev = e;
             e += c.len;
         }

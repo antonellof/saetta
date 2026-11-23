@@ -1,5 +1,5 @@
 // Chat prompt rendering: the official Qwen3.8-Flash-Next chat_template.jinja (HF 812d96e)
-// written out in C for this one template, instead of a general Jinja engine (sushi ships
+// and Inkling 2's written out in C for these templates, instead of a general Jinja engine (sushi ships
 // one, src/template/). It reads an OpenAI chat request body; a development check compares
 // it byte for byte with the template rendered by jinja2 the way transformers does it.
 // Template kwargs come from `chat_template_kwargs` (enable_thinking, reasoning_effort,
@@ -10,11 +10,19 @@
 #include "base.h"
 #include "json.h"
 
+// The chat templates written out here: Qwen3.8's (both Qwen models) and Inkling 2's
+// (HF thinkingmachines/Inkling-2-Mini b85c3cf; role and content special tokens, no
+// generation prompt: the model writes its own <|message_model|>).
+typedef enum { CHAT_QWEN, CHAT_INKLING } ChatFormat;
+
 // Renders the prompt for req (an OpenAI chat completion request, parsed with
 // parse_numbers false so numbers keep their spelling) with the generation prompt.
 // *out lives in the arena. Errors: "NoMessages", "NoUserQuery", "SystemNotFirst",
 // "BadRole", "BadContent", "VisionUnsupported", "BadReasoningEffort", "BadToolCall".
 Err chat_render(Arena *a, const JValue *req, Str *out);
+// Same in template f. Inkling also: "BadTool", and "VisionUnsupported" for image parts
+// (the template has them; this engine reads no images).
+Err chat_render_as(Arena *a, ChatFormat f, const JValue *req, Str *out);
 
 // Python json.dumps(x, ensure_ascii=False): ", " and ": " separators, keys in order.
 // Numbers are written as the request spelled them (parse with parse_numbers false).

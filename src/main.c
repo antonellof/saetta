@@ -2,7 +2,7 @@
 //   saetta info <model-dir>                  check the pack against its model's shapes and the GPU
 //   saetta verify [golden-dir]                    compare with golden reference output (pack: $SAETTA_PACK or the golden's, under the models folder)
 //   saetta serve <model-dir> [--port N]           OpenAI-compatible API on 127.0.0.1 (default 8080)
-//   saetta render <request.json>                  print the chat prompt for an OpenAI request body
+//   saetta render [<model-dir>] <request.json>    print the chat prompt for an OpenAI request body
 //   saetta tokenize <model-dir> <file>            print the token ids of a text file
 //   saetta generate <model-dir> <n> <ids..>  greedy: run the prompt token ids, print n new ids
 //   saetta download <pack>                   fetch a model pack from Hugging Face (pinned revision)
@@ -699,14 +699,21 @@ static Err run(Arena *arena, int argc, char **argv) {
         }
         return err;
     }
-    if (argc == 3 && eq(cmd, "render")) {
+    if ((argc == 3 || argc == 4) && eq(cmd, "render")) {
+        // the pack (when given) picks the template; Qwen's otherwise
+        ChatFormat f = CHAT_QWEN;
+        if (argc == 4) {
+            const ModelInfo *mi = model_info_dir(arena, pack_arg(arena, argv[2]));
+            if (!mi) return "UnknownModelType";
+            f = mi->chat;
+        }
         char *body;
         size_t len;
-        TRY(read_file(argv[2], 64u << 20, &body, &len));
+        TRY(read_file(argv[argc - 1], 64u << 20, &body, &len));
         JValue *req;
         TRY(json_parse(arena, str_n(body, len), false, &req));
         Str prompt;
-        TRY(chat_render(arena, req, &prompt));
+        TRY(chat_render_as(arena, f, req, &prompt));
         fwrite(prompt.ptr, 1, prompt.len, out);
         fflush(out);
         free(body);
@@ -753,7 +760,7 @@ static Err run(Arena *arena, int argc, char **argv) {
                 "Tools:\n"
                 "  generate <pack> <n> <token ids...>   n greedy tokens after the ids (SAETTA_LORA=adapter)\n"
                 "  tokenize <pack> <file>       token ids of a text file\n"
-                "  render <request.json>        the prompt a chat request renders to\n"
+                "  render [<pack>] <request.json> the prompt a chat request renders to (Qwen's template without a pack)\n"
                 "  verify [golden-dir]          the engine against reference outputs (development)\n"
                 "  update | version | help\n");
     fflush(uo);

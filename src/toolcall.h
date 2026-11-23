@@ -1,4 +1,4 @@
-// Parses the model's XML tool calls into OpenAI `tool_calls`:
+// Parses the model's tool calls into OpenAI `tool_calls`. Qwen writes XML:
 //   <tool_call>\n<function=NAME>\n<parameter=KEY>\nVALUE\n</parameter>\n</function>\n</tool_call>
 // Rules adapted from sushi src/tool_calls.zig (MIT, Copyright (c) 2026 Theinruj Toranavikrai, David Dalcu; d5e876e),
 // learned there from live agent traffic: exactly one framing newline is removed on each
@@ -31,5 +31,35 @@ ptrdiff_t toolcall_start(Str text);
 // request's "tools" array (or NULL) for the parameter types. Results live in the arena;
 // content and names point into text.
 Parsed toolcall_parse(Arena *a, Str text, const JValue *tools);
+
+// ---- Inkling 2 ---------------------------------------------------------------------------
+// An Inkling 2 reply is a run of blocks framed by special tokens (tokenizer_config.json
+// response_template; vLLM's unified Inkling parser, rust/src/parser/src/unified/inkling.rs at
+// ef687f6, reads them the same way):
+//   [<|message_model|>HEADER]<|content_thinking|>TEXT<|end_message|>          reasoning
+//   [<|message_model|>HEADER]<|content_text|>TEXT<|end_message|>              content (also
+//       <|content_tool_error|> and <|content_invoke_tool_text|>)
+//   [<|message_model|>HEADER]<|content_invoke_tool_json|>{"name":N,"args":{..}}<|end_message|>
+// and <|content_model_end_sampling|> (the end of the reply, also a block end). HEADER (the
+// author name, the tool's name before a call) is dropped when a content kind follows; one
+// that is closed without content, and text outside any block, are content. Blocks keep their
+// text as written (no trimming); reasoning blocks are joined, and so are content blocks.
+
+typedef struct {
+    Str reasoning, content; // stable parts (see toolcall_inkling)
+    Call *calls;            // complete tool calls, in order; arguments is the args object
+    size_t n_calls;
+    bool in_call;           // not final: the text ends inside a tool call block
+    bool bad_call;          // a tool call block was not {"name": string, "args": object}
+                            // (or, final, was cut off): its raw text went to content instead
+    bool ended;             // <|content_model_end_sampling|> was seen
+} InkParsed;
+
+// Parses text, the reply so far (special tokens decoded to their text). Streaming-safe when
+// final is false: reasoning and content leave out what a later token could still change (a
+// tail that may begin a marker, a partial UTF-8 character, a header not yet resolved), so
+// the results for a growing text extend each other and the caller sends the new bytes. With
+// final, everything is resolved. Results live in the arena.
+InkParsed toolcall_inkling(Arena *a, Str text, bool final);
 
 #endif

@@ -19,6 +19,7 @@
 #define SAETTA_MODEL_H
 
 #include "base.h"
+#include "chat.h"
 #include "ctxlimits.h"
 #include "gpu.h"
 #include "metal/shim.h"
@@ -56,6 +57,7 @@ typedef struct {
     // what the model implements beyond a plain forward pass: speculative decoding (prompt
     // lookup, verification chunks) and serving (tokenizer, chat template, sessions)
     bool no_spec, no_serve;
+    ChatFormat chat; // the chat template the model was trained with
 } ModelInfo;
 
 // Per-conversation restore point.
@@ -158,6 +160,8 @@ Err model_load(Arena *a, const Pack *pack, Gpu *g, Model **out);
 // The loaded model's facts; for a pack before loading, model_info_for (NULL if unknown).
 const ModelInfo *model_info(const Model *m);
 const ModelInfo *model_info_for(Arena *a, const Pack *pack);
+// Same from the pack folder alone (its config.json), without opening the weights.
+const ModelInfo *model_info_dir(Arena *a, const char *dir);
 // `saetta info`: every linear of the pack against the shapes the model expects, problems
 // printed to out; returns their count (the pack's model must be known).
 size_t model_check_pack(Arena *a, const Pack *pack, FILE *out);

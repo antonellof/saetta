@@ -168,3 +168,209 @@ Parsed toolcall_parse(Arena *a, Str text, const JValue *tools) {
     buf_free(&args);
     return r;
 }
+
+// ---- Inkling 2 ---------------------------------------------------------------------------
+
+static const Str ink_model = S("<|message_model|>");
+static const Str ink_thinking = S("<|content_thinking|>");
+static const Str ink_text = S("<|content_text|>");
+static const Str ink_tool_error = S("<|content_tool_error|>");
+static const Str ink_tool_text = S("<|content_invoke_tool_text|>");
+static const Str ink_tool_json = S("<|content_invoke_tool_json|>");
+static const Str ink_end = S("<|end_message|>");
+static const Str ink_end_sampling = S("<|content_model_end_sampling|>");
+
+typedef enum { IM_IDLE, IM_HEADER, IM_TEXT, IM_REASONING, IM_TOOL } InkMode;
+
+// The marker at p (one of the reply's framing tokens), or an empty Str.
+static Str ink_marker_at(Str t, size_t p) {
+    static const Str *const all[] = {&ink_model, &ink_thinking, &ink_text, &ink_tool_error, &ink_tool_text,
+                                     &ink_tool_json, &ink_end, &ink_end_sampling};
+    if (p >= t.len || t.ptr[p] != '<') return S("");
+    for (size_t k = 0; k < COUNT(all); k++)
+        if (starts_at(t, p, *all[k])) return *all[k];
+    return S("");
+}
+
+// Whether t[p..] (to the end) is a proper prefix of a marker: a later token may complete it.
+static bool ink_partial_marker(Str t, size_t p) {
+    static const Str *const all[] = {&ink_model, &ink_thinking, &ink_text, &ink_tool_error, &ink_tool_text,
+                                     &ink_tool_json, &ink_end, &ink_end_sampling};
+    size_t n = t.len - p;
+    for (size_t k = 0; k < COUNT(all); k++)
+        if (n < all[k]->len && memcmp(t.ptr + p, all[k]->ptr, n) == 0) return true;
+    return false;
+}
+
+// Length of s without a trailing partial UTF-8 character.
+static size_t utf8_whole(Str s) {
+    size_t n = s.len, back = 0;
+    while (n > 0 && back < 3 && ((uint8_t)s.ptr[n - 1] & 0xC0) == 0x80) n--, back++;
+    if (n == 0) return s.len;
+    uint8_t b = (uint8_t)s.ptr[n - 1];
+    size_t need = b >= 0xF0 ? 4 : b >= 0xE0 ? 3 : b >= 0xC0 ? 2 : 1;
+    return need > back + 1 ? n - 1 : s.len;
+}
+
+// End of the JSON object starting at p (just past its '}'), or 0 when the text ends first.
+// Strings and escapes are skipped, so a brace or a marker spelled inside a string is data.
+static size_t json_object_end(Str t, size_t p) {
+    int depth = 0;
+    bool in_str = false;
+    for (size_t i = p; i < t.len; i++) {
+        char c = t.ptr[i];
+        if (in_str) {
+            if (c == '\\') i++;
+            else if (c == '"') in_str = false;
+        } else if (c == '"') {
+            in_str = true;
+        } else if (c == '{' || c == '[') {
+            depth++;
+        } else if (c == '}' || c == ']') {
+            if (--depth == 0) return i + 1;
+        }
+    }
+    return 0;
+}
+
+// A tool call payload {"name": string, "args": object}; false when it is not one.
+static bool ink_call(Arena *a, Str payload, Call *out) {
+    JValue *v;
+    if (json_parse(a, payload, false, &v) || v->kind != J_OBJECT) return false;
+    const JValue *n = json_get(v, "name"), *args = json_get(v, "args");
+    if (!n || n->kind != J_STRING || n->s.len == 0) return false;
+    if (args && args->kind != J_OBJECT) return false;
+    Buf b = {0};
+    if (args) json_write(&b, args);
+    else buf_adds(&b, "{}");
+    *out = (Call){n->s, str_n(arena_dup(a, b.ptr, b.len + 1), b.len)};
+    buf_free(&b);
+    return true;
+}
+
+// A NUL-terminated arena copy of b.
+static Str arena_str(Arena *a, const Buf *b) {
+    char *d = arena_alloc(a, b->len + 1);
+    if (b->len) memcpy(d, b->ptr, b->len);
+    d[b->len] = 0;
+    return str_n(d, b->len);
+}
+
+InkParsed toolcall_inkling(Arena *a, Str t, bool final) {
+    InkParsed r = {0};
+    Buf reasoning = {0}, content = {0};
+    VEC(Call) calls = {0};
+    InkMode mode = IM_IDLE;
+    size_t hdr = 0; // start of the pending header (IM_HEADER)
+    size_t p = 0;
+    while (p < t.len) {
+        if (mode == IM_TOOL) {
+            // {"name":...,"args":{...}}, then optional whitespace and the block end; read
+            // JSON-aware, so a brace or a marker spelled inside a string is data
+            size_t q = p, oe = 0, e = 0;
+            while (q < t.len && is_ws(t.ptr[q])) q++;
+            bool open = q == t.len; // the text may still turn into a call
+            Str m = S("");
+            if (!open && t.ptr[q] == '{') {
+                oe = json_object_end(t, q);
+                if (!oe) open = true;
+                else {
+                    e = oe;
+                    while (e < t.len && is_ws(t.ptr[e])) e++;
+                    m = ink_marker_at(t, e);
+                    if (e == t.len || (m.len == 0 && ink_partial_marker(t, e))) open = true;
+                }
+            }
+            // final: a whole object at the very end is a call too (the reply was cut after it)
+            bool closed = (m.len && (str_eq(m, ink_end) || str_eq(m, ink_end_sampling))) || (final && oe && e == t.len);
+            Call c;
+            if (closed && ink_call(a, str_sub(t, q, oe), &c)) {
+                vec_push(&calls, c);
+                if (str_eq(m, ink_end_sampling)) r.ended = true;
+                p = e + m.len;
+                mode = IM_IDLE;
+                continue;
+            }
+            // not a call: its raw text is content, up to the block end
+            size_t end = t.len, after = t.len;
+            if (closed) {
+                end = e;
+                after = e + m.len;
+                if (str_eq(m, ink_end_sampling)) r.ended = true;
+            } else {
+                ptrdiff_t be = str_find(t, ink_end, oe ? oe : p), bs = str_find(t, ink_end_sampling, oe ? oe : p);
+                ptrdiff_t bx = be < 0 ? bs : bs < 0 ? be : MIN(be, bs);
+                if (bx >= 0 && !open) {
+                    end = (size_t)bx;
+                    after = end + (bx == be ? ink_end.len : ink_end_sampling.len);
+                    if (bx != be) r.ended = true;
+                } else if (!final) {
+                    r.in_call = true; // still being written, or its end is not known yet
+                    break;
+                } else if (bx >= 0) {
+                    end = (size_t)bx; // cut off: the first block end
+                    after = end + (bx == be ? ink_end.len : ink_end_sampling.len);
+                    if (bx != be) r.ended = true;
+                }
+            }
+            buf_add(&content, t.ptr + p, end - p);
+            r.bad_call = true;
+            p = after;
+            mode = IM_IDLE;
+            continue;
+        }
+        Str m = ink_marker_at(t, p);
+        if (m.len == 0 && !final && ink_partial_marker(t, p)) break; // wait for the next token
+        bool block_end = m.len && (str_eq(m, ink_end) || str_eq(m, ink_end_sampling));
+        if (block_end && str_eq(m, ink_end_sampling)) r.ended = true;
+        if (mode == IM_TEXT || mode == IM_REASONING) {
+            if (block_end) {
+                mode = IM_IDLE;
+                p += m.len;
+                continue;
+            }
+            // text up to the next possible marker start
+            size_t e = p + 1;
+            while (e < t.len && t.ptr[e] != '<') e++;
+            buf_add(mode == IM_TEXT ? &content : &reasoning, t.ptr + p, e - p);
+            p = e;
+            continue;
+        }
+        // IM_IDLE or IM_HEADER: a marker opens, closes or starts a message
+        if (m.len) {
+            if (mode == IM_HEADER && (block_end || str_eq(m, ink_model)))
+                buf_add(&content, t.ptr + hdr, p - hdr); // a header with no content is text
+            p += m.len;
+            if (str_eq(m, ink_model)) {
+                mode = IM_HEADER;
+                hdr = p;
+            } else if (block_end) {
+                mode = IM_IDLE;
+            } else if (str_eq(m, ink_thinking)) {
+                mode = IM_REASONING;
+            } else if (str_eq(m, ink_tool_json)) {
+                mode = IM_TOOL;
+            } else {
+                mode = IM_TEXT; // content_text, content_tool_error, content_invoke_tool_text
+            }
+            continue;
+        }
+        size_t e = p + 1;
+        while (e < t.len && t.ptr[e] != '<') e++;
+        if (mode == IM_IDLE) buf_add(&content, t.ptr + p, e - p);
+        p = e; // header bytes stay in t until the header resolves
+    }
+    if (mode == IM_HEADER && final) buf_add(&content, t.ptr + hdr, t.len - hdr);
+    if (!final) {
+        reasoning.len = utf8_whole(buf_str(&reasoning));
+        content.len = utf8_whole(buf_str(&content));
+    }
+    r.reasoning = arena_str(a, &reasoning);
+    r.content = arena_str(a, &content);
+    r.n_calls = calls.len;
+    if (calls.len) r.calls = arena_dup(a, calls.ptr, calls.len * sizeof(Call));
+    vec_free(&calls);
+    buf_free(&reasoning);
+    buf_free(&content);
+    return r;
+}

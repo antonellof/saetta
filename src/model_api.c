@@ -1,7 +1,8 @@
-// The model API (model.h) over the models in this binary: model_load picks Flash-Next or
-// Qwen3.8-27B by the pack's config.json model_type, and every call goes to that model's
-// ModelArch (src/model_arch.h). Also the functions both models share (they depend on no
-// model constant): model_argmax, restore-point and prefix-point matching.
+// The model API (model.h) over the models in this binary: model_load picks Flash-Next,
+// Qwen3.8-27B, DeepSeek-V4-Flash or Inkling 2 (registered, not run yet) by the pack's
+// config.json model_type, and every call goes to that model's ModelArch (src/model_arch.h).
+// Also the functions the models share (they depend on no model constant): model_argmax,
+// restore-point and prefix-point matching.
 #include "model.h"
 
 #include <stdlib.h>
@@ -12,7 +13,7 @@
 #include "model_arch.h"
 #include "xcache.h"
 
-static const ModelArch *const archs[] = {&flash_arch, &dense_arch, &dsv4_arch};
+static const ModelArch *const archs[] = {&flash_arch, &dense_arch, &dsv4_arch, &inkling_arch};
 
 // Model starts with its ModelArch pointer in both implementations.
 static const ModelArch *arch_of(const Model *m) { return *(const ModelArch *const *)m; }
@@ -43,7 +44,7 @@ static const ModelArch *arch_for(Arena *a, const Pack *pack) {
 Err model_load(Arena *a, const Pack *pack, Gpu *g, Model **out) {
     const ModelArch *A = arch_for(a, pack);
     if (!A) {
-        dbg("model: %s is not a Qwen3.8-Flash-Next, Qwen3.8-27B or DeepSeek-V4-Flash pack\n", pack->dir);
+        dbg("model: %s is not a Qwen3.8-Flash-Next, Qwen3.8-27B, DeepSeek-V4-Flash or Inkling 2 pack\n", pack->dir);
         return "UnknownModelType";
     }
     return A->load(a, pack, g, out);
@@ -76,6 +77,10 @@ const ModelInfo *model_info(const Model *m) { return &arch_of(m)->info; }
 const ModelInfo *model_info_for(Arena *a, const Pack *pack) {
     const ModelArch *A = arch_for(a, pack);
     return A ? &A->info : NULL;
+}
+const ModelInfo *model_info_dir(Arena *a, const char *dir) {
+    Pack p = {.dir = dir};
+    return model_info_for(a, &p);
 }
 size_t model_check_pack(Arena *a, const Pack *pack, FILE *out) {
     const ModelArch *A = arch_for(a, pack);

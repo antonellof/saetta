@@ -246,12 +246,18 @@ Err gpu_dispatch_cost(Gpu *g, size_t n, size_t serial_threads, double *secs) {
 }
 
 Err gpu_pipeline(Gpu *g, const char *source, const char *name, sx_pipeline **out) {
-    // SAETTA_NO_ACCEL=1: no tensor-op (neural accelerator) kernels, as when they do not compile;
-    // every model then takes its simdgroup paths (checks the path older GPUs may take)
-    if (strstr(source, "<metal_tensor>") != NULL && getenv("SAETTA_NO_ACCEL") != NULL &&
-        strcmp(getenv("SAETTA_NO_ACCEL"), "0") != 0) {
-        *out = NULL;
-        return "AccelDisabled";
+    // Tensor-op (neural accelerator) kernels only on GPUs with neural accelerators (Apple10: M5
+    // and later), where they are verified; older GPUs take every model's simdgroup paths, as when
+    // the tensor-op kernels do not compile. SAETTA_NO_ACCEL=1 forces the simdgroup paths anywhere,
+    // SAETTA_ACCEL=1 forces the tensor-op kernels on an older GPU.
+    if (strstr(source, "<metal_tensor>") != NULL) {
+        const char *no = getenv("SAETTA_NO_ACCEL"), *yes = getenv("SAETTA_ACCEL");
+        bool forced_off = no != NULL && strcmp(no, "0") != 0;
+        bool forced_on = yes != NULL && strcmp(yes, "0") != 0;
+        if (forced_off || (!forced_on && !sx_device_supports_apple10(g->dev))) {
+            *out = NULL;
+            return "AccelDisabled";
+        }
     }
     char err[2048];
     err[0] = 0;

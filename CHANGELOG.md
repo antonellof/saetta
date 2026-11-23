@@ -3,6 +3,12 @@
 All notable changes to saetta and Saetta Code (`saetta code`), newest first. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are saetta's.
 
+## [0.17.1] - 2026-11-23
+
+### Fixed
+
+- M1 to M4: replies were garbage. The prompt kernels written for the M5's neural accelerators now run only on GPUs that have them; M1 to M4 take the plain GPU kernels automatically (`SAETTA_NO_ACCEL=1` is no longer needed). `SAETTA_ACCEL=1` forces the accelerator kernels for testing.
+
 ## [0.17.0] - 2026-11-23
 
 ### Added

@@ -15,6 +15,18 @@ On the first run, with no model downloaded, Saetta Code shows the model that fit
 
 If a Saetta server is already running on this Mac, `saetta start code` joins it instead of loading a second copy of the model.
 
+## Try Inkling 2 Mini
+
+Inkling 2 Mini is Thinking Machines' 26B mixture of experts with 3.4B active per token. It runs from 32 GB of memory and is not picked automatically, so download it by name and open the agent on it:
+
+```sh
+curl -fsSL https://saetta.dev/install.sh | sh     # or: saetta update
+saetta download inkling                           # Inkling 2 Mini, 17 GB
+saetta start code --pack inkling
+```
+
+Inside the agent, `/model` switches between Inkling and the Qwen packs you have downloaded. See [Choosing a model](choosing-a-model.md).
+
 ## Trust the project
 
 When the folder has project resources (a `.pi` folder with settings, skills or MCP servers), the agent asks whether to trust it before loading them. Context files such as `AGENTS.md` load either way. See [Context and skills](context-and-skills.md).

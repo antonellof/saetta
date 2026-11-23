@@ -40,6 +40,13 @@ curl -fsSL https://saetta.dev/install.sh | sh    # into ~/.local/bin
 saetta start code        # the built-in agent: picks the model that fits this Mac, downloads it and opens it
 ```
 
+To try Inkling 2 Mini (17 GB, from 32 GB of memory), name it:
+
+```sh
+saetta download inkling
+saetta start code --pack inkling
+```
+
 `saetta` alone (or `saetta auto`) is a guided start: it shows this Mac's chip, memory and free disk, lists the models best first (the ones that do not fit are greyed out), downloads the one you pick, offers the built-in agent or the Claude Code, pi and opencode it finds (with the official installer for a missing one), and starts it. The same by hand:
 
 ```sh

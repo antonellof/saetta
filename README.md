@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/saetta-banner.png" alt="Saetta" width="900">
+  <img src="docs/assets/saetta-banner.gif" alt="Saetta: local coding agent" width="900">
 </p>
 
 <h3 align="center">Saetta: a local coding agent with the model built in.</h3>

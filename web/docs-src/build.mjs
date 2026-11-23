@@ -225,7 +225,7 @@ function pageHtml(page, i) {
   <meta property="og:site_name" content="Saetta">
   <meta property="og:title" content="${esc(fullTitle)}">
   <meta property="og:description" content="${esc(description)}">
-  <meta property="og:image" content="${SITE}/assets/og-card.png">
+  <meta property="og:image" content="https://www.saetta.dev/assets/og-card.png">
   <meta property="og:image:width" content="1200">
   <meta property="og:image:height" content="630">
   <meta property="og:image:alt" content="Saetta, local coding agent">
@@ -233,7 +233,7 @@ function pageHtml(page, i) {
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="${esc(fullTitle)}">
   <meta name="twitter:description" content="${esc(description)}">
-  <meta name="twitter:image" content="${SITE}/assets/og-card.png">
+  <meta name="twitter:image" content="https://www.saetta.dev/assets/og-card.png">
   ${themeScript}
   ${fontLinks}
   <link rel="stylesheet" href="/docs.css">

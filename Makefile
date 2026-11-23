@@ -32,7 +32,7 @@ TEST_SRCS := $(wildcard src/test/*.c)
 TEST_OBJS := $(TEST_SRCS:src/test/%.c=$(OBJ)/test/%.o)
 LIB_OBJS  := $(filter-out $(OBJ)/main.o,$(OBJS))
 
-.PHONY: all test verify verify-dsv4 bench clean
+.PHONY: all test verify verify-quick verify-dsv4 bench clean
 .DELETE_ON_ERROR:
 
 all: $(BIN)
@@ -71,6 +71,23 @@ verify: $(BIN)
 	@for g in $(GOLDENS_INKLING); do d="$(dir $(abspath $(GOLDEN)))$$g"; \
 	  if [ -d "$$d" ] && [ -d "$(INKLING_PACK)" ]; then echo "verify: $$d"; SAETTA_PACK="$(INKLING_PACK)" $(BIN) verify "$$d" || exit 1; \
 	  elif [ -d "$$d" ]; then echo "verify: no Inkling pack at $(INKLING_PACK), $$g skipped"; fi; done
+
+# The commit hook's check: one golden per model family in QUICK (flash, 27b, inkling; default
+# all three), the fastest of each: the Coder (or GOLDEN, the full Flash-Next, without the Coder
+# pack), golden-27b-4bit, golden-inkling. `make verify` (every golden) runs before each release.
+QUICK ?= flash 27b inkling
+verify-quick: $(BIN)
+	@b="$(dir $(abspath $(GOLDEN)))"; for f in $(QUICK); do \
+	  case $$f in \
+	    flash) if [ -d "$(CODER_PACK)" ] && [ -d "$${b}golden-coder" ]; then d="$${b}golden-coder"; p="$(CODER_PACK)"; else d="$(abspath $(GOLDEN))"; p=; fi;; \
+	    27b) d="$${b}golden-27b-4bit"; p=;; \
+	    inkling) d="$${b}golden-inkling"; p="$(INKLING_PACK)";; \
+	    *) echo "verify-quick: unknown family $$f"; exit 1;; \
+	  esac; \
+	  if [ ! -d "$$d" ] || { [ -n "$$p" ] && [ ! -d "$$p" ]; }; then echo "verify-quick: $$f skipped (no golden or pack)"; continue; fi; \
+	  echo "verify-quick: $$d"; \
+	  if [ -n "$$p" ]; then SAETTA_PACK="$$p" $(BIN) verify "$$d" || exit 1; else env -u SAETTA_PACK $(BIN) verify "$$d" || exit 1; fi; \
+	done
 
 # DeepSeek-V4-Flash against its goldens next to GOLDEN: the forced per-layer check on the
 # all-positions golden, then the functional check on the others (streamed experts, cache

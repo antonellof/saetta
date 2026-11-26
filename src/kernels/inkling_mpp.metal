@@ -322,3 +322,146 @@ IM_GU(ink_mpp_gu_mx, true)
     }
 IM_DN(ink_mpp_dn_nv, false)
 IM_DN(ink_mpp_dn_mx, true)
+
+// ---- prompt attention (f16 KV cache) ----------------------------------------------------------
+// The scores q.k / sqrt(HD) + the relative bias rs . proj[:, distance] (0 from distance EXT on),
+// causal, sliding layers masked to distances < win, the head's sink logit with a zero value, the
+// output times sigmoid(gate) (src/kernels/inkling_attn.metal has the f32 forms and the formulas'
+// sources). Keys below pos0 come from the cache (f16; a ring of `ring` rows on sliding layers),
+// those from pos0 on from the chunk's own rows in half (kh, vh [T][NKV * HD]): the chunk is
+// written to the cache only after its attention.
+// After Strata (MIT, Copyright (c) 2026 Niko1221 and the Strata contributors; c6f6427,
+// engine/src/inkling2/metal/ink_metal_mpp.metal ink_mpp_prep_qr / ink_mpp_relpos_gqa_pf): 32
+// queries of one head per threadgroup, key tiles of 64 staged in threadgroup memory, S = Q K^T
+// and O += P V on matmul2d, the bias from a transposed table and the sink folded in at the end.
+// Changed: its keys' sources (no write of the chunk into the ring before its attention), the
+// bias table and the relative states in f32, the bias 0 from distance EXT on.
+struct ImAttP { uint NH, NKV, HD, DREL, EXT, pos0, win, ring, nsplit, span, T; float scale; };
+
+// q [T][NH][HD] (prepared) to qh [NH][rows][HD] half, times scale, zero rows from T on.
+// Grid (ceil(T / 32) * 32, NH) x HD.
+kernel void ink_mpp_attn_q(device const float *q [[buffer(0)]], device half *qh [[buffer(1)]], constant ImAttP &p [[buffer(2)]],
+                           constant uint &rows [[buffer(3)]], uint2 tg [[threadgroup_position_in_grid]], uint d [[thread_index_in_threadgroup]]) {
+    const uint m = tg.x, h = tg.y;
+    qh[((ulong)h * rows + m) * p.HD + d] = half(m < p.T ? q[((ulong)m * p.NH + h) * p.HD + d] * p.scale : 0.0f);
+}
+
+// Grid (ceil(T / 32), NH) x 128 (4 simdgroups). projt [EXT + 1][16] f32 (row EXT zeros), rs
+// [T][NH][DREL] f32, sink [T][NH], gate and out [T][NH][HD] f32.
+kernel void ink_mpp_attn(device half *qh [[buffer(0)]], device const float *rs [[buffer(1)]], device const float *projt [[buffer(2)]],
+                         device const half *kc [[buffer(3)]], device const half *vc [[buffer(4)]], device const half *kh [[buffer(5)]],
+                         device const half *vh [[buffer(6)]], device const float *sink [[buffer(7)]], device const float *gate [[buffer(8)]],
+                         device float *out [[buffer(9)]], constant ImAttP &p [[buffer(10)]], constant uint &rows [[buffer(11)]],
+                         uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup half sKV[64 * 128]; // K tile, then the scores (f32 [32][64]), then V, then O (f32 [32][128])
+    threadgroup half sP[32 * 64];
+    threadgroup float sR[32][16];
+    threadgroup float sm[32], sl[32], sc[32];
+    threadgroup float *sF = (threadgroup float *)sKV;
+    const uint q0 = tg.x * 32, h = tg.y, g = h / (p.NH / p.NKV), ld = p.NKV * p.HD;
+    const int qv = min(32, int(p.T) - int(q0));
+    const int qpos0 = int(p.pos0 + q0);
+    if (tid < 32) {
+        sm[tid] = -INFINITY;
+        sl[tid] = 0.0f;
+        sc[tid] = 0.0f;
+    }
+    for (uint e = tid; e < 32 * 16; e += 128) {
+        const uint r = e / 16, i = e % 16;
+        sR[r][i] = int(r) < qv && i < p.DREL ? rs[((ulong)(q0 + r) * p.NH + h) * p.DREL + i] : 0.0f;
+    }
+    using T2 = dextents<int32_t, 2>;
+    tensor<device half, T2, tensor_inline> tQ(qh + ((ulong)h * rows + q0) * 128, T2(128, 32));
+    tensor<threadgroup half, T2, tensor_inline> tKV(sKV, T2(128, 64));
+    tensor<threadgroup half, T2, tensor_inline> tP(sP, T2(64, 32));
+    tensor<threadgroup float, T2, tensor_inline> tS(sF, T2(64, 32));
+    tensor<threadgroup float, T2, tensor_inline> tO(sF, T2(128, 32));
+    constexpr auto dQK = matmul2d_descriptor(32, 64, 128, false, true, false);
+    constexpr auto dPV = matmul2d_descriptor(32, 128, 64, false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<dQK, execution_simdgroups<4>> opQK;
+    matmul2d<dPV, execution_simdgroups<4>> opPV;
+    auto accO = opPV.template get_destination_cooperative_tensor<decltype(tP), decltype(tKV), float>();
+    for (uint16_t i = 0; i < accO.get_capacity(); ++i) accO[i] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const int k_min = p.win ? max(0, qpos0 - int(p.win) + 1) : 0, k_max = qpos0 + qv; // keys [k_min, k_max)
+    // a key row (64 keys x 128 dims, 8 halves a thread per pass)
+    auto stage = [&](device const half *cache, device const half *chunk, int k0) {
+        for (uint pass = 0; pass < 8; ++pass) {
+            const uint idx = pass * 128 + tid, kr = idx >> 4, kcol = (idx & 15u) << 3;
+            const int j = k0 + int(kr);
+            uint4 v = uint4(0u);
+            if (j < k_max) {
+                if (j >= int(p.pos0)) v = *(device const uint4 *)(chunk + (ulong)(j - int(p.pos0)) * ld + g * 128 + kcol);
+                else v = *(device const uint4 *)(cache + (ulong)(p.ring ? uint(j) % p.ring : uint(j)) * ld + g * 128 + kcol);
+            }
+            *(threadgroup uint4 *)(sKV + kr * 128 + kcol) = v;
+        }
+    };
+    for (int k0 = k_min; k0 < k_max; k0 += 64) {
+        stage(kc, kh, k0);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        auto accS = opQK.template get_destination_cooperative_tensor<decltype(tQ), decltype(tKV), float>();
+        opQK.run(tQ, tKV, accS);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        accS.store(tS);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        {
+            // 4 threads a row, 16 keys each: bias, mask, online softmax
+            const int r = int(tid >> 2), l4 = int(tid & 3u), qpos = qpos0 + r;
+            const bool rok = r < qv;
+            float vals[16], mx = -INFINITY;
+            for (int e = 0; e < 16; ++e) {
+                const int j = l4 * 16 + e, kpos = k0 + j;
+                float x = -INFINITY;
+                if (rok && kpos <= qpos && (!p.win || qpos - kpos < int(p.win))) {
+                    device const float4 *pr = (device const float4 *)(projt + (ulong)min(uint(qpos - kpos), p.EXT) * 16);
+                    threadgroup const float4 *rr = (threadgroup const float4 *)sR[r];
+                    x = sF[r * 64 + j] + (dot(rr[0], pr[0]) + dot(rr[1], pr[1]) + dot(rr[2], pr[2]) + dot(rr[3], pr[3]));
+                }
+                vals[e] = x;
+                mx = max(mx, x);
+            }
+            mx = max(mx, simd_shuffle_xor(mx, ushort(1)));
+            mx = max(mx, simd_shuffle_xor(mx, ushort(2)));
+            const float mo = sm[r], mn = max(mo, mx);
+            const float corr = mo == -INFINITY ? 0.0f : exp(mo - mn);
+            float ps = 0.0f;
+            for (int e = 0; e < 16; ++e) {
+                const float pe = vals[e] == -INFINITY ? 0.0f : exp(vals[e] - mn);
+                ps += pe;
+                sP[r * 64 + l4 * 16 + e] = half(pe);
+            }
+            ps += simd_shuffle_xor(ps, ushort(1));
+            ps += simd_shuffle_xor(ps, ushort(2));
+            threadgroup_barrier(mem_flags::mem_threadgroup); // every row's old sm read
+            if (l4 == 0) {
+                sm[r] = mn;
+                sl[r] = sl[r] * corr + ps;
+                sc[r] = corr;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (k0 > k_min)
+            for (uint16_t i = 0; i < accO.get_capacity(); ++i)
+                if (accO.is_valid_element(i)) accO[i] *= sc[accO.get_multidimensional_index(i)[1]];
+        stage(vc, vh, k0);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        opPV.run(tP, tKV, accO);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    // the sink (a zero value) in the normalization, then the gate
+    if (int(tid) < qv) {
+        const float sk = sink[(ulong)(q0 + tid) * p.NH + h], mk = sm[tid];
+        if (mk == -INFINITY) sc[tid] = 0.0f;
+        else {
+            const float mf = max(mk, sk), so = exp(mk - mf);
+            sc[tid] = so / (sl[tid] * so + exp(sk - mf));
+        }
+    }
+    accO.store(tO);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int r = 0; r < qv; ++r) {
+        const ulong o = ((ulong)(q0 + r) * p.NH + h) * 128 + tid;
+        out[o] = sF[r * 128 + tid] * sc[r] * im_sigm(gate[o]);
+    }
+}

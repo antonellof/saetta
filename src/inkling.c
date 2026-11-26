@@ -112,7 +112,8 @@ typedef struct {
     sx_pipeline *mv, *mm; // qgen: qmatvec_gen, qmm_gen
     // prompt chunks on the tensor ops (inkling_mpp.metal; NULL where they do not run)
     sx_pipeline *im_plan, *im_gather, *im_gu_nv, *im_gu_mx, *im_dn_nv, *im_dn_mx;
-    sx_pipeline *im_half, *im_dq, *im_mm; // to_half, dq_f16_gen, mmh_dense (qmm_mpp.metal, qgen_mpp.metal)
+    sx_pipeline *im_half, *im_dq, *im_mm;
+    sx_pipeline *im_attq, *im_attn; // to_half, dq_f16_gen, mmh_dense (qmm_mpp.metal, qgen_mpp.metal)
 } Pipes;
 
 // Scratch regions, floats per token (each region holds PCH rows).
@@ -197,6 +198,10 @@ struct Model {
     sx_buffer *xs_h, *hs_h, *msrt, *mtiles, *mmeta;
     // the dense projections: their input in half (xh [PCH][QD]), the weights unpacked to f16 (wh)
     sx_buffer *xh, *wh;
+    // the prompt attention: queries in half per head (qh [NH][PCH][HD]), the chunk's keys and
+    // values in half (kvh [2][PCH][KVD]), the relative bias table per layer (projt [NL][EXT + 1][16]
+    // f32: proj transposed, row EXT zeros)
+    sx_buffer *qh, *kvh, *projt;
     // SAETTA_INK_ROUTES=<golden dir>, read at load (verify, src/inkling.h): the reference's
     // experts of every token at every visit and their margins, so the routers' own choices are
     // checked against them and the engine can be run on them: f32 rounding flips the router at
@@ -490,7 +495,8 @@ static bool load_mpp(Gpu *g, Pipes *pp) {
         const char *name;
     } kn[] = {{offsetof(Pipes, im_plan), "ink_mpp_plan"},   {offsetof(Pipes, im_gather), "ink_mpp_gather"},
               {offsetof(Pipes, im_gu_nv), "ink_mpp_gu_nv"}, {offsetof(Pipes, im_gu_mx), "ink_mpp_gu_mx"},
-              {offsetof(Pipes, im_dn_nv), "ink_mpp_dn_nv"}, {offsetof(Pipes, im_dn_mx), "ink_mpp_dn_mx"}};
+              {offsetof(Pipes, im_dn_nv), "ink_mpp_dn_nv"}, {offsetof(Pipes, im_dn_mx), "ink_mpp_dn_mx"},
+              {offsetof(Pipes, im_attq), "ink_mpp_attn_q"}, {offsetof(Pipes, im_attn), "ink_mpp_attn"}};
     bool ok = true;
     for (size_t i = 0; i < COUNT(kn) && ok; i++) {
         ok = gpu_pipeline(g, ink_mpp_src, kn[i].name, (sx_pipeline **)((char *)pp + kn[i].off)) == OK;
@@ -576,6 +582,8 @@ Err model_load(Arena *arena, const Pack *pack, Gpu *g, Model **out) {
         TRY(gpu_new_buffer(g, 16, &m->mmeta));
         TRY(gpu_new_buffer(g, (size_t)PCH * QD * 2, &m->xh));
         TRY(gpu_new_buffer(g, (size_t)QD * QD * 2, &m->wh));
+        TRY(gpu_new_buffer(g, (size_t)NH * PCH * HD * 2, &m->qh));
+        TRY(gpu_new_buffer(g, (size_t)2 * PCH * KVD * 2, &m->kvh));
     } else
         dbg("model: accelerator kernels unavailable, Inkling prompt chunks on f32 tiles\n");
 
@@ -595,6 +603,17 @@ Err model_load(Arena *arena, const Pack *pack, Gpu *g, Model **out) {
             TRY(gpu_new_buffer(g, ALIGN_UP(P.used, 16), &m->params));
             P.buf = m->params;
             P.base = sx_buffer_contents(m->params);
+        }
+    }
+    if (m->accel) {
+        static_assert(DREL <= 16);
+        TRY(gpu_new_buffer(g, (size_t)NL * (EXT + 1) * 16 * 4, &m->projt));
+        float *pt = gpu_floats(m->projt);
+        memset(pt, 0, (size_t)NL * (EXT + 1) * 16 * 4);
+        for (size_t li = 0; li < NL; li++) {
+            const float *pj = (const float *)((const uint8_t *)sx_buffer_contents(m->params) + m->L[li].proj.offset);
+            for (size_t i = 0; i < DREL; i++)
+                for (size_t dd = 0; dd < EXT; dd++) pt[(li * (EXT + 1) + dd) * 16 + i] = pj[i * EXT + dd];
         }
     }
     TRY(gpu_new_buffer(g, region_off[R_N] * 4, &m->scratch));
@@ -844,6 +863,16 @@ static void enc_visit(Model *m, InkSession *d, Enc *c, size_t v, uint32_t T, uin
             DISP(c, d->kv_half ? m->p.attn_part_h : m->p.attn_part, NKV, nsplit, T, 128, reg(m, R_Q), reg(m, R_RS), L->proj, kc, vc,
                  reg(m, R_KN), reg(m, R_VN), B(m->part), BYTES(p));
             DISP(c, m->p.attn_merge, NH, T, 1, HD, B(m->part), reg(m, R_SK), reg(m, R_GT), reg(m, R_ATT), BYTES(p));
+        } else if (m->half_prefill && d->kv_half) {
+            // prompt chunks on the tensor ops (f16 cache): queries per head and the chunk's keys
+            // and values in half, 32 queries a threadgroup
+            AttP p = {NH, NKV, HD, DREL, EXT, pos0, full ? 0 : WIN, ring, 1, 0, T, scale};
+            const uint32_t rows = PCH, tq = (T + 31) / 32, n = T * KVD;
+            DISP(c, m->p.im_attq, tq * 32, NH, 1, HD, reg(m, R_Q), B(m->qh), BYTES(p), BYTES(rows));
+            DISP(c, m->p.im_half, (n + 255) / 256, 1, 1, 256, reg(m, R_KN), B(m->kvh), BYTES(n));
+            DISP(c, m->p.im_half, (n + 255) / 256, 1, 1, 256, reg(m, R_VN), AT(m->kvh, (size_t)PCH * KVD * 2), BYTES(n));
+            DISP(c, m->p.im_attn, tq, NH, 1, 128, B(m->qh), reg(m, R_RS), AT(m->projt, li * (EXT + 1) * 16 * 4), kc, vc, B(m->kvh),
+                 AT(m->kvh, (size_t)PCH * KVD * 2), reg(m, R_SK), reg(m, R_GT), reg(m, R_ATT), BYTES(p), BYTES(rows));
         } else {
             // prompt chunks: key tiles shared by blocks of 16 queries
             AttP p = {NH, NKV, HD, DREL, EXT, pos0, full ? 0 : WIN, ring, 1, 0, T, scale};

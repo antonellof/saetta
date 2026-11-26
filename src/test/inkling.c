@@ -306,7 +306,8 @@ TEST(ink_router) {
 // own rows: the window, the relative bias extent, the sink and the gate. half: the cache in f16
 // (the reference then sees the cached keys and values rounded to f16). flash: the prompt-chunk
 // kernel instead of the split-K one.
-static Err attn_case(Arena *a, QgenCtx *x, size_t pos0, size_t T, size_t win, size_t ext, size_t nsplit, bool half, bool flash,
+// flash: 0 the split-K kernels, 1 the prompt tiles, 2 the tensor-op prompt kernel (f16 cache)
+static Err attn_case(Arena *a, QgenCtx *x, size_t pos0, size_t T, size_t win, size_t ext, size_t nsplit, bool half, int flash,
                      float *err) {
     const size_t ld = NKV * HD, P = pos0 + T;
     float *K = ARENA_ARRAY(a, float, P * ld), *V = ARENA_ARRAY(a, float, P * ld);
@@ -354,7 +355,26 @@ static Err attn_case(Arena *a, QgenCtx *x, size_t pos0, size_t T, size_t win, si
     struct { uint32_t nh, nkv, hd, drel, ext, pos0, win, ring, nsplit, span, t; float scale; } p = {
         NH, NKV, HD, DREL, (uint32_t)ext, (uint32_t)pos0, (uint32_t)win, (uint32_t)win, (uint32_t)nsplit, span, (uint32_t)T,
         1.0f / sqrtf((float)HD)};
-    if (flash) {
+    if (flash == 2) {
+        // ink_mpp_attn: the queries per head in half (ink_mpp_attn_q), the chunk's rows in half,
+        // the bias table transposed
+        const uint32_t qrows = (uint32_t)((T + 31) / 32 * 32);
+        sx_buffer *bqh, *bkh, *bvh, *bpt;
+        TRY(gpu_new_buffer(&x->g, (size_t)NH * qrows * HD * 2, &bqh));
+        TRY(gpu_new_buffer(&x->g, T * ld * 2, &bkh));
+        TRY(gpu_new_buffer(&x->g, T * ld * 2, &bvh));
+        TRY(fbuf(x, NULL, (ext + 1) * 16, &bpt));
+        _Float16 *kh = sx_buffer_contents(bkh), *vh = sx_buffer_contents(bvh);
+        for (size_t i = 0; i < T * ld; i++) kh[i] = (_Float16)K[pos0 * ld + i], vh[i] = (_Float16)V[pos0 * ld + i];
+        float *pt = gpu_floats(bpt);
+        memset(pt, 0, (ext + 1) * 16 * 4);
+        for (size_t i = 0; i < DREL; i++)
+            for (size_t dd = 0; dd < ext; dd++) pt[dd * 16 + i] = proj[i * ext + dd];
+        sx_arg aq[] = {BA(bq), BA(bqh), BYTES(&p), BYTES(&qrows)};
+        TRY(run_src(x, ink_mpp_src, "ink_mpp_attn_q", aq, COUNT(aq), qrows, NH, 1, HD));
+        sx_arg am[] = {BA(bqh), BA(br), BA(bpt), BA(bkc), BA(bvc), BA(bkh), BA(bvh), BA(bs), BA(bg), BA(bo), BYTES(&p), BYTES(&qrows)};
+        TRY(run_src(x, ink_mpp_src, "ink_mpp_attn", am, COUNT(am), qrows / 32, NH, 1, 128));
+    } else if (flash) {
         sx_arg af[] = {BA(bq), BA(br), BA(bp), BA(bkc), BA(bvc), BA(bkn), BA(bvn), BA(bs), BA(bg), BA(bo), BYTES(&p)};
         TRY(run(x, half ? "ink_attn_flash_mma" : "ink_attn_flash", af, COUNT(af), NKV, (T + 15) / 16, 1, half ? 192 : 256));
     } else {
@@ -387,12 +407,18 @@ TEST(ink_attention) {
     EXPECT_OK(qgen_ctx_init(&a, &x));
     // decode and chunks; sliding with the ring wrapped (a chunk longer than the window too), full
     // with distances past the bias extent; both kernels, f32 and f16 caches
-    static const struct { size_t pos0, T, win, ext, nsplit; bool flash; } cs[] = {
+    static const struct { size_t pos0, T, win, ext, nsplit; int flash; } cs[] = {
         {0, 1, 64, 64, 1, false},    {200, 1, 64, 64, 3, false},  {130, 7, 64, 64, 2, false}, {40, 150, 64, 64, 4, false},
         {300, 1, 0, 96, 8, false},   {90, 20, 0, 96, 4, false},   {0, 37, 64, 64, 1, true},   {130, 70, 64, 64, 1, true},
-        {40, 150, 64, 64, 1, true},  {90, 50, 0, 96, 1, true},    {2000, 33, 0, 96, 1, true}, {5000, 1, 0, 96, 64, false}};
+        {40, 150, 64, 64, 1, true},  {90, 50, 0, 96, 1, true},    {2000, 33, 0, 96, 1, true}, {5000, 1, 0, 96, 64, false},
+        // the tensor-op kernel (f16 cache only; skipped without tensor ops)
+        {0, 37, 64, 64, 1, 2},       {130, 70, 64, 64, 1, 2},     {40, 150, 64, 64, 1, 2},    {90, 50, 0, 96, 1, 2},
+        {2000, 33, 0, 96, 1, 2},     {1000, 300, 0, 96, 1, 2}};
+    sx_pipeline *mp;
+    const bool accel = qgen_ctx_pipe(&x, ink_mpp_src, "ink_mpp_attn", &mp) == OK;
     for (int half = 0; half < 2; half++)
         for (size_t i = 0; i < COUNT(cs); i++) {
+            if (cs[i].flash == 2 && (!half || !accel)) continue;
             float e;
             EXPECT_OK(attn_case(&a, &x, cs[i].pos0, cs[i].T, cs[i].win, cs[i].ext, cs[i].nsplit, half, cs[i].flash, &e));
             // the f16-cache prompt kernel multiplies half Q, K, V and P

@@ -90,10 +90,11 @@
 <tr><td><code>HF_TOKEN</code></td><td>unset</td><td>a Hugging Face token for downloads, which raises Hugging Face&#39;s limits (else <code>~/.cache/huggingface/token</code>)</td></tr>
 <tr><td><code>SAETTA_IGNORE_MEMORY</code></td><td>unset</td><td><code>1</code> loads or downloads a pack this Mac&#39;s memory is too small for, and keeps the asked context</td></tr></tbody></table></div>
 <h2 id="server-and-engine"><a class="anchor" href="#server-and-engine" aria-hidden="true" tabindex="-1">#</a>Server and engine</h2>
-<div class="doc-table"><table><thead><tr><th>variable</th><th>default</th><th>effect</th></tr></thead><tbody><tr><td><code>SAETTA_CTX</code></td><td>32768 (<code>saetta serve</code>), 204800 (<code>saetta start</code>)</td><td>context in tokens, 1024 to 262144, rounded down to a multiple of 128 (Flash-Next about 35 KB per token, 27B 64 KB)</td></tr>
+<div class="doc-table"><table><thead><tr><th>variable</th><th>default</th><th>effect</th></tr></thead><tbody><tr><td><code>SAETTA_CTX</code></td><td>32768 (<code>saetta serve</code>), 204800 (<code>saetta start</code>)</td><td>context in tokens, 1024 to 262144 (Inkling 2 Mini 1048576), rounded down to a multiple of 128 (Flash-Next about 35 KB per token, 27B 64 KB)</td></tr>
 <tr><td><code>SAETTA_PORT</code></td><td>8080</td><td>the port <code>saetta start</code> uses</td></tr>
 <tr><td><code>SAETTA_CONVERSATIONS</code></td><td>4</td><td>conversations the server keeps between turns</td></tr>
-<tr><td><code>SAETTA_SPEC</code> / <code>SAETTA_MTP</code></td><td>1 / 1</td><td><code>0</code> turns speculative decoding / the MTP head off</td></tr>
+<tr><td><code>SAETTA_SPEC</code> / <code>SAETTA_MTP</code></td><td>1 / 1</td><td><code>0</code> turns speculative decoding / the MTP head (Inkling: the DSpark drafter) off</td></tr>
+<tr><td><code>SAETTA_DSPARK</code></td><td>unset</td><td>Inkling 2 Mini: <code>1</code> loads the downloaded DSpark drafter (or a path to its <code>mtp.safetensors</code>); off by default</td></tr>
 <tr><td><code>SAETTA_KV_F32</code></td><td>unset</td><td>f32 KV cache</td></tr>
 <tr><td><code>SAETTA_NO_ACCEL</code></td><td>unset</td><td><code>1</code> runs without the tensor-op (neural accelerator) kernels, for a Mac where they misbehave (slower prompt reading, same output)</td></tr>
 <tr><td><code>SAETTA_EXPERT_CACHE_GB</code></td><td>unset</td><td>experimental: keep this many GB of experts in memory, read the rest from the SSD (Flash-Next: slower than resident, same output)</td></tr>
@@ -108,7 +109,8 @@
 <tr><td><code>PI_CLIPBOARD_OSC52</code></td><td>unset</td><td><code>1</code> copies through the terminal (OSC 52), as over SSH</td></tr>
 <tr><td><code>PI_TUI_ESC_TIMEOUT</code></td><td>10 (100 over SSH)</td><td>milliseconds to tell Escape from an escape sequence</td></tr>
 <tr><td><code>PI_CACHE_RETENTION</code></td><td>unset</td><td><code>long</code> asks providers that support it for 24-hour prompt caching</td></tr>
-<tr><td><code>VISUAL</code>, <code>EDITOR</code></td><td>nano</td><td>the editor Ctrl+G opens, when settings.json has no <code>externalEditor</code></td></tr></tbody></table></div>
+<tr><td><code>VISUAL</code>, <code>EDITOR</code></td><td>nano</td><td>the editor Ctrl+G opens, when settings.json has no <code>externalEditor</code></td></tr>
+<tr><td><code>SAETTA_STATE</code></td><td>1</td><td><code>0</code> turns off the conversation state on disk (<code>~/.saetta/state</code>): a resumed session then reads its history again</td></tr></tbody></table></div>
       </article>
       <p class="doc-edit"><a href="https://github.com/antonellof/saetta/blob/main/docs/environment.md" rel="noopener">Edit this page on GitHub</a></p>
       <nav class="doc-pager" aria-label="Previous and next"><a class="prev" href="/docs/commands/"><span>Previous</span>Commands</a><a class="next" href="/docs/faq/"><span>Next</span>FAQ</a></nav>

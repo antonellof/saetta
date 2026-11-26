@@ -91,6 +91,7 @@
 saetta code --session path/to/file.jsonl  <span class="hljs-comment"># a given session file</span>
 saetta code --no-session                  <span class="hljs-comment"># do not save this one</span></code></pre></div>
 <p>In the agent, <code>/resume</code> opens a picker of earlier sessions, searchable by their messages and names, and <code>/new</code> starts a fresh one.</p>
+<p>With the model in the agent&#39;s process, the engine&#39;s state of the conversation (its KV cache and recurrent state) is saved to <code>~/.saetta/state</code> in the background at the end of each turn. A session resumed later, or forked from an earlier message with <code>/fork</code>, continues from that state instead of reading its whole history again: only the new message is read. A session another terminal joins (<code>saetta start code</code> beside a running one) resumes from saved states but does not save its own. The folder keeps up to 20 GB in all and nothing unused for 7 days; states are tied to the pack, the engine build and this Mac, and checked at every read. <code>SAETTA_STATE=0</code> turns it off. Not yet for Inkling 2 Mini or with a LoRA adapter.</p>
 <p><img src="/assets/code/resume.png" alt="/resume: the session picker" loading="lazy"></p>
 <h2 id="the-session-tree"><a class="anchor" href="#the-session-tree" aria-hidden="true" tabindex="-1">#</a>The session tree</h2>
 <p>A session is a tree, not a list: going back to an earlier message and continuing from there adds a branch, and the old branch stays in the file.</p>

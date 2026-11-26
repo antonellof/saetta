@@ -218,28 +218,32 @@ make && ./build/bin/saetta start code</pre>
     <section class="block" id="models">
       <div class="wrap">
         <span class="eyebrow">Models</span>
-        <h2>The models inside the agent</h2>
+        <h2>Model families</h2>
         <p class="sub">Saetta Code runs one of three model families, picked by your Mac's memory. <code>saetta download &lt;pack&gt;</code> fetches one, <code>saetta start code --pack &lt;pack&gt;</code> opens the agent on it, and <code>/model</code> switches packs in a running session.</p>
         <div class="nope">
           <div><h3>Qwen3.8-Flash-Next, from 96 GB</h3><p>The fastest here, with the highest published scores. <code>coder</code> keeps the 256 of 512 experts that matter for code and is the default on 96 GB; <code>full</code> needs 128 GB.</p></div>
           <div><h3>Qwen3.8-27B, from 32 GB</h3><p>Dense, 4-bit or 8-bit. The 8-bit pack takes LoRA adapters such as the one trained for pi. Coding fine-tunes: TURBO, Fable-5 and Coder390 with their MTP draft heads, and Qwopus, distilled from Qwen3.8-Flash-Max.</p></div>
-          <div><h3>Inkling 2 Mini, from 32 GB</h3><p>Thinking Machines' 26B mixture of experts with 3.4B active per token. First version: no speculative decoding yet, and prompts on the GPU cores rather than the M5's neural accelerators.</p></div>
+          <div><h3>Inkling 2 Mini, from 32 GB</h3><p>Thinking Machines' 26B mixture of experts with 3.4B active per token, context up to 1M tokens where memory allows. Prompt lookup speeds up its answers by default; its DSpark drafter is opt-in.</p></div>
           <div><h3>Fits the Mac you have</h3><p>A pack too big for this Mac is refused before it loads and greyed out in <code>/model</code>, and the context is sized to the memory left: about 37K tokens with <code>27b-4bit</code> on 32 GB.</p></div>
         </div>
         <div class="table" style="margin-top: 16px">
           <table>
-            <thead><tr><th>Pack</th><th>Model</th><th>On disk</th><th>Mac memory</th><th>SWE-bench</th><th>Terminal-Bench 2.1</th></tr></thead>
+            <thead><tr><th>Pack</th><th>Weights</th><th>On disk</th><th>Mac memory</th><th>Options</th><th>SWE-bench</th><th>Terminal-Bench 2.1</th></tr></thead>
             <tbody>
-              <tr><td><code>coder</code></td><td>Qwen3.8-Flash-Next, 256 experts pruned for code, the fastest for agents</td><td class="num">76 GB</td><td><span class="tagm">96 GB</span></td><td class="num">Verified 79.2</td><td class="num">n/p</td></tr>
-              <tr><td><code>full</code></td><td>Qwen3.8-Flash-Next, all 512 experts</td><td class="num">105 GB</td><td><span class="tagm">128 GB</span></td><td class="num">Pro 62.5, Verified 82.8</td><td class="num">n/p</td></tr>
-              <tr><td><code>27b-4bit</code></td><td>Qwen3.8-27B, 4-bit, the smallest</td><td class="num">16 GB</td><td><span class="tagm">32 GB</span></td><td class="num">Pro 61.7</td><td class="num">73.0</td></tr>
-              <tr><td><code>27b-8bit</code></td><td>Qwen3.8-27B, 8-bit, takes LoRA adapters</td><td class="num">29 GB</td><td><span class="tagm">48 GB</span></td><td class="num">Pro 61.7</td><td class="num">73.0</td></tr>
-              <tr><td><code>27b-pi</code></td><td>LoRA adapter for Qwen3.8-27B (harness-hub), trained to drive pi</td><td class="num">0.6 GB</td><td></td><td class="num">Pro hard-51 64.7</td><td class="num">55.8</td></tr>
-              <tr><td><code>27b-turbo</code></td><td>Qwen3.8-27B TURBO fine-tune, shorter thinking, with its draft head</td><td class="num">20 GB</td><td><span class="tagm">36 GB</span></td><td class="num">n/p</td><td class="num">n/p</td></tr>
-              <tr><td><code>27b-fable5</code></td><td>Qwen3.8-27B Fable-5 coding distill, with its draft head</td><td class="num">20 GB</td><td><span class="tagm">36 GB</span></td><td class="num">n/p</td><td class="num">n/p</td></tr>
-              <tr><td><code>27b-coder390</code></td><td>Qwen3.8-27B Coder390, SFT and RL on code, with its draft head</td><td class="num">23 GB</td><td><span class="tagm">48 GB</span></td><td class="num">n/p</td><td class="num">n/p</td></tr>
-              <tr><td><code>27b-qwopus</code></td><td>Qwopus3.8-27B Coder-Flash (Jackrong), a Qwen3.8-27B coding fine-tune distilled from Qwen3.8-Flash-Max</td><td class="num">16 GB</td><td><span class="tagm">32 GB</span></td><td class="num">n/p</td><td class="num">n/p</td></tr>
-              <tr><td><code>inkling</code></td><td>Inkling 2 Mini (Thinking Machines), 128 experts with 8 active, 3.4B active parameters; first version</td><td class="num">17 GB</td><td><span class="tagm">32 GB</span></td><td class="num">Verified 79.2</td><td class="num">71.6</td></tr>
+              <tr><th colspan="7" style="text-align:left">Qwen3.8-Flash-Next</th></tr>
+              <tr><td><strong><code>coder</code></strong></td><td>Flash-Next Coder, 256 of 512 experts kept for code</td><td class="num">76 GB</td><td><span class="tagm">96 GB</span></td><td>draft head (MTP)</td><td class="num">Verified 79.2</td><td class="num">n/p</td></tr>
+              <tr><td><code>full</code></td><td>Flash-Next, all 512 experts, 4-bit</td><td class="num">105 GB</td><td><span class="tagm">128 GB</span></td><td>draft head (MTP)</td><td class="num">Pro 62.5, Verified 82.8</td><td class="num">n/p</td></tr>
+              <tr><th colspan="7" style="text-align:left">Qwen3.8-27B</th></tr>
+              <tr><td><strong><code>27b-4bit</code></strong></td><td>Qwen3.8-27B, 4-bit</td><td class="num">16 GB</td><td><span class="tagm">32 GB</span></td><td></td><td class="num">Pro 61.7</td><td class="num">73.0</td></tr>
+              <tr><td><code>27b-8bit</code></td><td>Qwen3.8-27B, 8-bit</td><td class="num">29 GB</td><td><span class="tagm">48 GB</span></td><td>LoRA adapters</td><td class="num">Pro 61.7</td><td class="num">73.0</td></tr>
+              <tr><td><code>27b-pi</code></td><td>pi adapter (LoRA, for 27b-8bit), trained to drive pi</td><td class="num">0.6 GB</td><td></td><td>adapter</td><td class="num">Pro hard-51 64.7</td><td class="num">55.8</td></tr>
+              <tr><td><strong><code>27b-turbo</code></strong></td><td>TURBO fine-tune, shorter thinking</td><td class="num">20 GB</td><td><span class="tagm">36 GB</span></td><td>draft head (MTP)</td><td class="num">n/p</td><td class="num">n/p</td></tr>
+              <tr><td><code>27b-fable5</code></td><td>Fable-5 coding distill</td><td class="num">20 GB</td><td><span class="tagm">36 GB</span></td><td>draft head (MTP)</td><td class="num">n/p</td><td class="num">n/p</td></tr>
+              <tr><td><code>27b-coder390</code></td><td>Coder390, SFT and RL on code</td><td class="num">23 GB</td><td><span class="tagm">48 GB</span></td><td>draft head (MTP)</td><td class="num">n/p</td><td class="num">n/p</td></tr>
+              <tr><td><code>27b-qwopus</code></td><td>Qwopus Coder-Flash, distilled from Qwen3.8-Flash-Max</td><td class="num">16 GB</td><td><span class="tagm">32 GB</span></td><td></td><td class="num">n/p</td><td class="num">n/p</td></tr>
+              <tr><th colspan="7" style="text-align:left">Inkling 2 Mini</th></tr>
+              <tr><td><code>inkling</code></td><td>Inkling 2 Mini, dense 4-bit, experts NVFP4 / MXFP8</td><td class="num">17 GB</td><td><span class="tagm">32 GB</span></td><td>prompt lookup; 1M context</td><td class="num">Verified 79.2</td><td class="num">71.6</td></tr>
+              <tr><td><code>inkling-dspark</code></td><td>DSpark drafter for inkling</td><td class="num">0.6 GB</td><td></td><td>opt-in, SAETTA_DSPARK=1</td><td class="num"></td><td class="num"></td></tr>
             </tbody>
           </table>
         </div>

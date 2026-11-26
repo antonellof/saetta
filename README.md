@@ -233,6 +233,15 @@ Endpoints: `POST /v1/chat/completions` (streaming, `tool_calls`, `reasoning_cont
 
 ## Performance
 
+### Inkling 2 Mini against llama.cpp and Strata
+
+<p align="center"><img src="docs/assets/inkling-bench.svg" width="900" alt="Inkling 2 Mini on an M5 Max, 4K prompt: answering at 85.3 tokens/s in Saetta with prompt lookup and 58.6 without, Strata 54.2, llama.cpp 47.2, Strata with DSpark 36.7; prompt reading Strata 2,990, llama.cpp 685, Saetta 473 tokens/s"></p>
+
+Saetta answers fastest; Strata reads prompts about six times faster, because it runs Inkling's prompt on the M5's tensor ops, which Saetta does not do for Inkling yet (next on its list).
+
+### Qwen3.8
+
+
 Tuned and measured on an M5 Max with 128 GB, whose neural accelerators read prompts fastest. M1 to M4 read prompts with half-precision kernels of their own on their GPU cores and are not measured yet (reports welcome).
 
 Flash-Next on the M5 Max, a six-request coding-agent workload through the HTTP API, seconds (first token / total):

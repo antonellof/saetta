@@ -156,6 +156,7 @@ h2 { font-size: clamp(28px, 3.6vw, 38px); line-height: 1.12; letter-spacing: -0.
 .legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 11px; color: var(--muted); margin-bottom: 14px; }
 .legend i { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 6px; }
 .rows { display: grid; gap: 10px; }
+.subhead { font-size: 17px; font-weight: 600; margin: 28px 0 4px; }
 .row { display: grid; grid-template-columns: 110px 1fr; align-items: center; gap: 12px; font-size: 12px; }
 .row .name { color: var(--muted); }
 .track { display: flex; align-items: center; gap: 8px; font: 10.5px var(--mono); color: var(--muted); }
@@ -163,6 +164,7 @@ h2 { font-size: clamp(28px, 3.6vw, 38px); line-height: 1.12; letter-spacing: -0.
 .f-a { background: var(--accent); }
 .f-a2 { background: color-mix(in srgb, var(--accent) 55%, var(--bg)); }
 .f-o { background: var(--orange); }
+.f-g { background: color-mix(in srgb, var(--muted) 55%, var(--bg)); }
 .axis { font: 10px var(--mono); color: var(--dim); text-align: right; margin-top: 10px; }
 
 /* cell grid */

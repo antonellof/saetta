@@ -479,6 +479,33 @@ saetta code --mode json -p "list the TODOs"</pre>
         <span class="eyebrow">Benchmarks</span>
         <h2>Engine speed on an M5 Max</h2>
         <p class="sub">On an M5 Max with 128 GB, through the HTTP API that Claude Code, pi and opencode use: cold prompts of 4K to 64K tokens, follow-up turns and a tool-call edit. M1 to M4 are not measured yet.</p>
+        <h3 class="subhead">Inkling 2 Mini: Saetta, llama.cpp and Strata</h3>
+        <p class="sub">The same 4,096-token prompt and 128 answer tokens on an M5 Max, median of 3 interleaved runs (2026-11-26). Each engine uses its own 4-bit or lossless weights: Saetta the mlx-community 4-bit pack (17 GB), llama.cpp Unsloth's UD-Q4_K_XL (17.6 GB), Strata its lossless SQ-20 (19.3 GB).</p>
+        <div class="charts" style="margin-bottom: 28px">
+          <figure class="chart">
+            <h3>Answering</h3>
+            <p class="cap">tokens per second, higher is better</p>
+            <div class="legend"><span><i class="f-a"></i>Saetta</span><span><i class="f-g"></i>other engines</span></div>
+            <div class="rows" style="--max: 90">
+              <div class="row"><span class="name">Saetta, lookup</span><span class="track"><span class="fill f-a" style="--v: 85.3"></span>85.3</span></div>
+              <div class="row"><span class="name">Saetta</span><span class="track"><span class="fill f-a" style="--v: 58.6"></span>58.6</span></div>
+              <div class="row"><span class="name">Strata</span><span class="track"><span class="fill f-g" style="--v: 54.2"></span>54.2</span></div>
+              <div class="row"><span class="name">llama.cpp</span><span class="track"><span class="fill f-g" style="--v: 47.2"></span>47.2</span></div>
+              <div class="row"><span class="name">Strata, DSpark</span><span class="track"><span class="fill f-g" style="--v: 36.7"></span>36.7</span></div>
+            </div>
+          </figure>
+          <figure class="chart">
+            <h3>Prompt reading</h3>
+            <p class="cap">prompt tokens per second, higher is better</p>
+            <div class="legend"><span><i class="f-a"></i>Saetta</span><span><i class="f-g"></i>other engines</span></div>
+            <div class="rows" style="--max: 3000">
+              <div class="row"><span class="name">Strata</span><span class="track"><span class="fill f-g" style="--v: 2990"></span>2,990</span></div>
+              <div class="row"><span class="name">llama.cpp</span><span class="track"><span class="fill f-g" style="--v: 685"></span>685</span></div>
+              <div class="row"><span class="name">Saetta</span><span class="track"><span class="fill f-a" style="--v: 473"></span>473</span></div>
+            </div>
+          </figure>
+        </div>
+        <p class="note" style="margin: -16px 0 28px">Saetta's prompt reading for Inkling does not use the M5's tensor ops yet; Strata's does. Prompt lookup's gain depends on the prompt, and Strata's DSpark row ran on its synthetic benchmark prompt.</p>
         <div class="charts">
           <figure class="chart">
             <h3>Prompt reading</h3>

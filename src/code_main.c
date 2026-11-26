@@ -649,6 +649,18 @@ static Err stream_assistant(Run *r, JValue **out) {
     TRY(e);
     json_put(a, msg, S("thinkingLevel"), json_string(a, str(level_of(r))));
     code_autocompact_observe(&r->ac, msg);
+    CodeGenStats gen;
+    if (r->ui && !r->rpc && code_oai_last_gen(&gen)) { // the footer's tok/s (the interactive mode's own event)
+        JValue *ev = ev_new(a, "ui_gen");
+        const char *keys[] = {"genTokens", "genMs", "promptTokens", "promptMs"};
+        double vals[] = {gen.gen_tokens, gen.gen_ms, gen.prompt_tokens, gen.prompt_ms};
+        for (size_t i = 0; i < COUNT(keys); i++) {
+            JValue *v = json_new(a, J_FLOAT);
+            v->f = vals[i];
+            json_put(a, ev, str(keys[i]), v);
+        }
+        emit(r, ev);
+    }
     if (!st.started) emit_message(r, "message_start", msg);
     emit_message(r, "message_end", msg);
     // a successful answer ends the retries at once (AgentSession._handleAgentEvent)

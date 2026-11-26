@@ -660,3 +660,42 @@ TEST(code_oai_http_errors) {
     EXPECT_STR(str(code_oai_http_error(&a, 503, S(""))), S("503 status code (no body)"));
     arena_reset(&a);
 }
+
+// The footer's speed: one decimal below 100 tok/s, an integer from 100, nothing without tokens or time.
+static Str tps(Buf *b, double tokens, double ms) {
+    b->len = 0;
+    if (!code_fmt_tps(b, tokens, ms)) return S("");
+    return buf_str(b);
+}
+
+TEST(code_fmt_tps) {
+    Buf b = {0};
+    EXPECT_STR(tps(&b, 208, 11601), S("17.9 tok/s"));
+    EXPECT_STR(tps(&b, 1, 1000), S("1.0 tok/s"));
+    EXPECT_STR(tps(&b, 9995, 100000), S("100 tok/s")); // 99.95 rounds to 100.0: an integer
+    EXPECT_STR(tps(&b, 9994, 100000), S("99.9 tok/s"));
+    EXPECT_STR(tps(&b, 1234, 1000), S("1234 tok/s"));
+    EXPECT_STR(tps(&b, 1005, 10000), S("100 tok/s"));
+    EXPECT_STR(tps(&b, 0, 1000), S(""));
+    EXPECT_STR(tps(&b, 10, 0), S(""));
+    EXPECT_EQ(b.len, 0);
+    buf_free(&b);
+}
+
+// A run with tool calls has several requests: its speed is the total generated tokens over the
+// total generation time (prompt reading apart), not the mean of the requests' speeds.
+TEST(code_gen_add_turn) {
+    CodeGenStats req[] = {{.gen_tokens = 100, .gen_ms = 2000, .prompt_tokens = 5000, .prompt_ms = 1000},
+                          {.gen_tokens = 10, .gen_ms = 1000, .prompt_tokens = 300, .prompt_ms = 200},
+                          {.gen_tokens = 98, .gen_ms = 8601}};
+    CodeGenStats sum = {0};
+    for (size_t i = 0; i < COUNT(req); i++) code_gen_add(&sum, &req[i]);
+    EXPECT_EQ(sum.gen_tokens, 208);
+    EXPECT_EQ(sum.gen_ms, 11601);
+    EXPECT_EQ(sum.prompt_tokens, 5300);
+    EXPECT_EQ(sum.prompt_ms, 1200);
+    Buf b = {0};
+    EXPECT_STR(tps(&b, sum.gen_tokens, sum.gen_ms), S("17.9 tok/s"));
+    EXPECT_STR(tps(&b, sum.prompt_tokens, sum.prompt_ms), S("4417 tok/s"));
+    buf_free(&b);
+}

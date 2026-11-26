@@ -135,6 +135,24 @@ Err code_oai_body(Arena *a, const CodeModel *m, const JValue *system, const JVal
 // "stopReason":"error" and "errorMessage", as pi records it; Err only for harness failures.
 Err code_oai_complete(Arena *a, const CodeModel *m, const CodeEnv *env, Str body, const CodeSink *sink, JValue **assistant);
 
+// The speed of model requests, for the interactive footer and /session (Saetta Code's own, not
+// pi's): generated tokens and the time spent generating them (prompt reading excluded), and
+// the prompt tokens read (the reused ones excluded) with their time. The in-process engine
+// gives its own numbers (the request log's "N generated in M ms"); another model's come from
+// the stream: usage's completion_tokens (else the content chunks) over the time from the
+// first streamed token to the end, and no prompt numbers (prompt_ms 0).
+typedef struct {
+    double gen_tokens, gen_ms, prompt_tokens, prompt_ms;
+} CodeGenStats;
+// The numbers of the last code_oai_complete on this thread; false (and *g zero) when it measured
+// nothing: an error or aborted answer, or no token generated.
+bool code_oai_last_gen(CodeGenStats *g);
+// Adds one request's numbers to *sum (a turn's requests: total tokens over total time).
+void code_gen_add(CodeGenStats *sum, const CodeGenStats *g);
+// "17.9 tok/s" for tokens over ms (one decimal below 100, an integer from 100), appended to b;
+// nothing when either is not positive. Returns whether it wrote.
+bool code_fmt_tps(Buf *b, double tokens, double ms);
+
 // ---- sessions (code_session.c; pi: core/session-manager.js)
 
 typedef struct CodeSession CodeSession;

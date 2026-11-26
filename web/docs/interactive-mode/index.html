@@ -93,7 +93,7 @@
 <li>Ctrl+G edits the message in an external editor (<code>externalEditor</code> in settings.json, else <code>$VISUAL</code> or <code>$EDITOR</code>).</li>
 <li>Ctrl+V pastes from the clipboard.</li>
 </ul>
-<p>The footer shows the folder as <code>~/...</code>, the git branch and status, the time of the last turn, and the model&#39;s full name and quantization.</p>
+<p>The footer shows the folder as <code>~/...</code>, the git branch and status, the time of the last turn, the tokens sent and received, the context use, the last turn&#39;s generation speed (<code>17.9 tok/s</code>: generated tokens over the time spent generating them, summed over the turn&#39;s requests, prompt reading excluded; the first field dropped when the terminal is too narrow), and the model&#39;s full name and quantization. With a pack the speed is the engine&#39;s own measure; with another model it is counted from the stream, from the first token to the end.</p>
 <h2 id="commands"><a class="anchor" href="#commands" aria-hidden="true" tabindex="-1">#</a>Commands</h2>
 <div class="doc-table"><table><thead><tr><th>command</th><th>what it does</th></tr></thead><tbody><tr><td><code>/settings</code></td><td>open the settings menu</td></tr>
 <tr><td><code>/model</code></td><td>switch model, pack or LoRA adapter, download a pack or an adapter, add or edit OpenAI-compatible models</td></tr>
@@ -107,7 +107,7 @@
 <tr><td><code>/clone</code></td><td>duplicate the session at the current position</td></tr>
 <tr><td><code>/compact</code></td><td>compact the session context now</td></tr>
 <tr><td><code>/name</code></td><td>set the session&#39;s display name</td></tr>
-<tr><td><code>/session</code></td><td>show the session&#39;s info and stats</td></tr>
+<tr><td><code>/session</code></td><td>show the session&#39;s info and stats; with a pack in this process, also the generation and prompt reading speed of its requests</td></tr>
 <tr><td><code>/export</code></td><td>write the session as HTML (default) or JSONL</td></tr>
 <tr><td><code>/import</code></td><td>load a JSONL session, keeping its id and working directory</td></tr>
 <tr><td><code>/share</code></td><td>upload the session as a secret GitHub gist</td></tr>

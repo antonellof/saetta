@@ -1901,6 +1901,18 @@ static void footer_render(void *ctx, int width, Lines *out) {
         rw = tui_width(buf_str(&right));
         if (sw + 2 + rw <= width || !U->model.label || c >= 2) break;
     }
+    // the last run's generation speed (Saetta Code's own, not in pi's footer), after the context
+    // use: the first field dropped when the line does not fit (the model name keeps its room)
+    Buf tps = {0};
+    buf_adds(&tps, " \xc2\xb7 ");
+    if (sess_ui_footer_speed(&tps)) {
+        int tw = tui_width(buf_str(&tps));
+        if (sw + tw + 2 + rw <= width) {
+            buf_addstr(&stats, buf_str(&tps));
+            sw += tw;
+        }
+    }
+    buf_free(&tps);
     Buf line = {0};
     Buf rem = {0};
     if (sw + 2 + rw <= width) {

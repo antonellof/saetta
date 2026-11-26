@@ -112,6 +112,10 @@ static struct {
     char *tail_summary;
     double tail_tokens;
     bool compacting;         // between compaction_start and compaction_end
+    // the model's speed (ui_gen events, Saetta Code's own): this session's requests in this
+    // process (/session), the current run's, and the footer's (the last run's, or the current
+    // one's once a request of it has finished)
+    CodeGenStats speed_session, speed_run, speed_shown;
 } G;
 
 bool sess_ui_compacting(void) { return G.compacting; }
@@ -133,8 +137,11 @@ void sess_ui_reset(void) {
     G.capture = false;
     G.unknown = false;
     G.requested = false;
+    G.speed_session = G.speed_run = G.speed_shown = (CodeGenStats){0};
     refresh_name();
 }
+
+bool sess_ui_footer_speed(Buf *out) { return code_fmt_tps(out, G.speed_shown.gen_tokens, G.speed_shown.gen_ms); }
 
 void sess_ui_footer_name(Buf *out) {
     if (!G.named && !uix_busy()) refresh_name();
@@ -301,7 +308,14 @@ static bool valid_usage(const JValue *m) {
 void sess_ui_event(const JValue *ev) {
     const char *type = json_str(json_get(ev, "type"));
     if (!type) return;
-    if (!strcmp(type, "message_end")) {
+    if (!strcmp(type, "agent_start")) G.speed_run = (CodeGenStats){0};
+    else if (!strcmp(type, "ui_gen")) {
+        CodeGenStats g = {jnum(json_get(ev, "genTokens")), jnum(json_get(ev, "genMs")), jnum(json_get(ev, "promptTokens")),
+                          jnum(json_get(ev, "promptMs"))};
+        code_gen_add(&G.speed_run, &g);
+        code_gen_add(&G.speed_session, &g);
+        G.speed_shown = G.speed_run;
+    } else if (!strcmp(type, "message_end")) {
         const JValue *m = json_get(ev, "message");
         if (!strcmp(json_str(json_get(m, "role")) ?: "", "assistant")) {
             G.requested = true;
@@ -450,6 +464,31 @@ static void session_command(void) {
     buf_addc(&b, ' ');
     locale_int(&b, st.input + st.output + st.cache_read + st.cache_write);
     buf_adds(&b, "\n");
+    // Speed (Saetta Code's own): this session's requests in this process to the in-process
+    // engine, the one that times prompt reading: generation (prompt reading excluded) and prompt
+    // reading (reused tokens excluded). Another model's speed is the footer's alone.
+    if (G.speed_session.gen_tokens > 0 && G.speed_session.gen_ms > 0 && G.speed_session.prompt_ms > 0) {
+        buf_adds(&b, "\n");
+        th_bold(&b, S("Speed"));
+        buf_adds(&b, "\n");
+        const char *labels[] = {"Generation:", "Prompt reading:"};
+        double tok[] = {G.speed_session.gen_tokens, G.speed_session.prompt_tokens};
+        double ms[] = {G.speed_session.gen_ms, G.speed_session.prompt_ms};
+        for (int k = 0; k < 2; k++) {
+            if (!(tok[k] > 0) || !(ms[k] > 0)) continue;
+            dim_label(&b, labels[k]);
+            buf_addc(&b, ' ');
+            code_fmt_tps(&b, tok[k], ms[k]);
+            Buf d = {0};
+            buf_adds(&d, "(");
+            locale_int(&d, tok[k]);
+            buf_printf(&d, " tokens in %.1f s)", ms[k] / 1000);
+            buf_addc(&b, ' ');
+            th_fg(&b, T_DIM, buf_str(&d));
+            buf_free(&d);
+            buf_adds(&b, "\n");
+        }
+    }
     // Cache Warming: Saetta Code's providers report no cache lifetime, so the warmer never starts
     const JValue *settings = uix_cfg()->settings;
     const char *mode = json_str(json_get(settings, "cacheWarming"));

@@ -14,7 +14,7 @@ Enter sends. Shift+Enter (or a trailing `\`) starts a new line. While the agent 
 - Ctrl+G edits the message in an external editor (`externalEditor` in settings.json, else `$VISUAL` or `$EDITOR`).
 - Ctrl+V pastes from the clipboard.
 
-The footer shows the folder as `~/...`, the git branch and status, the time of the last turn, and the model's full name and quantization.
+The footer shows the folder as `~/...`, the git branch and status, the time of the last turn, the tokens sent and received, the context use, the last turn's generation speed (`17.9 tok/s`: generated tokens over the time spent generating them, summed over the turn's requests, prompt reading excluded; the first field dropped when the terminal is too narrow), and the model's full name and quantization. With a pack the speed is the engine's own measure; with another model it is counted from the stream, from the first token to the end.
 
 ## Commands
 
@@ -32,7 +32,7 @@ The footer shows the folder as `~/...`, the git branch and status, the time of t
 | `/clone` | duplicate the session at the current position |
 | `/compact` | compact the session context now |
 | `/name` | set the session's display name |
-| `/session` | show the session's info and stats |
+| `/session` | show the session's info and stats; with a pack in this process, also the generation and prompt reading speed of its requests |
 | `/export` | write the session as HTML (default) or JSONL |
 | `/import` | load a JSONL session, keeping its id and working directory |
 | `/share` | upload the session as a secret GitHub gist |

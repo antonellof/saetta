@@ -57,6 +57,9 @@ void sess_ui_set_expanded(bool expanded);
 // The footer (footer.ts getSessionStats): the totals over every session entry and whether the
 // context use is unknown ("?"), from the sums over the drawn messages.
 void sess_ui_footer(double *in, double *out, double *cache_read, double *cache_write, double *cost, bool *unknown);
+// The footer's speed ("17.9 tok/s", the last run's generation; code_fmt_tps) appended to out;
+// false (nothing appended) before a request of this session has finished.
+bool sess_ui_footer_speed(Buf *out);
 // " • <name>" after the footer's folder when the session has a name.
 void sess_ui_footer_name(Buf *out);
 // The main loop's timer: ms until the next deadline (a selector status that expires), -1 none.

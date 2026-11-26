@@ -19,6 +19,7 @@
 #include "unix_http.h"
 #include "metal/shim.h"
 #include "server.h"
+#include "stats.h"
 
 #include <math.h>
 #include <stdlib.h>
@@ -1957,6 +1958,9 @@ struct CodeOaiStream {
     // event delivery
     bool busy;
     VEC(JValue *) queue;
+    // the speed numbers (CodeGenStats): when the first token streamed, the chunks that carried one
+    uint64_t t_first;
+    double chunks;
 };
 
 static void deliver(CodeOaiStream *s, JValue *ev) {
@@ -2212,6 +2216,17 @@ static void map_stop(CodeOaiStream *s, const JValue *reason) {
     s->has_finish = true;
 }
 
+// Whether a chunk's delta carries generated text: reasoning, content or a tool call's part.
+static bool gen_chunk(const JValue *delta) {
+    static const char *const keys[] = {"reasoning_content", "reasoning", "reasoning_text", "content"};
+    for (size_t k = 0; k < COUNT(keys); k++) {
+        const JValue *v = json_get(delta, keys[k]);
+        if (json_is(v, J_STRING) && v->s.len) return true;
+    }
+    const JValue *tcs = json_get(delta, "tool_calls");
+    return json_is(tcs, J_ARRAY) && tcs->arr.len > 0;
+}
+
 static void on_chunk(CodeOaiStream *s, const JValue *chunk) {
     Arena *a = s->a;
     if (!json_is(chunk, J_OBJECT)) return;
@@ -2234,6 +2249,10 @@ static void on_chunk(CodeOaiStream *s, const JValue *chunk) {
     if (truthy(fin)) map_stop(s, fin);
     const JValue *delta = json_get(choice, "delta");
     if (!truthy(delta)) return;
+    if (gen_chunk(delta)) {
+        if (!s->t_first) s->t_first = now_ns();
+        s->chunks += 1;
+    }
     static const char *const rf[] = {"reasoning_content", "reasoning", "reasoning_text"};
     for (int k = 0; k < 3; k++) {
         const JValue *v = json_get(delta, rf[k]);
@@ -2505,8 +2524,84 @@ static Err complete_in_process(Arena *a, const CodeModel *m, CodeOaiStream *s, c
     return OK;
 }
 
+// ---- speed (CodeGenStats) ------------------------------------------------------------------------
+
+static _Thread_local CodeGenStats g_gen;
+static _Thread_local bool g_gen_ok;
+
+bool code_oai_last_gen(CodeGenStats *g) {
+    *g = g_gen_ok ? g_gen : (CodeGenStats){0};
+    return g_gen_ok;
+}
+
+void code_gen_add(CodeGenStats *sum, const CodeGenStats *g) {
+    sum->gen_tokens += g->gen_tokens;
+    sum->gen_ms += g->gen_ms;
+    sum->prompt_tokens += g->prompt_tokens;
+    sum->prompt_ms += g->prompt_ms;
+}
+
+bool code_fmt_tps(Buf *b, double tokens, double ms) {
+    if (!(tokens > 0) || !(ms > 0)) return false;
+    double r = tokens * 1000.0 / ms;
+    // one decimal below 100: 99.96 would print "100.0", so it is an integer too
+    if (round(r * 10) < 1000) buf_printf(b, "%.1f tok/s", r);
+    else buf_printf(b, "%.0f tok/s", r);
+    return true;
+}
+
+// The request's numbers: the engine's own when it ran in this process (its newest finished
+// request with this answer's token counts: requests run one at a time, and a shared session's may
+// follow at once), else the stream's.
+static void measure(const CodeModel *m, const CodeOaiStream *s, const JValue *msg) {
+    g_gen = (CodeGenStats){0};
+    g_gen_ok = false;
+    Str sr = json_strs(json_get(msg, "stopReason"));
+    if (str_eqz(sr, "error") || str_eqz(sr, "aborted")) return;
+    const JValue *u = json_get(msg, "usage");
+    double out = num_of(json_get(u, "output"));
+    double prompt = num_of(json_get(u, "input")) + num_of(json_get(u, "cacheRead")) + num_of(json_get(u, "cacheWrite"));
+    Stats *st = m->engine ? server_engine_stats(m->engine) : NULL;
+    if (st && out > 0) {
+        Done d = {0};
+        bool found = false;
+        for (;;) {
+            bool want = false;
+            if (atomic_compare_exchange_strong_explicit(&st->mu, &want, true, memory_order_acquire, memory_order_relaxed)) break;
+            __builtin_arm_yield();
+        }
+        for (size_t i = st->ring_n; i-- > 0 && !found;)
+            if ((double)st->ring[i].output == out && (double)st->ring[i].prompt == prompt) {
+                d = st->ring[i];
+                found = true;
+            }
+        atomic_store_explicit(&st->mu, false, memory_order_release);
+        if (found) {
+            g_gen = (CodeGenStats){.gen_tokens = d.output, .gen_ms = MAX(d.decode_ms, 1u), .prompt_tokens = d.prompt - MIN(d.reused, d.prompt),
+                                   .prompt_ms = d.prefill_ms};
+            g_gen_ok = true;
+            return;
+        }
+    }
+    double tokens = out > 0 ? out : s->chunks;
+    double ms = s->t_first ? (double)(now_ns() - s->t_first) / 1e6 : 0;
+    if (tokens > 0 && ms > 0) {
+        g_gen = (CodeGenStats){.gen_tokens = tokens, .gen_ms = ms};
+        g_gen_ok = true;
+    }
+}
+
+static Err complete_once(Arena *a, const CodeModel *m, CodeOaiStream *s, const CodeEnv *env, Str body, JValue **assistant);
+
 Err code_oai_complete(Arena *a, const CodeModel *m, const CodeEnv *env, Str body, const CodeSink *sink, JValue **assistant) {
+    g_gen_ok = false;
     CodeOaiStream *s = code_oai_stream_new(a, m, env, sink);
+    TRY(complete_once(a, m, s, env, body, assistant));
+    measure(m, s, *assistant);
+    return OK;
+}
+
+static Err complete_once(Arena *a, const CodeModel *m, CodeOaiStream *s, const CodeEnv *env, Str body, JValue **assistant) {
     if (m->engine) return complete_in_process(a, m, s, env, body, assistant);
     if (m->verify) {
         int v = m->verify(m);

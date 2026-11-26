@@ -158,7 +158,7 @@ static size_t argmax_scan(const float *v, size_t n) {
 static Err read_json(Arena *a, const char *dir, const char *name, JValue **out) {
     char *bytes;
     size_t len;
-    TRY(read_file(path_join(a, dir, name), (size_t)1 << 20, &bytes, &len));
+    TRY(read_file(path_join(a, dir, name), (size_t)64 << 20, &bytes, &len)); // long goldens: a top2.json of MBs
     char *copy = arena_dup(a, bytes, len + 1);
     free(bytes);
     return json_parse(a, str_n(copy, len), true, out);
@@ -330,22 +330,30 @@ static Err verify_dsv4(Arena *a, FILE *out, const Pack *pack, const char *pack_d
 // Goldens longer than a prompt chunk are run in pieces (the prefill trace of a piece only).
 
 #define INK_PIECE 1024
+#define INK_DECODE_MAX 16384
 
 typedef struct {
     float worst_logits;
     double worst_kl;
     size_t aok, askip, abad;
+    size_t first_bad; // the first position whose argmax differs outside near ties (ntok: none)
 } InkDec;
 
-// Decode over the golden: err [npos][L] the per-visit error at each dumped position.
+// Decode over the golden from position `from` (the tokens before it prefilled in chunks: the
+// long goldens): err [npos][L] the per-visit error at each dumped position decoded (others 0).
 static Err ink_decode(Arena *a, FILE *out, Model *m, Session *s, const DsGolden *G, const uint32_t *tokens, const size_t *pidx,
-                      float *err, InkDec *r) {
+                      size_t from, float *err, InkDec *r) {
     const size_t L = G->layers, W = G->width, V = G->vocab;
     float *trace = ARENA_ARRAY(a, float, L * W);
-    *r = (InkDec){0};
+    *r = (InkDec){.first_bad = G->ntok};
+    for (size_t i = 0; i < G->npos * L; i++) err[i] = 0;
     session_reset(s);
+    if (from) {
+        float *lg;
+        TRY(model_prefill(m, s, tokens, from, NULL, &lg));
+    }
     char b1[64];
-    for (size_t t = 0; t < G->ntok; t++) {
+    for (size_t t = from; t < G->ntok; t++) {
         const size_t pi = pidx[t];
         s->trace = pi < G->npos ? trace : NULL;
         s->trace_len = pi < G->npos ? L * W : 0;
@@ -369,6 +377,7 @@ static Err ink_decode(Arena *a, FILE *out, Model *m, Session *s, const DsGolden 
             r->askip++;
         else {
             r->abad++;
+            r->first_bad = MIN(r->first_bad, t);
             fmt_fixed(b1, sizeof b1, margin, 4);
             fprintf(out, "argmax differs at position %zu: engine %zu, reference %zu (margin %s)\n", t, best, want, b1);
         }
@@ -405,6 +414,7 @@ static bool ink_routes_ok(FILE *out, Model *m, const char *what, InkRouteStats *
     verify_fmt_e(b1, sizeof b1, TOL_INK_ROUTE_MARGIN, true, -1);
     fprintf(out, "  %s: own top-8 differs from the oracle's at %u (visit, token) pairs with margin over %s%s, %u at near ties\n", what,
             st->flips_sure, b1, st->flips_sure ? "  FAIL" : "", st->flips_near);
+    if (st->flips_sure) fprintf(out, "    first at position %u, largest margin %g\n", st->first_sure, (double)st->sure_margin);
     return st->flips_sure == 0;
 }
 
@@ -425,8 +435,9 @@ static Err verify_inkling(Arena *a, FILE *out, const Pack *pack, const char *pac
     const ModelInfo *mi = err ? NULL : model_info(m);
     if (!err && (G->layers != mi->layers || G->width != mi->width || G->vocab != mi->vocab)) err = "GoldenShapeMismatch";
     if (!err && !inkling_has_routes(m)) err = "GoldenWithoutRoutes";
-    if (!err) err = session_create_kv(m, &g, false, &s);
-    if (!err && s->cap < G->ntok) err = "GoldenLongerThanContext";
+    // a context that holds the golden (sessions of SAETTA_CTX tokens otherwise)
+    const size_t capv = MAX((size_t)SESSION_CTX_DEFAULT, ALIGN_UP(G->ntok + 64, (size_t)SESSION_CTX_ALIGN));
+    if (!err) err = session_create_cap(m, &g, false, capv, capv, &s);
     if (err) {
         gpu_deinit(&g);
         return err;
@@ -447,9 +458,13 @@ static Err verify_inkling(Arena *a, FILE *out, const Pack *pack, const char *pac
     InkDec dr;
     InkRouteStats rs;
 
+    // goldens past INK_DECODE_MAX tokens decode only their last 32 (after a chunked prefill)
+    const size_t from = N > INK_DECODE_MAX ? N - 32 : 0, ND = N - from;
+    if (from) fprintf(out, "decode runs: positions %zu to %zu after a prefill of the rest\n", from, N - 1);
+
     // on the oracle's experts
     inkling_set_routes(m, INK_ROUTES_REPLAY);
-    err = ink_decode(a, out, m, s, G, tokens, pidx, derr, &dr);
+    err = ink_decode(a, out, m, s, G, tokens, pidx, from, derr, &dr);
     if (!err) {
         fprintf(out, "decode, the oracle's experts: visit  max rel err (hidden states, %zu positions)\n", P);
         for (size_t li = 0; li < L; li++) {
@@ -486,31 +501,69 @@ static Err verify_inkling(Arena *a, FILE *out, const Pack *pack, const char *pac
         ok = ink_routes_ok(out, m, "prefill routers", &rs) && ok;
     }
 
+    // the default f16 KV cache, on the oracle's experts: greedy argmax and KL like the other
+    // models' f16-KV checks (TOL_PREFILL_FAST_KL)
+    Session *sh = NULL;
+    if (!err) err = session_create_cap(m, &g, true, capv, capv, &sh);
+    if (!err) err = ink_decode(a, out, m, sh, G, tokens, pidx, from, derr, &dr);
+    if (!err) {
+        (void)inkling_route_stats(m);
+        float w = 0;
+        for (size_t i = 0; i < P * L; i++) w = fmaxf(w, derr[i]);
+        const bool hok = dr.abad == 0 && dr.worst_kl <= TOL_PREFILL_FAST_KL && (double)dr.askip <= TOL_INK_ARGMAX_SKIP_FRAC * (double)ND;
+        ok = ok && hok;
+        fprintf(out, "decode, f16 KV, the oracle's experts: worst visit rel err %s (not gated), max KL(ref||engine) %s; greedy argmax %zu equal, %zu near ties skipped, %zu different%s\n",
+                e3(b1, w), e3d(b2, dr.worst_kl), dr.aok, dr.askip, dr.abad, hok ? "" : "  FAIL");
+    }
+    if (!err) err = ink_prefill(m, sh, tb, G, tokens, pidx, pw, &plog);
+    if (!err) {
+        (void)inkling_route_stats(m);
+        const double k = kl(last, plog, V);
+        const bool eq = argmax_scan(plog, V) == want_last, pok = k <= TOL_PREFILL_FAST_KL && eq;
+        ok = ok && pok;
+        fprintf(out, "prefill (chunks), f16 KV, the oracle's experts: last-token KL(ref||engine) %s, argmax %s%s\n", e3d(b1, k),
+                eq ? "equal" : "DIFFERENT", pok ? "" : "  FAIL");
+    }
+
     // on its own experts
     inkling_set_routes(m, INK_ROUTES_OWN);
-    if (!err) err = ink_decode(a, out, m, s, G, tokens, pidx, derr, &dr);
+    if (!err) err = ink_decode(a, out, m, s, G, tokens, pidx, from, derr, &dr);
     if (!err) {
         rs = inkling_route_stats(m);
         float before = 0, after = 0;
         size_t nbefore = 0;
         for (size_t i = 0; i < P; i++) {
             const size_t pos = (size_t)G->poss->arr.items[i]->i;
+            if (pos < from) continue;
             for (size_t li = 0; li < L; li++) {
                 if (pos < rs.first_flip) before = fmaxf(before, derr[i * L + li]);
                 else after = fmaxf(after, derr[i * L + li]);
             }
             nbefore += pos < rs.first_flip;
         }
-        const bool skip_bad = (double)dr.askip > TOL_INK_ARGMAX_SKIP_FRAC * (double)N;
-        const bool dok = before <= TOL_INK_OWN_LAYER_REL && dr.abad == 0 && !skip_bad && dr.worst_kl <= TOL_PREFILL_FAST_KL;
+        // after its first route that differs from the oracle's, the engine's own continuation may
+        // differ (one flipped expert moves every later token): its argmax there is gated by
+        // agreement, before it exactly
+        const bool skip_bad = (double)dr.askip > TOL_INK_ARGMAX_SKIP_FRAC * (double)ND;
+        const bool early = dr.first_bad < MIN((size_t)rs.first_flip, N);
+        const size_t nt = dr.aok + dr.abad;
+        const double agree = nt ? (double)dr.aok / (double)nt : 1.0;
+        // a long golden decodes only its tail (32 tokens after a prefill on the engine's own
+        // routing, which left the oracle's path long before): reported, not gated; its own-routing
+        // checks are the prefill's last-token KL below and the self-consistency test
+        // (src/test/inkling_long.c)
+        const bool gated = from == 0;
+        const bool dok = !gated || (before <= TOL_INK_OWN_LAYER_REL && !early && agree >= TOL_INK_OWN_ARGMAX_AGREE && !skip_bad &&
+                                    dr.worst_kl <= TOL_PREFILL_FAST_KL);
         ok = ok && dok;
         if (rs.first_flip == UINT32_MAX) snprintf(b3, sizeof b3, "none");
         else snprintf(b3, sizeof b3, "position %u", rs.first_flip);
         fprintf(out,
                 "decode, its own experts: first route different from the oracle's: %s; worst visit rel err %s at the %zu dumped "
                 "positions before it, %s after it (not gated); max KL(ref||engine) %s; greedy argmax %zu equal, %zu near ties "
-                "skipped, %zu different%s\n",
-                b3, e3(b1, before), nbefore, e3(b2, after), e3d(b4, dr.worst_kl), dr.aok, dr.askip, dr.abad, dok ? "" : "  FAIL");
+                "skipped, %zu different (%s before the first different route)%s%s\n",
+                b3, e3(b1, before), nbefore, e3(b2, after), e3d(b4, dr.worst_kl), dr.aok, dr.askip, dr.abad, early ? "some" : "none",
+                gated ? "" : " (the tail of a long golden: not gated)", dok ? "" : "  FAIL");
     }
     if (!err) err = ink_prefill(m, s, tb, G, tokens, pidx, pw, &plog);
     if (!err) {

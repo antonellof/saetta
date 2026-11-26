@@ -2730,8 +2730,10 @@ static void model_render(int width, Lines *out) {
             if (m->note) buf_printf(&st, " \xc2\xb7 %s", m->note);
             if (m->blocked) buf_printf(&st, " [%s]", m->blocked);
             else if (m->too_big) buf_printf(&st, " [needs %u GB memory]", m->min_ram_gb);
+            else if (m->drafter) buf_printf(&st, m->unavailable ? " [not downloaded, %u GB]" : " [downloaded]", m->disk_gb);
             else if (!m->unavailable) buf_adds(&st, " [on this Mac]");
             else buf_printf(&st, " [not downloaded, %u GB]", m->disk_gb);
+            if (m->drafter_note && !m->too_big) buf_printf(&st, " \xc2\xb7 %s", m->drafter_note);
             th_fg(&l, dim ? T_DIM : T_MUTED, buf_str(&st));
             buf_free(&st);
             text_lines(buf_str(&l), 0, width, out);
@@ -2971,10 +2973,16 @@ static void download_poll(void) {
             if (mm->pack && !strcmp(mm->id, U->dl_name)) mm->unavailable = false;
         }
         Buf m = {0};
-        buf_printf(&m, "Downloaded %s", U->dl_title);
+        const bool drafter = !strcmp(U->dl_name, "inkling-dspark");
+        const bool on_inkling = U->model.provider && U->model.id && !strcmp(U->model.provider, "saetta") && !strcmp(U->model.id, "inkling");
+        if (!drafter) buf_printf(&m, "Downloaded %s", U->dl_title);
+        else if (on_inkling) buf_printf(&m, "Downloaded %s; starting Inkling 2 Mini again to load it", U->dl_title);
+        else buf_printf(&m, "Downloaded %s; Inkling 2 Mini loads it when it starts", U->dl_title);
         show_status(m.ptr);
         buf_free(&m);
-        restart_model("saetta", U->dl_then ? U->dl_then : U->dl_name);
+        // a drafter is not a model: stay on this one (Inkling again, so that its engine loads it)
+        if (!drafter) restart_model("saetta", U->dl_then ? U->dl_then : U->dl_name);
+        else if (on_inkling) restart_model("saetta", "inkling");
     } else if (U->dl_cancelled) {
         show_status("Download stopped; choose the model again to resume it");
     } else {
@@ -3018,6 +3026,12 @@ static void choose_model(const CodeUiModel *m, bool persist) {
         buf_printf(&b, "%s: %s", m->name ? m->name : m->id, m->blocked);
         show_status(b.ptr);
         buf_free(&b);
+        return;
+    }
+    if (m->drafter && !m->unavailable && !m->too_big) {
+        // a downloaded drafter is not a model: the engine uses it with its model
+        close_selector();
+        show_status("DSpark drafter downloaded: Inkling 2 Mini loads it when it starts (SAETTA_SPEC=0 leaves it off)");
         return;
     }
     if (m->pack && (m->unavailable || m->too_big)) {

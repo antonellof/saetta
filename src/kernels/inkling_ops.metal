@@ -298,8 +298,14 @@ kernel void ink_router(device const float *lg [[buffer(0)]], device const float 
             same = same && found;
         }
         if (!same) {
-            atomic_fetch_add_explicit(&stats[margin[t] > p.thr ? 0 : 1], 1u, memory_order_relaxed);
+            const bool sure = margin[t] > p.thr;
+            atomic_fetch_add_explicit(&stats[sure ? 0 : 1], 1u, memory_order_relaxed);
             atomic_fetch_min_explicit(&stats[2], p.pos0 + t, memory_order_relaxed);
+            if (sure) {
+                // the largest such margin (positive floats order as their bits) and its position
+                atomic_fetch_max_explicit(&stats[3], as_type<uint>(margin[t]), memory_order_relaxed);
+                atomic_fetch_min_explicit(&stats[4], p.pos0 + t, memory_order_relaxed);
+            }
         }
     }
     if (p.forced)
@@ -335,15 +341,25 @@ kernel void ink_copy(device const float *src [[buffer(0)]], device float *dst [[
     if (i < n) dst[i] = src[i];
 }
 
-// KV store after attention: chunk rows [T][C] to cache rows (ring: (pos0 + t) % ring, else pos0 + t;
-// in a ring only the chunk's last `ring` rows, which are the ones it keeps). Grid (C / 256, T) x 256.
+// KV store after attention: chunk rows [T][C] (f32) to cache rows (ring: (pos0 + t) % ring, else
+// pos0 + t; in a ring only the chunk's last `ring` rows, which are the ones it keeps), f32 or f16
+// (_h). Grid (C / 256, T) x 256.
 struct StP { uint C, pos0, ring, T; };
-kernel void ink_kv_store(device const float *kn [[buffer(0)]], device const float *vn [[buffer(1)]], device float *kc [[buffer(2)]],
-                         device float *vc [[buffer(3)]], constant StP &p [[buffer(4)]], uint2 tg [[threadgroup_position_in_grid]],
-                         uint tid [[thread_index_in_threadgroup]]) {
+template <typename KT>
+inline void ik_kv_store(device const float *kn, device const float *vn, device KT *kc, device KT *vc, constant StP &p, uint2 tg, uint tid) {
     const uint c = tg.x * 256 + tid, t = tg.y;
     if (c >= p.C || (p.ring && t + p.ring < p.T)) return;
     const uint pos = p.pos0 + t, row = p.ring ? pos % p.ring : pos;
-    kc[row * p.C + c] = kn[t * p.C + c];
-    vc[row * p.C + c] = vn[t * p.C + c];
+    kc[row * p.C + c] = KT(kn[t * p.C + c]);
+    vc[row * p.C + c] = KT(vn[t * p.C + c]);
+}
+kernel void ink_kv_store(device const float *kn [[buffer(0)]], device const float *vn [[buffer(1)]], device float *kc [[buffer(2)]],
+                         device float *vc [[buffer(3)]], constant StP &p [[buffer(4)]], uint2 tg [[threadgroup_position_in_grid]],
+                         uint tid [[thread_index_in_threadgroup]]) {
+    ik_kv_store<float>(kn, vn, kc, vc, p, tg, tid);
+}
+kernel void ink_kv_store_h(device const float *kn [[buffer(0)]], device const float *vn [[buffer(1)]], device half *kc [[buffer(2)]],
+                           device half *vc [[buffer(3)]], constant StP &p [[buffer(4)]], uint2 tg [[threadgroup_position_in_grid]],
+                           uint tid [[thread_index_in_threadgroup]]) {
+    ik_kv_store<half>(kn, vn, kc, vc, p, tg, tid);
 }

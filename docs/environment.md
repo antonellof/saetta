@@ -19,10 +19,11 @@
 
 | variable | default | effect |
 |---|---|---|
-| `SAETTA_CTX` | 32768 (`saetta serve`), 204800 (`saetta start`) | context in tokens, 1024 to 262144, rounded down to a multiple of 128 (Flash-Next about 35 KB per token, 27B 64 KB) |
+| `SAETTA_CTX` | 32768 (`saetta serve`), 204800 (`saetta start`) | context in tokens, 1024 to 262144 (Inkling 2 Mini 1048576), rounded down to a multiple of 128 (Flash-Next about 35 KB per token, 27B 64 KB) |
 | `SAETTA_PORT` | 8080 | the port `saetta start` uses |
 | `SAETTA_CONVERSATIONS` | 4 | conversations the server keeps between turns |
-| `SAETTA_SPEC` / `SAETTA_MTP` | 1 / 1 | `0` turns speculative decoding / the MTP head off |
+| `SAETTA_SPEC` / `SAETTA_MTP` | 1 / 1 | `0` turns speculative decoding / the MTP head (Inkling: the DSpark drafter) off |
+| `SAETTA_DSPARK` | unset | Inkling 2 Mini: `1` loads the downloaded DSpark drafter (or a path to its `mtp.safetensors`); off by default |
 | `SAETTA_KV_F32` | unset | f32 KV cache |
 | `SAETTA_NO_ACCEL` | unset | `1` runs without the tensor-op (neural accelerator) kernels, for a Mac where they misbehave (slower prompt reading, same output) |
 | `SAETTA_EXPERT_CACHE_GB` | unset | experimental: keep this many GB of experts in memory, read the rest from the SSD (Flash-Next: slower than resident, same output) |

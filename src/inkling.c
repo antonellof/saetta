@@ -22,6 +22,9 @@
 
 #include <math.h>
 #include <stdlib.h>
+#include <unistd.h>
+
+#include "download.h"
 
 #include "inkling.h"
 #include "ops.h"
@@ -61,13 +64,15 @@ static_assert(H % 256 == 0 && FF % 32 == 0 && LS % NBLK == 0 && LE % NBLK == 0);
 // kernel's IK_MAXS (6: MAXBS states and the partial) or IK_MAXQ (4 message queries).
 static_assert(LS == NBLK && (LE - LS) == 2 * NBLK && NP >= 1);
 static_assert(NL / NBLK + 1 <= MAXBS && MAXBS + 1 <= 6);
+// Element offsets in the kernels are 32-bit: every position of the longest context times one row.
+static_assert((uint64_t)CONFIG_MODEL_MAX_LENGTH * KVD <= UINT32_MAX && CONFIG_MODEL_MAX_LENGTH == SESSION_CTX_INKLING_MAX);
 static_assert(CONFIG_N_SHARED_EXPERTS == 0 && CONFIG_USE_GATE_BIAS && NE % 32 == 0 && RANK % 8 == 0);
 
 // Prompt chunk: tokens per command buffer.
 #define PCH 256
-// Attention splits: decode up to NSPLIT_DEC, chunks NSPLIT_PRE.
-#define NSPLIT_DEC 64
-#define NSPLIT_PRE 4
+// Attention splits of decode and verification chunks (T <= KMAX): up to NSPLIT_DEC per query;
+// prompt chunks use the tiled kernel, no splits.
+#define NSPLIT_DEC 256
 
 // ---- the visit schedule -------------------------------------------------------------------
 static uint8_t vis_layer[NVIS], vis_pass[NVIS], vis_kv[NVIS]; // kv: index among full / sliding visits
@@ -97,20 +102,24 @@ typedef struct {
 
 typedef struct {
     sx_pipeline *mix, *norm, *msg_down, *msg_out, *qr, *kv_conv, *conv_res, *conv_state, *router, *moe_sum, *softcap, *copy,
-        *kv_store, *attn_part, *attn_merge, *gu_nv, *dn_nv, *gu_mx, *dn_mx, *plan, *gu_nv_g, *gu_mx_g, *dn_nv_g,
+        *kv_store, *kv_store_h, *attn_part, *attn_part_h, *attn_flash, *attn_flash_h, *attn_merge, *gu_nv, *dn_nv, *gu_mx, *dn_mx, *plan, *gu_nv_g, *gu_mx_g, *dn_nv_g,
         *dn_mx_g, *router_lg;
+    // the DSpark drafter (inkling_dspark.metal)
+    sx_pipeline *ds_mv, *ds_mix, *ds_rope, *ds_attn, *ds_attn_h, *ds_addn, *ds_silu, *ds_step, *ds_fold, *ds_argmax, *ds_fold_t,
+        *ds_ring;
     sx_pipeline *mv, *mm; // qgen: qmatvec_gen, qmm_gen
 } Pipes;
 
 // Scratch regions, floats per token (each region holds PCH rows).
 enum { R_H, R_HN, R_BS, R_P0, R_MS, R_MSG, R_MIX, R_G, R_XN, R_Q, R_K, R_V, R_GT, R_SK, R_RS, R_KD, R_VD, R_KN, R_VN, R_ATT, R_A,
-       R_R, R_HM, R_XM, R_D, R_IDX, R_W, R_HACT, R_YS, R_YSUM, R_PAIRS, R_TILES, R_NT, R_LG, R_N };
+       R_R, R_HM, R_XM, R_D, R_IDX, R_W, R_HACT, R_YS, R_YSUM, R_PAIRS, R_TILES, R_NT, R_LG, R_TAP, R_N };
 static const size_t region_w[R_N] = {
     [R_H] = H, [R_HN] = H, [R_BS] = MAXBS * H, [R_P0] = H, [R_MS] = 2 * H, [R_MSG] = 4 * H, [R_MIX] = 3 * H, [R_G] = 3 * H,
     [R_XN] = 3 * H, [R_Q] = QD, [R_K] = KVD, [R_V] = KVD, [R_GT] = QD, [R_SK] = NH, [R_RS] = NH * DREL, [R_KD] = NKV * 4,
     [R_VD] = NKV * 4, [R_KN] = KVD, [R_VN] = KVD, [R_ATT] = QD, [R_A] = H, [R_R] = H, [R_HM] = H, [R_XM] = H, [R_D] = RANK,
     [R_IDX] = TOPK, [R_W] = TOPK, [R_HACT] = TOPK * FF, [R_YS] = TOPK * H, [R_YSUM] = H,
-    [R_PAIRS] = TOPK, [R_TILES] = 4, [R_NT] = 1, [R_LG] = NE};
+    [R_PAIRS] = TOPK, [R_TILES] = 4, [R_NT] = 1, [R_LG] = NE,
+    [R_TAP] = 4 * H}; // R_TAP: 4 planes of [PCH][H], the drafter's trunk features
 // the expert tiles of a chunk (ink_moe_plan): at most T * TOPK / 32 + NE, 4 words each
 static_assert(PCH * TOPK / 32 + NE <= PCH);
 static size_t region_off[R_N + 1]; // floats
@@ -125,6 +134,40 @@ __attribute__((constructor)) static void regions(void) {
 
 static const char *kernel_names[sizeof(Pipes) / sizeof(sx_pipeline *)];
 static const Model *prof_model;
+
+// ---- the DSpark drafter (thinkingmachines' mtp.safetensors, BF16) ---------------------------
+#define DS_L CONFIG_MTP_NUM_HIDDEN_LAYERS   // 3
+#define DS_FF CONFIG_MTP_INTERMEDIATE_SIZE  // 9216
+#define DS_BLK CONFIG_MTP_BLOCK_SIZE        // 8: the anchor and 7 drafts
+#define DS_R CONFIG_MTP_MARKOV_RANK         // 256
+static_assert(CONFIG_MTP_HIDDEN_SIZE == H && CONFIG_MTP_NUM_ATTENTION_HEADS == NH && CONFIG_MTP_NUM_KEY_VALUE_HEADS == NKV &&
+              CONFIG_MTP_HEAD_DIM == HD && CONFIG_MTP_SLIDING_WINDOW_SIZE == WIN && DS_BLK == KMAX && DS_R == 256 &&
+              CONFIG_MTP_N_TARGET_LAYERS == 4 && DS_L == 3);
+// the kernels' shapes (inkling_dspark.metal): a block of 8 rows (ds_attn_part's p0 + 8), the
+// Markov state of 256 in one threadgroup, rnn_proj rows of [state, w1, hidden, f_rnn]; the
+// drafter's norms use the trunk's epsilon (enc_norm)
+static_assert(DS_BLK == 8 && DS_R == 256 && 2 * DS_R + 2 * CONFIG_MTP_HIDDEN_SIZE == 5120 && CONFIG_MTP_RMS_NORM_EPS == CONFIG_RMS_NORM_EPS);
+// the drafter's layers: local ones in rings, global ones in full planes (ds_planes)
+static size_t ds_n_global(void) {
+    size_t n = 0;
+    for (size_t l = 0; l < DS_L; l++) n += config_mtp_layer_kinds[l] == LAYER_KIND_GLOBAL;
+    return n;
+}
+// Activations (floats, offsets into Ds.a).
+enum { DA_RES, DA_XN, DA_Q, DA_KB, DA_VB, DA_ATT, DA_O, DA_G, DA_U, DA_HM, DA_CTX, DA_KC, DA_VC, DA_INP, DA_MCTX, DA_STATE,
+       DA_LAT, DA_PREV, DA_DRAFT, DA_PART, DA_FRNN, DA_FTAP, DA_BASE, DA_GATE1, DA_SINK, DA_N };
+typedef struct {
+    bool on;
+    sx_buffer *w; // BF16 matrices, then f32 vectors, 16-byte aligned
+    size_t q[DS_L], k[DS_L], v[DS_L], kc[DS_L], vc[DS_L], o[DS_L], gt[DS_L], up[DS_L], dn[DS_L], w1, rnn; // byte offsets (bf16)
+    size_t qn[DS_L], kn[DS_L], kcn[DS_L], iln[DS_L], pln[DS_L], dfl[DS_L], mdfl, norm, mask, rnnb, alpha; // byte offsets (f32)
+    sx_buffer *fold, *foldb; // lm_head . hidden_out: f16 [VOCAB][DS_R]; lm_head . hidden_out bias [VOCAB]
+    sx_buffer *a;            // activations
+    sx_buffer *cs;           // RoPE (cos, sin) rows [PCH + DS_BLK][HD / 2][2], host-written in double
+    size_t off[DA_N + 1];
+    uint32_t tap_t, tap_pos0; // the rows R_TAP holds (the last chunk's): SAETTA_DS_DUMP
+    bool dumped;
+} Ds;
 
 struct Model {
     const ModelArch *arch; // first: model_api.c dispatches on it
@@ -149,7 +192,21 @@ struct Model {
     size_t routes_rows;
     bool replay;        // INK_ROUTES_REPLAY
     bool route_ref;     // this chunk lies within the reference
+    Ds ds;
+    // A verification chunk (model_spec_verify) commits nothing while it runs: each visit's rows of
+    // the conv inputs (raw K, raw V, attention out, MLP out) and of the keys and values stay in spk;
+    // the commit then moves the accepted rows into the conv states and caches, after saving the
+    // conv states and the ring rows it replaces in spb (session_roll_to puts them back).
+    bool spec_chunk;
+    sx_buffer *spk, *spb;
 };
+#define SPK_W (4 * KVD + 2 * H) // floats per visit and row
+
+static const Model *ds_model;
+static Err ds_load(Arena *arena, Model *m, Gpu *g);
+static void ds_rope_rows(Model *m, size_t row0, size_t pos0, size_t T);
+struct Enc_;
+static void enc_ds_ctx(Model *m, Session *d, struct Enc_ *c, uint32_t T, uint32_t pos0);
 
 // The per-conversation state lives in the base Session's buffers, so conversations swap as the
 // other models' do (session_swap_conv):
@@ -161,9 +218,13 @@ struct Model {
 // s->pos tokens), and a prompt that extends those tokens reuses them; anything else starts over.
 typedef Session InkSession;
 #define CONV_VIS (6 * KVD + 6 * H) // floats per visit
-#define RING_BYTES ((size_t)n_swa_vis * 2 * WIN * KVD * 4)
+// With the DSpark drafter loaded the sessions hold its context keys and values too: its global
+// layer as one more full plane pair (index n_full_vis), its two local layers as two more rings
+// (n_swa_vis, n_swa_vis + 1); set by model_load before any session exists.
+static size_t n_kvf_planes, n_ring_planes;
+#define RING_BYTES(elem) ((size_t)n_ring_planes * 2 * WIN * KVD * (elem))
 #define CONV_BYTES ((size_t)NVIS * CONV_VIS * 4)
-static size_t kvf_bytes(size_t cap) { return n_full_vis * 2 * cap * KVD * 4; }
+static size_t kvf_bytes(size_t cap, size_t elem) { return n_kvf_planes * 2 * cap * KVD * elem; }
 
 static inline sx_arg B(sx_buffer *b) { return (sx_arg){b, 0, NULL, 0}; }
 static inline sx_arg AT(sx_buffer *b, size_t off) { return (sx_arg){b, off, NULL, 0}; }
@@ -171,7 +232,7 @@ static inline sx_arg OFF(sx_arg a, size_t floats) { return (sx_arg){a.buffer, a.
 #define BYTES(v) gpu_bytes_arg(&(v), sizeof(v))
 // The command buffer being encoded. SAETTA_PROFILE=1: every dispatch in its own command buffer,
 // GPU time summed per kernel (model_prof_report).
-typedef struct {
+typedef struct Enc_ {
     sx_cmd *cmd;
     Gpu *g;
 } Enc;
@@ -395,6 +456,8 @@ static const char ink_src[] = {
 #embed "kernels/inkling_attn.metal"
     , '\n',
 #embed "kernels/inkling_moe.metal"
+    , '\n',
+#embed "kernels/inkling_dspark.metal"
     , 0};
 
 Err model_load(Arena *arena, const Pack *pack, Gpu *g, Model **out) {
@@ -413,8 +476,12 @@ Err model_load(Arena *arena, const Pack *pack, Gpu *g, Model **out) {
 #define K(f, n) {offsetof(Pipes, f), n}
         K(mix, "ink_mix"), K(norm, "ink_rmsnorm"), K(msg_down, "ink_msg_down"), K(msg_out, "ink_msg_out"), K(qr, "ink_qr_prep"),
         K(kv_conv, "ink_kv_conv"), K(conv_res, "ink_conv_res"), K(conv_state, "ink_conv_state"), K(router, "ink_router"), K(router_lg, "ink_router_logits"),
+        K(ds_mv, "ds_mv"), K(ds_mix, "ds_mix_norm"), K(ds_rope, "ds_norm_rope"), K(ds_attn, "ds_attn_part"), K(ds_attn_h, "ds_attn_part_h"),
+        K(ds_addn, "ds_add_norm"), K(ds_silu, "ds_silu_mul"), K(ds_step, "ds_markov_step"), K(ds_fold, "ds_fold_argmax"),
+        K(ds_argmax, "ds_argmax_final"), K(ds_fold_t, "ds_fold_t"), K(ds_ring, "ds_ring_copy"),
         K(moe_sum, "ink_moe_sum"), K(softcap, "ink_softcap"), K(copy, "ink_copy"), K(kv_store, "ink_kv_store"),
-        K(attn_part, "ink_attn_part"), K(attn_merge, "ink_attn_merge"), K(gu_nv, "ink_moe_gu_nv"), K(dn_nv, "ink_moe_dn_nv"),
+        K(attn_part, "ink_attn_part"), K(attn_part_h, "ink_attn_part_h"), K(attn_flash, "ink_attn_flash"),
+        K(attn_flash_h, "ink_attn_flash_mma"), K(kv_store_h, "ink_kv_store_h"), K(attn_merge, "ink_attn_merge"), K(gu_nv, "ink_moe_gu_nv"), K(dn_nv, "ink_moe_dn_nv"),
         K(gu_mx, "ink_moe_gu_mx"), K(dn_mx, "ink_moe_dn_mx"), K(plan, "ink_moe_plan"),
         K(gu_nv_g, "ink_moe_gu_nv_g"), K(gu_mx_g, "ink_moe_gu_mx_g"), K(dn_nv_g, "ink_moe_dn_nv_g"), K(dn_mx_g, "ink_moe_dn_mx_g"),
 #undef K
@@ -426,7 +493,19 @@ Err model_load(Arena *arena, const Pack *pack, Gpu *g, Model **out) {
     kernel_names[offsetof(Pipes, mv) / sizeof(sx_pipeline *)] = "qmatvec_gen";
     kernel_names[offsetof(Pipes, mm) / sizeof(sx_pipeline *)] = "qmm_gen";
     prof_model = m;
-    TRY(gpu_pipeline(g, qgen_src, "qmatvec_gen", &pp->mv));
+    {
+        // qmatvec_gen over T rows (grid y): decode and verification chunks share this kernel, so a
+        // token's projections are the same bits whichever of the two reads it
+        static const char tail[] =
+            "\nkernel void ink_qmv_rows(device const uchar *w [[buffer(0)]], device const uchar *scales [[buffer(1)]],\n"
+            "    device const uchar *biases [[buffer(2)]], device const float *x [[buffer(3)]], device float *y [[buffer(4)]],\n"
+            "    constant uint &in [[buffer(5)]], constant uint &out [[buffer(6)]], constant uint *shift [[buffer(7)]],\n"
+            "    constant uint2 &q [[buffer(8)]], uint2 tg [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {\n"
+            "    if (tg.x < out) qg_row(q.x, q.y, w + shift[0], scales + shift[1], biases + shift[2], x + tg.y * in, y + tg.y * out, in, tg.x, lane);\n"
+            "}\n";
+        char *src = arena_printf(arena, "%s%s", qgen_src, tail);
+        TRY(gpu_pipeline(g, src, "ink_qmv_rows", &pp->mv));
+    }
     TRY(gpu_pipeline(g, qgen_src, "qmm_gen", &pp->mm));
 
     TRY(lin(pack, PFX, "embed_tokens", CONFIG_VOCAB_SIZE, H, &m->embed));
@@ -448,9 +527,16 @@ Err model_load(Arena *arena, const Pack *pack, Gpu *g, Model **out) {
         }
     }
     TRY(gpu_new_buffer(g, region_off[R_N] * 4, &m->scratch));
-    TRY(gpu_new_buffer(g, (size_t)MAX(PCH * NSPLIT_PRE, NSPLIT_DEC) * NH * (HD + 2) * 4, &m->part));
+    TRY(gpu_new_buffer(g, (size_t)KMAX * NSPLIT_DEC * NH * (HD + 2) * 4, &m->part));
     TRY(gpu_new_buffer(g, (size_t)PCH * H * 4, &m->stage));
     TRY(gpu_new_buffer(g, (size_t)KMAX * VOCAB * 4, &m->logits));
+    // the DSpark drafter, when downloaded: its planes in every session, the verification buffers
+    TRY(ds_load(arena, m, g));
+    n_kvf_planes = n_full_vis + (m->ds.on ? ds_n_global() : 0);
+    n_ring_planes = n_swa_vis + (m->ds.on ? DS_L - ds_n_global() : 0);
+    TRY(gpu_new_buffer(g, (size_t)NVIS * KMAX * SPK_W * 4, &m->spk));
+    TRY(gpu_new_buffer(g, (size_t)n_swa_vis * 2 * KMAX * KVD * 4 + CONV_BYTES, &m->spb));
+    ds_model = m;
     // SAETTA_INK_ROUTES=<golden dir> (verify), read once
     const char *rd = getenv("SAETTA_INK_ROUTES");
     if (rd && rd[0]) {
@@ -466,7 +552,7 @@ Err model_load(Arena *arena, const Pack *pack, Gpu *g, Model **out) {
         e = n > 0 && n * NVIS * TOPK == rl && ml == (size_t)NVIS * n * 4 ? OK : "BadRoutesFile";
         if (!e) e = gpu_new_buffer(g, rl * 4, &m->routes);
         if (!e) e = gpu_new_buffer(g, ml, &m->margins);
-        if (!e) e = gpu_new_buffer(g, 16, &m->rstats);
+        if (!e) e = gpu_new_buffer(g, 32, &m->rstats);
         if (!e) {
             uint32_t *r = sx_buffer_contents(m->routes);
             for (size_t i = 0; i < rl; i++) r[i] = (uint8_t)rb[i];
@@ -512,19 +598,20 @@ typedef struct { uint32_t e, h, k; float scale; uint32_t forced, check, pos0; fl
 typedef struct { uint32_t c, k; } SumP;
 typedef struct { uint32_t n; float cap; } CapP;
 typedef struct { uint32_t C, pos0, ring, T; } StP;
-typedef struct { uint32_t NH_, NKV_, HD_, DREL_, EXT_, pos0, win, ring, nsplit, span; float scale; } AttP;
+typedef struct { uint32_t NH_, NKV_, HD_, DREL_, EXT_, pos0, win, ring, nsplit, span, T; float scale; } AttP;
 typedef struct { uint32_t h, i, k, sh_w, sh_s; uint64_t wsE, ssE; float gcap, ucap; } MoeP;
 typedef struct { uint32_t e, k, t; } PlanP;
 static_assert(sizeof(MoeP) == 48);
 
-// y = W x over T rows: the run-time affine kernels (decode: one simdgroup per row; chunks: f32
+// y = W x over T rows: the run-time affine kernels (decode and verification chunks, T <= KMAX:
+// one simdgroup per output row and token, the same bits for a token in either; prompt chunks: f32
 // tiles). out rows of W (lm_head: the unpadded vocabulary).
 static void enc_lin(Model *m, Enc *c, const Linear *l, sx_arg x, sx_arg y, uint32_t T, uint32_t out) {
     uint32_t sh[3], q[2] = {l->bits, l->group_size}, in = (uint32_t)l->in_features;
     sx_arg w = gpu_tensor_arg(m->g, &l->weight, &sh[0]), s = gpu_tensor_arg(m->g, &l->scales, &sh[1]),
            b = gpu_tensor_arg(m->g, &l->biases, &sh[2]);
-    if (T == 1) {
-        DISP(c, m->p.mv, out, 1, 1, 32, w, s, b, x, y, BYTES(in), BYTES(out), gpu_bytes_arg(sh, 12), BYTES(q));
+    if (T <= KMAX) {
+        DISP(c, m->p.mv, out, T, 1, 32, w, s, b, x, y, BYTES(in), BYTES(out), gpu_bytes_arg(sh, 12), BYTES(q));
     } else {
         uint32_t dims[3] = {in, out, T};
         DISP(c, m->p.mm, (out + 31) / 32, (T + 31) / 32, 1, 128, w, s, b, x, y, gpu_bytes_arg(dims, 12), gpu_bytes_arg(sh, 12),
@@ -626,12 +713,13 @@ static void enc_visit(Model *m, InkSession *d, Enc *c, size_t v, uint32_t T, uin
     // keys and values: conv, clip / norm (M:478-528)
     {
         const float den = full ? sqrtf(9.0f) : sqrtf(5.0f);
-        KvP pk = {KVD, HD, full, 0, T == 1, den, CONFIG_QK_L2_CLIP_THRESHOLD, EPS};
-        KvP pv = {KVD, HD, full, 1, T == 1, den, CONFIG_QK_L2_CLIP_THRESHOLD, EPS};
+        const bool upd = T == 1 && !m->spec_chunk;
+        KvP pk = {KVD, HD, full, 0, upd, den, CONFIG_QK_L2_CLIP_THRESHOLD, EPS};
+        KvP pv = {KVD, HD, full, 1, upd, den, CONFIG_QK_L2_CLIP_THRESHOLD, EPS};
         const sx_arg ks = conv, vs = OFF(conv, 3 * KVD);
         DISP(c, m->p.kv_conv, NKV, T, 1, HD, reg(m, R_K), ks, L->kw, reg(m, R_KD), reg(m, R_KN), BYTES(pk));
         DISP(c, m->p.kv_conv, NKV, T, 1, HD, reg(m, R_V), vs, L->vw, reg(m, R_VD), reg(m, R_VN), BYTES(pv));
-        if (T > 1) {
+        if (T > 1 && !m->spec_chunk) {
             enc_conv_state(m, c, reg(m, R_K), ks, KVD, T);
             enc_conv_state(m, c, reg(m, R_V), vs, KVD, T);
         }
@@ -640,35 +728,51 @@ static void enc_visit(Model *m, InkSession *d, Enc *c, size_t v, uint32_t T, uin
     {
         sx_arg kc, vc;
         uint32_t ring;
+        const size_t elem = d->kv_half ? 2 : 4;
         if (full) {
-            const size_t plane = (size_t)d->cap * KVD * 4;
+            const size_t plane = (size_t)d->cap * KVD * elem;
             kc = AT(d->kv, vis_kv[v] * 2 * plane);
             vc = AT(d->kv, (vis_kv[v] * 2 + 1) * plane);
             ring = 0;
         } else {
-            const size_t plane = (size_t)WIN * KVD * 4;
+            const size_t plane = (size_t)WIN * KVD * elem;
             kc = AT(d->ixk, vis_kv[v] * 2 * plane);
             vc = AT(d->ixk, (vis_kv[v] * 2 + 1) * plane);
             ring = WIN;
         }
-        // keys of the last query: its whole range; the splits cover the longest range of the chunk
+        // keys of the last query: its whole range
         const uint32_t last = pos0 + T - 1, range = full ? last + 1 : MIN(last + 1, (uint32_t)WIN);
-        uint32_t nsplit = T == 1 ? MIN((uint32_t)NSPLIT_DEC, MAX(1u, (range + 127) / 128)) : MIN((uint32_t)NSPLIT_PRE, MAX(1u, (range + 255) / 256));
-        const uint32_t span = (range + nsplit - 1) / nsplit;
-        AttP p = {NH, NKV, HD, DREL, EXT, pos0, full ? 0 : WIN, ring, nsplit, span, 1.0f / sqrtf((float)HD)};
-        DISP(c, m->p.attn_part, NH, nsplit, T, 128, reg(m, R_Q), reg(m, R_RS), L->proj, kc, vc, reg(m, R_KN), reg(m, R_VN), B(m->part),
-             BYTES(p));
-        DISP(c, m->p.attn_merge, NH, T, 1, HD, B(m->part), reg(m, R_SK), reg(m, R_GT), reg(m, R_ATT), BYTES(p));
-        StP sp = {KVD, pos0, ring, T};
-        DISP(c, m->p.kv_store, KVD / 256, T, 1, 256, reg(m, R_KN), reg(m, R_VN), kc, vc, BYTES(sp));
+        const float scale = 1.0f / sqrtf((float)HD);
+        if (T <= KMAX) {
+            // decode and verification chunks: split-K over the range (enough threadgroups at
+            // 100K-1M keys: one per KV head and split), then the merge with the sink and gate
+            // each query splits its own range as decode would (the kernel derives it); the grid
+            // covers the last query's, the longest
+            const uint32_t nsplit = MIN((uint32_t)NSPLIT_DEC, MAX(1u, (range + 255) / 256));
+            const uint32_t span = (range + nsplit - 1) / nsplit;
+            AttP p = {NH, NKV, HD, DREL, EXT, pos0, full ? 0 : WIN, ring, nsplit, span, T, scale};
+            DISP(c, d->kv_half ? m->p.attn_part_h : m->p.attn_part, NKV, nsplit, T, 128, reg(m, R_Q), reg(m, R_RS), L->proj, kc, vc,
+                 reg(m, R_KN), reg(m, R_VN), B(m->part), BYTES(p));
+            DISP(c, m->p.attn_merge, NH, T, 1, HD, B(m->part), reg(m, R_SK), reg(m, R_GT), reg(m, R_ATT), BYTES(p));
+        } else {
+            // prompt chunks: key tiles shared by blocks of 16 queries
+            AttP p = {NH, NKV, HD, DREL, EXT, pos0, full ? 0 : WIN, ring, 1, 0, T, scale};
+            // (f16 cache: simdgroup matrices, 6 simdgroups; f32: the exact scalar tiles, 8)
+            DISP(c, d->kv_half ? m->p.attn_flash_h : m->p.attn_flash, NKV, (T + 15) / 16, 1, d->kv_half ? 192 : 256, reg(m, R_Q),
+                 reg(m, R_RS), L->proj, kc, vc, reg(m, R_KN), reg(m, R_VN), reg(m, R_SK), reg(m, R_GT), reg(m, R_ATT), BYTES(p));
+        }
+        if (!m->spec_chunk) {
+            StP sp = {KVD, pos0, ring, T};
+            DISP(c, d->kv_half ? m->p.kv_store_h : m->p.kv_store, KVD / 256, T, 1, 256, reg(m, R_KN), reg(m, R_VN), kc, vc, BYTES(sp));
+        }
     }
     enc_lin(m, c, &L->o, reg(m, R_ATT), reg(m, R_A), T, H);
     // post-attention conv and the residual (M:899-905)
     {
-        CrP p = {H, boundary, T == 1, sqrtf(5.0f)};
+        CrP p = {H, boundary, T == 1 && !m->spec_chunk, sqrtf(5.0f)};
         const sx_arg as = OFF(conv, 6 * KVD);
         DISP(c, m->p.conv_res, H / 256, T, 1, 256, reg(m, R_A), as, L->aw, h, reg(m, R_R), OFF(bs, n * PH), BYTES(p));
-        if (T > 1) enc_conv_state(m, c, reg(m, R_A), as, H, T);
+        if (T > 1 && !m->spec_chunk) enc_conv_state(m, c, reg(m, R_A), as, H, T);
     }
     const uint32_t n2 = n + boundary;
     // MLP input (M:907-908, 990-993)
@@ -694,8 +798,9 @@ static void enc_visit(Model *m, InkSession *d, Enc *c, size_t v, uint32_t T, uin
         MoeP mp = {H, FF, TOPK, shw, shs, L->guw.nbytes / NE, L->gus.nbytes / NE, CONFIG_MLP_GATE_SOFTCAP, CONFIG_MLP_UP_SOFTCAP};
         sx_arg dw = gpu_tensor_arg(m->g, &L->dnw, &shw), ds = gpu_tensor_arg(m->g, &L->dns, &shs);
         MoeP dp = {H, FF, TOPK, shw, shs, L->dnw.nbytes / NE, L->dns.nbytes / NE, CONFIG_MLP_GATE_SOFTCAP, CONFIG_MLP_UP_SOFTCAP};
-        if (T == 1) {
-            // one token: each expert's rows read once, f32 dot products per row
+        if (T <= KMAX) {
+            // decode and verification chunks: per token, each expert's rows read once, f32 dot
+            // products per row (the same bits for a token in either)
             DISP(c, L->mx ? m->p.gu_mx : m->p.gu_nv, FF / 8, TOPK, T, 256, gw, gs, L->gfu, reg(m, R_XM), reg(m, R_IDX),
                  reg(m, R_HACT), BYTES(mp));
             DISP(c, L->mx ? m->p.dn_mx : m->p.dn_nv, H / 32, TOPK, T, 256, dw, ds, L->gfd, reg(m, R_HACT), reg(m, R_IDX),
@@ -716,10 +821,20 @@ static void enc_visit(Model *m, InkSession *d, Enc *c, size_t v, uint32_t T, uin
     }
     // post-MLP conv and the layer output (M:909-910)
     {
-        CrP p = {H, 0, T == 1, sqrtf(5.0f)};
+        CrP p = {H, 0, T == 1 && !m->spec_chunk, sqrtf(5.0f)};
         const sx_arg ms = OFF(conv, 6 * KVD + 3 * H);
         DISP(c, m->p.conv_res, H / 256, T, 1, 256, reg(m, R_YSUM), ms, L->mw, reg(m, R_R), reg(m, R_HN), reg(m, R_HN), BYTES(p));
-        if (T > 1) enc_conv_state(m, c, reg(m, R_YSUM), ms, H, T);
+        if (T > 1 && !m->spec_chunk) enc_conv_state(m, c, reg(m, R_YSUM), ms, H, T);
+    }
+    // a verification chunk keeps this visit's rows for its commit
+    if (m->spec_chunk) {
+        const sx_arg sk = AT(m->spk, v * KMAX * SPK_W * 4);
+        enc_copy(m, c, reg(m, R_K), sk, T * KVD);
+        enc_copy(m, c, reg(m, R_V), OFF(sk, KMAX * KVD), T * KVD);
+        enc_copy(m, c, reg(m, R_KN), OFF(sk, 2 * KMAX * KVD), T * KVD);
+        enc_copy(m, c, reg(m, R_VN), OFF(sk, 3 * KMAX * KVD), T * KVD);
+        enc_copy(m, c, reg(m, R_A), OFF(sk, 4 * KMAX * KVD), T * H);
+        enc_copy(m, c, reg(m, R_YSUM), OFF(sk, 4 * KMAX * KVD + KMAX * H), T * H);
     }
 }
 
@@ -744,6 +859,11 @@ static void enc_forward(Model *m, InkSession *d, Enc *c, uint32_t T, sx_buffer *
             enc_copy(m, c, reg(m, R_P0), h, T * H);
             n = npre;
         }
+        // the drafter's features: the partial block at the input of visits 5, 23 and 41 (vLLM
+        // ef687f6 nvidia/loop.py:342-345, 375-376)
+        if (m->ds.on)
+            for (uint32_t k = 0; k < 3; k++)
+                if (v == config_mtp_target_layers[k]) enc_copy(m, c, h, OFF(reg(m, R_TAP), k * PH), T * H);
         enc_visit(m, d, c, v, T, pos0, n);
         n += li % NBLK == 0;
         if (trace) {
@@ -755,6 +875,7 @@ static void enc_forward(Model *m, InkSession *d, Enc *c, uint32_t T, sx_buffer *
     // final mix, norm, lm_head, softcap (M:1442-1443, 1533-1535)
     enc_mix(m, c, n, h, m->final_q, 1, reg(m, R_HM), H, T, bs, PH);
     enc_norm(m, c, reg(m, R_HM), H, m->final_norm, true, reg(m, R_XM), T);
+    if (m->ds.on) enc_copy(m, c, reg(m, R_XM), OFF(reg(m, R_TAP), 3 * PH), T * H); // and the final norm's output (visit 48)
     const uint32_t nl = all_logits ? T : 1;
     const sx_arg xl = all_logits ? reg(m, R_XM) : regt(m, R_XM, T - 1);
     enc_lin(m, c, &m->lm_head, xl, B(m->logits), nl, VOCAB);
@@ -791,15 +912,24 @@ static Err run_chunk(Model *m, Session *s, const uint32_t *toks, uint32_t T, sx_
     // the reference's experts where it has them (verify)
     m->route_ref = m->routes && s->pos + T <= m->routes_rows;
     TRY(stage_tokens(m, toks, T));
+    const bool ctx = m->ds.on && !m->spec_chunk;
+    if (ctx) ds_rope_rows(m, 0, s->pos, T);
     Enc enc = {sx_cmd_begin(m->g->dev), m->g}, *c = &enc;
     if (!c->cmd) return "GpuFailed";
     enc_forward(m, d, c, T, trace, trow, tstride, all_logits);
+    if (ctx) {
+        enc_ds_ctx(m, d, c, T, (uint32_t)s->pos);
+        m->ds.tap_t = T;
+        m->ds.tap_pos0 = (uint32_t)s->pos;
+    }
     char err[512];
     if (sx_cmd_finish(c->cmd, err, sizeof err) != 0) {
         dbg("command buffer: %s\n", err);
         return "GpuFailed";
     }
+    if (m->spec_chunk) return OK; // model_spec_verify commits
     s->pos += T;
+    s->chunk_t = 0; // no verification chunk to roll back into
     // a restore point is usable only while it is the live state
     for (int k = 0; k < 2; k++)
         if (s->ck[k].tokens.len != s->pos) s->ck[k].tokens.len = 0;
@@ -850,21 +980,486 @@ Err model_verify_chunk(Model *m, Session *s, const uint32_t *toks, size_t n, flo
     return OK;
 }
 
+// ---- the DSpark drafter --------------------------------------------------------------------
+//
+// Thinking Machines' block drafter (config.json mtp_config; mtp.safetensors of the official
+// release, BF16), run as vLLM ef687f6 runs it (vllm/models/inkling2/nvidia/dspark.py, D):
+// - every committed token leaves its context keys and values in the drafter's three layers: each
+//   layer mixes the trunk's four features (the partial block at the input of visits 5, 23 and 41,
+//   and the final norm's output) with softmax(fuse_weight[layer]), RMS-normalizes them with its
+//   dflare_norm, and projects K (k_norm_ctx, RoPE at the token's position) and V (D:249-265, 403-408);
+// - a draft is one block of 8 rows at positions p .. p + 7 (p the next token's position): the
+//   anchor (that token's normalized embedding) and 7 mask_embed rows, through 3 pre-norm layers
+//   (q/k RMSNorm per head and NeoX RoPE with theta 1e6, attention over the context keys and all 8
+//   block keys, no causal mask, the local layers 0 and 2 the last 1024 keys up to p + 7, no sink;
+//   SwiGLU 9216) and the
+//   final norm (D:195-246, 303-318, 433-439);
+// - the Markov head turns rows 1..7 into 7 drafts one after another: its 256-wide state starts at
+//   0 and the previous token at the anchor; raw = rnn_proj [state, markov_w1[prev], h_i, f_rnn] +
+//   bias (f_rnn: the last committed token's features mixed with fuse_weight[3]); the state gates
+//   on raw's thirds; the logits are lm_head h_i + (lm_head hidden_out) latent + lm_head b, and the
+//   draft their argmax (the softcap is monotone) (D:330-385, 544-561).
+// The lm_head is the pack's (affine 4-bit, where the reference has BF16) and lm_head . hidden_out
+// is formed once at load (f16). Drafts only decide what is verified: the output is the trunk's.
+
+// ds_model: session_roll_to has no model argument (one model per process)
+static const TensorInfo *st_get(StrMap *m, const char *name) {
+    void **v = strmap_get(m, str(name));
+    return v ? (const TensorInfo *)*v : NULL;
+}
+
+static sx_arg dsa(const Model *m, int r) { return AT(m->ds.a, m->ds.off[r] * 4); }
+static sx_arg dsw(const Model *m, size_t off) { return AT(m->ds.w, off); }
+
+// y [T][out] = W x [T][in] for W bf16 at byte offset w (rows ldw values, from column col0).
+static void ds_lin(Model *m, Enc *c, size_t w, uint32_t ldw, uint32_t col0, uint32_t in, uint32_t out, sx_arg x, uint32_t xs, sx_arg y,
+                   uint32_t ys, uint32_t T) {
+    struct { uint32_t in, out, T, ldw, col0, xs, ys; } p = {in, out, T, ldw, col0, xs, ys};
+    DISP(c, m->p.ds_mv, (out + 7) / 8, (T + 7) / 8, 1, 256, dsw(m, w), x, y, BYTES(p));
+}
+
+// The drafter's planes in the session's caches: its layer l's keys / values.
+static void ds_planes(const Session *d, size_t l, sx_arg *kc, sx_arg *vc, uint32_t *ring) {
+    const size_t elem = d->kv_half ? 2 : 4;
+    const bool global = config_mtp_layer_kinds[l] == LAYER_KIND_GLOBAL;
+    size_t r = 0; // this layer's place among the drafter's layers of its kind
+    for (size_t i = 0; i < l; i++) r += (config_mtp_layer_kinds[i] == LAYER_KIND_GLOBAL) == global;
+    if (global) {
+        const size_t plane = (size_t)d->cap * KVD * elem;
+        *kc = AT(d->kv, (n_full_vis + r) * 2 * plane);
+        *vc = AT(d->kv, ((n_full_vis + r) * 2 + 1) * plane);
+        *ring = 0;
+    } else {
+        const size_t plane = (size_t)WIN * KVD * elem;
+        *kc = AT(d->ixk, (n_swa_vis + r) * 2 * plane);
+        *vc = AT(d->ixk, ((n_swa_vis + r) * 2 + 1) * plane);
+        *ring = WIN;
+    }
+}
+
+// (cos, sin) of positions pos0 .. pos0 + T - 1 into rope rows row0.. (double precision angles).
+static void ds_rope_rows(Model *m, size_t row0, size_t pos0, size_t T) {
+    float *cs = gpu_floats(m->ds.cs);
+    for (size_t t = 0; t < T; t++)
+        for (size_t i = 0; i < HD / 2; i++) {
+            const double inv = pow(CONFIG_MTP_ROPE_THETA, -(double)(2 * i) / (double)HD), a = (double)(pos0 + t) * inv;
+            cs[((row0 + t) * (HD / 2) + i) * 2] = (float)cos(a);
+            cs[((row0 + t) * (HD / 2) + i) * 2 + 1] = (float)sin(a);
+        }
+}
+
+// Context keys and values of chunk rows 0..T-1 (their taps in R_TAP) at positions pos0.., and the
+// last row's taps kept for f_rnn. The host wrote their RoPE rows 0..T-1.
+static void enc_ds_ctx(Model *m, Session *d, Enc *c, uint32_t T, uint32_t pos0) {
+    const Ds *ds = &m->ds;
+    const uint32_t PH = PCH * H;
+    for (size_t l = 0; l < DS_L; l++) {
+        struct { uint32_t h, ts; float eps; } mp = {H, PH, EPS};
+        DISP(c, m->p.ds_mix, T, 1, 1, 256, reg(m, R_TAP), dsw(m, ds->alpha + l * 16), dsw(m, ds->dfl[l]), dsa(m, DA_CTX), BYTES(mp));
+        ds_lin(m, c, ds->kc[l], H, 0, H, KVD, dsa(m, DA_CTX), H, dsa(m, DA_KC), KVD, T);
+        ds_lin(m, c, ds->vc[l], H, 0, H, KVD, dsa(m, DA_CTX), H, dsa(m, DA_VC), KVD, T);
+        struct { uint32_t heads, hd, xs, norm; float eps; } rp = {NKV, HD, KVD, 1, EPS};
+        DISP(c, m->p.ds_rope, NKV, T, 1, HD / 2, dsa(m, DA_KC), dsw(m, ds->kcn[l]), B(ds->cs), BYTES(rp));
+        sx_arg kc, vc;
+        uint32_t ring;
+        ds_planes(d, l, &kc, &vc, &ring);
+        StP sp = {KVD, pos0, ring, T};
+        DISP(c, d->kv_half ? m->p.kv_store_h : m->p.kv_store, KVD / 256, T, 1, 256, dsa(m, DA_KC), dsa(m, DA_VC), kc, vc, BYTES(sp));
+    }
+    for (uint32_t k = 0; k < 4; k++) enc_copy(m, c, OFF(reg(m, R_TAP), k * PH + (T - 1) * H), OFF(dsa(m, DA_FTAP), k * H), H);
+}
+
+// SAETTA_DS_DUMP=<dir>: the first draft's inputs and outputs as raw files (for checking the
+// drafter against a reference): the taps of the last chunk, the drafter's caches, f_rnn's taps,
+// the block's final normalized rows, the Markov head's inputs, the fold and the drafts.
+static void ds_dump(Model *m, Session *d, uint32_t x, const uint32_t *drafts, size_t nd) {
+    Ds *ds = &m->ds;
+    ds->dumped = true;
+    const char *dir = getenv("SAETTA_DS_DUMP");
+    char path[1024];
+    FILE *f;
+#define DUMP(name, ptr, bytes)                                                                     \
+    do {                                                                                           \
+        snprintf(path, sizeof path, "%s/%s", dir, name);                                           \
+        if ((f = fopen(path, "wb"))) {                                                             \
+            fwrite(ptr, 1, bytes, f);                                                              \
+            fclose(f);                                                                             \
+        }                                                                                          \
+    } while (0)
+    const float *af = gpu_floats(ds->a);
+    DUMP("taps.f32", gpu_floats(m->scratch) + region_off[R_TAP], (size_t)4 * PCH * H * 4);
+    DUMP("ftap.f32", af + ds->off[DA_FTAP], (size_t)4 * H * 4);
+    DUMP("xn.f32", af + ds->off[DA_XN], (size_t)DS_BLK * H * 4);
+    DUMP("base.f32", af + ds->off[DA_BASE], (size_t)(DS_BLK - 1) * VOCAB * 4);
+    DUMP("mctx.f32", af + ds->off[DA_MCTX], (size_t)(DS_BLK - 1) * 3 * DS_R * 4);
+    DUMP("frnn.f32", af + ds->off[DA_FRNN], (size_t)H * 4);
+    DUMP("lat.f32", af + ds->off[DA_LAT], (size_t)DS_R * 4);
+    DUMP("state.f32", af + ds->off[DA_STATE], (size_t)DS_R * 4);
+    DUMP("fold.f16", sx_buffer_contents(ds->fold), (size_t)VOCAB * DS_R * 2);
+    DUMP("foldb.f32", sx_buffer_contents(ds->foldb), (size_t)VOCAB * 4);
+    const size_t elem = d->kv_half ? 2 : 4;
+    for (size_t l = 0; l < DS_L; l++) {
+        sx_arg kc, vc;
+        uint32_t ring;
+        ds_planes(d, l, &kc, &vc, &ring);
+        const size_t rows = ring ? WIN : d->pos;
+        char nm[32];
+        snprintf(nm, sizeof nm, "k%zu.bin", l);
+        DUMP(nm, (const uint8_t *)sx_buffer_contents(kc.buffer) + kc.offset, rows * KVD * elem);
+        snprintf(nm, sizeof nm, "v%zu.bin", l);
+        DUMP(nm, (const uint8_t *)sx_buffer_contents(vc.buffer) + vc.offset, rows * KVD * elem);
+    }
+    snprintf(path, sizeof path, "%s/meta.json", dir);
+    if ((f = fopen(path, "w"))) {
+        fprintf(f, "{\"p0\": %zu, \"x\": %u, \"kv_half\": %d, \"tap_t\": %u, \"tap_pos0\": %u, \"pch\": %d, \"drafts\": [", d->pos, x,
+                d->kv_half ? 1 : 0, ds->tap_t, ds->tap_pos0, PCH);
+        for (size_t i = 0; i < nd; i++) fprintf(f, "%s%u", i ? ", " : "", drafts[i]);
+        fprintf(f, "]}\n");
+        fclose(f);
+    }
+#undef DUMP
+    dbg("model: DSpark dump in %s\n", dir);
+}
+
+// The drafter's block and Markov head after the trunk's last committed token: up to k drafts
+// for the token x at position s->pos.
+static Err ds_draft(Model *m, Session *d, uint32_t x, size_t k, uint32_t *out, size_t *nd) {
+    Ds *ds = &m->ds;
+    const uint32_t p0 = (uint32_t)d->pos, nk = (uint32_t)MIN(k, (size_t)DS_BLK - 1);
+    *nd = 0;
+    if (nk == 0 || p0 == 0) return OK;
+    TRY(stage_tokens(m, &x, 1));
+    ds_rope_rows(m, PCH, p0, DS_BLK);
+    ((uint32_t *)sx_buffer_contents(ds->a))[ds->off[DA_PREV]] = x;
+    memset(gpu_floats(ds->a) + ds->off[DA_STATE], 0, DS_R * 4);
+    Enc enc = {sx_cmd_begin(m->g->dev), m->g}, *c = &enc;
+    if (!c->cmd) return "GpuFailed";
+    const sx_arg res = dsa(m, DA_RES), xn = dsa(m, DA_XN), cs = AT(ds->cs, PCH * (HD / 2) * 2 * 4);
+    // the block: the anchor's normalized embedding, then mask rows
+    enc_norm(m, c, B(m->stage), H, m->embed_norm, true, res, 1);
+    for (uint32_t r = 1; r < DS_BLK; r++) enc_copy(m, c, dsw(m, ds->mask), OFF(res, r * H), H);
+    for (size_t l = 0; l < DS_L; l++) {
+        if (l == 0) enc_norm(m, c, res, H, dsw(m, ds->iln[0]), true, xn, DS_BLK);
+        else {
+            struct { uint32_t h; float eps; } ap = {H, EPS};
+            DISP(c, m->p.ds_addn, DS_BLK, 1, 1, 256, res, dsa(m, DA_O), dsw(m, ds->iln[l]), xn, BYTES(ap));
+        }
+        ds_lin(m, c, ds->q[l], H, 0, H, QD, xn, H, dsa(m, DA_Q), QD, DS_BLK);
+        ds_lin(m, c, ds->k[l], H, 0, H, KVD, xn, H, dsa(m, DA_KB), KVD, DS_BLK);
+        ds_lin(m, c, ds->v[l], H, 0, H, KVD, xn, H, dsa(m, DA_VB), KVD, DS_BLK);
+        struct { uint32_t heads, hd, xs, norm; float eps; } rq = {NH, HD, QD, 1, EPS}, rk = {NKV, HD, KVD, 1, EPS};
+        DISP(c, m->p.ds_rope, NH, DS_BLK, 1, HD / 2, dsa(m, DA_Q), dsw(m, ds->qn[l]), cs, BYTES(rq));
+        DISP(c, m->p.ds_rope, NKV, DS_BLK, 1, HD / 2, dsa(m, DA_KB), dsw(m, ds->kn[l]), cs, BYTES(rk));
+        sx_arg kc, vc;
+        uint32_t ring;
+        ds_planes(d, l, &kc, &vc, &ring);
+        // every block row sits at the block's last position p0 + 7 (vLLM ef687f6
+        // ops/attention.py:903-917): a local layer sees the 1024 keys up to it
+        const bool local = config_mtp_layer_kinds[l] == LAYER_KIND_LOCAL;
+        const uint32_t lo = !local ? 0 : (p0 + DS_BLK > WIN ? p0 + DS_BLK - WIN : 0), range = p0 + DS_BLK - lo;
+        const uint32_t nsplit = MIN((uint32_t)NSPLIT_DEC, MAX(1u, (range + 255) / 256)), span = (range + nsplit - 1) / nsplit;
+        struct { uint32_t nh, nkv, hd, p0, lo, ring, nsplit, span; float scale; } ap = {NH, NKV, HD, p0, lo, ring, nsplit, span,
+                                                                                         1.0f / sqrtf((float)HD)};
+        DISP(c, d->kv_half ? m->p.ds_attn_h : m->p.ds_attn, NKV, nsplit, DS_BLK, 128, dsa(m, DA_Q), kc, vc, dsa(m, DA_KB), dsa(m, DA_VB),
+             B(m->part), BYTES(ap));
+        AttP mp = {NH, NKV, HD, DREL, EXT, 0, 0, 0, nsplit, span, DS_BLK, 1.0f};
+        DISP(c, m->p.attn_merge, NH, DS_BLK, 1, HD, B(m->part), dsa(m, DA_SINK), dsa(m, DA_GATE1), dsa(m, DA_ATT), BYTES(mp));
+        ds_lin(m, c, ds->o[l], QD, 0, QD, H, dsa(m, DA_ATT), QD, dsa(m, DA_O), H, DS_BLK);
+        struct { uint32_t h; float eps; } ap2 = {H, EPS};
+        DISP(c, m->p.ds_addn, DS_BLK, 1, 1, 256, res, dsa(m, DA_O), dsw(m, ds->pln[l]), xn, BYTES(ap2));
+        ds_lin(m, c, ds->gt[l], H, 0, H, DS_FF, xn, H, dsa(m, DA_G), DS_FF, DS_BLK);
+        ds_lin(m, c, ds->up[l], H, 0, H, DS_FF, xn, H, dsa(m, DA_U), DS_FF, DS_BLK);
+        uint32_t nn = DS_BLK * DS_FF;
+        DISP(c, m->p.ds_silu, (nn + 255) / 256, 1, 1, 256, dsa(m, DA_G), dsa(m, DA_U), dsa(m, DA_HM), BYTES(nn));
+        ds_lin(m, c, ds->dn[l], DS_FF, 0, DS_FF, H, dsa(m, DA_HM), DS_FF, dsa(m, DA_O), H, DS_BLK);
+    }
+    {
+        struct { uint32_t h; float eps; } ap = {H, EPS};
+        DISP(c, m->p.ds_addn, DS_BLK, 1, 1, 256, res, dsa(m, DA_O), dsw(m, ds->norm), xn, BYTES(ap));
+    }
+    // the Markov head's inputs: f_rnn, [h_i, f_rnn] for rows 1..7, base logits of rows 1..7
+    {
+        struct { uint32_t h, ts; float eps; } mp = {H, H, EPS};
+        DISP(c, m->p.ds_mix, 1, 1, 1, 256, dsa(m, DA_FTAP), dsw(m, ds->alpha + 3 * 16), dsw(m, ds->mdfl), dsa(m, DA_FRNN), BYTES(mp));
+    }
+    for (uint32_t i = 0; i < DS_BLK - 1; i++) {
+        enc_copy(m, c, OFF(xn, (i + 1) * H), OFF(dsa(m, DA_INP), i * 2 * H), H);
+        enc_copy(m, c, dsa(m, DA_FRNN), OFF(dsa(m, DA_INP), i * 2 * H + H), H);
+    }
+    ds_lin(m, c, ds->rnn, 2 * DS_R + 2 * H, 2 * DS_R, 2 * H, 3 * DS_R, dsa(m, DA_INP), 2 * H, dsa(m, DA_MCTX), 3 * DS_R, nk);
+    enc_lin(m, c, &m->lm_head, OFF(xn, H), dsa(m, DA_BASE), nk, VOCAB);
+    const uint32_t ng = (VOCAB + 255) / 256, ldr = 2 * DS_R + 2 * H;
+    for (uint32_t i = 0; i < nk; i++) {
+        DISP(c, m->p.ds_step, 1, 1, 1, 256, OFF(dsa(m, DA_MCTX), i * 3 * DS_R), dsw(m, ds->rnnb), dsa(m, DA_STATE), dsa(m, DA_PREV),
+             dsw(m, ds->w1), dsw(m, ds->rnn), dsa(m, DA_LAT), BYTES(ldr));
+        uint32_t vv = VOCAB;
+        DISP(c, m->p.ds_fold, ng, 1, 1, 256, OFF(dsa(m, DA_BASE), (size_t)i * VOCAB), B(ds->foldb), B(ds->fold), dsa(m, DA_LAT),
+             dsa(m, DA_PART), BYTES(vv));
+        DISP(c, m->p.ds_argmax, 1, 1, 1, 256, dsa(m, DA_PART), BYTES(ng), dsa(m, DA_DRAFT), dsa(m, DA_PREV), BYTES(i));
+    }
+    char err[512];
+    if (sx_cmd_finish(c->cmd, err, sizeof err) != 0) {
+        dbg("command buffer: %s\n", err);
+        return "GpuFailed";
+    }
+    const uint32_t *dr = (const uint32_t *)sx_buffer_contents(ds->a) + ds->off[DA_DRAFT];
+    for (uint32_t i = 0; i < nk; i++) {
+        if (dr[i] >= VOCAB) break;
+        out[(*nd)++] = dr[i];
+    }
+    if (getenv("SAETTA_DS_DUMP") && !ds->dumped) ds_dump(m, d, x, out, *nd);
+    return OK;
+}
+
+static Err ds_load_file(Arena *arena, Model *m, Gpu *g, const char **pathp) {
+    Ds *ds = &m->ds;
+    const char *dv = getenv("SAETTA_DSPARK");
+    const char *cand[3] = {dv && strcmp(dv, "1") != 0 ? dv : NULL, path_join(arena, m->pack->dir, "mtp.safetensors"), NULL};
+    {
+        const DownloadPack *dp = download_find("inkling-dspark");
+        char *dir;
+        if (dp && !download_pack_dir(arena, dp, &dir)) cand[2] = path_join(arena, dir, "mtp.safetensors");
+    }
+    const char *path = NULL;
+    for (int i = 0; i < 3 && !path; i++)
+        if (cand[i] && access(cand[i], R_OK) == 0) path = cand[i];
+    if (!path) return OK;
+    *pathp = path;
+    size_t flen;
+    const uint8_t *bytes = sx_map_file(path, &flen);
+    if (!bytes) return "MapFailed";
+    StrMap tm = {0};
+    Err e = safetensors_parse(arena, bytes, flen, 0, &tm);
+    // layout: bf16 matrices first, then f32 vectors (norms, mask, bias, fuse softmax)
+    size_t used = 0;
+    const char *names_m[] = {"q_proj", "k_proj", "v_proj", "k_proj_ctx", "v_proj_ctx", "o_proj"};
+    struct { const char *name; size_t *off; uint64_t numel; } mats[64];
+    size_t nm = 0;
+    char nb[128];
+#define DSN(...) (snprintf(nb, sizeof nb, __VA_ARGS__), arena_strdup(arena, nb))
+    for (size_t l = 0; l < DS_L; l++) {
+        size_t *offs[6] = {&ds->q[l], &ds->k[l], &ds->v[l], &ds->kc[l], &ds->vc[l], &ds->o[l]};
+        const uint64_t ne[6] = {(uint64_t)QD * H, (uint64_t)KVD * H, (uint64_t)KVD * H, (uint64_t)KVD * H, (uint64_t)KVD * H, (uint64_t)H * QD};
+        for (int i = 0; i < 6; i++) mats[nm++] = (typeof(mats[0])){DSN("layers.%zu.self_attn.%s.weight", l, names_m[i]), offs[i], ne[i]};
+        mats[nm++] = (typeof(mats[0])){DSN("layers.%zu.mlp.gate_proj.weight", l), &ds->gt[l], (uint64_t)DS_FF * H};
+        mats[nm++] = (typeof(mats[0])){DSN("layers.%zu.mlp.up_proj.weight", l), &ds->up[l], (uint64_t)DS_FF * H};
+        mats[nm++] = (typeof(mats[0])){DSN("layers.%zu.mlp.down_proj.weight", l), &ds->dn[l], (uint64_t)H * DS_FF};
+    }
+    mats[nm++] = (typeof(mats[0])){"markov_head.markov_w1.weight", &ds->w1, (uint64_t)CONFIG_VOCAB_SIZE * DS_R};
+    mats[nm++] = (typeof(mats[0])){"markov_head.rnn_proj.weight", &ds->rnn, (uint64_t)3 * DS_R * (2 * DS_R + 2 * H)};
+    struct { const char *name; size_t *off; uint64_t numel; } vecs[64];
+    size_t nv = 0;
+    for (size_t l = 0; l < DS_L; l++) {
+        vecs[nv++] = (typeof(vecs[0])){DSN("layers.%zu.self_attn.q_norm.weight", l), &ds->qn[l], HD};
+        vecs[nv++] = (typeof(vecs[0])){DSN("layers.%zu.self_attn.k_norm.weight", l), &ds->kn[l], HD};
+        vecs[nv++] = (typeof(vecs[0])){DSN("layers.%zu.self_attn.k_norm_ctx.weight", l), &ds->kcn[l], HD};
+        vecs[nv++] = (typeof(vecs[0])){DSN("layers.%zu.input_layernorm.weight", l), &ds->iln[l], H};
+        vecs[nv++] = (typeof(vecs[0])){DSN("layers.%zu.post_attention_layernorm.weight", l), &ds->pln[l], H};
+        vecs[nv++] = (typeof(vecs[0])){DSN("layers.%zu.dflare_norm.weight", l), &ds->dfl[l], H};
+    }
+    vecs[nv++] = (typeof(vecs[0])){"markov_head.dflare_norm.weight", &ds->mdfl, H};
+    vecs[nv++] = (typeof(vecs[0])){"norm.weight", &ds->norm, H};
+    vecs[nv++] = (typeof(vecs[0])){"mask_embed", &ds->mask, H};
+    vecs[nv++] = (typeof(vecs[0])){"markov_head.rnn_proj.bias", &ds->rnnb, 3 * DS_R};
+#undef DSN
+    const TensorInfo *tw[64], *tv[64];
+    for (size_t i = 0; i < nm && !e; i++) {
+        tw[i] = st_get(&tm, mats[i].name);
+        if (!tw[i] || tw[i]->dtype != DTYPE_BF16 || tensor_numel(tw[i]) != mats[i].numel || tw[i]->offset + mats[i].numel * 2 > flen)
+            e = "DSparkTensor";
+        *mats[i].off = used;
+        used = ALIGN_UP(used + mats[i].numel * 2, 16);
+    }
+    for (size_t i = 0; i < nv && !e; i++) {
+        tv[i] = st_get(&tm, vecs[i].name);
+        if (!tv[i] || tv[i]->dtype != DTYPE_BF16 || tensor_numel(tv[i]) != vecs[i].numel || tv[i]->offset + vecs[i].numel * 2 > flen)
+            e = "DSparkTensor";
+        *vecs[i].off = used;
+        used = ALIGN_UP(used + vecs[i].numel * 4, 16);
+    }
+    const TensorInfo *fw = e ? NULL : st_get(&tm, "fuse_weight"), *ho = e ? NULL : st_get(&tm, "markov_head.hidden_out.weight"),
+                     *hb = e ? NULL : st_get(&tm, "markov_head.hidden_out.bias");
+    if (!e && (!fw || fw->dtype != DTYPE_BF16 || tensor_numel(fw) != 16 || fw->offset + 32 > flen || !ho || ho->dtype != DTYPE_BF16 ||
+               tensor_numel(ho) != (uint64_t)H * DS_R || ho->offset + (uint64_t)H * DS_R * 2 > flen || !hb || hb->dtype != DTYPE_BF16 ||
+               tensor_numel(hb) != H || hb->offset + H * 2 > flen))
+        e = "DSparkTensor";
+    ds->alpha = used;
+    used = ALIGN_UP(used + 4 * 16, 16);
+    if (!e) e = gpu_new_buffer(g, used, &ds->w);
+    if (e) {
+        sx_unmap_file(bytes, flen);
+        return e;
+    }
+    uint8_t *base = sx_buffer_contents(ds->w);
+    for (size_t i = 0; i < nm; i++) memcpy(base + *mats[i].off, bytes + tw[i]->offset, mats[i].numel * 2);
+    for (size_t i = 0; i < nv; i++) {
+        float *o = (float *)(base + *vecs[i].off);
+        const uint8_t *src = bytes + tv[i]->offset;
+        for (size_t j = 0; j < vecs[i].numel; j++) {
+            uint16_t b;
+            memcpy(&b, src + 2 * j, 2);
+            o[j] = ops_bf16_to_f32(b);
+        }
+    }
+    {
+        // softmax over the 4 taps of each fuse_weight row (D:506-508: refresh_derived_weights)
+        float *al = (float *)(base + ds->alpha);
+        for (size_t r = 0; r < 4; r++) {
+            double z[4], mx = -INFINITY, sum = 0;
+            for (size_t t = 0; t < 4; t++) {
+                uint16_t b;
+                memcpy(&b, bytes + fw->offset + 2 * (r * 4 + t), 2);
+                z[t] = ops_bf16_to_f32(b);
+                mx = fmax(mx, z[t]);
+            }
+            for (size_t t = 0; t < 4; t++) sum += z[t] = exp(z[t] - mx);
+            for (size_t t = 0; t < 4; t++) al[r * 4 + t] = (float)(z[t] / sum);
+        }
+    }
+    // lm_head . hidden_out and lm_head . hidden_out_bias on the GPU (qmm over the 256 columns of
+    // hidden_out and the bias, then transposed to [vocab][256] f16)
+    sx_buffer *xin = NULL, *prod = NULL;
+    e = gpu_new_buffer(g, (size_t)(DS_R + 1) * H * 4, &xin);
+    if (!e) {
+        float *xi = gpu_floats(xin);
+        for (size_t r = 0; r < DS_R; r++)
+            for (size_t i = 0; i < H; i++) {
+                uint16_t b;
+                memcpy(&b, bytes + ho->offset + 2 * (i * DS_R + r), 2);
+                xi[r * H + i] = ops_bf16_to_f32(b);
+            }
+        for (size_t i = 0; i < H; i++) {
+            uint16_t b;
+            memcpy(&b, bytes + hb->offset + 2 * i, 2);
+            xi[DS_R * H + i] = ops_bf16_to_f32(b);
+        }
+    }
+    sx_unmap_file(bytes, flen);
+    if (!e) e = gpu_new_buffer(g, (size_t)(DS_R + 1) * VOCAB * 4, &prod);
+    if (!e) e = gpu_new_buffer(g, (size_t)VOCAB * DS_R * 2, &ds->fold);
+    if (!e) e = gpu_new_buffer(g, (size_t)VOCAB * 4, &ds->foldb);
+    Enc fenc = {e ? NULL : sx_cmd_begin(g->dev), g};
+    if (!e && !fenc.cmd) e = "GpuFailed";
+    if (!e) {
+        Enc *c = &fenc;
+        enc_lin(m, c, &m->lm_head, B(xin), B(prod), DS_R + 1, VOCAB);
+        uint32_t fp[2] = {VOCAB, DS_R};
+        DISP(c, m->p.ds_fold_t, (VOCAB + 255) / 256, DS_R, 1, 256, B(prod), B(ds->fold), gpu_bytes_arg(fp, 8));
+        uint32_t nb = VOCAB;
+        DISP(c, m->p.copy, (nb + 255) / 256, 1, 1, 256, AT(prod, (size_t)DS_R * VOCAB * 4), B(ds->foldb), BYTES(nb));
+        char err[512];
+        if (sx_cmd_finish(c->cmd, err, sizeof err) != 0) {
+            dbg("command buffer: %s\n", err);
+            e = "GpuFailed";
+        }
+    }
+    if (xin) sx_buffer_release(xin);
+    if (prod) sx_buffer_release(prod);
+    if (e) return e;
+    // activations
+    static const size_t aw[DA_N] = {[DA_RES] = DS_BLK * H, [DA_XN] = DS_BLK * H, [DA_Q] = DS_BLK * QD, [DA_KB] = DS_BLK * KVD,
+                                    [DA_VB] = DS_BLK * KVD, [DA_ATT] = DS_BLK * QD, [DA_O] = DS_BLK * H, [DA_G] = DS_BLK * DS_FF,
+                                    [DA_U] = DS_BLK * DS_FF, [DA_HM] = DS_BLK * DS_FF, [DA_CTX] = PCH * H, [DA_KC] = PCH * KVD,
+                                    [DA_VC] = PCH * KVD, [DA_INP] = (DS_BLK - 1) * 2 * H, [DA_MCTX] = (DS_BLK - 1) * 3 * DS_R,
+                                    [DA_STATE] = DS_R, [DA_LAT] = DS_R, [DA_PREV] = 4, [DA_DRAFT] = DS_BLK,
+                                    [DA_PART] = 2 * ((VOCAB + 255) / 256), [DA_FRNN] = H, [DA_FTAP] = 4 * H,
+                                    [DA_BASE] = (DS_BLK - 1) * VOCAB, [DA_GATE1] = DS_BLK * QD, [DA_SINK] = DS_BLK * NH};
+    size_t o = 0;
+    for (size_t i = 0; i < DA_N; i++) {
+        ds->off[i] = o;
+        o += ALIGN_UP(aw[i], 64);
+    }
+    ds->off[DA_N] = o;
+    TRY(gpu_new_buffer(g, o * 4, &ds->a)); // ds_load releases what was made on an error
+    float *af = gpu_floats(ds->a);
+    for (size_t i = 0; i < DS_BLK * QD; i++) af[ds->off[DA_GATE1] + i] = 1e4f;      // sigmoid: 1
+    for (size_t i = 0; i < DS_BLK * NH; i++) af[ds->off[DA_SINK] + i] = -INFINITY;  // no sink
+    TRY(gpu_new_buffer(g, (size_t)(PCH + DS_BLK) * (HD / 2) * 2 * 4, &ds->cs));
+    ds->on = true;
+    dbg("model: DSpark drafter loaded (%s, %.0f MB)\n", path, (double)used / 1e6);
+    return OK;
+}
+
+// Loads the DSpark drafter only when asked: SAETTA_DSPARK=1 (the pack folder's mtp.safetensors,
+// else the inkling-dspark download's) or SAETTA_DSPARK=<file>; never with SAETTA_MTP=0 or
+// SAETTA_SPEC=0. Off by default: at 4K, prompt lookup alone decodes faster than lookup with the
+// drafter (an 8-row verify pass costs about 3 single steps). A missing file leaves it off; a file
+// that does not load leaves it off with a warning (the model runs without it).
+static Err ds_load(Arena *arena, Model *m, Gpu *g) {
+    const char *mv = getenv("SAETTA_MTP"), *sv = getenv("SAETTA_SPEC"), *dv = getenv("SAETTA_DSPARK");
+    if (!dv || !dv[0] || dv[0] == '0') return OK; // opt-in
+    if ((mv && mv[0] == '0') || (sv && sv[0] == '0')) return OK; // no drafts: no drafter context per token either
+    const char *path = "?";
+    Err e = ds_load_file(arena, m, g, &path);
+    if (e) {
+        dbg("saetta: warning: the DSpark drafter %s did not load (%s); Inkling 2 Mini runs without it\n", path, e);
+        Ds *ds = &m->ds;
+        sx_buffer *bufs[] = {ds->w, ds->fold, ds->foldb, ds->a, ds->cs};
+        for (size_t i = 0; i < COUNT(bufs); i++)
+            if (bufs[i]) sx_buffer_release(bufs[i]);
+        *ds = (Ds){0};
+    }
+    return OK;
+}
+
+// The commit of a verification chunk's first n rows (accepted drafts and the token before them)
+// at positions pos0..: conv states and caches from the saved rows, the drafter's context.
+static void enc_commit(Model *m, Session *d, Enc *c, uint32_t pos0, uint32_t n) {
+    for (size_t v = 0; v < NVIS; v++) {
+        const sx_arg conv = AT(d->bk, v * CONV_VIS * 4), sk = AT(m->spk, v * KMAX * SPK_W * 4);
+        enc_conv_state(m, c, sk, conv, KVD, n);
+        enc_conv_state(m, c, OFF(sk, KMAX * KVD), OFF(conv, 3 * KVD), KVD, n);
+        enc_conv_state(m, c, OFF(sk, 4 * KMAX * KVD), OFF(conv, 6 * KVD), H, n);
+        enc_conv_state(m, c, OFF(sk, 4 * KMAX * KVD + KMAX * H), OFF(conv, 6 * KVD + 3 * H), H, n);
+        const bool full = is_full(vis_layer[v]);
+        const size_t elem = d->kv_half ? 2 : 4;
+        sx_arg kc, vc;
+        uint32_t ring;
+        if (full) {
+            const size_t plane = (size_t)d->cap * KVD * elem;
+            kc = AT(d->kv, vis_kv[v] * 2 * plane);
+            vc = AT(d->kv, (vis_kv[v] * 2 + 1) * plane);
+            ring = 0;
+        } else {
+            const size_t plane = (size_t)WIN * KVD * elem;
+            kc = AT(d->ixk, vis_kv[v] * 2 * plane);
+            vc = AT(d->ixk, (vis_kv[v] * 2 + 1) * plane);
+            ring = WIN;
+        }
+        StP sp = {KVD, pos0, ring, n};
+        DISP(c, d->kv_half ? m->p.kv_store_h : m->p.kv_store, KVD / 256, n, 1, 256, OFF(sk, 2 * KMAX * KVD), OFF(sk, 3 * KMAX * KVD), kc,
+             vc, BYTES(sp));
+    }
+    if (m->ds.on) enc_ds_ctx(m, d, c, n, pos0);
+}
+
+// The sliding rings' rows at pos0..pos0 + T - 1 to (dir 0) or from (1) the backup, and the conv
+// states likewise: what a commit replaces.
+static void enc_backup(Model *m, Session *d, Enc *c, uint32_t pos0, uint32_t T, uint32_t dir) {
+    const size_t elem = d->kv_half ? 2 : 4;
+    struct { uint32_t words, pos0, ring, kmax, dir; } rp = {(uint32_t)(KVD * elem / 4), pos0, WIN, KMAX, dir};
+    DISP(c, m->p.ds_ring, (rp.words + 255) / 256, T, n_swa_vis * 2, 256, B(d->ixk), B(m->spb), BYTES(rp));
+    const uint32_t nc = (uint32_t)(CONV_BYTES / 4);
+    const sx_arg cb = AT(m->spb, (size_t)n_swa_vis * 2 * KMAX * KVD * 4);
+    if (dir == 0) DISP(c, m->p.copy, (nc + 255) / 256, 1, 1, 256, B(d->bk), cb, BYTES(nc));
+    else DISP(c, m->p.copy, (nc + 255) / 256, 1, 1, 256, cb, B(d->bk), BYTES(nc));
+}
+
 // ---- sessions -----------------------------------------------------------------------------
 
-// KV in f32 whatever kv_half asks (no f16 attention kernels yet); session_kv_elem says so, and
-// the server's memory fit counts it.
+// KV in f16 when kv_half (the server's default; SAETTA_KV_F32 and verify's exact checks ask f32),
+// the full visits' and the rings alike.
 Err session_create_cap(Gpu *g, bool kv_half, size_t cap, size_t max_cap, Session **out) {
-    (void)kv_half;
     cap = ALIGN_UP(MIN(MAX(cap, (size_t)4), max_cap), 4);
     Session *s = xcalloc(1, sizeof *s);
     s->arch = &inkling_arch;
     s->cap = cap;
     s->max_cap = max_cap;
-    s->kv_half = false;
+    s->kv_half = kv_half;
     s->roll = SESSION_NO_ROLL;
-    TRY(gpu_new_buffer(g, kvf_bytes(cap), &s->kv));
-    TRY(gpu_new_buffer(g, RING_BYTES, &s->ixk));
+    const size_t elem = kv_half ? 2 : 4;
+    TRY(gpu_new_buffer(g, kvf_bytes(cap, elem), &s->kv));
+    TRY(gpu_new_buffer(g, RING_BYTES(elem), &s->ixk));
     TRY(gpu_new_buffer(g, CONV_BYTES, &s->bk));
     TRY(gpu_new_buffer(g, (size_t)NVIS * H * 4, &s->trace_buf));
     *out = s;
@@ -876,7 +1471,7 @@ Err session_create_kv(Gpu *g, bool kv_half, Session **out) {
     TRY(session_ctx_parse(getenv("SAETTA_CTX"), CONFIG_MODEL_MAX_LENGTH, &cap));
     return session_create_cap(g, kv_half, cap, cap, out);
 }
-Err session_create(Gpu *g, Session **out) { return session_create_kv(g, false, out); }
+Err session_create(Gpu *g, Session **out) { return session_create_kv(g, getenv("SAETTA_KV_F32") == NULL, out); }
 
 void session_reset(Session *s) {
     s->pos = 0;
@@ -885,23 +1480,25 @@ void session_reset(Session *s) {
     memset(sx_buffer_contents(s->bk), 0, sx_buffer_length(s->bk));
 }
 
-size_t session_kv_elem(const Session *s) { (void)s; return 4; }
+size_t session_kv_elem(const Session *s) { return s->kv_half ? 2 : 4; }
 // The bytes that grow with the capacity (the full visits' KV); the rings and conv states are
 // fixed (session_conv_bytes).
 size_t session_kv_bytes(const Session *s, size_t cap) {
-    (void)s;
-    return kvf_bytes(cap);
+    return kvf_bytes(cap, session_kv_elem(s));
 }
-size_t session_conv_bytes(const Session *s, size_t cap) { return session_kv_bytes(s, cap) + RING_BYTES + CONV_BYTES; }
+size_t session_conv_bytes(const Session *s, size_t cap) {
+    return session_kv_bytes(s, cap) + RING_BYTES(session_kv_elem(s)) + CONV_BYTES;
+}
 
 // The full visits' rows below s->pos copied into new buffers of capacity cap.
-static Err regrow(Gpu *g, sx_buffer **kv, size_t old_cap, size_t cap, size_t rows) {
+// The peak is both buffers (session_conv_bytes doubled in the server's fit).
+static Err regrow(Gpu *g, sx_buffer **kv, size_t old_cap, size_t cap, size_t rows, size_t elem) {
     sx_buffer *nb;
-    TRY(gpu_new_buffer(g, kvf_bytes(cap), &nb));
-    const size_t row = KVD * 4;
+    TRY(gpu_new_buffer(g, kvf_bytes(cap, elem), &nb));
+    const size_t row = KVD * elem;
     const uint8_t *src = sx_buffer_contents(*kv);
     uint8_t *dst = sx_buffer_contents(nb);
-    for (size_t plane = 0; plane < n_full_vis * 2; plane++) memcpy(dst + plane * cap * row, src + plane * old_cap * row, rows * row);
+    for (size_t plane = 0; plane < n_kvf_planes * 2; plane++) memcpy(dst + plane * cap * row, src + plane * old_cap * row, rows * row);
     sx_buffer_release(*kv);
     *kv = nb;
     return OK;
@@ -910,7 +1507,7 @@ static Err regrow(Gpu *g, sx_buffer **kv, size_t old_cap, size_t cap, size_t row
 Err session_grow(Session *s, Gpu *g, size_t cap) {
     if (!(cap >= s->cap && cap <= s->max_cap && cap % 4 == 0)) die("session_grow: bad capacity %zu\n", cap);
     if (cap == s->cap) return OK;
-    TRY(regrow(g, &s->kv, s->cap, cap, s->pos));
+    TRY(regrow(g, &s->kv, s->cap, cap, s->pos, session_kv_elem(s)));
     s->cap = cap;
     return OK;
 }
@@ -939,19 +1536,17 @@ void session_restore(Session *s) {
 }
 
 Err session_new_conv(const Session *s, Gpu *g, size_t cap, Conv *out) {
-    (void)s;
     Conv cv = {0};
     cv.cap = cap;
-    TRY(gpu_new_buffer(g, kvf_bytes(cap), &cv.kv));
-    TRY(gpu_new_buffer(g, RING_BYTES, &cv.ixk));
+    TRY(gpu_new_buffer(g, kvf_bytes(cap, session_kv_elem(s)), &cv.kv));
+    TRY(gpu_new_buffer(g, RING_BYTES(session_kv_elem(s)), &cv.ixk));
     TRY(gpu_new_buffer(g, CONV_BYTES, &cv.bk));
     *out = cv;
     return OK;
 }
 Err session_conv_shrink(const Session *s, Gpu *g, Conv *cv, size_t cap) {
-    (void)s;
     sx_buffer *nb;
-    TRY(gpu_new_buffer(g, kvf_bytes(cap), &nb));
+    TRY(gpu_new_buffer(g, kvf_bytes(cap, session_kv_elem(s)), &nb));
     sx_buffer_release(cv->kv);
     cv->kv = nb;
     cv->cap = cap;
@@ -997,7 +1592,7 @@ void model_prof_report(size_t tokens) {
         dbg("  %-18s %8.3f ms  %5.1f%%  %6.1f calls\n", prof.name[i], prof.s[i] * 1e3 / (double)tokens, 100 * prof.s[i] / tot,
             (double)prof.calls[i] / (double)tokens);
 }
-bool model_has_mtp(const Model *m) { (void)m; return false; }
+bool model_has_mtp(const Model *m) { return m->ds.on; }
 bool model_fast_prefill(const Model *m) { return m->fast_prefill; }
 bool model_fast_prefill_available(const Model *m) { (void)m; return true; }
 void model_set_fast_prefill(Model *m, bool on) { m->fast_prefill = on; }
@@ -1005,18 +1600,55 @@ static uint32_t greedy_pick(void *ctx, const float *row, bool has_draft, uint32_
     (void)ctx, (void)has_draft, (void)draft;
     return model_argmax(row, VOCAB);
 }
+// Verification: x and the drafts as one chunk through the 48 visits (the same bits per token as
+// decode: src/kernels and enc_lin), nothing committed while it runs; the longest prefix of drafts
+// the rule agrees with is accepted, and only x and those rows are committed (conv states, rings,
+// caches, the drafter's context), after the backup of what the commit replaces
+// (session_roll_to). Rejected rows never reach a ring or a conv state.
 Err model_spec_verify(Model *m, Session *s, uint32_t x, const uint32_t *drafts, size_t nd, SpecPick pick, void *ctx,
                       SpecResult *out) {
-    (void)m, (void)s, (void)x, (void)drafts, (void)nd, (void)pick, (void)ctx, (void)out;
-    return NI;
+    if (!(nd >= 1 && nd < KMAX)) die("model_spec_verify: %zu drafts\n", nd);
+    uint32_t toks[KMAX];
+    toks[0] = x;
+    memcpy(toks + 1, drafts, nd * sizeof(uint32_t));
+    const uint32_t T = (uint32_t)(1 + nd), pos0 = (uint32_t)s->pos;
+    m->spec_chunk = true;
+    Err err = run_chunk(m, s, toks, T, NULL, 0, 1, true);
+    m->spec_chunk = false;
+    TRY(err);
+    const float *lg = gpu_floats(m->logits);
+    size_t j = 0;
+    uint32_t next = pick(ctx, lg, true, drafts[0]);
+    while (j < nd && next == drafts[j]) {
+        j += 1;
+        next = pick(ctx, lg + j * VOCAB, j < nd, j < nd ? drafts[j] : 0);
+    }
+    const uint32_t n = (uint32_t)j + 1;
+    if (m->ds.on) ds_rope_rows(m, 0, pos0, n);
+    Enc enc = {sx_cmd_begin(m->g->dev), m->g}, *c = &enc;
+    if (!c->cmd) return "GpuFailed";
+    enc_backup(m, s, c, pos0, n, 0);
+    enc_commit(m, s, c, pos0, n);
+    char e2[512];
+    if (sx_cmd_finish(c->cmd, e2, sizeof e2) != 0) {
+        dbg("command buffer: %s\n", e2);
+        return "GpuFailed";
+    }
+    s->pos = pos0 + n;
+    s->chunk_pos0 = pos0;
+    s->chunk_t = n;
+    for (int k = 0; k < 2; k++)
+        if (s->ck[k].tokens.len != s->pos) s->ck[k].tokens.len = 0;
+    *out = (SpecResult){j, next};
+    return OK;
 }
 Err model_spec_greedy(Model *m, Session *s, uint32_t x, const uint32_t *drafts, size_t nd, SpecResult *out) {
     return model_spec_verify(m, s, x, drafts, nd, greedy_pick, NULL, out);
 }
 Err model_draft_mtp(Model *m, Session *s, uint32_t x, size_t k, uint32_t *out, size_t *nd) {
-    (void)m, (void)s, (void)x, (void)k, (void)out;
     *nd = 0;
-    return OK;
+    if (!m->ds.on) return OK;
+    return ds_draft(m, s, x, k, out, nd);
 }
 Err model_lora_load(Arena *a, Model *m, const char *name, const char *dir) { (void)a, (void)m, (void)name, (void)dir; return NI; }
 int model_lora_find(const Model *m, const char *name) { (void)m, (void)name; return -1; }
@@ -1024,7 +1656,26 @@ void model_lora_select(Model *m, int idx) { (void)m, (void)idx; }
 int model_lora_selected(const Model *m) { (void)m; return -1; }
 size_t model_lora_count(const Model *m) { (void)m; return 0; }
 const char *model_lora_name(const Model *m, size_t i) { (void)m, (void)i; return NULL; }
-bool session_roll_to(Session *s, size_t p, const uint32_t *toks) { (void)s, (void)p, (void)toks; return false; }
+// Back to just after token p - 1 inside the last verification chunk (a reply that ended with
+// accepted drafts still queued): the conv states and ring rows its commit replaced come back
+// from the backup, then the chunk's first p - chunk_pos0 rows are committed again.
+bool session_roll_to(Session *s, size_t p, const uint32_t *toks) {
+    (void)toks;
+    Model *m = (Model *)ds_model;
+    if (!m || s->chunk_t == 0 || p <= s->chunk_pos0 || p > s->chunk_pos0 + s->chunk_t) return false;
+    if (p == s->pos) return true;
+    const uint32_t pos0 = (uint32_t)s->chunk_pos0, n = (uint32_t)(p - s->chunk_pos0);
+    if (m->ds.on) ds_rope_rows(m, 0, pos0, n);
+    Enc enc = {sx_cmd_begin(m->g->dev), m->g}, *c = &enc;
+    if (!c->cmd) return false;
+    enc_backup(m, s, c, pos0, (uint32_t)s->chunk_t, 1);
+    enc_commit(m, s, c, pos0, n);
+    char err[512];
+    if (sx_cmd_finish(c->cmd, err, sizeof err) != 0) return false;
+    s->pos = p;
+    s->chunk_t = n;
+    return true;
+}
 Err session_save_point(Session *s, Gpu *g, const uint32_t *toks, size_t n) { (void)s, (void)g, (void)toks, (void)n; return OK; }
 void session_start_at_own_point(Session *s, size_t n) { (void)s, (void)n; }
 Err session_start_from(Session *s, Gpu *g, const Conv *src, size_t n) { (void)s, (void)g, (void)src, (void)n; return NI; }
@@ -1041,7 +1692,6 @@ const ModelArch inkling_arch = MODEL_ARCH_TABLE({
     .eos = config_eos_token_ids,
     .n_eos = CONFIG_N_EOS_TOKEN_IDS,
     .max_positions = CONFIG_MODEL_MAX_LENGTH,
-    .no_spec = true,
     .chat = CHAT_INKLING,
 });
 
@@ -1050,11 +1700,13 @@ const ModelArch inkling_arch = MODEL_ARCH_TABLE({
 bool inkling_has_routes(const Model *m) { return m->arch == &inkling_arch && m->routes != NULL; }
 void inkling_set_routes(Model *m, InkRouteMode mode) { m->replay = mode == INK_ROUTES_REPLAY; }
 InkRouteStats inkling_route_stats(Model *m) {
-    InkRouteStats r = {0, 0, UINT32_MAX};
+    InkRouteStats r = {0, 0, UINT32_MAX, 0, UINT32_MAX};
     if (!m->rstats) return r;
     uint32_t *st = sx_buffer_contents(m->rstats);
-    r = (InkRouteStats){st[0], st[1], st[2]};
-    st[0] = st[1] = 0;
-    st[2] = UINT32_MAX;
+    float mg;
+    memcpy(&mg, &st[3], 4);
+    r = (InkRouteStats){st[0], st[1], st[2], mg, st[4]};
+    st[0] = st[1] = st[3] = 0;
+    st[2] = st[4] = UINT32_MAX;
     return r;
 }

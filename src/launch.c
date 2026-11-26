@@ -756,15 +756,8 @@ static Err run_in(Arena *a, const char *const *args, size_t n, int *code) {
             break;
         }
     }
-    // the server's rule (session_ctx_parse in src/model.h, limits in src/ctxlimits.h)
-    ctx -= ctx % SESSION_CTX_ALIGN;
-    if (ctx < SESSION_CTX_MIN || ctx > SESSION_CTX_QWEN_MAX) {
-        dbg("saetta: --ctx / SAETTA_CTX wants %d to %zu tokens\n", SESSION_CTX_MIN, SESSION_CTX_QWEN_MAX);
-        *code = 64;
-        return OK;
-    }
     // the model the agent asks for: the adapter's name with --lora, else the pack's base id
-    bool is27 = false;
+    bool is27 = false, inkling = false;
     if (pack_arg) {
         const char *dir;
         TRY(pack_for(a, pack_arg, &dir));
@@ -773,9 +766,19 @@ static Err run_in(Arena *a, const char *const *args, size_t n, int *code) {
             size_t cl;
             if (!read_file(path_join(a, dir, "config.json"), 4u << 20, &cfg, &cl)) {
                 is27 = strstr(cfg, "\"qwen3_5_text\"") != NULL;
+                inkling = strstr(cfg, "\"inkling2_loop_text\"") != NULL;
                 free(cfg);
             }
         }
+    }
+    // the server's rule (session_ctx_parse in src/model.h, limits in src/ctxlimits.h): the pack's
+    // largest context (Inkling 2 Mini 1M tokens, the Qwen models 256K)
+    const size_t ctx_max = inkling ? SESSION_CTX_INKLING_MAX : SESSION_CTX_QWEN_MAX;
+    ctx -= ctx % SESSION_CTX_ALIGN;
+    if (ctx < SESSION_CTX_MIN || ctx > ctx_max) {
+        dbg("saetta: --ctx / SAETTA_CTX wants %d to %zu tokens\n", SESSION_CTX_MIN, ctx_max);
+        *code = 64;
+        return OK;
     }
     if (loras.n) {
         if (!pack_arg) {

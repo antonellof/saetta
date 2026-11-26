@@ -160,15 +160,26 @@
 // values, f64 sums) on random data: max |gpu - ref| / max |ref| per output. f32 sums of up to
 // 2304 terms in a different order.
 #define TOL_INK_KERNEL_REL 2e-5f // f32
+// The f16-cache prompt attention (ink_attn_flash_mma: half Q, K, V and probabilities in the
+// simdgroup matrix products, f32 sums) against the f64 reference on the rounded cache.
+#define TOL_INK_ATTN_HALF_REL 2e-3f // f32 (measured 4.2e-4)
 // Inkling verify: a router whose own top-8 differs from the oracle's where the oracle's 8th - 9th
-// biased-score margin exceeds this is a bug, not rounding (f32 scores of these sizes differ from
-// f64 by about 1e-6; measured near ties are 3e-7 to 1e-6).
-#define TOL_INK_ROUTE_MARGIN 1e-4f // f32
+// biased-score margin exceeds this is a bug, not rounding. f32 rounding of the 48 visits (hidden
+// states within about 1e-5 of the oracle) moves router scores by up to about 2e-4: measured one
+// flip at margin 1.75e-4 (8329-token golden, token 5392, 256-token prefill chunks, with the tiled
+// prompt attention; the earlier kernel had none over 1e-4 at the same visit error); the measured
+// near ties are 3e-7 to 1e-6. A golden flipping between 3e-4 and 1e-3 is a finding, not a reason
+// to widen this.
+#define TOL_INK_ROUTE_MARGIN 3e-4f // f32
 // The share of positions whose greedy argmax is skipped as a near tie (TOL_ARGMAX_MARGIN) may not
 // exceed this (measured 3 of 8329, 0.04%).
 #define TOL_INK_ARGMAX_SKIP_FRAC 0.005 // f64
 // Own routing, at the dumped positions before the first position where any visit's router
 // differs from the oracle's: the same per-visit bound as on the oracle's experts.
 #define TOL_INK_OWN_LAYER_REL 5e-5f // f32
+// Own routing after the first route that differs from the oracle's: the share of positions outside
+// near ties whose greedy argmax equals the oracle's (measured 1814 of 1815 after a near-tie flip
+// at token 992 of the 1815-token golden).
+#define TOL_INK_OWN_ARGMAX_AGREE 0.99 // f64
 
 #endif

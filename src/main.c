@@ -90,7 +90,10 @@ static Err decode_loop(Model *m, Session *s, float *logits, const uint32_t *toks
     const char *sv = getenv("SAETTA_SPEC");
     bool use_spec = (sv ? sv[0] != '0' : true) && !model_info(m)->no_spec;
     Gate gate = GATE_INIT;
+    const ModelInfo *mi = model_info(m);
     Depth depth = DEPTH_INIT;
+    if (mi->depth_ms) memcpy(depth.ms, mi->depth_ms, sizeof depth.ms);
+    const size_t mtp_k = mi->mtp_kmax ? mi->mtp_kmax : KMAX - 1, lookup_enough = mi->mtp_no_lookup ? 1 : 3;
     for (size_t i = 0; i < ntoks; i++) lookup_push(lk, toks[i]);
     uint32_t x = model_argmax(logits, model_info(m)->vocab);
     while (gs->done < n) {
@@ -103,13 +106,13 @@ static Err decode_loop(Model *m, Session *s, float *logits, const uint32_t *toks
         uint64_t tr0 = now_ns();
         size_t nd = use_spec ? lookup_draft(lk, drafts, gate_depth(&gate, KMAX - 1)) : 0;
         bool from_mtp = false;
-        if (use_spec && nd < 3 && model_has_mtp(m)) {
+        if (use_spec && nd < lookup_enough && model_has_mtp(m)) {
             // SAETTA_MTP_K fixes the depth; otherwise the controller picks it
             size_t k;
             const char *kv = getenv("SAETTA_MTP_K");
             if (kv) {
                 if (parse_usize(kv, &k)) k = 2;
-            } else k = depth_pick(&depth, KMAX - 1);
+            } else k = depth_pick(&depth, mtp_k);
             uint64_t td0 = now_ns();
             TRY(model_draft_mtp(m, s, x, MIN(k, (size_t)(KMAX - 1)), drafts, &nd));
             gs->t_draft += now_ns() - td0;

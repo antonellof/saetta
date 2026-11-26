@@ -337,6 +337,10 @@ typedef struct {
     bool unavailable;   // a pack not downloaded yet (choosing it offers the download)
     bool too_big;       // its memory need exceeds this Mac's
     unsigned disk_gb, min_ram_gb;
+    // a pack's speculative drafter (inkling-dspark): `drafter` marks its own row (choosing it
+    // downloads it), drafter_note the model row's word on it ("DSpark drafter: downloaded")
+    bool drafter;
+    const char *drafter_note;
     // a pack's name and quantization for the footer (code_cfg.h cfg_pack_label), the brief one
     // without "(mixed ...)"; NULL: the footer shows the id, as pi does
     const char *label, *label_brief;

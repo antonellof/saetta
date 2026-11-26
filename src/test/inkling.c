@@ -246,7 +246,7 @@ TEST(ink_router) {
     sx_buffer *bl;
     EXPECT_OK(fbuf(&x, NULL, T * E, &bl));
     sx_buffer *bst, *bmg;
-    EXPECT_OK(gpu_new_buffer(&x.g, 16, &bst));
+    EXPECT_OK(gpu_new_buffer(&x.g, 32, &bst));
     EXPECT_OK(fbuf(&x, NULL, T, &bmg));
     RUN(&x, "ink_router_logits", E / 8, T, 1, 256, BA(bx), BA(bW), BA(bl), gpu_bytes_arg(lgp, 8));
     RUN(&x, "ink_router", T, 1, 1, E, BA(bl), BA(bb), BA(bi), BA(bw), BYTES(&p), BA(bi), BA(bmg), BA(bst));
@@ -269,8 +269,8 @@ TEST(ink_router) {
     float mg[3] = {1.0f, 1e-6f, 1e-6f};
     memcpy(sx_buffer_contents(bmg), mg, sizeof mg);
     uint32_t *stt = sx_buffer_contents(bst);
-    stt[0] = stt[1] = 0;
-    stt[2] = UINT32_MAX;
+    stt[0] = stt[1] = stt[3] = 0;
+    stt[2] = stt[4] = UINT32_MAX;
     p.forced = 1;
     p.check = 1;
     p.pos0 = 100;
@@ -296,8 +296,11 @@ TEST(ink_router) {
 }
 
 // A chunk of T queries at pos0 over a ring of `win` rows (positions below pos0) and the chunk's
-// own rows: the window, the relative bias extent, the sink and the gate.
-static Err attn_case(Arena *a, QgenCtx *x, size_t pos0, size_t T, size_t win, size_t ext, size_t nsplit, float *err) {
+// own rows: the window, the relative bias extent, the sink and the gate. half: the cache in f16
+// (the reference then sees the cached keys and values rounded to f16). flash: the prompt-chunk
+// kernel instead of the split-K one.
+static Err attn_case(Arena *a, QgenCtx *x, size_t pos0, size_t T, size_t win, size_t ext, size_t nsplit, bool half, bool flash,
+                     float *err) {
     const size_t ld = NKV * HD, P = pos0 + T;
     float *K = ARENA_ARRAY(a, float, P * ld), *V = ARENA_ARRAY(a, float, P * ld);
     float *q = ARENA_ARRAY(a, float, T * NH * HD), *r = ARENA_ARRAY(a, float, T * NH * DREL), *proj = ARENA_ARRAY(a, float, DREL * ext);
@@ -309,21 +312,30 @@ static Err attn_case(Arena *a, QgenCtx *x, size_t pos0, size_t T, size_t win, si
     fill(x, proj, DREL * ext, -1, 1);
     fill(x, sink, T * NH, -2, 2);
     fill(x, gate, T * NH * HD, -3, 3);
-    const size_t rows = win ? win : P;
-    float *kc = ARENA_ARRAY(a, float, rows * ld), *vc = ARENA_ARRAY(a, float, rows * ld);
-    memset(kc, 0x7f, rows * ld * 4); // rows the kernel must not read: NaN-like garbage
-    memset(vc, 0x7f, rows * ld * 4);
+    if (half)
+        for (size_t i = 0; i < pos0 * ld; i++) K[i] = (float)(_Float16)K[i], V[i] = (float)(_Float16)V[i];
+    const size_t rows = win ? win : P, es = half ? 2 : 4;
+    uint8_t *kc = ARENA_ARRAY(a, uint8_t, rows * ld * es), *vc = ARENA_ARRAY(a, uint8_t, rows * ld * es);
+    memset(kc, 0x7c, rows * ld * es); // rows the kernel must not read: huge or infinite values
+    memset(vc, 0x7c, rows * ld * es);
     for (size_t j = 0; j < pos0; j++)
-        if (!win || j + win >= pos0) {
-            memcpy(kc + (win ? j % win : j) * ld, K + j * ld, ld * 4);
-            memcpy(vc + (win ? j % win : j) * ld, V + j * ld, ld * 4);
-        }
+        if (!win || j + win >= pos0)
+            for (size_t i = 0; i < ld; i++) {
+                const size_t o = (win ? j % win : j) * ld + i;
+                if (half) {
+                    ((_Float16 *)kc)[o] = (_Float16)K[j * ld + i];
+                    ((_Float16 *)vc)[o] = (_Float16)V[j * ld + i];
+                } else {
+                    ((float *)kc)[o] = K[j * ld + i];
+                    ((float *)vc)[o] = V[j * ld + i];
+                }
+            }
     sx_buffer *bq, *br, *bp, *bkc, *bvc, *bkn, *bvn, *bpart, *bs, *bg, *bo;
     TRY(fbuf(x, q, T * NH * HD, &bq));
     TRY(fbuf(x, r, T * NH * DREL, &br));
     TRY(fbuf(x, proj, DREL * ext, &bp));
-    TRY(fbuf(x, kc, rows * ld, &bkc));
-    TRY(fbuf(x, vc, rows * ld, &bvc));
+    TRY(fbuf(x, (const float *)kc, rows * ld * es / 4, &bkc));
+    TRY(fbuf(x, (const float *)vc, rows * ld * es / 4, &bvc));
     TRY(fbuf(x, K + pos0 * ld, T * ld, &bkn));
     TRY(fbuf(x, V + pos0 * ld, T * ld, &bvn));
     TRY(fbuf(x, NULL, T * NH * nsplit * (HD + 2), &bpart));
@@ -332,17 +344,29 @@ static Err attn_case(Arena *a, QgenCtx *x, size_t pos0, size_t T, size_t win, si
     TRY(fbuf(x, NULL, T * NH * HD, &bo));
     const size_t range = win ? MIN(P, win) : P;
     const uint32_t span = (uint32_t)((range + nsplit - 1) / nsplit);
-    struct { uint32_t nh, nkv, hd, drel, ext, pos0, win, ring, nsplit, span; float scale; } p = {
-        NH, NKV, HD, DREL, (uint32_t)ext, (uint32_t)pos0, (uint32_t)win, (uint32_t)win, (uint32_t)nsplit, span, 1.0f / sqrtf((float)HD)};
-    {
+    struct { uint32_t nh, nkv, hd, drel, ext, pos0, win, ring, nsplit, span, t; float scale; } p = {
+        NH, NKV, HD, DREL, (uint32_t)ext, (uint32_t)pos0, (uint32_t)win, (uint32_t)win, (uint32_t)nsplit, span, (uint32_t)T,
+        1.0f / sqrtf((float)HD)};
+    if (flash) {
+        sx_arg af[] = {BA(bq), BA(br), BA(bp), BA(bkc), BA(bvc), BA(bkn), BA(bvn), BA(bs), BA(bg), BA(bo), BYTES(&p)};
+        TRY(run(x, half ? "ink_attn_flash_mma" : "ink_attn_flash", af, COUNT(af), NKV, (T + 15) / 16, 1, half ? 192 : 256));
+    } else {
         sx_arg ar[] = {BA(bq), BA(br), BA(bp), BA(bkc), BA(bvc), BA(bkn), BA(bvn), BA(bpart), BYTES(&p)};
-        TRY(run(x, "ink_attn_part", ar, COUNT(ar), NH, nsplit, T, 128));
+        TRY(run(x, half ? "ink_attn_part_h" : "ink_attn_part", ar, COUNT(ar), NKV, nsplit, T, 128));
         sx_arg am[] = {BA(bpart), BA(bs), BA(bg), BA(bo), BYTES(&p)};
         TRY(run(x, "ink_attn_merge", am, COUNT(am), NH, T, 1, HD));
     }
     float *ref = ARENA_ARRAY(a, float, NH * HD);
     *err = 0;
     for (size_t t = 0; t < T; t++) {
+        // the split-K kernel reads the chunk's earlier rows rounded to the cache's type (as a
+        // decode of that query would read them from the cache): so does the reference
+        if (half && !flash && t > 0)
+            for (size_t i = 0; i < ld; i++) {
+                const size_t o = (pos0 + t - 1) * ld + i;
+                K[o] = (float)(_Float16)K[o];
+                V[o] = (float)(_Float16)V[o];
+            }
         ink_ref_attn(q + t * NH * HD, r + t * NH * DREL, proj, K, V, sink + t * NH, gate + t * NH * HD, NH, NKV, HD, DREL, ext,
                      pos0 + t, win, ref);
         *err = fmaxf(*err, rel(gpu_floats(bo) + t * NH * HD, ref, NH * HD));
@@ -355,17 +379,22 @@ TEST(ink_attention) {
     QgenCtx x;
     EXPECT_OK(qgen_ctx_init(&a, &x));
     // decode and chunks; sliding with the ring wrapped (a chunk longer than the window too), full
-    // with distances past the bias extent
-    static const struct { size_t pos0, T, win, ext, nsplit; } cs[] = {
-        {0, 1, 64, 64, 1}, {200, 1, 64, 64, 3}, {130, 7, 64, 64, 2}, {40, 150, 64, 64, 4}, {300, 1, 0, 96, 8}, {90, 20, 0, 96, 4}};
-    for (size_t i = 0; i < COUNT(cs); i++) {
-        float e;
-        EXPECT_OK(attn_case(&a, &x, cs[i].pos0, cs[i].T, cs[i].win, cs[i].ext, cs[i].nsplit, &e));
-        if (!(e <= TOL_INK_KERNEL_REL)) {
-            dbg("attention case %zu: rel err %.3g\n", i, (double)e);
-            EXPECT(0);
+    // with distances past the bias extent; both kernels, f32 and f16 caches
+    static const struct { size_t pos0, T, win, ext, nsplit; bool flash; } cs[] = {
+        {0, 1, 64, 64, 1, false},    {200, 1, 64, 64, 3, false},  {130, 7, 64, 64, 2, false}, {40, 150, 64, 64, 4, false},
+        {300, 1, 0, 96, 8, false},   {90, 20, 0, 96, 4, false},   {0, 37, 64, 64, 1, true},   {130, 70, 64, 64, 1, true},
+        {40, 150, 64, 64, 1, true},  {90, 50, 0, 96, 1, true},    {2000, 33, 0, 96, 1, true}, {5000, 1, 0, 96, 64, false}};
+    for (int half = 0; half < 2; half++)
+        for (size_t i = 0; i < COUNT(cs); i++) {
+            float e;
+            EXPECT_OK(attn_case(&a, &x, cs[i].pos0, cs[i].T, cs[i].win, cs[i].ext, cs[i].nsplit, half, cs[i].flash, &e));
+            // the f16-cache prompt kernel multiplies half Q, K, V and P
+            const float bound = half && cs[i].flash ? TOL_INK_ATTN_HALF_REL : TOL_INK_KERNEL_REL;
+            dbg("attention case %zu%s: rel err %.3g\n", i, half ? " (f16 cache)" : "", (double)e);
+            if (!(e <= bound)) {
+                EXPECT(0);
+            }
         }
-    }
 }
 
 static void rand_e4m3(QgenCtx *x, uint8_t *p, size_t n, int emin, int emax) {

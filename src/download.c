@@ -45,6 +45,9 @@ static const char *const turbo_files[] = {"config.json", "tokenizer.json", "toke
 static const char *const hf_files[] = {"config.json", "tokenizer.json", "tokenizer_config.json", "chat_template.jinja",
                                        "generation_config.json", NULL};
 
+// Inkling 2 Mini's drafter: one file of the official BF16 release
+static const char *const dspark_files[] = {"mtp.safetensors", NULL};
+
 const DownloadPack download_packs[DOWNLOAD_NPACKS] = {
     {.name = "coder", .title = "Qwen3.8-Flash-Next Coder", .disk_gb = 80, .min_ram_gb = 96, .repo = "mbrown-uno/Qwen3.8-Flash-Next-GSQ-RCO-Coder-MLX", .rev = "50fa68c5e9cebf53276d8eae8af594fa8b3de9e4", .note = "256 experts, pruned for code, 76 GB"},
     {.name = "full", .title = "Qwen3.8-Flash-Next", .disk_gb = 110, .min_ram_gb = 128, .repo = "mlx-community/Qwen3.8-Flash-Next-4bit-mtp", .rev = "825df623302aeebc434f44ca9122827b04f9a0f1", .note = "512 experts, the original model, 105 GB"},
@@ -91,6 +94,11 @@ const DownloadPack download_packs[DOWNLOAD_NPACKS] = {
     // with the official NVFP4 / MXFP8 experts; 17.3 GB of weights, so 32 GB Macs (fit.h)
     {.name = "inkling", .title = "Inkling 2 Mini", .disk_gb = 18, .min_ram_gb = 32, .repo = "mlx-community/Inkling-2-Mini-4bit",
      .rev = "9c0e2960609ba7cb40daf92c6f7bf8ed56e1dd62", .note = "Inkling 2 Mini, 26B MoE, 3.4B active, 17 GB"},
+    // Inkling 2 Mini's DSpark drafter (thinkingmachines, Apache-2.0): mtp.safetensors of the official
+    // release, BF16, 0.6 GB; the inkling pack loads it from this folder for speculative decoding
+    {.name = "inkling-dspark", .title = "Inkling 2 Mini DSpark drafter", .disk_gb = 1, .min_ram_gb = 0,
+     .repo = "thinkingmachines/Inkling-2-Mini", .rev = "b85c3cfa615fc413cc9af3379f491b963f3b586a", .only = dspark_files,
+     .dir = "thinkingmachines/Inkling-2-Mini-DSpark", .note = "speculative decoding for inkling (DSpark block drafter), 0.6 GB"},
 };
 
 // Idle timeout of a transfer (between bytes); a stalled connection fails and is retried.
@@ -122,7 +130,7 @@ Err download_pack_dir(Arena *a, const DownloadPack *p, char **out) {
 }
 
 const char *download_usage(void) {
-    return "usage: saetta download [coder|full|all|27b-8bit|27b-4bit|27b-pi|27b-turbo|27b-turbo-8bit|27b-coder390|27b-coder390-8bit|27b-fable5|27b-fable5-8bit|27b-qwopus|27b-qwopus-8bit|inkling] [--jobs N]   (default: coder with 96 GB of memory or more, 27b-turbo with 36, 27b-4bit with 32; all = coder and "
+    return "usage: saetta download [coder|full|all|27b-8bit|27b-4bit|27b-pi|27b-turbo|27b-turbo-8bit|27b-coder390|27b-coder390-8bit|27b-fable5|27b-fable5-8bit|27b-qwopus|27b-qwopus-8bit|inkling|inkling-dspark] [--jobs N]   (default: coder with 96 GB of memory or more, 27b-turbo with 36, 27b-4bit with 32; all = coder and "
            "full; into $SAETTA_MODELS, default ~/Models)\n";
 }
 
@@ -816,7 +824,7 @@ size_t download_adapters(Arena *a, DownloadAdapter **out) {
     DownloadAdapter *v = ARENA_ARRAY(a, DownloadAdapter, cap);
     for (size_t i = 0; i < DOWNLOAD_NPACKS; i++) {
         const DownloadPack *p = &download_packs[i];
-        if (p->min_ram_gb) continue;
+        if (p->min_ram_gb || !p->lora_name) continue; // models, and Inkling's drafter (no LoRA)
         char *dir;
         if (download_pack_dir(a, p, &dir)) continue;
         bool have = file_exists(path_join(a, dir, "adapter_config.json"));

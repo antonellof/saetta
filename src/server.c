@@ -823,8 +823,8 @@ static Err generate_reply(Engine *e, Arena *a, Conn *c, Req *h, Work *w, JValue 
         uint64_t tr0 = now_ns();
         size_t nd = spec_on ? lookup_draft(lk, drafts, gate_depth(gate, KMAX - 1)) : 0;
         bool from_mtp = false;
-        if (spec_on && nd < 3 && model_has_mtp(e->m)) {
-            TRY(model_draft_mtp(e->m, e->s, t, depth_pick(depth, KMAX - 1), drafts, &nd));
+        if (spec_on && nd < (mi->mtp_no_lookup ? 1u : 3u) && model_has_mtp(e->m)) {
+            TRY(model_draft_mtp(e->m, e->s, t, depth_pick(depth, mi->mtp_kmax ? mi->mtp_kmax : KMAX - 1), drafts, &nd));
             from_mtp = nd > 0;
         } else if (nd > 0 && !gate_allow(gate)) nd = 0;
         if (nd > 0) {
@@ -1493,6 +1493,7 @@ static Err engine_open(Arena *arena, const char *dir, const char *const *loras, 
     if (model_info(m)->chat == CHAT_QWEN && !tokenizer_token_id(tok, S("</think>"), &e->think_end)) return "BadTokenizer";
     e->gate = GATE_INIT;
     e->depth = DEPTH_INIT;
+    if (model_info(m)->depth_ms) memcpy(e->depth.ms, model_info(m)->depth_ms, sizeof e->depth.ms);
     e->n_conv = 1;
     e->active = 0;
     for (size_t i = 0; i < MAX_CONV; i++) e->conv_lora[i] = -1;

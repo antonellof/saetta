@@ -1594,7 +1594,7 @@ static CodeUiModel *list_models(Arena *a, const Run *r, size_t *n, CodeUiModel *
     const JValue *providers = json_get(models, "providers");
     DownloadAdapter *ads;
     size_t nads = download_adapters(a, &ads);
-    size_t cap = DOWNLOAD_NPACKS + 1 + (nads + r->nloras + 1) * (DOWNLOAD_NPACKS + 2);
+    size_t cap = 2 * DOWNLOAD_NPACKS + 1 + (nads + r->nloras + 1) * (DOWNLOAD_NPACKS + 2); // packs, Inkling's drafter, adapters
     for (size_t i = 0; providers && json_is(providers, J_OBJECT) && i < providers->obj.len; i++) {
         const JValue *list = json_get(providers->obj.items[i].val, "models");
         cap += json_is(list, J_ARRAY) ? list->arr.len : 0;
@@ -1612,6 +1612,12 @@ static CodeUiModel *list_models(Arena *a, const Run *r, size_t *n, CodeUiModel *
                          .context_window = 204800, .pack = true, .unavailable = !have,
                          .too_big = ram && ((uint64_t)p->min_ram_gb << 30) > ram, .disk_gb = p->disk_gb, .min_ram_gb = p->min_ram_gb};
         if (have) cfg_pack_label(a, m.name, p->gguf_file, dir, &m.label, &m.label_brief);
+        // Inkling's DSpark drafter (src/inkling.c ds_load uses it when downloaded): a word on the
+        // model's row, and a row of its own that downloads it
+        const DownloadPack *dr = !strcmp(p->name, "inkling") ? download_find("inkling-dspark") : NULL;
+        char *ddir;
+        const bool dhave = dr && !download_pack_dir(a, dr, &ddir) && file_exists(path_join(a, ddir, "mtp.safetensors"));
+        if (dr) m.drafter_note = dhave ? "DSpark drafter: downloaded" : "DSpark drafter: not downloaded (0.6 GB)";
         bool cur = pack_is_current(a, r, p);
         if (cur) {
             m.unavailable = false;
@@ -1620,6 +1626,9 @@ static CodeUiModel *list_models(Arena *a, const Run *r, size_t *n, CodeUiModel *
             if (!r->lora_cur) *current = m;
         }
         out[(*n)++] = m;
+        if (dr)
+            out[(*n)++] = (CodeUiModel){.provider = "saetta", .id = dr->name, .name = dr->title, .pack = true, .drafter = true,
+                                        .unavailable = !dhave, .too_big = m.too_big, .disk_gb = dr->disk_gb, .min_ram_gb = p->min_ram_gb};
         if (!have) continue;
         const ModelInfo *mi = model_info_dir(a, dir);
         have_id[i] = mi ? mi->id : NULL;

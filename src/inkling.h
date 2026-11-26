@@ -14,6 +14,8 @@ typedef struct {
     uint32_t flips_sure; // own top-8 differs where the reference's margin exceeds TOL_INK_ROUTE_MARGIN
     uint32_t flips_near; // differs at a near tie (margin at most that)
     uint32_t first_flip; // the first position with a difference (UINT32_MAX: none)
+    float sure_margin;   // the largest reference margin among the flips_sure ones
+    uint32_t first_sure; // the first position of those (UINT32_MAX: none)
 } InkRouteStats;
 
 // Whether m is an Inkling model with reference routes loaded.

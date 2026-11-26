@@ -38,6 +38,7 @@ To run another model, download its pack and name it:
 
 ```sh
 saetta download inkling                 # Inkling 2 Mini, 17 GB, from 32 GB of memory
+saetta download inkling-dspark          # its DSpark drafter, 0.6 GB (optional; used with SAETTA_DSPARK=1)
 saetta start code --pack inkling
 saetta download 27b-qwopus              # Qwopus, a Qwen3.8-27B coding fine-tune, 16 GB
 saetta start code --pack 27b-qwopus
@@ -87,7 +88,7 @@ A pack that cannot run on this Mac is refused, and the context shrinks to what m
 
 ### Inkling 2 Mini
 
-[Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) is Thinking Machines' coding model: 26B parameters in a mixture of 128 experts, 8 used per token. Its 24 layers run as 48 (a block of 12 is looped three times), with sliding-window attention and its own JSON tool-call format, which Saetta translates for the agent and for the OpenAI and Anthropic APIs. The MLX pack keeps Thinking Machines' NVFP4 and MXFP8 experts as published. This is a first version: no speculative decoding yet, prompts on the GPU cores rather than the M5's neural accelerators, and a follow-up turn reuses the conversation only when it appends to it.
+[Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) is Thinking Machines' coding model: 26B parameters in a mixture of 128 experts, 8 used per token. Its 24 layers run as 48 (a block of 12 is looped three times), with sliding-window attention and its own JSON tool-call format, which Saetta translates for the agent and for the OpenAI and Anthropic APIs. The MLX pack keeps Thinking Machines' NVFP4 and MXFP8 experts as published. Its context goes to 1,048,576 tokens (32 KB per token in the f16 cache, 36 KB with the drafter), as far as memory allows. Saetta speeds up Inkling's answers with prompt lookup by default (on an M5 Max at a 4K prompt: 58.6 tokens/s without it, 85.3 with it). Thinking Machines' DSpark block drafter is opt-in: `saetta download inkling-dspark`, then start with `SAETTA_DSPARK=1`. Drafts are checked in one pass of the model, so greedy output is token for token the same as without them and sampled output follows the same distribution; at 4K, lookup with the drafter measured 79 tokens/s, below lookup alone, so it stays off until its verify pass gets cheaper. `/model` in Saetta Code shows whether the drafter is downloaded and downloads it. This is a first version: prompts on the GPU cores rather than the M5's neural accelerators, and a follow-up turn reuses the conversation only when it appends to it.
 
 ### GGUF fine-tunes of Qwen3.8-27B
 
@@ -157,7 +158,7 @@ By default the model runs inside the agent. Saetta Code can also use a running S
 
 <p align="center"><img src="web/assets/code/model.png" width="900" alt="/model: a saetta server model, two packs on this Mac, one greyed out as too big for its memory, and the others with their download size"></p>
 
-Coming next: sessions saved with the engine's state, so a resumed session does not read its prompt again; prompts read while tools run; speculative decoding and the M5's neural accelerators for Inkling 2 Mini; the agent's commands confined to the project by macOS's Seatbelt.
+Coming next: sessions saved with the engine's state, so a resumed session does not read its prompt again; prompts read while tools run; the M5's neural accelerators for Inkling 2 Mini; the agent's commands confined to the project by macOS's Seatbelt.
 
 ## Other agents and clients
 
@@ -205,8 +206,9 @@ Endpoints: `POST /v1/chat/completions` (streaming, `tool_calls`, `reasoning_cont
 
 | variable | default | effect |
 |---|---|---|
-| `SAETTA_CTX` | 32768 | context in tokens, 1024 to 262144, rounded down to a multiple of 128 (Flash-Next about 35 KB per token, 27B 64 KB) |
-| `SAETTA_SPEC` / `SAETTA_MTP` | 1 / 1 | `0` turns speculative decoding / the MTP head off |
+| `SAETTA_CTX` | 32768 | context in tokens, 1024 to 262144 (Inkling 2 Mini 1048576), rounded down to a multiple of 128 (Flash-Next about 35 KB per token, 27B 64 KB, Inkling 32 KB) |
+| `SAETTA_SPEC` / `SAETTA_MTP` | 1 / 1 | `0` turns speculative decoding / the MTP head (Inkling: the DSpark drafter) off |
+| `SAETTA_DSPARK` | unset | Inkling 2 Mini: `1` loads the downloaded DSpark drafter (or a path to its `mtp.safetensors`); off by default |
 | `SAETTA_KV_F32` | unset | f32 KV cache |
 | `SAETTA_IGNORE_MEMORY` | unset | `1` loads or downloads a pack this Mac's memory is too small for, and keeps the asked context |
 | `SAETTA_NO_ACCEL` | unset | `1` runs without the tensor-op (neural accelerator) kernels on an M5 (M1 to M4 never use them; `SAETTA_ACCEL=1` forces them there, for testing) |
@@ -236,7 +238,7 @@ Flash-Next on the M5 Max, a six-request coding-agent workload through the HTTP A
 
 Prompts at 1,620 to 1,930 tokens/s; answers at 78 to 85 (full) and 66 to 75 (Coder) tokens/s, 142 and 139 tokens/s on the edit with speculation. A follow-up turn reads only what is new: turn 2 above answers in 0.2 s. Qwen3.8-27B: prompts at 940 tokens/s (4K) to 787 (64K); answers at 31 ms/token on the 4-bit pack, 19 ms/token on `27b-turbo` with its MTP head (short prompts; 25 ms/token at 16K).
 
-Inkling 2 Mini, first build, 4K prompt: about 430 tokens/s reading and 58 tokens/s answering, without speculative decoding (not yet re-measured after its last fixes).
+Inkling 2 Mini, 4K prompt: 470 tokens/s reading, 58 tokens/s answering without speculation. 32K prompt: 419 tokens/s reading, 52 tokens/s answering without speculation.
 
 On the M5 Max forced onto the M1 to M4 prompt kernels, the 27B reads a 4K prompt at 256 tokens/s and the Coder at 742, against 961 and 1,538 with the neural accelerators on the same prompt.
 

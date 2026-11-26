@@ -57,6 +57,13 @@ typedef struct {
     // what the model implements beyond a plain forward pass: speculative decoding (prompt
     // lookup, verification chunks) and serving (tokenizer, chat template, sessions)
     bool no_spec, no_serve;
+    // the MTP drafter's policy in the decode loops (main.c, server.c): with mtp_no_lookup it
+    // drafts only when prompt lookup offers nothing (else when lookup offers under 3 tokens), at
+    // most mtp_kmax tokens (0: KMAX - 1), from the controller's starting costs depth_ms (ms of a
+    // plain step and of rounds of 1..4 drafts; NULL: DEPTH_INIT's, measured on Qwen)
+    bool mtp_no_lookup;
+    uint8_t mtp_kmax;
+    const float *depth_ms;
     ChatFormat chat; // the chat template the model was trained with
 } ModelInfo;
 

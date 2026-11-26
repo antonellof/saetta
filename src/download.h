@@ -34,12 +34,12 @@ typedef struct {
     const char *lora_name, *lora_base;
 } DownloadPack;
 
-#define DOWNLOAD_NPACKS 14
+#define DOWNLOAD_NPACKS 15
 // The first DOWNLOAD_NFLASH are the Flash-Next packs ("all"); saetta start's default is the
 // first downloaded pack that fits this Mac (launch.c pack_for).
 #define DOWNLOAD_NFLASH 2
 extern const DownloadPack download_packs[DOWNLOAD_NPACKS]; // coder, full, 27b-8bit, 27b-4bit, 27b-pi, 27b-turbo, 27b-turbo-8bit,
-// 27b-coder390, 27b-coder390-8bit, 27b-fable5, 27b-fable5-8bit, 27b-qwopus, 27b-qwopus-8bit, inkling
+// 27b-coder390, 27b-coder390-8bit, 27b-fable5, 27b-fable5-8bit, 27b-qwopus, 27b-qwopus-8bit, inkling, inkling-dspark
 
 // The pack named `name`, or NULL.
 const DownloadPack *download_find(const char *name);

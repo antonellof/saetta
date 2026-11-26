@@ -9,9 +9,9 @@ GOLDENS_27B := golden-27b-4bit golden-27b-8bit golden-27b-4bit-pi golden-27b-4bi
 # the Coder variant's golden (its manifest names the pack without a folder); skipped when absent
 MODELS ?= $(or $(SAETTA_MODELS),$(HOME)/Models)
 CODER_PACK ?= $(MODELS)/mbrown-uno/Qwen3.8-Flash-Next-GSQ-RCO-Coder-MLX
-# Inkling 2 Mini's goldens beside GOLDEN (1815 tokens; 8329, past the log-scaling floor), on
+# Inkling 2 Mini's goldens beside GOLDEN (1815 tokens; 8329, past the log-scaling floor; 36746), on
 # INKLING_PACK; skipped when either is absent
-GOLDENS_INKLING := golden-inkling golden-inkling-long
+GOLDENS_INKLING := golden-inkling golden-inkling-long golden-inkling-32k
 INKLING_PACK ?= $(MODELS)/mlx-community/Inkling-2-Mini-4bit
 
 # MCPU: the oldest CPU the binary runs on (every Apple Silicon Mac); -mcpu=native would let

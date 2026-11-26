@@ -6,8 +6,8 @@
 <p align="center">A coding agent for Apple Silicon Macs with the model inside it: a C port of pi that runs Qwen3.8 and Inkling 2 Mini in its own process, on its own Metal inference engine, without Python, Node or a server. <a href="https://saetta.dev">saetta.dev</a></p>
 
 <p align="center">
-  <a href="#start"><b>Start</b></a> · <a href="#models"><b>Models</b></a> · <a href="#the-agent"><b>The agent</b></a> ·
-  <a href="#other-agents-and-clients">Other agents</a> · <a href="#performance">Performance</a> · <a href="#build-from-source">Build from source</a>
+  <a href="#performance"><b>Performance</b></a> · <a href="#start"><b>Start</b></a> · <a href="#models"><b>Models</b></a> · <a href="#the-agent"><b>The agent</b></a> ·
+  <a href="#other-agents-and-clients">Other agents</a> · <a href="#build-from-source">Build from source</a>
 </p>
 
 <p align="center">
@@ -23,6 +23,20 @@ Saetta Code is a C port of the [pi](https://pi.dev) coding agent with the model 
   <img src="docs/assets/demo-code.gif" width="900" alt="saetta start code: the agent loads the model, writes a one-page site for a coffee roastery, checks and fixes it; the page it wrote at the end">
   <br><sub><code>saetta start code</code> writes a landing page in one HTML file, checks it and fixes what it finds (waits cut, checks at 8x).</sub>
 </p>
+
+## Performance
+
+All on an M5 Max with 128 GB; every number is a measured run.
+
+<p align="center"><img src="web/assets/perf/qwen.svg" width="900" alt="Qwen3.8 on an M5 Max: prompt reading Coder 1,656 to 1,927 tokens/s, full 1,738 to 1,808, 27B 940 to 787; answering full 142 and Coder 139 tokens/s on a code edit, full 85 and Coder 66 at 16K, 27B TURBO 52, 27B 4-bit 32"></p>
+
+<p align="center"><img src="web/assets/perf/resume.svg" width="900" alt="Time to the first token with the Coder pack: 37.31 s on a cold 64K prompt, 8.24 s on a cold 16K prompt, 0.20 s on a follow-up turn"></p>
+
+<p align="center"><img src="web/assets/perf/inkling.svg" width="900" alt="Inkling 2 Mini on an M5 Max, 4K prompt: answering at 85.3 tokens/s in Saetta with prompt lookup and 58.6 without, Strata 54.2, llama.cpp 47.2, Strata with DSpark 36.7; prompt reading Strata 2,990, llama.cpp 685, Saetta 473 tokens/s"></p>
+
+<p align="center"><img src="web/assets/perf/m14.svg" width="900" alt="Prompt reading at 4K on the M1 to M4 kernels, measured on the M5 Max: 27B 152 before 0.18, 256 now, 961 with the M5's accelerators; Coder 487, 742 and 1,538"></p>
+
+Strata reads Inkling prompts faster because it runs them on the M5's tensor ops, which Saetta does not do for Inkling yet. M1 to M4 are not measured on real hardware yet (reports welcome). Details: [Performance](docs/performance.md).
 
 ## Start
 
@@ -101,20 +115,6 @@ saetta serve coder                       # any client: http://127.0.0.1:8080/v1 
 </p>
 
 Options, endpoints and environment variables: [Server](docs/server.md), [HTTP API](docs/http-api.md), [Environment](docs/environment.md).
-
-## Performance
-
-All on an M5 Max with 128 GB; every number is a measured run.
-
-<p align="center"><img src="web/assets/perf/qwen.svg" width="900" alt="Qwen3.8 on an M5 Max: prompt reading Coder 1,656 to 1,927 tokens/s, full 1,738 to 1,808, 27B 940 to 787; answering full 142 and Coder 139 tokens/s on a code edit, full 85 and Coder 66 at 16K, 27B TURBO 52, 27B 4-bit 32"></p>
-
-<p align="center"><img src="web/assets/perf/resume.svg" width="900" alt="Time to the first token with the Coder pack: 37.31 s on a cold 64K prompt, 8.24 s on a cold 16K prompt, 0.20 s on a follow-up turn"></p>
-
-<p align="center"><img src="web/assets/perf/inkling.svg" width="900" alt="Inkling 2 Mini on an M5 Max, 4K prompt: answering at 85.3 tokens/s in Saetta with prompt lookup and 58.6 without, Strata 54.2, llama.cpp 47.2, Strata with DSpark 36.7; prompt reading Strata 2,990, llama.cpp 685, Saetta 473 tokens/s"></p>
-
-<p align="center"><img src="web/assets/perf/m14.svg" width="900" alt="Prompt reading at 4K on the M1 to M4 kernels, measured on the M5 Max: 27B 152 before 0.18, 256 now, 961 with the M5's accelerators; Coder 487, 742 and 1,538"></p>
-
-Strata reads Inkling prompts faster because it runs them on the M5's tensor ops, which Saetta does not do for Inkling yet. M1 to M4 are not measured on real hardware yet (reports welcome). Details: [Performance](docs/performance.md).
 
 ## Build from source
 

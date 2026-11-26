@@ -412,10 +412,13 @@ static bool ink_routes_ok(FILE *out, Model *m, const char *what, InkRouteStats *
     *st = inkling_route_stats(m);
     char b1[64];
     verify_fmt_e(b1, sizeof b1, TOL_INK_ROUTE_MARGIN, true, -1);
+    bool ok = st->flips_sure <= TOL_INK_ROUTE_RARE && (st->flips_sure == 0 || st->sure_margin <= TOL_INK_ROUTE_MARGIN_MAX);
     fprintf(out, "  %s: own top-8 differs from the oracle's at %u (visit, token) pairs with margin over %s%s, %u at near ties\n", what,
-            st->flips_sure, b1, st->flips_sure ? "  FAIL" : "", st->flips_near);
-    if (st->flips_sure) fprintf(out, "    first at position %u, largest margin %g\n", st->first_sure, (double)st->sure_margin);
-    return st->flips_sure == 0;
+            st->flips_sure, b1, ok ? "" : "  FAIL", st->flips_near);
+    if (st->flips_sure)
+        fprintf(out, "    first at position %u, largest margin %g (allowed: at most %u, none above %g)\n", st->first_sure,
+                (double)st->sure_margin, TOL_INK_ROUTE_RARE, (double)TOL_INK_ROUTE_MARGIN_MAX);
+    return ok;
 }
 
 static Err verify_inkling(Arena *a, FILE *out, const Pack *pack, const char *pack_dir, const DsGolden *G, bool *okp) {

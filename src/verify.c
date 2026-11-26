@@ -506,7 +506,7 @@ static Err verify_inkling(Arena *a, FILE *out, const Pack *pack, const char *pac
         bool pok = lr <= TOL_LOGITS_REL && eq && pmax <= TOL_LAYER_REL;
         ok = ok && pok;
         fprintf(out, "prefill (%s-token chunks), the oracle's experts: worst visit rel err %s, last-token logits %s, argmax %s%s\n",
-                chunks[k] ? chunks[k] : "256", e3(b1, pmax), e3(b2, lr), eq ? "equal" : "DIFFERENT", pok ? "" : "  FAIL");
+                chunks[k] ? chunks[k] : "prompt", e3(b1, pmax), e3(b2, lr), eq ? "equal" : "DIFFERENT", pok ? "" : "  FAIL");
         for (size_t li = 0; li < L; li++)
             if (pw[li] > TOL_LAYER_REL) fprintf(out, "  visit %zu: %s  FAIL\n", li, e3(b1, pw[li]));
         ok = ink_routes_ok(out, m, "prefill routers", &rs) && ok;

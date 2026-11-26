@@ -68,8 +68,10 @@ static_assert(NL / NBLK + 1 <= MAXBS && MAXBS + 1 <= 6);
 static_assert((uint64_t)CONFIG_MODEL_MAX_LENGTH * KVD <= UINT32_MAX && CONFIG_MODEL_MAX_LENGTH == SESSION_CTX_INKLING_MAX);
 static_assert(CONFIG_N_SHARED_EXPERTS == 0 && CONFIG_USE_GATE_BIAS && NE % 32 == 0 && RANK % 8 == 0);
 
-// Prompt chunk: tokens per command buffer.
-#define PCH 256
+// Prompt chunk: tokens per command buffer. Each chunk reads every routed expert's weights about
+// once per visit (29 GB a chunk), so chunks are long: 4K prompt 3.79 s at 1024, 3.60 s at 2048
+// and at 4096 (scratch about 1 GB at 2048).
+#define PCH 2048
 // Attention splits of decode and verification chunks (T <= KMAX): up to NSPLIT_DEC per query;
 // prompt chunks use the tiled kernel, no splits.
 #define NSPLIT_DEC 256

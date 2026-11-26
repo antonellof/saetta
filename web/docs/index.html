@@ -10,14 +10,14 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Saetta documentation</title>
-  <meta name="description" content="Saetta runs Qwen3.8 and Inkling 2 Mini coding models on any Apple Silicon Mac with 32 GB of memory or more. It is one binary, saetta, with three parts:">
+  <meta name="description" content="Saetta Code is a local coding agent for Apple Silicon Macs with the model built in. It is a C port of pi 1.5.2 that runs Qwen3.8 and Inkling 2 Mini in its own process, on Saetta's inference engine...">
   <link rel="canonical" href="https://www.saetta.dev/docs/">
   <meta name="robots" content="index, follow">
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
   <meta property="og:type" content="article">
   <meta property="og:site_name" content="Saetta">
   <meta property="og:title" content="Saetta documentation">
-  <meta property="og:description" content="Saetta runs Qwen3.8 and Inkling 2 Mini coding models on any Apple Silicon Mac with 32 GB of memory or more. It is one binary, saetta, with three parts:">
+  <meta property="og:description" content="Saetta Code is a local coding agent for Apple Silicon Macs with the model built in. It is a C port of pi 1.5.2 that runs Qwen3.8 and Inkling 2 Mini in its own process, on Saetta's inference engine...">
   <meta property="og:image" content="https://www.saetta.dev/assets/og-card.png">
   <meta property="og:image:width" content="1200">
   <meta property="og:image:height" content="630">
@@ -25,7 +25,7 @@
   <meta property="og:url" content="https://www.saetta.dev/docs/">
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="Saetta documentation">
-  <meta name="twitter:description" content="Saetta runs Qwen3.8 and Inkling 2 Mini coding models on any Apple Silicon Mac with 32 GB of memory or more. It is one binary, saetta, with three parts:">
+  <meta name="twitter:description" content="Saetta Code is a local coding agent for Apple Silicon Macs with the model built in. It is a C port of pi 1.5.2 that runs Qwen3.8 and Inkling 2 Mini in its own process, on Saetta's inference engine...">
   <meta name="twitter:image" content="https://www.saetta.dev/assets/og-card.png">
   <script>
     // theme before paint: saved choice, else the system's
@@ -49,11 +49,11 @@
         Saetta <span class="ver">v0.18.0</span>
       </a>
       <nav class="links">
+        <a href="/#models">Models</a>
         <a href="/#features">Agent</a>
         <a href="/docs/" aria-current="page">Docs</a>
-        <a class="hide-sm" href="/#benchmarks">Benchmarks</a>
-        <a class="hide-sm" href="/#models">Models</a>
         <a class="hide-sm" href="/#agents">Other agents</a>
+        <a class="hide-sm" href="/#benchmarks">Benchmarks</a>
         <a class="hide-sm" href="/#faq">FAQ</a>
         <a href="https://github.com/antonellof/saetta" aria-label="GitHub">
           <svg width="18" height="18" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
@@ -82,27 +82,24 @@
     <main class="doc" id="top">
       <article class="doc-body">
 <h1>Saetta documentation</h1>
-<p>Saetta runs Qwen3.8 and Inkling 2 Mini coding models on any Apple Silicon Mac with 32 GB of memory or more. It is one binary, <code>saetta</code>, with three parts:</p>
-<ul>
-<li>Saetta Code, a coding agent in C that runs the model in its own process. It is a port of <a href="https://pi.dev" rel="noopener">pi</a> 1.5.2 and shares pi&#39;s settings, sessions, skills and MCP servers.</li>
-<li>An inference engine in C and hand-written Metal, tuned for coding agents: long shared-prefix prompts (20K to 200K tokens), short answers, tool calls.</li>
-<li>A local server with OpenAI- and Anthropic-compatible APIs, which <code>saetta start</code> points Claude Code, pi or opencode at.</li>
-</ul>
-<p>It is tuned and measured on an M5 Max with 128 GB, whose neural accelerators read prompts fastest. M1 to M4 run the same kernels on their GPU cores (not yet tested on those chips: reports welcome).</p>
+<p>Saetta Code is a local coding agent for Apple Silicon Macs with the model built in. It is a C port of <a href="https://pi.dev" rel="noopener">pi</a> 1.5.2 that runs Qwen3.8 and Inkling 2 Mini in its own process, on Saetta&#39;s inference engine (C and hand-written Metal). There is no Python, no Node and no server between the agent and the model. It shares pi&#39;s settings, sessions, skills and MCP servers.</p>
+<p>The same engine also runs as a local server with OpenAI- and Anthropic-compatible APIs, which <code>saetta start</code> points Claude Code, pi or opencode at.</p>
 <h2 id="start-here"><a class="anchor" href="#start-here" aria-hidden="true" tabindex="-1">#</a>Start here</h2>
 <div class="code doc-code"><div class="code-head"><span>shell</span><button class="copy" type="button">Copy</button></div><pre><code>curl -fsSL https://saetta.dev/install.sh | sh
 saetta start code</code></pre></div>
-<p>The second command picks the model that fits this Mac, downloads it and opens the agent on it. <a href="/docs/install/">Install</a> has the details and <a href="/docs/quickstart/">Quickstart</a> walks through a first session.</p>
+<p>The second command picks the model that fits this Mac, downloads it and opens the agent on it. <code>saetta start code --pack inkling</code> opens it on Inkling 2 Mini instead, and <code>/model</code> inside the agent switches packs. <a href="/docs/install/">Install</a> has the details and <a href="/docs/quickstart/">Quickstart</a> walks through a first session.</p>
 <h2 id="where-to-go-next"><a class="anchor" href="#where-to-go-next" aria-hidden="true" tabindex="-1">#</a>Where to go next</h2>
 <ul>
 <li><a href="/docs/choosing-a-model/">Choosing a model</a>: which pack fits how much memory, and the published benchmark scores.</li>
 <li><a href="/docs/saetta-code/">Saetta Code</a>: the agent, its commands, sessions, skills and MCP servers.</li>
+<li><a href="/docs/lora/">LoRA adapters</a>: adapters on Qwen3.8-27B, in the agent or the server.</li>
 <li><a href="/docs/claude-code/">Claude Code</a>, <a href="/docs/pi/">pi</a> and <a href="/docs/opencode/">opencode</a> on the local model.</li>
 <li><a href="/docs/http-api/">HTTP API</a>: endpoints for any other client.</li>
 <li><a href="/docs/commands/">Commands</a> and <a href="/docs/environment/">Environment variables</a> for reference.</li>
 </ul>
 <h2 id="requirements"><a class="anchor" href="#requirements" aria-hidden="true" tabindex="-1">#</a>Requirements</h2>
-<p>An Apple Silicon Mac (M1 or later) with 32 GB of memory or more, and macOS 26 or later. The model runs on the Mac: prompts and code stay local. The network is used to download the weights from Hugging Face, for the agent&#39;s update check at start, and for what you ask for (<code>/share</code>, a remote model, an MCP server you configure).</p>
+<p>An Apple Silicon Mac (M1 or later) with 32 GB of memory or more, and macOS 26 or later. Saetta is tuned and measured on an M5 Max with 128 GB, whose neural accelerators read prompts fastest; M1 to M4 run kernels of their own on their GPU cores (not yet tested on those chips: reports welcome).</p>
+<p>The model runs on the Mac: prompts and code stay local. The network is used to download the weights from Hugging Face, for the agent&#39;s update check at start, and for what you ask for (<code>/share</code>, a remote model, an MCP server you configure).</p>
 <p>Saetta is open source under the <a href="https://github.com/antonellof/saetta/blob/main/LICENSE" rel="noopener">MIT license</a>. The models keep their own licenses.</p>
       </article>
       <p class="doc-edit"><a href="https://github.com/antonellof/saetta/blob/main/docs/index.md" rel="noopener">Edit this page on GitHub</a></p>

@@ -15,17 +15,18 @@ On the first run, with no model downloaded, Saetta Code shows the model that fit
 
 If a Saetta server is already running on this Mac, `saetta start code` joins it instead of loading a second copy of the model.
 
-## Try Inkling 2 Mini
+## Pick a model
 
-Inkling 2 Mini is Thinking Machines' 26B mixture of experts with 3.4B active per token. It runs from 32 GB of memory and is not picked automatically, so download it by name and open the agent on it:
+By default `saetta start code` picks by memory: `coder` (Qwen3.8-Flash-Next) with 96 GB or more, `27b-turbo` with 36 GB, `27b-4bit` with 32 GB. To use another model, download its pack and name it:
 
 ```sh
-curl -fsSL https://saetta.dev/install.sh | sh     # or: saetta update
-saetta download inkling                           # Inkling 2 Mini, 17 GB
+saetta download inkling                 # Inkling 2 Mini, 17 GB, from 32 GB of memory
 saetta start code --pack inkling
+saetta download 27b-qwopus              # Qwopus, a Qwen3.8-27B coding fine-tune, 16 GB
+saetta start code --pack 27b-qwopus
 ```
 
-Inside the agent, `/model` switches between Inkling and the Qwen packs you have downloaded. See [Choosing a model](choosing-a-model.md).
+Inside the agent, `/model` lists the packs on this Mac and the ones you can download (with their size and the free disk), downloads the one you pick and switches to it in the running session. Inkling 2 Mini is Thinking Machines' 26B mixture of experts with 3.4B active per token; it is not picked automatically. See [Choosing a model](choosing-a-model.md).
 
 ## Trust the project
 
@@ -67,7 +68,3 @@ saetta code -p "list the TODO comments in src/"
 ```
 
 See [Print, JSON and RPC modes](print-json-rpc.md).
-
-## Choosing the model
-
-`saetta start code --pack 27b-turbo` picks a pack by name. `/model` switches packs in the running agent and can download one. See [Choosing a model](choosing-a-model.md).

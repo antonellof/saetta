@@ -10,7 +10,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Saetta: a local coding agent with the model built in, for Apple Silicon Macs</title>
-  <meta name="description" content="Saetta is a local coding agent for Apple Silicon Macs, written in C, that runs Qwen3.8 and Inkling 2 Mini, two of the strongest open coding models, in its own process. It is a port of pi, with pi's tools, sessions and terminal UI, and its engine also serves Claude Code, pi and opencode. It works offline and is open source under the MIT license.">
+  <meta name="description" content="Saetta is a local coding agent for Apple Silicon Macs with the model built in: a C port of pi that runs Qwen3.8 and Inkling 2 Mini in its own process, with no Python, no Node and no server. Its engine also serves Claude Code, pi and opencode. It works offline and is open source under the MIT license.">
   <meta name="keywords" content="Saetta, Saetta Code, Inkling 2 Mini, Qwen3.8, local coding agent, local LLM for coding, local coding model, run LLM locally on Mac, Apple Silicon LLM, pi coding agent, Claude Code local model, offline coding agent, Qwen3.8, Metal inference engine, private code AI">
   <link rel="canonical" href="https://www.saetta.dev/">
   <meta name="robots" content="index, follow">
@@ -67,6 +67,14 @@
   },
   {
    "@type": "Question",
+   "name": "How do I choose which model the agent uses?",
+   "acceptedAnswer": {
+    "@type": "Answer",
+    "text": "By default saetta start code picks the model that fits this Mac. saetta download inkling and then saetta start code --pack inkling opens the agent on another pack, and /model inside the agent lists the packs on this Mac and the ones to download, and switches between them in the running session."
+   }
+  },
+  {
+   "@type": "Question",
    "name": "Can Saetta use a model other than the local one?",
    "acceptedAnswer": {
     "@type": "Answer",
@@ -94,7 +102,7 @@
    "name": "Which Mac do I need to run a coding LLM locally?",
    "acceptedAnswer": {
     "@type": "Answer",
-    "text": "Any Apple Silicon Mac (M1 or later) with 32 GB of memory or more and macOS 26 or later. 32 GB runs Qwen3.8-27B in 4-bit or Inkling 2 Mini, 36 GB the 27B TURBO or Fable-5 coding fine-tunes, 48 GB the Coder390 fine-tune, 96 GB Qwen3.8-Flash-Next Coder and 128 GB the full Flash-Next. Saetta picks the one that fits."
+    "text": "Any Apple Silicon Mac (M1 or later) with 32 GB of memory or more and macOS 26 or later. 32 GB runs Qwen3.8-27B in 4-bit, its Qwopus fine-tune or Inkling 2 Mini, 36 GB the 27B TURBO or Fable-5 coding fine-tunes, 48 GB the 8-bit 27B packs and the Coder390 fine-tune, 96 GB Qwen3.8-Flash-Next Coder and 128 GB the full Flash-Next. Saetta picks the one that fits."
    }
   },
   {
@@ -145,11 +153,11 @@
         Saetta <span class="ver">v0.18.0</span>
       </a>
       <nav class="links">
+        <a href="#models">Models</a>
         <a href="#features">Agent</a>
         <a href="/docs/">Docs</a>
-        <a class="hide-sm" href="#benchmarks">Benchmarks</a>
-        <a class="hide-sm" href="#models">Models</a>
         <a class="hide-sm" href="#agents">Other agents</a>
+        <a class="hide-sm" href="#benchmarks">Benchmarks</a>
         <a class="hide-sm" href="#faq">FAQ</a>
         <a href="https://github.com/antonellof/saetta" aria-label="GitHub">
           <svg width="18" height="18" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
@@ -165,9 +173,9 @@
     <section class="hero">
       <canvas id="hero-bg" class="hero-bg" aria-hidden="true"></canvas>
       <div class="wrap">
-        <a class="pill" href="#features">New in Saetta 0.16.0: the built-in coding agent <span aria-hidden="true">&rarr;</span></a>
+        <a class="pill" href="#models">New in Saetta 0.18.0: Inkling 2 Mini, first version <span aria-hidden="true">&rarr;</span></a>
         <h1>Saetta: a local coding agent with built-in inference.</h1>
-        <p class="lede">A fully native local coding agent in C, combining an inference engine and agent harness in a single runtime. A complete port of Pi, built for Apple Silicon (M1+ with 32 GB RAM or more), supporting Qwen3.8, Inkling 2 Mini, and a growing range of open coding models.</p>
+        <p class="lede">A fully native local coding agent in C, combining an inference engine and agent harness in a single runtime, with no Python, Node or server. A port of pi, built for Apple Silicon (M1 or later with 32 GB of memory or more), running Qwen3.8 and Inkling 2 Mini.</p>
         <div class="code hero-cmd install">
           <div class="code-head">
             <div class="itabs" role="tablist" aria-label="Install">
@@ -184,9 +192,10 @@ saetta start claude      <span class="c"># or: saetta start pi, saetta start ope
 <pre id="c2" role="tabpanel" aria-labelledby="t-c2" hidden>git clone https://github.com/antonellof/saetta.git && cd saetta
 make && ./build/bin/saetta start code</pre>
         </div>
-        <p class="hint"><code>saetta start code</code> picks the model that fits this Mac, downloads it and opens the agent on it.</p>
+        <p class="hint"><code>saetta start code</code> picks the model that fits this Mac, downloads it and opens the agent on it. <code>saetta start code --pack inkling</code> opens it on a pack you downloaded, and <code>/model</code> switches inside the agent.</p>
         <div class="actions">
-          <a class="btn primary" href="#features">What the agent does <span aria-hidden="true">&rarr;</span></a>
+          <a class="btn primary" href="#models">Pick a model <span aria-hidden="true">&rarr;</span></a>
+          <a class="btn" href="#features">What the agent does</a>
           <a class="btn" href="https://github.com/antonellof/saetta">GitHub</a>
         </div>
 
@@ -205,6 +214,39 @@ make && ./build/bin/saetta start code</pre>
         <span class="chip">32 GB or more</span>
       </div>
     </div>
+
+    <section class="block" id="models">
+      <div class="wrap">
+        <span class="eyebrow">Models</span>
+        <h2>The models inside the agent</h2>
+        <p class="sub">Saetta Code runs one of three model families, picked by your Mac's memory. <code>saetta download &lt;pack&gt;</code> fetches one, <code>saetta start code --pack &lt;pack&gt;</code> opens the agent on it, and <code>/model</code> switches packs in a running session.</p>
+        <div class="nope">
+          <div><h3>Qwen3.8-Flash-Next, from 96 GB</h3><p>The fastest here, with the highest published scores. <code>coder</code> keeps the 256 of 512 experts that matter for code and is the default on 96 GB; <code>full</code> needs 128 GB.</p></div>
+          <div><h3>Qwen3.8-27B, from 32 GB</h3><p>Dense, 4-bit or 8-bit. The 8-bit pack takes LoRA adapters such as the one trained for pi. Coding fine-tunes: TURBO, Fable-5 and Coder390 with their MTP draft heads, and Qwopus, distilled from Qwen3.8-Flash-Max.</p></div>
+          <div><h3>Inkling 2 Mini, from 32 GB</h3><p>Thinking Machines' 26B mixture of experts with 3.4B active per token. First version: no speculative decoding yet, and prompts on the GPU cores rather than the M5's neural accelerators.</p></div>
+          <div><h3>Fits the Mac you have</h3><p>A pack too big for this Mac is refused before it loads and greyed out in <code>/model</code>, and the context is sized to the memory left: about 37K tokens with <code>27b-4bit</code> on 32 GB.</p></div>
+        </div>
+        <div class="table" style="margin-top: 16px">
+          <table>
+            <thead><tr><th>Pack</th><th>Model</th><th>On disk</th><th>Mac memory</th><th>SWE-bench</th><th>Terminal-Bench 2.1</th></tr></thead>
+            <tbody>
+              <tr><td><code>coder</code></td><td>Qwen3.8-Flash-Next, 256 experts pruned for code, the fastest for agents</td><td class="num">76 GB</td><td><span class="tagm">96 GB</span></td><td class="num">Verified 79.2</td><td class="num">n/p</td></tr>
+              <tr><td><code>full</code></td><td>Qwen3.8-Flash-Next, all 512 experts</td><td class="num">105 GB</td><td><span class="tagm">128 GB</span></td><td class="num">Pro 62.5, Verified 82.8</td><td class="num">n/p</td></tr>
+              <tr><td><code>27b-4bit</code></td><td>Qwen3.8-27B, 4-bit, the smallest</td><td class="num">16 GB</td><td><span class="tagm">32 GB</span></td><td class="num">Pro 61.7</td><td class="num">73.0</td></tr>
+              <tr><td><code>27b-8bit</code></td><td>Qwen3.8-27B, 8-bit, takes LoRA adapters</td><td class="num">29 GB</td><td><span class="tagm">48 GB</span></td><td class="num">Pro 61.7</td><td class="num">73.0</td></tr>
+              <tr><td><code>27b-pi</code></td><td>LoRA adapter for Qwen3.8-27B (harness-hub), trained to drive pi</td><td class="num">0.6 GB</td><td></td><td class="num">Pro hard-51 64.7</td><td class="num">55.8</td></tr>
+              <tr><td><code>27b-turbo</code></td><td>Qwen3.8-27B TURBO fine-tune, shorter thinking, with its draft head</td><td class="num">20 GB</td><td><span class="tagm">36 GB</span></td><td class="num">n/p</td><td class="num">n/p</td></tr>
+              <tr><td><code>27b-fable5</code></td><td>Qwen3.8-27B Fable-5 coding distill, with its draft head</td><td class="num">20 GB</td><td><span class="tagm">36 GB</span></td><td class="num">n/p</td><td class="num">n/p</td></tr>
+              <tr><td><code>27b-coder390</code></td><td>Qwen3.8-27B Coder390, SFT and RL on code, with its draft head</td><td class="num">23 GB</td><td><span class="tagm">48 GB</span></td><td class="num">n/p</td><td class="num">n/p</td></tr>
+              <tr><td><code>27b-qwopus</code></td><td>Qwopus3.8-27B Coder-Flash (Jackrong), a Qwen3.8-27B coding fine-tune distilled from Qwen3.8-Flash-Max</td><td class="num">16 GB</td><td><span class="tagm">32 GB</span></td><td class="num">n/p</td><td class="num">n/p</td></tr>
+              <tr><td><code>inkling</code></td><td>Inkling 2 Mini (Thinking Machines), 128 experts with 8 active, 3.4B active parameters; first version</td><td class="num">17 GB</td><td><span class="tagm">32 GB</span></td><td class="num">Verified 79.2</td><td class="num">71.6</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="note">SWE-bench and Terminal-Bench are the publishers' scores for the full-precision model, each with its own harness, not measured by Saetta: <a href="https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF">ISTA-DASLab</a> (SWE-bench Verified), <a href="https://huggingface.co/Qwen/Qwen3.8-27B">Qwen</a> (SWE-bench Pro, Terminal-Bench 2.1), <a href="https://huggingface.co/harness-hub/Qwen3.8-27B-pi-adapted">harness-hub</a> (the pi adapter under pi, SWE-bench Pro's hard 51 tasks; the base model scores 39.2 and 39.5 there) and <a href="https://huggingface.co/thinkingmachines/Inkling-2-Mini">Thinking Machines</a> (Inkling 2 Mini: SWE-bench Verified with bash only, Terminal-Bench 2.1 with pi). <a href="https://huggingface.co/Jackrong/Qwopus3.8-27B-Coder-Flash">Jackrong</a> publishes only its own local tests for Qwopus. n/p: not published.</p>
+        <p class="note">The fine-tunes and Qwopus also come in 8-bit (<code>27b-turbo-8bit</code>, <code>27b-fable5-8bit</code>, <code>27b-coder390-8bit</code>, <code>27b-qwopus-8bit</code>, 29 to 31 GB, 48 GB of memory). <a href="/docs/choosing-a-model/">Every pack</a>. Weights come from Hugging Face at pinned revisions and are never part of the repository.</p>
+      </div>
+    </section>
 
     <div id="features" class="features">
       <div class="wrap">
@@ -328,7 +370,7 @@ make && ./build/bin/saetta start code</pre>
       <section class="feature" id="pi">
         <div class="wrap">
           <h2>The same setup as pi</h2>
-          <p class="sub">Saetta Code, the agent in the <code>saetta</code> binary, is a port of the <a href="https://pi.dev">pi</a> coding agent 1.5.2 (MIT): one 2.3 MB binary with no Node.js and no Python. It reads and writes pi's <code>settings.json</code>, <code>models.json</code>, <code>trust.json</code> and <code>mcp.json</code> (in <code>~/.pi/agent</code> with <code>saetta code</code>; <code>saetta start code</code> keeps its own copy in <code>~/.saetta/pi</code>). Its requests and session files match pi's byte for byte on 54 recorded scenarios, and its screens are compared with pi's on 61.</p>
+          <p class="sub">Saetta Code, the agent in the <code>saetta</code> binary, is a port of the <a href="https://pi.dev">pi</a> coding agent 1.5.2 (MIT): one 2.3 MB binary with no Node.js and no Python. It reads and writes pi's <code>settings.json</code>, <code>models.json</code>, <code>trust.json</code> and <code>mcp.json</code> (in <code>~/.pi/agent</code> with <code>saetta code</code>; <code>saetta start code</code> keeps its own copy in <code>~/.saetta/pi</code>). Its requests and session files match pi's byte for byte on 63 recorded scenarios, its screens are compared with pi's on 75, and its rpc mode with pi's on 12.</p>
           <div class="qs">
             <div class="code">
               <div class="code-head"><span>run it</span><button class="copy" type="button" data-copy="c3">Copy</button></div>
@@ -351,6 +393,18 @@ saetta code --mode json -p "list the TODOs"</pre>
         </div>
       </section>
 
+      <section class="feature" id="parallel">
+        <div class="wrap">
+          <h2>Parallel agents, rpc mode and adapters</h2>
+          <div class="nope">
+            <div><h3>Sessions that share one model</h3><p>A <code>saetta start code</code> in another terminal uses the model the first one loaded, each session in its own conversation.</p></div>
+            <div><h3>Subagents</h3><p><code>--subagents</code> gives the model a tool that hands self-contained tasks to child agents, up to 3 at once. Off by default, which keeps the prompt pi's.</p></div>
+            <div><h3>RPC mode</h3><p><code>saetta code --mode rpc</code> speaks pi's JSON protocol on stdin and stdout, so tools built on pi's rpc client drive it.</p></div>
+            <div><h3>LoRA adapters</h3><p><code>saetta start code --pack 27b-8bit --lora-modules qwen3.8-pi=27b-pi</code> loads adapters with the model in process. <code>/model</code> lists them under their base model and downloads the others.</p></div>
+          </div>
+        </div>
+      </section>
+
       <section class="feature" id="next">
         <div class="wrap">
           <h2>Coming next</h2>
@@ -364,11 +418,63 @@ saetta code --mode json -p "list the TODOs"</pre>
       </section>
     </div>
 
+    <section class="block" id="agents">
+      <div class="wrap">
+        <span class="eyebrow">Other agents</span>
+        <h2>The same engine for Claude Code, pi and opencode</h2>
+        <p class="sub">The engine inside Saetta Code also runs as a local server with OpenAI- and Anthropic-compatible APIs. <code>saetta start</code> starts it (or joins one), waits for the model and runs the agent pointed at it, without touching its configuration. <code>saetta</code> alone is a guided start: it lists the models that fit, downloads one, finds your agents and installs a missing one.</p>
+        <div class="agents">
+          <div class="agent"><div class="k">Claude Code</div><code>saetta start claude</code></div>
+          <div class="agent"><div class="k">pi</div><code>saetta start pi</code></div>
+          <div class="agent"><div class="k">opencode</div><code>saetta start opencode</code></div>
+          <div class="agent"><div class="k">Any client</div><code>saetta serve coder</code></div>
+        </div>
+        <figure class="demo">
+          <img src="/assets/demo.gif" alt="Claude Code running on Saetta writes a snake game in Python, checks it, and the game runs" loading="lazy" width="1200" height="675">
+          <figcaption>Claude Code on the local model writes a snake game and checks it. Real time, no cloud.</figcaption>
+        </figure>
+
+        <div class="replay">
+          <div class="replay-bar" role="tablist">
+            <div class="dots" aria-hidden="true"><i></i><i></i><i></i></div>
+            <button class="tab" role="tab" aria-selected="true" data-tab="auto">saetta auto</button>
+            <button class="tab" role="tab" aria-selected="false" data-tab="api">The API</button>
+            <span class="spacer"></span>
+          </div>
+          <div class="replay-meta"><span id="meta-l">Qwen3.8-Flash-Next Coder on an M5 Max, 128 GB</span><span>simulated replay</span></div>
+          <pre class="screen" id="term" aria-live="off"></pre>
+          <div class="replay-foot">
+            <div><div class="chips-mini"><span>Saetta Code</span><span>Claude Code</span><span>pi</span><span>opencode</span></div>agents found on this Mac</div>
+            <div><div class="chips-mini"><span>/v1/chat/completions</span><span>/v1/messages</span></div>OpenAI and Anthropic APIs on 127.0.0.1:8080</div>
+          </div>
+        </div>
+        <p class="note">Any other client: <code>http://127.0.0.1:8080/v1</code> (OpenAI) or <code>http://127.0.0.1:8080</code> (Anthropic), any API key. Up to 4 conversations share one server.</p>
+      </div>
+    </section>
+
+    <section class="block" id="monitor">
+      <div class="wrap">
+        <span class="eyebrow">Monitor</span>
+        <h2>The monitor for the other agents</h2>
+        <p class="sub"><code>saetta monitor</code> shows, in a terminal of its own, the view that <code>/monitor</code> opens inside Saetta Code, for the local server that Claude Code, pi or opencode talk to.</p>
+        <figure class="shot">
+          <img src="/assets/monitor.png" alt="saetta monitor: model state, speed, GPU load, GPU memory, system RAM, prompt cache, speculation, context, sessions and recent requests of a Claude Code session" loading="lazy" width="1400" height="820">
+          <figcaption>A Claude Code session on the Coder pack: 74.8% of prompt tokens reused from the cache, 2.07 tokens per pass from the draft head, tool calls answered in 1.3 s.</figcaption>
+        </figure>
+        <div class="cells cells-3">
+          <div class="cell"><div class="k"><code>saetta monitor</code></div><div class="v">the live view; read-only, quitting leaves the server running</div></div>
+          <div class="cell"><div class="k"><code>saetta status</code></div><div class="v">the model, context, uptime and conversations, once</div></div>
+          <div class="cell"><div class="k"><code>saetta stop</code></div><div class="v">stops the server on this Mac</div></div>
+        </div>
+        <p class="note">Any Apple Silicon Mac, M1 or later, with 32 GB of memory or more and macOS 26 or later. Tuned and measured on an M5 Max; M1 to M4 are not yet tested on hardware.</p>
+      </div>
+    </section>
+
     <section class="block" id="benchmarks">
       <div class="wrap">
         <span class="eyebrow">Benchmarks</span>
         <h2>Engine speed on an M5 Max</h2>
-        <p class="sub">On an M5 Max with 128 GB, through the same HTTP API your agent uses: cold prompts of 4K to 64K tokens, follow-up turns and a tool-call edit. Every number has a log in the repository.</p>
+        <p class="sub">On an M5 Max with 128 GB, through the HTTP API that Claude Code, pi and opencode use: cold prompts of 4K to 64K tokens, follow-up turns and a tool-call edit. M1 to M4 are not measured yet.</p>
         <div class="charts">
           <figure class="chart">
             <h3>Prompt reading</h3>
@@ -485,93 +591,17 @@ logits       max rel err 6.7e-7</pre>
       </div>
     </section>
 
-    <section class="block" id="models">
-      <div class="wrap">
-        <span class="eyebrow">Models</span>
-        <h2>Pick by your Mac's memory</h2>
-        <div class="table">
-          <table>
-            <thead><tr><th>Pack</th><th>Model</th><th>On disk</th><th>Mac memory</th><th>SWE-bench</th><th>Terminal-Bench 2.1</th></tr></thead>
-            <tbody>
-              <tr><td><code>coder</code></td><td>Qwen3.8-Flash-Next, 256 experts pruned for code, the fastest for agents</td><td class="num">76 GB</td><td><span class="tagm">96 GB</span></td><td class="num">Verified 79.2</td><td class="num">n/p</td></tr>
-              <tr><td><code>full</code></td><td>Qwen3.8-Flash-Next, all 512 experts</td><td class="num">105 GB</td><td><span class="tagm">128 GB</span></td><td class="num">Pro 62.5, Verified 82.8</td><td class="num">n/p</td></tr>
-              <tr><td><code>27b-turbo</code></td><td>Qwen3.8-27B TURBO fine-tune, shorter thinking, with its draft head</td><td class="num">20 GB</td><td><span class="tagm">36 GB</span></td><td class="num">n/p</td><td class="num">n/p</td></tr>
-              <tr><td><code>27b-fable5</code></td><td>Qwen3.8-27B Fable-5 coding distill, with its draft head</td><td class="num">20 GB</td><td><span class="tagm">36 GB</span></td><td class="num">n/p</td><td class="num">n/p</td></tr>
-              <tr><td><code>27b-coder390</code></td><td>Qwen3.8-27B Coder390, SFT and RL on code, with its draft head</td><td class="num">23 GB</td><td><span class="tagm">48 GB</span></td><td class="num">n/p</td><td class="num">n/p</td></tr>
-              <tr><td><code>27b-qwopus</code></td><td>Qwopus3.8-27B Coder-Flash (Jackrong), a Qwen3.8-27B coding fine-tune distilled from Qwen3.8-Flash-Max</td><td class="num">16 GB</td><td><span class="tagm">32 GB</span></td><td class="num">n/p</td><td class="num">n/p</td></tr>
-              <tr><td><code>27b-8bit</code></td><td>Qwen3.8-27B, 8-bit, takes LoRA adapters</td><td class="num">29 GB</td><td><span class="tagm">48 GB</span></td><td class="num">Pro 61.7</td><td class="num">73.0</td></tr>
-              <tr><td><code>27b-4bit</code></td><td>Qwen3.8-27B, 4-bit, the smallest</td><td class="num">16 GB</td><td><span class="tagm">32 GB</span></td><td class="num">Pro 61.7</td><td class="num">73.0</td></tr>
-              <tr><td><code>inkling</code></td><td>Inkling 2 Mini (Thinking Machines), 128 experts with 8 active, 3.4B active parameters; first version</td><td class="num">17 GB</td><td><span class="tagm">32 GB</span></td><td class="num">Verified 79.2</td><td class="num">71.6</td></tr>
-            </tbody>
-          </table>
-        </div>
-        <p class="note">SWE-bench and Terminal-Bench are the publishers' scores for the full-precision model, each with its own harness, not measured by Saetta: <a href="https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF">ISTA-DASLab</a> (SWE-bench Verified) , <a href="https://huggingface.co/Qwen/Qwen3.8-27B">Qwen</a> (SWE-bench Pro, Terminal-Bench 2.1) and <a href="https://huggingface.co/thinkingmachines/Inkling-2-Mini">Thinking Machines</a> (Inkling 2 Mini: SWE-bench Verified with bash only, Terminal-Bench 2.1 with pi). n/p: not published.</p>
-        <p class="note"><code>saetta download</code> picks the largest that fits. Weights come from Hugging Face at pinned revisions and are never part of the repository.</p>
-      </div>
-    </section>
-
-    <section class="block" id="agents">
-      <div class="wrap">
-        <span class="eyebrow">Other agents</span>
-        <h2>Claude Code, pi and opencode on the same engine</h2>
-        <p class="sub"><code>saetta start</code> starts the local server (or joins one), waits for the model and runs the agent pointed at it, without touching its configuration. <code>saetta</code> alone is a guided start: it lists the models that fit, downloads one, finds your agents and installs a missing one.</p>
-        <div class="agents">
-          <div class="agent"><div class="k">Saetta Code</div><code>saetta start code</code></div>
-          <div class="agent"><div class="k">Claude Code</div><code>saetta start claude</code></div>
-          <div class="agent"><div class="k">pi</div><code>saetta start pi</code></div>
-          <div class="agent"><div class="k">opencode</div><code>saetta start opencode</code></div>
-        </div>
-        <figure class="demo">
-          <img src="/assets/demo.gif" alt="Claude Code running on Saetta writes a snake game in Python, checks it, and the game runs" loading="lazy" width="1200" height="675">
-          <figcaption>Claude Code on the local model writes a snake game and checks it. Real time, no cloud.</figcaption>
-        </figure>
-
-        <div class="replay">
-          <div class="replay-bar" role="tablist">
-            <div class="dots" aria-hidden="true"><i></i><i></i><i></i></div>
-            <button class="tab" role="tab" aria-selected="true" data-tab="auto">saetta auto</button>
-            <button class="tab" role="tab" aria-selected="false" data-tab="api">The API</button>
-            <span class="spacer"></span>
-          </div>
-          <div class="replay-meta"><span id="meta-l">Qwen3.8-Flash-Next Coder on an M5 Max, 128 GB</span><span>simulated replay</span></div>
-          <pre class="screen" id="term" aria-live="off"></pre>
-          <div class="replay-foot">
-            <div><div class="chips-mini"><span>Saetta Code</span><span>Claude Code</span><span>pi</span><span>opencode</span></div>agents found on this Mac</div>
-            <div><div class="chips-mini"><span>/v1/chat/completions</span><span>/v1/messages</span></div>OpenAI and Anthropic APIs on 127.0.0.1:8080</div>
-          </div>
-        </div>
-        <p class="note">Any other client: <code>http://127.0.0.1:8080/v1</code> (OpenAI) or <code>http://127.0.0.1:8080</code> (Anthropic), any API key. Up to 4 conversations share one server.</p>
-      </div>
-    </section>
-
-    <section class="block" id="monitor">
-      <div class="wrap">
-        <span class="eyebrow">Monitor</span>
-        <h2>The monitor for the other agents</h2>
-        <p class="sub"><code>saetta monitor</code> shows, in a terminal of its own, the view that <code>/monitor</code> opens inside Saetta Code, for the local server that Claude Code, pi or opencode talk to.</p>
-        <figure class="shot">
-          <img src="/assets/monitor.png" alt="saetta monitor: model state, speed, GPU load, GPU memory, system RAM, prompt cache, speculation, context, sessions and recent requests of a Claude Code session" loading="lazy" width="1400" height="820">
-          <figcaption>A Claude Code session on the Coder pack: 74.8% of prompt tokens reused from the cache, 2.07 tokens per pass from the draft head, tool calls answered in 1.3 s.</figcaption>
-        </figure>
-        <div class="cells cells-3">
-          <div class="cell"><div class="k"><code>saetta monitor</code></div><div class="v">the live view; read-only, quitting leaves the server running</div></div>
-          <div class="cell"><div class="k"><code>saetta status</code></div><div class="v">the model, context, uptime and conversations, once</div></div>
-          <div class="cell"><div class="k"><code>saetta stop</code></div><div class="v">stops the server on this Mac</div></div>
-        </div>
-        <p class="note">Any Apple Silicon Mac, M1 or later, with 32 GB of memory or more and macOS 26 or later. Tuned and measured on an M5 Max; M1 to M4 are not yet tested on hardware.</p>
-      </div>
-    </section>
-
     <section class="block" id="faq">
       <div class="wrap">
         <span class="eyebrow">FAQ</span>
         <h2>Questions</h2>
         <div class="faq">
           <details class="qa"><summary>Does Saetta work with my pi sessions and settings?</summary><p>Yes. It reads and writes pi's <code>settings.json</code>, <code>models.json</code>, <code>trust.json</code> and <code>mcp.json</code> in <code>~/.pi/agent</code>, and keeps its session files in the same folder and format as pi 1.5.2, so either one continues a session the other started. It also reads <code>AGENTS.md</code> and <code>CLAUDE.md</code> files, skills and prompt files as pi does. pi's TypeScript extensions are not supported.</p></details>
+          <details class="qa"><summary>How do I choose which model the agent uses?</summary><p>By default <code>saetta start code</code> picks the model that fits this Mac. <code>saetta download inkling</code> and then <code>saetta start code --pack inkling</code> opens the agent on another pack, and <code>/model</code> inside the agent lists the packs on this Mac and the ones to download, and switches between them in the running session.</p></details>
           <details class="qa"><summary>Can Saetta use a model other than the local one?</summary><p>Yes. By default the model runs inside the agent. It can also use a running Saetta server, or any OpenAI-compatible chat completions server listed in pi's <code>models.json</code>. <code>/model</code> switches between them and adds new ones.</p></details>
           <details class="qa"><summary>Does Saetta support MCP servers?</summary><p>Yes. It reads pi's <code>mcp.json</code> (global, or <code>.pi/mcp.json</code> in a trusted project) and connects to stdio and Streamable HTTP servers. Their tools are offered to the model, and <code>/mcp</code> manages the servers.</p></details>
           <details class="qa"><summary>Can I use Claude Code with a local model?</summary><p>Yes. <code>saetta start claude</code> runs Claude Code against Saetta's Anthropic-compatible API on your own Mac, without editing your Claude Code configuration. pi and opencode work the same way with <code>saetta start pi</code> and <code>saetta start opencode</code>.</p></details>
-          <details class="qa"><summary>Which Mac do I need to run a coding LLM locally?</summary><p>Any Apple Silicon Mac (M1 or later) with 32 GB of memory or more and macOS 26 or later. 32 GB runs Qwen3.8-27B in 4-bit or Inkling 2 Mini, 36 GB the 27B TURBO or Fable-5 coding fine-tunes, 48 GB the Coder390 fine-tune, 96 GB Qwen3.8-Flash-Next Coder and 128 GB the full Flash-Next. Saetta picks the one that fits.</p></details>
+          <details class="qa"><summary>Which Mac do I need to run a coding LLM locally?</summary><p>Any Apple Silicon Mac (M1 or later) with 32 GB of memory or more and macOS 26 or later. 32 GB runs Qwen3.8-27B in 4-bit, its Qwopus fine-tune or Inkling 2 Mini, 36 GB the 27B TURBO or Fable-5 coding fine-tunes, 48 GB the 8-bit 27B packs and the Coder390 fine-tune, 96 GB Qwen3.8-Flash-Next Coder and 128 GB the full Flash-Next. Saetta picks the one that fits.</p></details>
           <details class="qa"><summary>Does my code leave my machine?</summary><p>No. The model runs on your Mac, inside the agent or in a server that listens only on 127.0.0.1, so prompts and code stay local. The network is used to download the model weights from Hugging Face, for the agent's update check at start (<code>SAETTA_SKIP_VERSION_CHECK=1</code> turns it off), and for what you ask for: <code>/share</code>, a remote model or an MCP server you configure.</p></details>
           <details class="qa"><summary>Is Saetta free?</summary><p>Yes. Saetta is open source under the MIT license. The models keep their own licenses: Qwen3.8-27B and its TURBO, Coder390, Fable-5 and Qwopus fine-tunes and Inkling 2 Mini are Apache-2.0, Qwen3.8-Flash-Next uses the Qwen Community License.</p></details>
           <details class="qa"><summary>How fast is it?</summary><p>On an M5 Max with 128 GB, Qwen3.8-Flash-Next reads prompts at 1,600 to 1,950 tokens per second and answers at 66 to 85. M1 to M4 have half-precision kernels of their own on their GPU cores and are slower; they are not yet measured.</p></details>

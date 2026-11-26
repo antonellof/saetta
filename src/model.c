@@ -2605,9 +2605,13 @@ Err session_save_point(Session *s, Gpu *g, const uint32_t *toks, size_t n) {
     memcpy(gpu_floats(pt->gdn), live(s, s->gdn_state, s->sp_gdn, GDN_STATE_N), GDN_STATE_N * 4);
     memcpy(gpu_floats(pt->conv), live(s, s->gdn_conv, s->sp_conv, GDN_CONV_N), GDN_CONV_N * 4);
     memcpy(gpu_floats(pt->ple), live(s, s->ple_hist, s->sp_ple, PLE_HIST_N), PLE_HIST_N * 4);
-    pt->prev[0] = s->prev[0];
-    pt->prev[1] = s->prev[1];
-    pt->since_eos = s->since_eos;
+    // the n-gram history at n from the ids, not from s->prev: in a prefill the thread preparing
+    // the next chunk (prep_chunk) already moves s->prev and s->since_eos through that chunk's tokens
+    pt->prev[0] = n >= 2 ? toks[n - 2] : EOS_PLE;
+    pt->prev[1] = toks[n - 1];
+    size_t since = 0;
+    for (size_t i = n; i > 0 && toks[i - 1] != EOS_PLE; i--) since += 1;
+    pt->since_eos = since;
     pt->valid = true;
     vec_set(&s->ptoks, toks, n);
     return OK;

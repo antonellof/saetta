@@ -22,6 +22,8 @@ In the agent, `/resume` opens a picker of earlier sessions, searchable by their 
 
 With the model in the agent's process, the engine's state of the conversation (its KV cache and recurrent state) is saved to `~/.saetta/state` in the background at the end of each turn. A session resumed later, or forked from an earlier message with `/fork`, continues from that state instead of reading its whole history again: only the new message is read. A session another terminal joins (`saetta start code` beside a running one) resumes from saved states but does not save its own. The folder keeps up to 20 GB in all and nothing unused for 7 days; states are tied to the pack, the engine build and this Mac, and checked at every read. `SAETTA_STATE=0` turns it off. Not yet for Inkling 2 Mini or with a LoRA adapter.
 
+While a conversation is in memory, the engine also keeps checkpoints at message starts (up to 16 per conversation, the recent ones dense and the older ones spaced out), so a retried turn, an edited message or a `/fork` restarts at the nearest message instead of reading the history again. This works over the HTTP API too (`saetta serve`, Claude Code, pi, opencode), for Qwen3.8-Flash-Next and Qwen3.8-27B. Each checkpoint takes 118 MB (Flash-Next) or 157 MB (27B) of memory, counted when the context limit is fitted to this Mac. A saved state holds the conversation's last two checkpoints.
+
 ![/resume: the session picker](../web/assets/code/resume.png)
 
 ## Interrupted runs

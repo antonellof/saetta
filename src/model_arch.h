@@ -47,9 +47,9 @@ struct ModelArch {
     Err (*s_conv_shrink)(const Session *s, Gpu *g, Conv *cv, size_t cap);
     void (*s_swap_conv)(Session *s, Conv *cv);
     bool (*s_roll_to)(Session *s, size_t p, const uint32_t *toks);
-    Err (*s_save_point)(Session *s, Gpu *g, const uint32_t *toks, size_t n);
+    Err (*s_save_point)(Session *s, Gpu *g, const uint32_t *toks, size_t n, bool may_alloc);
     void (*s_start_at_own_point)(Session *s, size_t n);
-    Err (*s_start_from)(Session *s, Gpu *g, const Conv *src, size_t n);
+    Err (*s_start_from)(Session *s, Gpu *g, const Conv *src, size_t n, size_t alloc_max);
     void (*s_restore)(Session *s);
     void (*s_push_history)(Session *s, uint32_t token);
     void (*s_reset)(Session *s);

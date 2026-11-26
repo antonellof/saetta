@@ -1676,9 +1676,15 @@ bool session_roll_to(Session *s, size_t p, const uint32_t *toks) {
     s->chunk_t = n;
     return true;
 }
-Err session_save_point(Session *s, Gpu *g, const uint32_t *toks, size_t n) { (void)s, (void)g, (void)toks, (void)n; return OK; }
+Err session_save_point(Session *s, Gpu *g, const uint32_t *toks, size_t n, bool may_alloc) {
+    (void)s, (void)g, (void)toks, (void)n, (void)may_alloc;
+    return OK;
+}
 void session_start_at_own_point(Session *s, size_t n) { (void)s, (void)n; }
-Err session_start_from(Session *s, Gpu *g, const Conv *src, size_t n) { (void)s, (void)g, (void)src, (void)n; return NI; }
+Err session_start_from(Session *s, Gpu *g, const Conv *src, size_t n, size_t alloc_max) {
+    (void)s, (void)g, (void)src, (void)n, (void)alloc_max;
+    return NI;
+}
 void session_push_history(Session *s, uint32_t token) { (void)s, (void)token; }
 // Not yet: its restore point is the live state (full-attention KV, the sliding rings, the conv
 // states), which needs its own layout; the state store reports StateUnsupported for it.

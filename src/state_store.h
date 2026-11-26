@@ -19,8 +19,10 @@
 //                       computed elsewhere with its own rows and snapshot
 //   states/<32 hex>.st  one state, named by the sha256 of its lineage and its n ids: a header
 //                       page, the ids, the chunk keys it uses, the tail (rows past its last full
-//                       chunk, in the chunk layout) and one recurrent snapshot (the restore point
-//                       at n), with the caller's metadata (lineage, scalars, an opaque blob)
+//                       chunk, in the chunk layout) and up to ST_MAX_SNAP recurrent snapshots (the
+//                       restore point at n, then the conversation's last checkpoint before it, so a
+//                       prompt that leaves the state between the two restarts there), with the
+//                       caller's metadata (lineage, each snapshot's scalars, an opaque blob)
 // Every section carries CRC32C values (four per slice, computed in parallel), checked at every
 // load; the header pages carry their own. A file is written under a temporary name (O_EXCL,
 // O_NOFOLLOW), synced (F_FULLFSYNC) and renamed, so a crash leaves either the old state or the
@@ -56,8 +58,10 @@
 // slices of a chunk: one per plane of every region
 #define ST_MAX_SLICES 128
 #define ST_EXTRA_MAX 1024
+// recurrent snapshots in a state: at n, and the last checkpoint before n
+#define ST_MAX_SNAP 2
 // The file format's version (bump when a header or a section changes).
-#define ST_FORMAT 3u
+#define ST_FORMAT 4u
 
 // A buffer of per-token rows in planes: plane p's row r at base + p * plane_stride + r * row_bytes.
 // per_row tokens make one row (1 for KV and indexer keys; BLOCK for pooled block keys, of which
@@ -68,22 +72,33 @@ typedef struct {
 } StRegion;
 
 // What a conversation's state is made of: its row buffers (at their current capacity) and the
-// buffers of one restore point's recurrent state.
+// buffers of the restore point's recurrent state at n (rec), and of the second snapshot's (xrec,
+// the same sizes; with StMeta.nsnap 2).
 typedef struct {
     size_t nreg, nrec;
     StRegion reg[ST_MAX_REGIONS];
     uint8_t *rec[ST_MAX_REC];
+    uint8_t *xrec[ST_MAX_REC];
     size_t rec_bytes[ST_MAX_REC];
 } StLayout;
 
-// What a state carries besides rows and recurrent buffers: the lineage that writes its new chunks
-// (the conversation's own: picked at its first save, never a restored state's), the restore
-// point's scalars (Ckpt.prev, Ckpt.since_eos), and an opaque blob
-// (the engine's speculation controller).
+// A snapshot's position and scalars (Ckpt.prev, Ckpt.since_eos); loaded: set by state_store_load
+// for the snapshots it read (the ones the prompt extends).
 typedef struct {
-    uint8_t lineage[16];
+    uint64_t pos;
     uint32_t prev[2];
     uint64_t since_eos;
+    bool loaded;
+} StSnap;
+
+// What a state carries besides rows and recurrent buffers: the lineage that writes its new chunks
+// (the conversation's own: picked at its first save, never a restored state's), its snapshots
+// (snap[0] at n, snap[1], when nsnap is 2, before it), and an opaque blob (the engine's speculation
+// controller).
+typedef struct {
+    uint8_t lineage[16];
+    size_t nsnap;
+    StSnap snap[ST_MAX_SNAP];
     size_t extra_len;
     uint8_t extra[ST_EXTRA_MAX];
 } StMeta;
@@ -106,7 +121,9 @@ void state_store_close(StateStore *st);
 // The store's folder.
 const char *state_store_dir(const StateStore *st);
 
-// Saves the state of a conversation at n tokens (ids[0..n)) with meta. Chunks c < ninh are the
+// Saves the state of a conversation at n tokens (ids[0..n)) with meta (snap[0] is the snapshot at
+// n, its pos taken as n, nsnap 0 as 1; a second snapshot, at 0 < snap[1].pos < n, has its buffers
+// in lay.xrec). Chunks c < ninh are the
 // ones it was restored from, named by inh[c] (rows identical to theirs: reused when present,
 // else written under that key); the others are keyed by meta->lineage. The recurrent snapshot
 // (lay.rec), the ids and meta are copied now, the rows below n are read later by the writer
@@ -123,13 +140,22 @@ void state_store_fence(StateStore *st, const void *base, size_t from);
 // Waits for the writer.
 void state_store_wait(StateStore *st);
 
-// The longest saved state whose ids are a prefix of prompt[0..np) with more than min_n and fewer
-// than np tokens: its length (0 if none), and its name in name (33 bytes).
-size_t state_store_find(StateStore *st, const uint32_t *prompt, size_t np, size_t min_n, char name[33]);
+// The saved state with the longest snapshot the prompt extends: a snapshot at pos with ids[0..pos)
+// a prefix of prompt[0..np) (ids[0..pos] for the second snapshot), more than min_n and fewer than
+// np tokens. Returns that pos (0 if
+// none), the state's name in name (33 bytes).
+// pos (may be NULL) gets the position of each of its snapshots the prompt extends, 0 for the others.
+size_t state_store_find(StateStore *st, const uint32_t *prompt, size_t np, size_t min_n, char name[33],
+                        size_t pos[ST_MAX_SNAP]);
 // Reads state name into lay (its regions with room for its n tokens) and *meta, with 4 threads,
-// checking every header, size and CRC and that its ids are prompt[0..n) with n < np; *bytes
-// gets the bytes read, *keys (malloc'd, the caller frees it) its chunks' keys, *nkeys their
-// count (n / ST_CHUNK). *touched: whether lay's buffers were written (a failure before the
+// checking every header, size and CRC and that the prompt extends at least one of its snapshots
+// (its ids[0..pos) are prompt[0..pos), pos < np; for the second snapshot ids[pos] too, which its
+// MTP rows pair): the snapshots the prompt extends (snapshot 0 into lay.rec, snapshot 1 into
+// lay.xrec; meta->snap[i].loaded) and the rows: every row of the state with snapshot 0, else only
+// the chunks up to snapshot 1 (lay's capacity checked against the rows read).
+// *n gets the longest loaded snapshot's position (rows read past it are not the prompt's);
+// *bytes the bytes read, *keys (malloc'd, the caller frees it) the state's chunks' keys, *nkeys
+// their count (its n / ST_CHUNK). *touched: whether lay's buffers were written (a failure before the
 // reads leaves them as they were). A state that fails a check is deleted, and so is a chunk
 // that fails one. Errors: "StateMissing", "StateCorrupt", "StateMismatch", "StateTooLarge".
 Err state_store_load(StateStore *st, const char *name, const uint32_t *prompt, size_t np, const StLayout *lay, size_t *n,

@@ -148,9 +148,13 @@ Err session_new_conv(const Session *s, Gpu *g, size_t cap, Conv *out) { return s
 Err session_conv_shrink(const Session *s, Gpu *g, Conv *cv, size_t cap) { return s->arch->s_conv_shrink(s, g, cv, cap); }
 void session_swap_conv(Session *s, Conv *cv) { s->arch->s_swap_conv(s, cv); }
 bool session_roll_to(Session *s, size_t p, const uint32_t *toks) { return s->arch->s_roll_to(s, p, toks); }
-Err session_save_point(Session *s, Gpu *g, const uint32_t *toks, size_t n) { return s->arch->s_save_point(s, g, toks, n); }
+Err session_save_point(Session *s, Gpu *g, const uint32_t *toks, size_t n, bool may_alloc) {
+    return s->arch->s_save_point(s, g, toks, n, may_alloc);
+}
 void session_start_at_own_point(Session *s, size_t n) { s->arch->s_start_at_own_point(s, n); }
-Err session_start_from(Session *s, Gpu *g, const Conv *src, size_t n) { return s->arch->s_start_from(s, g, src, n); }
+Err session_start_from(Session *s, Gpu *g, const Conv *src, size_t n, size_t alloc_max) {
+    return s->arch->s_start_from(s, g, src, n, alloc_max);
+}
 void session_restore(Session *s) { s->arch->s_restore(s); }
 void session_push_history(Session *s, uint32_t token) { s->arch->s_push_history(s, token); }
 void session_reset(Session *s) { s->arch->s_reset(s); }
@@ -211,17 +215,100 @@ Reusable session_reusable_in(const Ckpt ck[2], const uint32_t *prompt, size_t np
 void session_keep_points(Session *s, size_t n) {
     s->ptoks.len = MIN(s->ptoks.len, n);
     for (size_t k = 0; k < PT_MAX; k++)
-        if ((k + 1) * PT_EVERY > s->ptoks.len) s->pts[k].valid = false;
+        if (s->pts[k].pos > s->ptoks.len) s->pts[k].valid = false;
 }
+
+static bool point_ok(const Point *p) { return p->gdn != NULL && p->valid && p->pos > 0; }
 
 size_t session_shared_point(const uint32_t *ptoks, size_t nptoks, const Point pts[PT_MAX], const uint32_t *prompt,
                             size_t n) {
+    if (n == 0) return 0;
     size_t lcp = 0;
-    size_t lim = MIN(nptoks, n - 1);
+    size_t lim = MIN(nptoks, n);
     while (lcp < lim && ptoks[lcp] == prompt[lcp]) lcp += 1;
-    size_t k = MIN(lcp / PT_EVERY, (size_t)PT_MAX);
-    while (k > 0 && !(pts[k - 1].gdn != NULL && pts[k - 1].valid)) k -= 1;
-    return k * PT_EVERY;
+    // pos < lcp: the prompt's token at pos is the one the checkpoint's MTP row at pos was written
+    // with (and pos < n: a token is left to run)
+    size_t best = 0;
+    for (size_t k = 0; k < PT_MAX; k++)
+        if (point_ok(&pts[k]) && pts[k].pos < lcp && pts[k].pos > best) best = pts[k].pos;
+    return best;
+}
+
+int session_point_at(const Point pts[PT_MAX], size_t pos) {
+    for (int k = 0; k < PT_MAX; k++)
+        if (point_ok(&pts[k]) && pts[k].pos == pos) return k;
+    return -1;
+}
+
+int session_point_slot(const Point pts[PT_MAX], size_t pos, bool may_alloc) {
+    int at = session_point_at(pts, pos);
+    if (at >= 0) return at;
+    for (int k = 0; k < PT_MAX; k++)
+        if (pts[k].gdn != NULL && !point_ok(&pts[k])) return k;
+    if (may_alloc)
+        for (int k = 0; k < PT_MAX; k++)
+            if (pts[k].gdn == NULL) return k;
+    // thinning: the valid points by position
+    int idx[PT_MAX];
+    size_t m = 0;
+    for (int k = 0; k < PT_MAX; k++)
+        if (point_ok(&pts[k])) idx[m++] = k;
+    if (m == 0) return -1;
+    for (size_t i = 1; i < m; i++)
+        for (size_t j = i; j > 0 && pts[idx[j - 1]].pos > pts[idx[j]].pos; j--) {
+            int t = idx[j];
+            idx[j] = idx[j - 1];
+            idx[j - 1] = t;
+        }
+    // the oldest and the PT_RECENT most recent stay (fewer kept when there are fewer points)
+    size_t lo = m > 1 ? 1 : 0, hi = m > PT_RECENT + 1 ? m - PT_RECENT : m;
+    if (hi <= lo) hi = m;
+    size_t pick = lo;
+    double best = 0;
+    for (size_t i = lo; i < hi; i++) {
+        size_t p = pts[idx[i]].pos, prev = i > 0 ? pts[idx[i - 1]].pos : 0, next = i + 1 < m ? pts[idx[i + 1]].pos : pos;
+        double score = (double)(next - prev) / (double)(pos > p ? pos - p : 1);
+        if (i == lo || score < best) {
+            best = score;
+            pick = i;
+        }
+    }
+    return idx[pick];
+}
+
+size_t session_point_bytes(const Session *s) { return (session_conv_bytes(s, s->cap) - session_kv_bytes(s, s->cap)) / 2; }
+
+size_t session_point_cuts(const uint32_t *ids, size_t n, size_t pos0, uint32_t im_start, size_t *out, size_t cap) {
+    if (n < 2 || pos0 + 1 >= n - 1) return 0;
+    size_t end = n - 1, k = 0, last = pos0;
+    // each one PT_GAP after the previous one taken and PT_GAP before the end: no chunk shorter than
+    // PT_GAP for a checkpoint (the request's own start keeps one without a cut, server.c)
+    for (size_t p = pos0 + 1; p < end && k < cap; p++) {
+        if (!(p % PT_EVERY == 0 || (im_start != UINT32_MAX && ids[p] == im_start))) continue;
+        if (p - last >= PT_GAP && end - p >= PT_GAP) {
+            out[k++] = p;
+            last = p;
+        }
+    }
+    return k;
+}
+
+size_t prefill_chunk_len(const PrefillHook *hook, size_t pos0, size_t n, size_t i) {
+    // the segment between the cuts around offset i: [a, b)
+    size_t a = 0, b = n;
+    for (size_t k = 0; hook && k < hook->ncuts; k++) {
+        size_t c = hook->cuts[k];
+        if (c <= pos0 || c >= pos0 + n) continue;
+        c -= pos0;
+        if (c <= i) a = c;
+        else {
+            b = c;
+            break;
+        }
+    }
+    size_t len = b - a, chunks = (len + CH - 1) / CH;
+    size_t per = (len + chunks - 1) / MAX(chunks, (size_t)1);
+    return MIN(per, b - i);
 }
 
 void session_invalidate_from(Session *s, size_t n) {

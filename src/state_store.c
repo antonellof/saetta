@@ -102,10 +102,13 @@ typedef struct {
     int64_t created_s;
     StSlice ids, keys;
     RowBlock tail;
-    uint32_t nrec, pad;
-    StSlice rec[ST_MAX_REC];
-    uint32_t prev[2];
-    uint64_t since_eos;
+    uint32_t nrec, nsnap;
+    struct {
+        uint64_t pos;
+        uint32_t prev[2];
+        uint64_t since_eos;
+        StSlice rec[ST_MAX_REC];
+    } snap[ST_MAX_SNAP]; // snap[0] at n, snap[1] before it
     uint64_t extra_len;
     uint8_t extra[ST_EXTRA_MAX];
 } StateHead;
@@ -292,9 +295,11 @@ static bool head_ok(int fd, StateHead *h, uint8_t *page, const uint8_t *shape, c
     if (h->n < ST_FIRST || h->n > fsize / 4 || h->nchunks != h->n / ST_CHUNK) return false;
     if (h->ids.len != h->n * 4 || !in_file(&h->ids, fsize)) return false;
     if (h->keys.len != h->nchunks * 32 || !in_file(&h->keys, fsize)) return false;
-    if (h->nrec > ST_MAX_REC || h->extra_len > ST_EXTRA_MAX) return false;
-    for (size_t i = 0; i < h->nrec; i++)
-        if (!in_file(&h->rec[i], fsize)) return false;
+    if (h->nrec > ST_MAX_REC || h->extra_len > ST_EXTRA_MAX || h->nsnap < 1 || h->nsnap > ST_MAX_SNAP) return false;
+    if (h->snap[0].pos != h->n || (h->nsnap > 1 && !(h->snap[1].pos > 0 && h->snap[1].pos < h->n))) return false;
+    for (size_t s = 0; s < h->nsnap; s++)
+        for (size_t i = 0; i < h->nrec; i++)
+            if (!in_file(&h->snap[s].rec[i], fsize)) return false;
     return rowblock_in_file(&h->tail, fsize) && h->tail.r0 == h->nchunks * ST_CHUNK && h->tail.r1 == h->n;
 }
 
@@ -717,17 +722,21 @@ static Err write_state(StateStore *st, const uint8_t *keys, size_t nchunks, cons
     off = align_page(off + h->keys.len);
     rowblock_plan(&st->lay, nchunks * ST_CHUNK, st->n, &off, &h->tail);
     h->nrec = (uint32_t)st->lay.nrec;
+    h->nsnap = (uint32_t)st->meta.nsnap;
     size_t ro = 0;
-    for (size_t i = 0; i < st->lay.nrec; i++) {
-        h->rec[i].off = off;
-        h->rec[i].len = st->lay.rec_bytes[i];
-        crc32c_quad(st->rec + ro, st->lay.rec_bytes[i], h->rec[i].crc);
-        off = align_page(off + st->lay.rec_bytes[i]);
-        ro += st->lay.rec_bytes[i];
+    for (size_t s = 0; s < st->meta.nsnap; s++) {
+        h->snap[s].pos = st->meta.snap[s].pos;
+        h->snap[s].prev[0] = st->meta.snap[s].prev[0];
+        h->snap[s].prev[1] = st->meta.snap[s].prev[1];
+        h->snap[s].since_eos = st->meta.snap[s].since_eos;
+        for (size_t i = 0; i < st->lay.nrec; i++) {
+            h->snap[s].rec[i].off = off;
+            h->snap[s].rec[i].len = st->lay.rec_bytes[i];
+            crc32c_quad(st->rec + ro, st->lay.rec_bytes[i], h->snap[s].rec[i].crc);
+            off = align_page(off + st->lay.rec_bytes[i]);
+            ro += st->lay.rec_bytes[i];
+        }
     }
-    h->prev[0] = st->meta.prev[0];
-    h->prev[1] = st->meta.prev[1];
-    h->since_eos = st->meta.since_eos;
     h->extra_len = st->meta.extra_len;
     memcpy(h->extra, st->meta.extra, st->meta.extra_len);
     h->crc = page_crc(page);
@@ -735,10 +744,11 @@ static Err write_state(StateStore *st, const uint8_t *keys, size_t nchunks, cons
     if (!err && nchunks) err = pwrite_all(fd, keys, h->keys.len, h->keys.off);
     if (!err) err = write_rowblock(fd, &st->lay, &h->tail);
     ro = 0;
-    for (size_t i = 0; i < st->lay.nrec && !err; i++) {
-        err = pwrite_all(fd, st->rec + ro, h->rec[i].len, h->rec[i].off);
-        ro += st->lay.rec_bytes[i];
-    }
+    for (size_t s = 0; s < st->meta.nsnap; s++)
+        for (size_t i = 0; i < st->lay.nrec && !err; i++) {
+            err = pwrite_all(fd, st->rec + ro, h->snap[s].rec[i].len, h->snap[s].rec[i].off);
+            ro += st->lay.rec_bytes[i];
+        }
     if (!err) err = pwrite_all(fd, page, ST_PAGE, 0);
     if (!err && ftruncate(fd, (off_t)off) != 0) err = "WriteFailed";
     free(page);
@@ -896,10 +906,10 @@ void state_store_fence(StateStore *st, const void *base, size_t from) {
     pthread_mutex_unlock(&st->mu);
 }
 
-static uint64_t state_bytes(const StLayout *lay, size_t n) {
+static uint64_t state_bytes(const StLayout *lay, size_t n, size_t nsnap) {
     uint64_t b = ST_PAGE + n * 4;
     for (size_t i = 0; i < lay->nreg; i++) b += (uint64_t)lay->reg[i].planes * (n / lay->reg[i].per_row) * lay->reg[i].row_bytes;
-    for (size_t i = 0; i < lay->nrec; i++) b += lay->rec_bytes[i];
+    for (size_t i = 0; i < lay->nrec; i++) b += nsnap * lay->rec_bytes[i];
     return b;
 }
 
@@ -921,10 +931,18 @@ bool state_store_save(StateStore *st, const StLayout *lay, const uint32_t *ids, 
                       const uint8_t (*inh)[32], size_t ninh, void *const *hold, size_t nhold, void (*release)(void *)) {
     if (ninh > n / ST_CHUNK) ninh = n / ST_CHUNK;
     const char *why = NULL;
+    StMeta mcopy = *meta;
+    if (mcopy.nsnap == 0) mcopy.nsnap = 1;
+    mcopy.snap[0].pos = n;
+    meta = &mcopy;
+    size_t nsnap = meta->nsnap;
     if (n < ST_MIN_TOKENS) why = "under the minimum";
     else if (layout_slices(lay) > ST_MAX_SLICES || lay->nrec > ST_MAX_REC || nhold > ST_MAX_REGIONS ||
              meta->extra_len > ST_EXTRA_MAX)
         why = "layout too large";
+    else if (nsnap < 1 || nsnap > ST_MAX_SNAP || meta->snap[0].pos != n ||
+             (nsnap > 1 && !(meta->snap[1].pos > 0 && meta->snap[1].pos < n)))
+        why = "bad snapshots";
     state_store_wait(st);
     uint8_t h[32];
     char hx[33], p[1200];
@@ -938,8 +956,9 @@ bool state_store_save(StateStore *st, const StLayout *lay, const uint32_t *ids, 
     }
     if (!why) {
         struct statfs fs;
-        if (statfs(st->dir, &fs) == 0 && (uint64_t)fs.f_bavail * fs.f_bsize < state_bytes(lay, n) + ST_DISK_FLOOR) why = "disk short";
-        else if (state_bytes(lay, n) > ST_MAX_BYTES) why = "larger than the store";
+        if (statfs(st->dir, &fs) == 0 && (uint64_t)fs.f_bavail * fs.f_bsize < state_bytes(lay, n, nsnap) + ST_DISK_FLOOR)
+            why = "disk short";
+        else if (state_bytes(lay, n, nsnap) > ST_MAX_BYTES) why = "larger than the store";
     }
     if (why) {
         if (strcmp(why, "already saved")) dbg("state: skipped %zu tokens (%s)\n", n, why);
@@ -950,16 +969,18 @@ bool state_store_save(StateStore *st, const StLayout *lay, const uint32_t *ids, 
     memcpy(st->ids, ids, n * sizeof(uint32_t));
     size_t rb = 0;
     for (size_t i = 0; i < lay->nrec; i++) rb += lay->rec_bytes[i];
+    rb *= nsnap;
     if (st->rec_cap < rb) {
         free(st->rec);
         st->rec = xmalloc(rb);
         st->rec_cap = rb;
     }
     size_t ro = 0;
-    for (size_t i = 0; i < lay->nrec; i++) {
-        memcpy(st->rec + ro, lay->rec[i], lay->rec_bytes[i]);
-        ro += lay->rec_bytes[i];
-    }
+    for (size_t s = 0; s < nsnap; s++)
+        for (size_t i = 0; i < lay->nrec; i++) {
+            memcpy(st->rec + ro, s == 0 ? lay->rec[i] : lay->xrec[i], lay->rec_bytes[i]);
+            ro += lay->rec_bytes[i];
+        }
     if (st->inh_cap < ninh) st->inh = xrealloc(st->inh, (st->inh_cap = ninh) * 32);
     if (ninh) memcpy(st->inh, inh, ninh * 32);
     pthread_mutex_lock(&st->mu);
@@ -983,17 +1004,31 @@ static int by_n_desc(const void *a, const void *b) {
     return x->n < y->n ? 1 : x->n > y->n ? -1 : 0;
 }
 
-// Whether the ids section of the state open at fd (header h checked) is prompt[0..h.n).
-static bool ids_match(int fd, const StateHead *h, const uint32_t *prompt, size_t np) {
-    if (h->n >= np) return false;
+// The longest snapshot of the state open at fd (header h checked) whose ids the prompt extends
+// (ids[0..pos) == prompt[0..pos), pos < np): its index, -1 if none (or the ids fail their crc);
+// usable[i]: whether snapshot i is one.
+static int ids_match(int fd, const StateHead *h, const uint32_t *prompt, size_t np, bool usable[ST_MAX_SNAP]) {
+    for (size_t s = 0; s < ST_MAX_SNAP; s++) usable[s] = false;
     uint32_t *ids = xmalloc(h->ids.len + 4);
-    bool ok = !pread_all(fd, ids, h->ids.len, h->ids.off) && crc32c(0, ids, h->ids.len) == h->ids.crc[0] &&
-              !memcmp(ids, prompt, h->ids.len);
+    int best = -1;
+    if (!pread_all(fd, ids, h->ids.len, h->ids.off) && crc32c(0, ids, h->ids.len) == h->ids.crc[0]) {
+        size_t lim = MIN((size_t)h->n, np), lcp = 0;
+        while (lcp < lim && ids[lcp] == prompt[lcp]) lcp++;
+        // the snapshot at n: its ids a prefix; one before n: the id at its position too (its MTP
+        // rows pair it), as a resident checkpoint (session_shared_point)
+        for (size_t s = 0; s < h->nsnap; s++) {
+            usable[s] = (s == 0 ? h->snap[s].pos <= lcp : h->snap[s].pos < lcp) && h->snap[s].pos < np;
+            if (usable[s] && (best < 0 || h->snap[s].pos > h->snap[best].pos)) best = (int)s;
+        }
+    }
     free(ids);
-    return ok;
+    return best;
 }
 
-size_t state_store_find(StateStore *st, const uint32_t *prompt, size_t np, size_t min_n, char name[33]) {
+size_t state_store_find(StateStore *st, const uint32_t *prompt, size_t np, size_t min_n, char name[33],
+                        size_t pos[ST_MAX_SNAP]) {
+    if (pos)
+        for (size_t s = 0; s < ST_MAX_SNAP; s++) pos[s] = 0;
     if (np <= ST_FIRST) return 0;
     uint8_t first[32];
     ids_hash(prompt, ST_FIRST, first);
@@ -1002,20 +1037,25 @@ size_t state_store_find(StateStore *st, const uint32_t *prompt, size_t np, size_
     size_t nc = 0;
     for (size_t i = 0; i < st->nents; i++) {
         const StEntry *e = &st->ents[i];
-        if (e->n > min_n && e->n < np && !memcmp(e->first, first, 32)) c[nc++] = *e;
+        if (e->n > min_n && !memcmp(e->first, first, 32)) c[nc++] = *e;
     }
     pthread_mutex_unlock(&st->mu);
     qsort(c, nc, sizeof *c, by_n_desc);
     size_t found = 0;
     uint8_t *page = xmalloc(ST_PAGE);
-    for (size_t i = 0; i < nc && !found; i++) {
+    // longest first: a state no longer than the best snapshot found cannot beat it
+    for (size_t i = 0; i < nc && c[i].n > found; i++) {
         char p[1200];
         int fd = open(pathf(p, sizeof p, "%s/states/%s.st", st->dir, c[i].name), O_RDONLY | O_NOFOLLOW);
         if (fd < 0) continue;
         StateHead h;
-        if (read_state_head(st, fd, &h, page) && h.n == c[i].n && ids_match(fd, &h, prompt, np)) {
-            found = h.n;
+        bool usable[ST_MAX_SNAP];
+        int s;
+        if (read_state_head(st, fd, &h, page) && h.n == c[i].n && (s = ids_match(fd, &h, prompt, np, usable)) >= 0 &&
+            h.snap[s].pos > min_n && h.snap[s].pos > found) {
+            found = h.snap[s].pos;
             memcpy(name, c[i].name, 33);
+            for (size_t k = 0; pos && k < ST_MAX_SNAP; k++) pos[k] = k < h.nsnap && usable[k] ? (size_t)h.snap[k].pos : 0;
         }
         close(fd);
     }
@@ -1059,6 +1099,19 @@ static void *read_worker(void *arg) {
     return NULL;
 }
 
+// Whether p[0..len) lies inside the rows [0, n) a load reads into lay (a snapshot's MTP rows at a
+// position below n: read with the rows, then only checked against the snapshot's crcs).
+static bool in_rows(const StLayout *lay, size_t n, const uint8_t *p, size_t len) {
+    for (size_t i = 0; i < lay->nreg; i++) {
+        const StRegion *g = &lay->reg[i];
+        for (size_t k = 0; k < g->planes; k++) {
+            const uint8_t *b = g->base + k * g->plane_stride;
+            if (p >= b && p + len <= b + (n / g->per_row) * g->row_bytes) return true;
+        }
+    }
+    return false;
+}
+
 // Adds a row block's slices (checked against lay's shapes) to the reads.
 static bool add_rowblock(const StLayout *lay, const RowBlock *rb, int fd, int file, ReadItem *items, size_t *ni) {
     if (rb->nslices != layout_slices(lay)) return false;
@@ -1099,27 +1152,41 @@ Err state_store_load(StateStore *st, const char *name, const uint32_t *prompt, s
     ReadItem *items = NULL;
     size_t nfiles = 0;
     int bad_file = -1; // a chunk that failed a check (deleted with the state)
+    bool usable[ST_MAX_SNAP] = {false};
+    int best = -1;
     if (!read_state_head(st, sfd, &h, page)) err = "StateCorrupt";
     else if (h.nrec != lay->nrec) err = "StateMismatch";
-    else if (!ids_match(sfd, &h, prompt, np)) err = "StateMismatch";
+    else if ((best = ids_match(sfd, &h, prompt, np, usable)) < 0) err = "StateMismatch";
+    // the rows read: all of them with the snapshot at n, else the chunks up to the second snapshot
+    // (the rows past it are the prompt's to write)
+    size_t rchunks = 0, rows = 0;
+    bool tail = false;
+    if (!err) {
+        size_t need = usable[0] ? (size_t)h.n : (size_t)h.snap[best].pos;
+        rchunks = MIN((size_t)h.nchunks, (need + ST_CHUNK - 1) / ST_CHUNK);
+        tail = need > h.nchunks * ST_CHUNK;
+        rows = tail ? (size_t)h.n : rchunks * ST_CHUNK;
+    }
     for (size_t i = 0; !err && i < lay->nreg; i++)
-        if (h.n / lay->reg[i].per_row > lay->reg[i].plane_stride / lay->reg[i].row_bytes) err = "StateTooLarge";
-    for (size_t i = 0; !err && i < lay->nrec; i++)
-        if (h.rec[i].len != lay->rec_bytes[i]) err = "StateMismatch";
+        if (rows / lay->reg[i].per_row > lay->reg[i].plane_stride / lay->reg[i].row_bytes) err = "StateTooLarge";
+    for (size_t s = 0; !err && s < h.nsnap; s++)
+        for (size_t i = 0; !err && i < lay->nrec; i++)
+            if (h.snap[s].rec[i].len != lay->rec_bytes[i] || (usable[s] && !(s == 0 ? lay->rec[i] : lay->xrec[i])))
+                err = "StateMismatch";
     if (!err) {
         keys = xmalloc(h.keys.len + 1);
         if (pread_all(sfd, keys, h.keys.len, h.keys.off) || crc32c(0, keys, h.keys.len) != h.keys.crc[0]) err = "StateCorrupt";
     }
     size_t per = layout_slices(lay), ni = 0;
     if (!err) {
-        items = xmalloc(((h.nchunks + 1) * per + ST_MAX_REC) * sizeof *items);
+        items = xmalloc(((h.nchunks + 1) * per + ST_MAX_SNAP * ST_MAX_REC) * sizeof *items);
         fds = xmalloc((h.nchunks + 1) * sizeof *fds);
         names = xmalloc((h.nchunks + 1) * sizeof *names);
         fds[nfiles] = sfd;
         memcpy(names[nfiles], name, 33);
         nfiles++;
     }
-    for (size_t c = 0; !err && c < h.nchunks; c++) {
+    for (size_t c = 0; !err && c < rchunks; c++) {
         char hx[33];
         hex16(keys + c * 32, hx);
         int fd = open(pathf(p, sizeof p, "%s/chunks/%s.kv", st->dir, hx), O_RDONLY | O_NOFOLLOW);
@@ -1137,10 +1204,20 @@ Err state_store_load(StateStore *st, const char *name, const uint32_t *prompt, s
             bad_file = file;
         }
     }
-    if (!err && !add_rowblock(lay, &h.tail, sfd, 0, items, &ni)) err = "StateCorrupt";
-    for (size_t i = 0; !err && i < lay->nrec; i++)
-        items[ni++] = (ReadItem){sfd, h.rec[i].off, h.rec[i].len, lay->rec[i],
-                                 {h.rec[i].crc[0], h.rec[i].crc[1], h.rec[i].crc[2], h.rec[i].crc[3]}, 0};
+    if (!err && tail && !add_rowblock(lay, &h.tail, sfd, 0, items, &ni)) err = "StateCorrupt";
+    // the snapshots' buffers; one inside the rows (the second snapshot's MTP rows) is not read twice
+    // into the same memory: it is checked against its crcs once the rows are in
+    ReadItem post[ST_MAX_SNAP * ST_MAX_REC];
+    size_t npost = 0;
+    for (size_t s = 0; !err && s < h.nsnap; s++) {
+        if (!usable[s]) continue;
+        for (size_t i = 0; i < lay->nrec; i++) {
+            const StSlice *r = &h.snap[s].rec[i];
+            ReadItem it = {sfd, r->off, r->len, s == 0 ? lay->rec[i] : lay->xrec[i], {r->crc[0], r->crc[1], r->crc[2], r->crc[3]}, 0};
+            if (in_rows(lay, rows, it.dst, (size_t)it.len)) post[npost++] = it;
+            else items[ni++] = it;
+        }
+    }
     if (!err) {
         *touched = true;
         ReadJob j = {.items = items, .n = ni};
@@ -1156,6 +1233,11 @@ Err state_store_load(StateStore *st, const char *name, const uint32_t *prompt, s
         if (b) {
             err = "StateCorrupt";
             bad_file = b - 1;
+        }
+        for (size_t i = 0; !err && i < npost; i++) {
+            uint32_t c[4];
+            crc32c_quad(post[i].dst, post[i].len, c);
+            if (memcmp(c, post[i].crc, sizeof c)) err = "StateCorrupt";
         }
         uint64_t tot = 0;
         for (size_t i = 0; i < ni; i++) tot += items[i].len;
@@ -1179,12 +1261,12 @@ Err state_store_load(StateStore *st, const char *name, const uint32_t *prompt, s
         pthread_mutex_unlock(&st->mu);
     }
     if (!err) {
-        *n_out = h.n;
+        *n_out = (size_t)h.snap[best].pos;
         memset(meta, 0, sizeof *meta);
         memcpy(meta->lineage, h.lineage, 16);
-        meta->prev[0] = h.prev[0];
-        meta->prev[1] = h.prev[1];
-        meta->since_eos = h.since_eos;
+        meta->nsnap = h.nsnap;
+        for (size_t s = 0; s < h.nsnap; s++)
+            meta->snap[s] = (StSnap){h.snap[s].pos, {h.snap[s].prev[0], h.snap[s].prev[1]}, h.snap[s].since_eos, usable[s]};
         meta->extra_len = h.extra_len;
         memcpy(meta->extra, h.extra, h.extra_len);
         futimes(sfd, NULL);

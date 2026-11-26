@@ -2203,24 +2203,12 @@ Err model_prefill(Model *m, Session *s, const uint32_t *tokens, size_t n, sx_buf
     return model_prefill_with(m, s, tokens, n, trace, NULL, logits);
 }
 
-static size_t size_at(size_t i, size_t ae, size_t eq, size_t rp) { return ae == 0 ? eq : i < ae ? PT_EVERY : rp; }
-
 Err model_prefill_with(Model *m, Session *s, const uint32_t *tokens, size_t n, sx_buffer *trace,
                        const PrefillHook *hook, float **logits) {
     skip_init();
-    // fewest chunks of at most CH tokens, of equal size: a short tail chunk would pay the
-    // whole per-chunk expert cost for a few tokens
-    size_t nchunks = (n + CH - 1) / CH;
-    size_t per = (n + nchunks - 1) / MAX(nchunks, (size_t)1);
-    // aligned: PT_EVERY-token chunks up to the last point boundary, then the equal split
+    // between the hook's cuts (checkpoints), the fewest chunks of at most CH tokens, of equal
+    // size: a short tail chunk would pay the whole per-chunk expert cost for a few tokens
     size_t pos0 = s->pos;
-    bool aligned = hook && hook->aligned ? hook->aligned(hook->ctx) : false;
-    size_t align_end = (aligned && pos0 % PT_EVERY == 0 && PT_EVERY <= CH)
-                           ? MIN(n, (MAX(pos0, (size_t)(PT_MAX * PT_EVERY)) - pos0) / PT_EVERY * PT_EVERY)
-                           : 0;
-    size_t rest = n - align_end;
-    size_t r_chunks = (rest + CH - 1) / CH;
-    size_t r_per = (rest + r_chunks - 1) / MAX(r_chunks, (size_t)1);
     size_t i = 0;
     float *lg = NULL;
     // the n-gram row ids of chunk c + 1 (and their prefetch, one syscall per row: about
@@ -2228,7 +2216,7 @@ Err model_prefill_with(Model *m, Session *s, const uint32_t *tokens, size_t n, s
     NextThread next = {0};
     s->ids_ready = false;
     while (i < n) {
-        size_t T = MIN(size_at(i, align_end, per, r_per), n - i);
+        size_t T = prefill_chunk_len(hook, pos0, n, i);
         if (next.on) {
             next_join(&next);
             uint64_t (*tmp)[NG_HEADS] = s->ple_rows;
@@ -2238,7 +2226,7 @@ Err model_prefill_with(Model *m, Session *s, const uint32_t *tokens, size_t n, s
             s->ids_ready = true;
         }
         size_t nx = i + T;
-        size_t nT = MIN(size_at(nx, align_end, per, r_per), n - nx);
+        size_t nT = nx < n ? prefill_chunk_len(hook, pos0, n, nx) : 0;
         bool has_next = nT > 0 && trace == NULL;
         Err err = chunk_logits_next(m, s, tokens + i, T, trace, false, has_next ? tokens + nx : NULL, has_next ? nT : 0,
                                     &next, &lg);
@@ -2414,10 +2402,18 @@ Err session_create_kv(Gpu *g, bool kv_half, Session **out) {
 #define GDN_CONV_N (n_gdn * (KCONV - 1) * CONV)
 #define PLE_HIST_N (PLE_CONV_STATE * HCW)
 
+// All three buffers, or none (a failure releases what it allocated and leaves the outputs as they were).
 static Err new_state(Gpu *g, sx_buffer **gdn, sx_buffer **conv, sx_buffer **ple) {
-    TRY(gpu_new_buffer(g, GDN_STATE_N * 4, gdn));
-    TRY(gpu_new_buffer(g, GDN_CONV_N * 4, conv));
-    TRY(gpu_new_buffer(g, PLE_HIST_N * 4, ple));
+    sx_buffer *a = NULL, *b = NULL, *c = NULL;
+    Err err = gpu_new_buffer(g, GDN_STATE_N * 4, &a);
+    if (!err) err = gpu_new_buffer(g, GDN_CONV_N * 4, &b);
+    if (!err) err = gpu_new_buffer(g, PLE_HIST_N * 4, &c);
+    if (err) {
+        if (a) sx_buffer_release(a);
+        if (b) sx_buffer_release(b);
+        return err;
+    }
+    *gdn = a, *conv = b, *ple = c;
     return OK;
 }
 
@@ -2558,7 +2554,15 @@ Err session_conv_shrink(const Session *s, Gpu *g, Conv *cv, size_t cap) {
     }
     for (int k = 0; k < 2; k++) cv->ck[k].tokens.len = 0;
     cv->ptoks.len = 0;
-    for (int k = 0; k < PT_MAX; k++) cv->pts[k].valid = false;
+    // an emptied conversation gives its checkpoints' memory back too
+    for (int k = 0; k < PT_MAX; k++) {
+        if (cv->pts[k].gdn) {
+            sx_buffer_release(cv->pts[k].gdn);
+            sx_buffer_release(cv->pts[k].conv);
+            sx_buffer_release(cv->pts[k].ple);
+        }
+        cv->pts[k] = (Point){0};
+    }
     return OK;
 }
 
@@ -2592,16 +2596,18 @@ bool session_roll_to(Session *s, size_t p, const uint32_t *toks) {
 }
 
 
-Err session_save_point(Session *s, Gpu *g, const uint32_t *toks, size_t n) {
-    if (!(s->pos % PT_EVERY == 0 && n == s->pos)) die("session_save_point: %zu tokens at position %zu\n", n, s->pos);
-    size_t k = s->pos / PT_EVERY - 1;
-    if (k >= PT_MAX) return OK;
+Err session_save_point(Session *s, Gpu *g, const uint32_t *toks, size_t n, bool may_alloc) {
+    if (!(n == s->pos && n > 0)) die("session_save_point: %zu tokens at position %zu\n", n, s->pos);
+    session_keep_points(s, n);
+    int k = session_point_slot(s->pts, n, may_alloc);
+    if (k < 0) return OK;
     Point *pt = &s->pts[k];
     if (pt->gdn == NULL) {
         Point np = {.prev = {EOS_PLE, EOS_PLE}};
         TRY(new_state(g, &np.gdn, &np.conv, &np.ple));
         *pt = np;
     }
+    pt->valid = false;
     memcpy(gpu_floats(pt->gdn), live(s, s->gdn_state, s->sp_gdn, GDN_STATE_N), GDN_STATE_N * 4);
     memcpy(gpu_floats(pt->conv), live(s, s->gdn_conv, s->sp_conv, GDN_CONV_N), GDN_CONV_N * 4);
     memcpy(gpu_floats(pt->ple), live(s, s->ple_hist, s->sp_ple, PLE_HIST_N), PLE_HIST_N * 4);
@@ -2612,8 +2618,9 @@ Err session_save_point(Session *s, Gpu *g, const uint32_t *toks, size_t n) {
     size_t since = 0;
     for (size_t i = n; i > 0 && toks[i - 1] != EOS_PLE; i--) since += 1;
     pt->since_eos = since;
+    pt->pos = n;
     pt->valid = true;
-    vec_set(&s->ptoks, toks, n);
+    vec_set(&s->ptoks, toks, n + 1);
     return OK;
 }
 
@@ -2632,40 +2639,53 @@ static void start_at(Session *s, const Point *pt, size_t n) {
 }
 
 void session_start_at_own_point(Session *s, size_t n) {
-    start_at(s, &s->pts[n / PT_EVERY - 1], n);
+    int k = session_point_at(s->pts, n);
+    if (k < 0) die("session_start_at_own_point: no checkpoint at %zu\n", n);
+    start_at(s, &s->pts[k], n);
     session_keep_points(s, n);
 }
 
-Err session_start_from(Session *s, Gpu *g, const Conv *src, size_t n) {
-    if (!(n % PT_EVERY == 0 && n > 0)) die("session_start_from: position %zu\n", n);
+Err session_start_from(Session *s, Gpu *g, const Conv *src, size_t n, size_t alloc_max) {
+    int k = session_point_at(src->pts, n);
+    if (k < 0) die("session_start_from: no checkpoint at %zu\n", n);
     // its rows below n become src's: no restore point of its own holds for them any more
     for (int i = 0; i < 2; i++) s->ck[i].tokens.len = 0;
     size_t kvrow = NKV * HD * session_kv_elem(s);
     uint8_t *dkv = sx_buffer_contents(s->kv);
     const uint8_t *skv = sx_buffer_contents(src->kv);
     if (!(n <= s->cap && n <= src->cap)) die("session_start_from: position %zu past capacity\n", n);
+    // the rows below n and the row at n (the MTP slot's, which its head reads after the start; the
+    // others are rewritten), the pooled blocks to the one holding n
+    size_t rows = MIN(n + 1, MIN(s->cap, src->cap)), nb = MIN(n / BLOCK + 1, MIN(s->cap, src->cap) / BLOCK);
     for (size_t plane = 0; plane < (n_attn + 1) * 2; plane++)
-        memcpy(dkv + plane * s->cap * kvrow, skv + plane * src->cap * kvrow, n * kvrow);
+        memcpy(dkv + plane * s->cap * kvrow, skv + plane * src->cap * kvrow, rows * kvrow);
     float *dix = gpu_floats(s->ixk), *six = gpu_floats(src->ixk);
     float *dbk = gpu_floats(s->bk), *sbk = gpu_floats(src->bk);
     for (size_t l = 0; l < n_attn + 1; l++) {
-        memcpy(dix + l * s->cap * IXD, six + l * src->cap * IXD, n * IXD * 4);
-        size_t nb = n / BLOCK;
+        memcpy(dix + l * s->cap * IXD, six + l * src->cap * IXD, rows * IXD * 4);
         memcpy(dbk + l * (s->cap / BLOCK) * IXD, sbk + l * (src->cap / BLOCK) * IXD, nb * IXD * 4);
     }
-    size_t k = n / PT_EVERY - 1;
     start_at(s, &src->pts[k], n);
-    // this conversation's own points up to n, so it can be shared from in turn
-    // (only src's valid ones: this conversation's own points below n were for other rows)
-    for (size_t i = 0; i < k + 1; i++) {
+    // this conversation's own points up to n, so it can be shared from in turn (only src's valid
+    // ones: this conversation's own points were for other rows), at most alloc_max of them in new
+    // buffers; an allocation that fails leaves none valid (nothing then holds for these rows)
+    for (size_t i = 0; i < PT_MAX; i++) s->pts[i].valid = false;
+    s->ptoks.len = 0;
+    size_t allocs = 0;
+    for (size_t i = 0; i < PT_MAX; i++) {
         const Point *sp = &src->pts[i];
-        s->pts[i].valid = false;
-        if (sp->gdn == NULL || !sp->valid) continue;
+        if (sp->gdn == NULL || !sp->valid || sp->pos > n) continue;
         Point *d = &s->pts[i];
         if (d->gdn == NULL) {
+            if (allocs >= alloc_max) continue;
             Point np = {.prev = {EOS_PLE, EOS_PLE}};
-            TRY(new_state(g, &np.gdn, &np.conv, &np.ple));
+            Err err = new_state(g, &np.gdn, &np.conv, &np.ple);
+            if (err) {
+                for (size_t j = 0; j < PT_MAX; j++) s->pts[j].valid = false;
+                return err;
+            }
             *d = np;
+            allocs++;
         }
         memcpy(gpu_floats(d->gdn), gpu_floats(sp->gdn), GDN_STATE_N * 4);
         memcpy(gpu_floats(d->conv), gpu_floats(sp->conv), GDN_CONV_N * 4);
@@ -2673,9 +2693,10 @@ Err session_start_from(Session *s, Gpu *g, const Conv *src, size_t n) {
         d->prev[0] = sp->prev[0];
         d->prev[1] = sp->prev[1];
         d->since_eos = sp->since_eos;
+        d->pos = sp->pos;
         d->valid = true;
     }
-    vec_set(&s->ptoks, src->ptoks.ptr, n);
+    vec_set(&s->ptoks, src->ptoks.ptr, MIN(src->ptoks.len, n + 1));
     return OK;
 }
 
@@ -2717,8 +2738,11 @@ void session_reset(Session *s) {
 // pooled block n / BLOCK.
 bool session_state_layout(const Session *s, size_t slot, size_t n, StLayout *out) {
     size_t kvrow = NKV * HD * session_kv_elem(s);
-    const Ckpt *k = &s->ck[slot];
-    if (n >= s->cap) return false;
+    if (n >= s->cap || slot >= 2 + PT_MAX) return false;
+    const Ckpt *ck = slot < 2 ? &s->ck[slot] : NULL;
+    const Point *pt = slot < 2 ? NULL : &s->pts[slot - 2];
+    if (pt && pt->gdn == NULL) return false;
+    sx_buffer *rg = ck ? ck->gdn : pt->gdn, *rc = ck ? ck->conv : pt->conv, *rp = ck ? ck->ple : pt->ple;
     uint8_t *kv = sx_buffer_contents(s->kv), *ix = sx_buffer_contents(s->ixk), *bk = sx_buffer_contents(s->bk);
     *out = (StLayout){
         .nreg = 3,
@@ -2726,7 +2750,7 @@ bool session_state_layout(const Session *s, size_t slot, size_t n, StLayout *out
         .reg = {{kv, (n_attn + 1) * 2, s->cap * kvrow, kvrow, 1},
                 {ix, n_attn + 1, s->cap * IXD * 4, IXD * 4, 1},
                 {bk, n_attn + 1, (s->cap / BLOCK) * IXD * 4, IXD * 4, BLOCK}},
-        .rec = {sx_buffer_contents(k->gdn), sx_buffer_contents(k->conv), sx_buffer_contents(k->ple),
+        .rec = {sx_buffer_contents(rg), sx_buffer_contents(rc), sx_buffer_contents(rp),
                 kv + (n_attn * 2) * s->cap * kvrow + n * kvrow, kv + (n_attn * 2 + 1) * s->cap * kvrow + n * kvrow,
                 ix + (n_attn * s->cap + n) * IXD * 4, bk + (n_attn * (s->cap / BLOCK) + n / BLOCK) * IXD * 4},
         .rec_bytes = {GDN_STATE_N * 4, GDN_CONV_N * 4, PLE_HIST_N * 4, kvrow, kvrow, IXD * 4, IXD * 4},

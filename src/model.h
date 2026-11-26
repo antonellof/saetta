@@ -31,9 +31,16 @@
 #define CH 4096
 // Most tokens a speculative verification chunk carries (the drafted ones plus the last).
 #define KMAX 8
-// Prefix points: the recurrent state every PT_EVERY tokens of a prompt, at most PT_MAX.
+// Checkpoints at message boundaries (prefix points): the recurrent state at chosen positions of a
+// prompt, at most PT_MAX per conversation: each request's start, and the positions where the
+// prompt's prefill ends a chunk for one (session_point_cuts picks them from the positions of the
+// <|im_start|> id and every PT_EVERY tokens, at least PT_GAP apart and from the end); past PT_MAX
+// the older ones are thinned to a geometric spacing (session_point_slot), the PT_RECENT most recent
+// and the oldest kept.
 #define PT_EVERY 4096
-#define PT_MAX 8
+#define PT_MAX 16
+#define PT_GAP 1024
+#define PT_RECENT 4
 
 // Chunks of at most MODEL_SMALL tokens use the decode-style kernels.
 #define MODEL_SMALL 8
@@ -76,13 +83,15 @@ typedef struct {
     VecU32 tokens;
 } Ckpt;
 
-// A prefix point; absent while gdn is NULL. valid: saved for the conversation's current prefix
-// tokens (ptoks); cleared whenever its position or anything below it is read again or replaced
-// (session_keep_points), so a buffer left by an earlier occupant of the slot is never used.
+// A checkpoint (prefix point) at position pos; its buffers are absent while gdn is NULL. valid: saved
+// for the conversation's current prefix tokens (ptoks, which covers pos); cleared whenever anything
+// below pos is read again or replaced (session_keep_points), so a buffer left by an earlier
+// occupant of the slot is never used. The slots are in no order.
 typedef struct {
     sx_buffer *gdn, *conv, *ple;
     uint32_t prev[2];
     size_t since_eos;
+    size_t pos;
     bool valid;
 } Point;
 
@@ -149,9 +158,9 @@ struct Session {
     bool mtp_ok;
     size_t mtp_n;
     uint32_t mtp_tok[KMAX];
-    // Prefix points: the recurrent state every PT_EVERY tokens of the prompt prefix ptoks
-    // (point k at position (k+1) * PT_EVERY), so another conversation that shares the prefix
-    // starts there after copying the KV rows.
+    // Checkpoints (prefix points) on the prompt prefix ptoks: a later prompt that leaves this
+    // conversation's history inside it (a retry, an edit, a fork) restarts at the nearest one, and
+    // another conversation that shares the prefix starts there after copying the KV rows.
     Point pts[PT_MAX];
     VecU32 ptoks;
     // The last verification chunk: its start position and length; its per-token states stay
@@ -193,13 +202,19 @@ Err model_step(Model *m, Session *s, uint32_t token, float **logits);
 Err model_prefill(Model *m, Session *s, const uint32_t *tokens, size_t n, sx_buffer *trace, float **logits);
 
 // Hook of model_prefill_with: chunk_done(ctx, s->pos) runs after each chunk (the GPU is done
-// with it); when aligned(ctx) is true the chunks of the first PT_MAX * PT_EVERY positions end
-// on multiples of PT_EVERY (prefix points) when the prompt starts on one. Either may be NULL.
+// with it); a chunk ends at each of the absolute positions cuts[0..ncuts) (increasing; the
+// checkpoints), and the tokens between two cuts are read in the fewest chunks of at most CH
+// tokens, of equal size (prefill_chunk_len). chunk_done may be NULL, cuts too (ncuts 0).
 typedef struct {
     void *ctx;
-    bool (*aligned)(void *ctx);
+    const size_t *cuts;
+    size_t ncuts;
     Err (*chunk_done)(void *ctx, size_t pos);
 } PrefillHook;
+
+// The length of the chunk that starts at offset i of a prefill of n tokens from position pos0
+// (hook may be NULL: equal chunks over the whole prompt).
+size_t prefill_chunk_len(const PrefillHook *hook, size_t pos0, size_t n, size_t i);
 
 // model_prefill with a hook. One call keeps the n-gram preparation of the next chunk
 // overlapped with the GPU: separate calls would each pay it (about 200 ms per call).
@@ -326,28 +341,53 @@ bool session_roll_to(Session *s, size_t p, const uint32_t *toks);
 
 // Keeps the prefix points within the first n tokens (the others are no longer valid).
 void session_keep_points(Session *s, size_t n);
-// Saves prefix point k (at position (k+1) * PT_EVERY == s->pos), allocating it on first use;
-// the prefix tokens are toks[0..n) (n == s->pos).
-Err session_save_point(Session *s, Gpu *g, const uint32_t *toks, size_t n);
-// The prefix point usable for prompt: the highest valid point within the prompt's common prefix
-// with ptoks (a valid point's state and every KV row below it are this conversation's for those
-// tokens, so the points below it need not be valid): its position (a multiple of PT_EVERY,
-// shorter than the prompt), 0 if none.
+// Saves a checkpoint at position n == s->pos (the prefix tokens are toks[0..n), and toks[n] the
+// next one, which its MTP row pairs: ptoks keeps n + 1 tokens) in the slot
+// session_point_slot picks: allocated on first use when may_alloc (the caller's memory check),
+// else an empty slot's or a thinned point's buffers; nothing when none is left.
+Err session_save_point(Session *s, Gpu *g, const uint32_t *toks, size_t n, bool may_alloc);
+// The slot for a new checkpoint at pos (past every valid one): a valid point already at pos; else
+// a slot with buffers and no valid point; else, with may_alloc, a slot without buffers; else, when
+// some point is valid, the one thinning drops (the oldest and the PT_RECENT most recent kept; of
+// the others, the one whose neighbours' gap is smallest against its distance from pos, which
+// leaves a geometric spacing); -1 when there is none.
+int session_point_slot(const Point pts[PT_MAX], size_t pos, bool may_alloc);
+// The slot of the valid point at pos, -1 if none.
+int session_point_at(const Point pts[PT_MAX], size_t pos);
+// Bytes of one checkpoint's recurrent buffers (118 MB Flash-Next, 157 MB 27B).
+size_t session_point_bytes(const Session *s);
+// The checkpoint usable for prompt: the highest valid point at a position pos < the prompt's common
+// prefix with ptoks (a valid point's state and every KV row below it are this conversation's for
+// those tokens, so the points below it need not be valid; the token at pos matches too, the one
+// its MTP row pairs): its position (shorter than the prompt), 0 if none.
 size_t session_shared_point(const uint32_t *ptoks, size_t nptoks, const Point pts[PT_MAX], const uint32_t *prompt,
                             size_t n);
-// Starts at this conversation's own prefix point at position n (its KV rows below n are in place).
+
+// The checkpoint positions of a prefill from pos0 of the prompt ids[0..n) (which reads it to n - 1,
+// where the prompt's restore point is saved), increasing, into out (room for cap): the candidates
+// are the message starts (positions of im_start; none when it is UINT32_MAX) and the multiples of
+// PT_EVERY in (pos0, n - 1); one is taken when it is at least PT_GAP after the previous one taken
+// (pos0 at first) and PT_GAP before n - 1, so no checkpoint makes a chunk shorter than PT_GAP (the
+// server keeps one at each request's start, which needs no cut). Returns the count. Depends on ids
+// and pos0 alone, so a prompt read from the same start is cut the same way in any process.
+size_t session_point_cuts(const uint32_t *ids, size_t n, size_t pos0, uint32_t im_start, size_t *out, size_t cap);
+// Starts at this conversation's own checkpoint at position n (its KV rows below n are in place).
 void session_start_at_own_point(Session *s, size_t n);
 // Before rows from position n on are rewritten: drops the restore points and prefix points
 // that reach past n (their state would no longer match the KV cache).
 void session_invalidate_from(Session *s, size_t n);
 // Starts this (reset) session at position n of a prefix it shares with src: copies the KV,
-// indexer-key and block-key rows below n and the recurrent state of src's prefix point there,
-// and adopts src's valid points up to n by copying them. Its own restore points are dropped (they
+// indexer-key and block-key rows below n (and the MTP slot's rows at n, which its head reads after
+// a start: the rows a state holds, session_state_layout) and the recurrent state of src's
+// checkpoint there,
+// and adopts src's valid points up to n by copying them (at most alloc_max of them into new buffers:
+// the caller's memory check; an allocation that fails leaves none of them valid and returns its
+// error). Its own restore points are dropped (they
 // were for the rows replaced): a restore point holds only while every row below its length is
 // this conversation's computation for its tokens; the other paths that replace rows below one
 // drop it as well (session_invalidate_from past its length, session_conv_shrink, a restore
 // from the state store, a LoRA switch, which invalidates from 0).
-Err session_start_from(Session *s, Gpu *g, const Conv *src, size_t n);
+Err session_start_from(Session *s, Gpu *g, const Conv *src, size_t n, size_t alloc_max);
 // Back to the restore point session_reusable picked.
 void session_restore(Session *s);
 // The n-gram token history after consuming token.
@@ -361,7 +401,8 @@ void session_reset(Session *s);
 // n). Flash-Next's first prompt chunk after a restore (mtp_ok false) skips the head's row n and
 // then reads it: saved with the state, it leaves a restored conversation's head as the resident
 // one's. The 27B's first chunk after a restore rewrites row n and keeps row n - 1 (in the state's
-// rows below n), so there the saved row n is only overwritten. False when the model keeps no such
+// rows below n), so there the saved row n is only overwritten. slot: 0 and 1 the restore points
+// ck[0] and ck[1]; 2 + k the checkpoint pts[k] (at n == pts[k].pos). False when the model keeps no such
 // state (DeepSeek-V4-Flash, Inkling 2 Mini).
 bool session_state_layout(const Session *s, size_t slot, size_t n, StLayout *out);
 

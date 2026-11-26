@@ -3,6 +3,14 @@
 All notable changes to saetta and Saetta Code (`saetta code`), newest first. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are saetta's.
 
+## [0.20.0] - 2026-11-26
+
+### Added
+
+- Saetta Code saves the engine's state with the session on the SSD and restores it on resume (`saetta code -c`, `/resume`): a resumed session reads only its new message instead of the whole conversation. Checked against the uninterrupted run (exact, or recomputed when anything differs: pack, build, chip, switches); `SAETTA_STATE=0` turns it off. Not yet for Inkling 2 Mini.
+- Inkling 2 Mini: context up to 1M tokens where memory allows (half-precision cache for its global layers), and Thinking Machines' DSpark drafter, opt-in with `saetta download inkling-dspark` and `SAETTA_DSPARK=1` (prompt lookup alone is faster at 4K and stays the default). Speculative answers are checked bit for bit against plain decoding.
+- README, docs and site: "Model families" and an "All packs" table with each pack's options.
+
 ## [0.19.1] - 2026-11-26
 
 ### Added

@@ -45,7 +45,7 @@
 #include "weights.h"
 
 // Release version; keep equal to the git tag (v<version>).
-#define SAETTA_VERSION "0.19.0"
+#define SAETTA_VERSION "0.19.1"
 
 #define CFG_IN_MAX ((size_t)16384)
 #define CFG_OUT_MAX ((size_t)262144)

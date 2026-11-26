@@ -3,6 +3,12 @@
 All notable changes to saetta and Saetta Code (`saetta code`), newest first. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are saetta's.
 
+## [0.19.1] - 2026-11-26
+
+### Added
+
+- Saetta Code's footer shows the last turn's generation speed after the context size (`· 17.9 tok/s`), and `/session` shows generation and prompt reading speed for the model in process.
+
 ## [0.19.0] - 2026-11-26
 
 ### Added

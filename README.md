@@ -155,9 +155,11 @@ Several Saetta Code sessions share one model: a `saetta start code` in another t
 
 By default the model runs inside the agent. Saetta Code can also use a running Saetta server, or any OpenAI-compatible chat completions server listed in `models.json`; `/model` adds one.
 
+In process, the engine's state of the conversation (its KV cache and recurrent state) is saved to `~/.saetta/state` in the background at the end of each turn, so a session reopened later (`--session`, `--continue`, `/resume`) or forked from an earlier message (`/fork`) continues from it instead of reading its whole history again. The folder keeps up to 20 GB and nothing unused for 7 days; `SAETTA_STATE=0` turns it off. Not yet for Inkling 2 Mini or with a LoRA adapter. Next: prompts read while tools run.
+
 <p align="center"><img src="web/assets/code/model.png" width="900" alt="/model: a saetta server model, two packs on this Mac, one greyed out as too big for its memory, and the others with their download size"></p>
 
-Coming next: sessions saved with the engine's state, so a resumed session does not read its prompt again; prompts read while tools run; speculative decoding and the M5's neural accelerators for Inkling 2 Mini; the agent's commands confined to the project by macOS's Seatbelt.
+Coming next: prompts read while tools run; speculative decoding and the M5's neural accelerators for Inkling 2 Mini; the agent's commands confined to the project by macOS's Seatbelt.
 
 ## Other agents and clients
 

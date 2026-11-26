@@ -1154,13 +1154,16 @@ static Err run_agent(Run *r, bool started) {
 }
 
 // agent_end, then _handlePostAgentRun's end of the retries and _checkCompaction: true when the
-// run continues (agent.continue()), else agent_settled.
+// run continues (agent.continue()), else agent_settled. In process, the conversation's state is
+// saved to the SSD here (in the background), so a later process resumes it without reading the
+// history again.
 static bool finish_agent(Run *r, bool will_retry, const JValue *last, const char *last_id) {
     Arena *a = r->a;
     JValue *ae = ev_new(a, "agent_end");
     json_put(a, ae, S("messages"), r->new_messages);
     json_put(a, ae, S("willRetry"), json_bool(a, will_retry));
     emit(r, ae);
+    if (!will_retry && r->model.engine) server_engine_state_save(r->model.engine);
     if (will_retry) return false;
     // retries used up on an error (_handlePostAgentRun)
     if (r->retry_attempt > 0 && last && str_eqz(json_strs(json_get(last, "stopReason")), "error")) {
@@ -2086,6 +2089,12 @@ static const char *find_pi_docs(Arena *a) {
     return NULL;
 }
 
+// The engine whose conversation state a run saves: a save in progress ends before the process does.
+static Engine *g_state_engine;
+static void state_flush(void) {
+    if (g_state_engine) server_engine_state_flush(g_state_engine);
+}
+
 // --lora-modules with --pack: each adapter's folder, and whether it fits the pack in dir as its
 // adapter_config.json tells (saetta serve's check, download_lora_check), before the load.
 static Err check_adapters(Arena *a, Run *r, const char *dir) {
@@ -2238,6 +2247,17 @@ static Err open_engine(Arena *a, Run *r, const char *arg, const char *ctx, bool 
         return err;
     }
     dbg("saetta code: %s loaded in process in %llu ms\n", dir, (unsigned long long)((now_ns() - t0) / 1000000));
+    // conversation state on the SSD (~/.saetta/state; SAETTA_STATE=0 turns it off): a resumed
+    // session reads it instead of its history
+    const char *sv = getenv("SAETTA_STATE");
+    if (!(sv && !strcmp(sv, "0"))) {
+        Err se = server_engine_state_enable(e, path_join(a, path_join(a, r->env.home, ".saetta"), "state"), code_version);
+        if (se) dbg("saetta code: no conversation state on disk (%s)\n", se);
+        else {
+            g_state_engine = e;
+            atexit(state_flush);
+        }
+    }
     CodeModel *m = &r->model;
     code_share_describe(a, m, server_engine_model(e), server_engine_context(e), "in-process");
     m->engine = e;
@@ -2592,6 +2612,7 @@ Err code_run(const char *const *args, size_t n, int *code) {
         }
     }
 done:
+    state_flush();
     code_share_end(false);
     code_mcp_shutdown();
     code_tools_kill_detached();

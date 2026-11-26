@@ -138,6 +138,11 @@ sx_buffer *sx_buffer_new(sx_device *d, size_t len) {
 
 void sx_buffer_release(sx_buffer *b) { if (b) (void)(__bridge_transfer id)(void *)b; }
 
+sx_buffer *sx_buffer_retain(sx_buffer *b) {
+    if (b) CFRetain((CFTypeRef)b);
+    return b;
+}
+
 void *sx_buffer_contents(sx_buffer *b) { return ((__bridge id<MTLBuffer>)(void *)b).contents; }
 
 size_t sx_buffer_length(const sx_buffer *b) { return ((__bridge id<MTLBuffer>)(void *)b).length; }

@@ -154,6 +154,7 @@ Err session_start_from(Session *s, Gpu *g, const Conv *src, size_t n) { return s
 void session_restore(Session *s) { s->arch->s_restore(s); }
 void session_push_history(Session *s, uint32_t token) { s->arch->s_push_history(s, token); }
 void session_reset(Session *s) { s->arch->s_reset(s); }
+bool session_state_layout(const Session *s, size_t slot, size_t n, StLayout *out) { return s->arch->s_layout(s, slot, n, out); }
 
 // ---- shared by both models ---------------------------------------------------------------------
 
@@ -207,7 +208,11 @@ Reusable session_reusable_in(const Ckpt ck[2], const uint32_t *prompt, size_t np
     return (Reusable){best, pick};
 }
 
-void session_keep_points(Session *s, size_t n) { s->ptoks.len = MIN(s->ptoks.len, n); }
+void session_keep_points(Session *s, size_t n) {
+    s->ptoks.len = MIN(s->ptoks.len, n);
+    for (size_t k = 0; k < PT_MAX; k++)
+        if ((k + 1) * PT_EVERY > s->ptoks.len) s->pts[k].valid = false;
+}
 
 size_t session_shared_point(const uint32_t *ptoks, size_t nptoks, const Point pts[PT_MAX], const uint32_t *prompt,
                             size_t n) {
@@ -215,7 +220,7 @@ size_t session_shared_point(const uint32_t *ptoks, size_t nptoks, const Point pt
     size_t lim = MIN(nptoks, n - 1);
     while (lcp < lim && ptoks[lcp] == prompt[lcp]) lcp += 1;
     size_t k = MIN(lcp / PT_EVERY, (size_t)PT_MAX);
-    while (k > 0 && pts[k - 1].gdn == NULL) k -= 1;
+    while (k > 0 && !(pts[k - 1].gdn != NULL && pts[k - 1].valid)) k -= 1;
     return k * PT_EVERY;
 }
 

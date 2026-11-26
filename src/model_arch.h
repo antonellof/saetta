@@ -53,6 +53,7 @@ struct ModelArch {
     void (*s_restore)(Session *s);
     void (*s_push_history)(Session *s, uint32_t token);
     void (*s_reset)(Session *s);
+    bool (*s_layout)(const Session *s, size_t slot, size_t n, StLayout *out);
 };
 
 extern const ModelArch flash_arch, dense_arch, dsv4_arch, inkling_arch;

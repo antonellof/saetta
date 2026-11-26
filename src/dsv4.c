@@ -970,6 +970,7 @@ void session_start_at_own_point(Session *s, size_t n) { (void)s, (void)n; }
 Err session_start_from(Session *s, Gpu *g, const Conv *src, size_t n) { (void)s, (void)g, (void)src, (void)n; return NI; }
 void session_restore(Session *s) { (void)s; }
 void session_push_history(Session *s, uint32_t token) { (void)s, (void)token; }
+bool session_state_layout(const Session *s, size_t slot, size_t n, StLayout *out) { (void)s, (void)slot, (void)n, (void)out; return false; }
 
 const ModelArch dsv4_arch = MODEL_ARCH_TABLE({
     .model_type = CONFIG_MODEL_TYPE,

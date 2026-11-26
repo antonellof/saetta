@@ -52,6 +52,7 @@
 #define session_restore MR_CAT(ARCH_PFX, session_restore)
 #define session_push_history MR_CAT(ARCH_PFX, session_push_history)
 #define session_reset MR_CAT(ARCH_PFX, session_reset)
+#define session_state_layout MR_CAT(ARCH_PFX, session_state_layout)
 
 Err model_load(Arena *a, const Pack *pack, Gpu *g, Model **out);
 size_t model_check_pack(Arena *a, const Pack *pack, FILE *out);
@@ -97,6 +98,7 @@ Err session_start_from(Session *s, Gpu *g, const Conv *src, size_t n);
 void session_restore(Session *s);
 void session_push_history(Session *s, uint32_t token);
 void session_reset(Session *s);
+bool session_state_layout(const Session *s, size_t slot, size_t n, StLayout *out);
 
 #define MODEL_ARCH_TABLE(...) \
     { .info = __VA_ARGS__, \
@@ -142,6 +144,7 @@ void session_reset(Session *s);
       .s_restore = session_restore, \
       .s_push_history = session_push_history, \
       .s_reset = session_reset, \
+      .s_layout = session_state_layout, \
     }
 
 #endif

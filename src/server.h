@@ -13,6 +13,7 @@
 #include "base.h"
 #include "json.h"
 #include "qgen.h"
+#include "spec.h"
 
 // Loads the pack in dir and serves on 127.0.0.1:port until the process ends. Errors:
 // "AlreadyRunning" (another server holds the lock; message printed), load errors, socket
@@ -39,6 +40,22 @@ const char *server_engine_model(const Engine *e);
 size_t server_engine_context(const Engine *e);
 // The engine's live statistics (stats.h; Saetta Code's /monitor reads them with stats_json).
 struct Stats *server_engine_stats(Engine *e);
+// Conversation state on the SSD for this engine (src/state_store.h), under root (Saetta Code:
+// ~/.saetta/state): a request whose prompt extends a saved state reads it instead of the
+// history. version: the engine's (states of another are not read). Errors: "StateUnsupported"
+// (the model keeps no such state: Inkling 2 Mini, DeepSeek-V4-Flash), "StateDirFailed",
+// "StateWriterFailed" (no writer thread; the engine runs without the store).
+Err server_engine_state_enable(Engine *e, const char *root, const char *version);
+// Saves, in the background, the state of the conversation the calling thread's last request ran
+// in (Saetta Code: at the end of each agent run), unless another request has used that
+// conversation since or it runs with a LoRA adapter. It waits for the engine's turn (other threads'
+// requests); nothing runs on the token path.
+void server_engine_state_save(Engine *e);
+// Waits for a save in progress (before the process exits).
+void server_engine_state_flush(Engine *e);
+// For tests: conversation i's speculation controller (one per conversation); false for a
+// conversation not open.
+bool server_engine_controller(const Engine *e, size_t i, Gate *gate, Depth *depth);
 // One POST /v1/chat/completions with this body, on the caller's thread: the response body
 // bytes (the SSE stream, or the JSON answer or error) go to sink as they are produced, with the
 // response status; sink returns nonzero to stop (the request ends as when a client leaves), and

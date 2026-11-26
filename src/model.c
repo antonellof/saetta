@@ -2558,6 +2558,7 @@ Err session_conv_shrink(const Session *s, Gpu *g, Conv *cv, size_t cap) {
     }
     for (int k = 0; k < 2; k++) cv->ck[k].tokens.len = 0;
     cv->ptoks.len = 0;
+    for (int k = 0; k < PT_MAX; k++) cv->pts[k].valid = false;
     return OK;
 }
 
@@ -2607,6 +2608,7 @@ Err session_save_point(Session *s, Gpu *g, const uint32_t *toks, size_t n) {
     pt->prev[0] = s->prev[0];
     pt->prev[1] = s->prev[1];
     pt->since_eos = s->since_eos;
+    pt->valid = true;
     vec_set(&s->ptoks, toks, n);
     return OK;
 }
@@ -2632,6 +2634,8 @@ void session_start_at_own_point(Session *s, size_t n) {
 
 Err session_start_from(Session *s, Gpu *g, const Conv *src, size_t n) {
     if (!(n % PT_EVERY == 0 && n > 0)) die("session_start_from: position %zu\n", n);
+    // its rows below n become src's: no restore point of its own holds for them any more
+    for (int i = 0; i < 2; i++) s->ck[i].tokens.len = 0;
     size_t kvrow = NKV * HD * session_kv_elem(s);
     uint8_t *dkv = sx_buffer_contents(s->kv);
     const uint8_t *skv = sx_buffer_contents(src->kv);
@@ -2648,9 +2652,11 @@ Err session_start_from(Session *s, Gpu *g, const Conv *src, size_t n) {
     size_t k = n / PT_EVERY - 1;
     start_at(s, &src->pts[k], n);
     // this conversation's own points up to n, so it can be shared from in turn
+    // (only src's valid ones: this conversation's own points below n were for other rows)
     for (size_t i = 0; i < k + 1; i++) {
         const Point *sp = &src->pts[i];
-        if (sp->gdn == NULL) continue;
+        s->pts[i].valid = false;
+        if (sp->gdn == NULL || !sp->valid) continue;
         Point *d = &s->pts[i];
         if (d->gdn == NULL) {
             Point np = {.prev = {EOS_PLE, EOS_PLE}};
@@ -2663,6 +2669,7 @@ Err session_start_from(Session *s, Gpu *g, const Conv *src, size_t n) {
         d->prev[0] = sp->prev[0];
         d->prev[1] = sp->prev[1];
         d->since_eos = sp->since_eos;
+        d->valid = true;
     }
     vec_set(&s->ptoks, src->ptoks.ptr, n);
     return OK;
@@ -2698,6 +2705,29 @@ void session_reset(Session *s) {
     memset(gpu_floats(s->gdn_state), 0, GDN_STATE_N * 4);
     memset(gpu_floats(s->gdn_conv), 0, GDN_CONV_N * 4);
     memset(gpu_floats(s->ple_hist), 0, PLE_HIST_N * 4);
+}
+
+// KV planes [(n_attn + 1) x 2][cap][NKV x HD], indexer keys [n_attn + 1][cap][IXD], pooled block keys
+// [n_attn + 1][cap / BLOCK][IXD] (one row per full block), and the restore point's GDN state,
+// conv history and n-gram history, then the MTP slot's (n_attn) rows at n: K, V, indexer key,
+// pooled block n / BLOCK.
+bool session_state_layout(const Session *s, size_t slot, size_t n, StLayout *out) {
+    size_t kvrow = NKV * HD * session_kv_elem(s);
+    const Ckpt *k = &s->ck[slot];
+    if (n >= s->cap) return false;
+    uint8_t *kv = sx_buffer_contents(s->kv), *ix = sx_buffer_contents(s->ixk), *bk = sx_buffer_contents(s->bk);
+    *out = (StLayout){
+        .nreg = 3,
+        .nrec = 7,
+        .reg = {{kv, (n_attn + 1) * 2, s->cap * kvrow, kvrow, 1},
+                {ix, n_attn + 1, s->cap * IXD * 4, IXD * 4, 1},
+                {bk, n_attn + 1, (s->cap / BLOCK) * IXD * 4, IXD * 4, BLOCK}},
+        .rec = {sx_buffer_contents(k->gdn), sx_buffer_contents(k->conv), sx_buffer_contents(k->ple),
+                kv + (n_attn * 2) * s->cap * kvrow + n * kvrow, kv + (n_attn * 2 + 1) * s->cap * kvrow + n * kvrow,
+                ix + (n_attn * s->cap + n) * IXD * 4, bk + (n_attn * (s->cap / BLOCK) + n / BLOCK) * IXD * 4},
+        .rec_bytes = {GDN_STATE_N * 4, GDN_CONV_N * 4, PLE_HIST_N * 4, kvrow, kvrow, IXD * 4, IXD * 4},
+    };
+    return true;
 }
 
 // ---- loading helpers ---------------------------------------------------------------------------

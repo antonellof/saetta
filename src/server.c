@@ -1,7 +1,9 @@
 // HTTP server (see server.h).
 #include "server.h"
 
+#include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <math.h>
 #include <netinet/in.h>
 #include <pthread.h>
@@ -24,6 +26,10 @@
 #include "metal/shim.h"
 #include "model.h"
 #include "spec.h"
+#include "hash.h"
+#include "state_store.h"
+#include "engine_id.h"
+#include "engine_env.h"
 #include "split.h"
 #include "stats.h"
 #include "tokenizer.h"
@@ -64,8 +70,11 @@ typedef struct Engine {
     // Speculation statistics kept across requests: a short reply then starts from what the
     // session has learned instead of the optimistic defaults (deep drafts with poor
     // acceptance cost most on short replies).
-    Gate gate;
-    Depth depth;
+    // (one per conversation: a conversation's tokens depend only on its own requests, so one
+    // restored from the state store, with its controller, continues as it would have; e.g. a
+    // subagent's speculation does not change the main agent's numbers)
+    Gate gate[MAX_CONV];
+    Depth depth[MAX_CONV];
     Stats *st;
     // Conversations: the active one's buffers are in s; held[i] keeps conversation i's
     // while it is inactive (has[i] false for the active one). A request goes to the
@@ -84,6 +93,22 @@ typedef struct Engine {
     // --default-chat-template-kwargs: an object whose keys fill in what a request leaves out
     JValue *kwargs_default;
     uint64_t opened_ns; // when engine_open began (the load time the server reports)
+    const char *dir;    // the pack
+    // conversation state on the SSD (server_engine_state_enable; Saetta Code in process only)
+    StateStore *store;
+    // each conversation's lineage (src/state_store.h): the computation that writes its chunks, set
+    // at its first save, never taken from a restored state; inh: the keys of the chunks it was
+    // restored from (read, and listed by its states, below the restore point); lin_hw: the most
+    // tokens saved or restored in it. A conversation that starts again from 0, from another's rows,
+    // or below lin_hw gets a new lineage and keeps only the inherited chunks below its start.
+    uint8_t lin[MAX_CONV][16];
+    bool lin_set[MAX_CONV];
+    size_t lin_hw[MAX_CONV];
+    uint8_t (*inh[MAX_CONV])[32];
+    size_t ninh[MAX_CONV];
+    // a count of the requests each conversation ran (apply): an end-of-turn save checks that the
+    // conversation its caller's last request used has not been used by another request since
+    uint64_t conv_gen[MAX_CONV];
     // One request at a time, in arrival order: the in-process caller (server_engine_chat, from
     // any thread: Saetta Code's agent and its subagents) and the connections of the Saetta Codes
     // that share this process's engine (server_engine_connection, one thread each) take tickets
@@ -222,6 +247,22 @@ static Start plan(Engine *e, const uint32_t *ids, size_t nids) {
 }
 
 static Err apply(Engine *e, Start st) {
+    // rows below st.n stay (from 0 when another conversation's rows are copied in): a background
+    // save that still reads this buffer past that point finishes first
+    if (e->store) state_store_fence(e->store, sx_buffer_contents(e->s->kv), st.kind == START_SHARED ? 0 : st.n);
+    size_t ci = e->active;
+    e->conv_gen[ci] += 1;
+    if (st.kind == START_FRESH || st.kind == START_SHARED) {
+        e->ninh[ci] = 0;
+        // a conversation that starts over (or from another's rows) learns its own speculation
+        e->gate[ci] = GATE_INIT;
+        e->depth[ci] = DEPTH_INIT;
+    }
+    if (st.kind == START_FRESH || st.kind == START_SHARED || st.n < e->lin_hw[ci]) {
+        e->lin_set[ci] = false;
+        e->lin_hw[ci] = 0;
+        e->ninh[ci] = MIN(e->ninh[ci], st.n / ST_CHUNK);
+    }
     switch (st.kind) {
     case START_CKPT: session_restore(e->s); break;
     case START_OWN: session_start_at_own_point(e->s, st.n); break;
@@ -663,6 +704,21 @@ static ToolChoiceKind tool_choice(const JValue *r, Str *named) {
 
 static float round_ms(uint64_t t0) { return (float)(now_ns() - t0) / 1e6f; }
 
+// SAETTA_BENCH_GREEDY (benchmarks only): see handle.
+static bool bench_greedy(void) {
+    const char *v = getenv("SAETTA_BENCH_GREEDY");
+    return v && v[0] && v[0] != '0';
+}
+
+// The time of a speculation round as the depth controller learns it: measured, or under
+// SAETTA_BENCH_GREEDY its current estimate for depth k, so the depths it picks depend only on the
+// acceptance (a verification chunk's logits differ slightly from single steps', so depths that
+// follow the clock make greedy output differ between runs).
+static float depth_ms(const Depth *d, size_t k, uint64_t t0, bool fixed) {
+    if (fixed && k < COUNT(d->ms)) return d->ms[k];
+    return round_ms(t0);
+}
+
 // Per-request allocations outside the arena, freed by the caller of handle.
 typedef struct {
     VecU32 ids;
@@ -770,12 +826,13 @@ static Err generate_reply(Engine *e, Arena *a, Conn *c, Req *h, Work *w, JValue 
     // already consumed by the model and come out of queue without another pass
     const char *sv = getenv("SAETTA_SPEC");
     bool spec_on = (sv ? sv[0] != '0' : true) && !model_info(e->m)->no_spec;
+    bool fixed = bench_greedy(); // read once per request, not per round
     // speculation at any temperature: greedy verifies by argmax, sampling by SampleChooser
     bool greedy = sp.temperature <= 0;
     Lookup *lk = &w->lk;
     for (size_t i = 0; i < n; i++) lookup_push(lk, ids[i]);
-    Gate *gate = &e->gate;
-    Depth *depth = &e->depth;
+    Gate *gate = &e->gate[e->active];
+    Depth *depth = &e->depth[e->active];
     uint32_t queue[KMAX];
     size_t qn = 0, qi = 0;
     uint32_t next = sample(e, logits, model_info(e->m)->vocab, sp, cand);
@@ -834,7 +891,7 @@ static Err generate_reply(Engine *e, Arena *a, Conn *c, Req *h, Work *w, JValue 
                 SampleChooser ch = {&e->rng, sp, cand, model_info(e->m)->vocab};
                 TRY(model_spec_verify(e->m, e->s, t, drafts, nd, server_sample_pick, &ch, &sr));
             }
-            if (from_mtp) depth_record(depth, nd, sr.accepted, round_ms(tr0));
+            if (from_mtp) depth_record(depth, nd, sr.accepted, depth_ms(depth, nd, tr0, fixed));
             else gate_record(gate, sr.accepted + 1);
             memcpy(queue, drafts, sr.accepted * sizeof(uint32_t));
             queue[sr.accepted] = sr.next;
@@ -844,7 +901,7 @@ static Err generate_reply(Engine *e, Arena *a, Conn *c, Req *h, Work *w, JValue 
         } else {
             TRY(model_step(e->m, e->s, t, &logits));
             next = sample(e, logits, model_info(e->m)->vocab, sp, cand);
-            if (spec_on && model_has_mtp(e->m)) depth_record(depth, 0, 0, round_ms(tr0));
+            if (spec_on && model_has_mtp(e->m)) depth_record(depth, 0, 0, depth_ms(depth, 0, tr0, fixed));
         }
     }
     uint64_t t2 = now_ns();
@@ -1065,6 +1122,268 @@ Err server_request_numbers(const JValue *r, ReqNumbers *out) {
     return OK;
 }
 
+// ---- conversation state on the SSD (src/state_store.h) ------------------------------------------
+
+static void release_buf(void *b) { sx_buffer_release(b); }
+
+// The conversation this thread's last request ran in (the in-process callers run their requests
+// on their own threads: Saetta Code's agent, each subagent), for its end-of-turn save.
+typedef struct {
+    const Engine *e;
+    size_t conv;
+    uint64_t gen;
+    bool set;
+} LastConv;
+static _Thread_local LastConv last_conv;
+
+// A saved state that covers more of the prompt than the conversations here (by at least
+// RESTORE_GAIN tokens, about what reading it costs in prefill time) is read into the active
+// conversation's buffers (sized for the prompt by ensure) as its restore point 1, which plan then
+// takes as for a resident conversation.
+#define RESTORE_GAIN ((size_t)2048)
+// The speculation controller saved with a state: a process resumed from it drafts as the one that
+// saved it would have (its learned acceptance and depth), so the resumed conversation continues
+// with the same tokens.
+typedef struct {
+    uint32_t magic;
+    Gate gate;
+    Depth depth;
+} SpecSaved;
+#define SPEC_SAVED_MAGIC 0x53504331u // "SPC1"
+
+static void state_restore(Engine *e, const uint32_t *ids, size_t n) {
+    Start cur = plan(e, ids, n);
+    char name[33];
+    size_t got = state_store_find(e->store, ids, n, cur.n ? cur.n + RESTORE_GAIN : 0, name);
+    if (!got) return;
+    uint64_t t0 = now_ns();
+    state_store_fence(e->store, sx_buffer_contents(e->s->kv), 0);
+    size_t i = e->active;
+    StLayout lay;
+    if (!session_state_layout(e->s, 1, got, &lay)) return;
+    size_t nn = 0, nkeys = 0;
+    StMeta meta;
+    uint8_t (*keys)[32] = NULL;
+    uint64_t bytes = 0;
+    bool touched = false;
+    Err err = state_store_load(e->store, name, ids, n, &lay, &nn, &meta, &keys, &nkeys, &bytes, &touched);
+    double ms = (double)(now_ns() - t0) / 1e6;
+    // the conversation's contents change (or may have): another thread's end-of-turn save for its
+    // earlier request in this conversation is no longer its conversation, even if this request
+    // fails before apply counts it
+    if (touched) e->conv_gen[i] += 1;
+    if (!err && (nn != got || nn >= n)) err = "StateMismatch";
+    if (err) {
+        free(keys);
+        dbg("state: dropped %s (%s); the prompt is read again\n", name, err);
+        // the conversation stays as it was unless the load wrote into its buffers
+        if (touched) {
+            session_invalidate_from(e->s, 0);
+            e->lin_set[i] = false;
+            e->lin_hw[i] = 0;
+            e->ninh[i] = 0;
+        }
+        return;
+    }
+    session_invalidate_from(e->s, 0); // its restore points and prefix points were for other rows
+    Ckpt *k = &e->s->ck[1];
+    k->prev[0] = meta.prev[0];
+    k->prev[1] = meta.prev[1];
+    k->since_eos = (size_t)meta.since_eos;
+    k->tokens.len = 0;
+    vec_reserve(&k->tokens, nn);
+    memcpy(k->tokens.ptr, ids, nn * sizeof(uint32_t));
+    k->tokens.len = nn;
+    // new chunks get a lineage of this conversation's own; the restored ones keep their keys
+    e->lin_set[i] = false;
+    e->lin_hw[i] = nn;
+    free(e->inh[i]);
+    e->inh[i] = keys;
+    e->ninh[i] = nkeys;
+    SpecSaved sv;
+    if (meta.extra_len == sizeof sv) {
+        memcpy(&sv, meta.extra, sizeof sv);
+        if (sv.magic == SPEC_SAVED_MAGIC) {
+            e->gate[i] = sv.gate;
+            e->depth[i] = sv.depth;
+        }
+    }
+    dbg("state: restored %zu of %zu prompt tokens (%s GB in %s ms, %s GB/s)\n", nn, n, fx((double)bytes / 1e9, 2), fx(ms, 0),
+        fx((double)bytes / 1e6 / (ms > 0 ? ms : 1), 1));
+}
+
+// sha256 of n bytes of fd at off (fewer at the end of the file) into h.
+static void hash_range(Sha256 *h, int fd, uint64_t off, size_t n) {
+    uint8_t *b = xmalloc(n ? n : 1);
+    ssize_t r = pread(fd, b, n, (off_t)off);
+    if (r > 0) sha256_update(h, b, (size_t)r);
+    free(b);
+}
+
+// The pack's identity: its resolved folder; config.json, the tokenizer files, the chat template
+// and the weight index by content; every weight file by name, size, mtime, its safetensors
+// header (the JSON of names, dtypes, shapes, offsets) and its first and last MB (hashing 15 to 80
+// GB of weights at each start is left out).
+static void pack_identity(const char *dir, uint8_t out[32]) {
+    Sha256 h;
+    sha256_init(&h);
+    char *real = realpath(dir, NULL);
+    sha256_update(&h, real ? real : dir, strlen(real ? real : dir) + 1);
+    free(real);
+    DIR *d = opendir(dir);
+    char **names = NULL;
+    size_t nn = 0, cap = 0;
+    struct dirent *de;
+    while (d && (de = readdir(d))) {
+        if (de->d_name[0] == '.') continue;
+        if (nn == cap) names = xrealloc(names, (cap = cap ? cap * 2 : 64) * sizeof *names);
+        names[nn++] = strdup(de->d_name);
+    }
+    if (d) closedir(d);
+    for (size_t i = 1; i < nn; i++) // insertion sort: a few dozen names
+        for (size_t j = i; j > 0 && strcmp(names[j - 1], names[j]) > 0; j--) {
+            char *t = names[j];
+            names[j] = names[j - 1];
+            names[j - 1] = t;
+        }
+    static const char *const by_content[] = {"config.json", "tokenizer.json", "tokenizer_config.json", "chat_template.jinja",
+                                             "chat_template.json", "generation_config.json", "special_tokens_map.json"};
+    for (size_t i = 0; i < nn; i++) {
+        char p[2048];
+        snprintf(p, sizeof p, "%s/%s", dir, names[i]);
+        bool content = str_ends(str(names[i]), S(".index.json"));
+        for (size_t k = 0; k < COUNT(by_content); k++) content |= !strcmp(names[i], by_content[k]);
+        struct stat sb;
+        if (content) {
+            char *text;
+            size_t len;
+            if (!read_file(p, 64u << 20, &text, &len)) {
+                sha256_update(&h, names[i], strlen(names[i]) + 1);
+                sha256_update(&h, text, len);
+                free(text);
+            }
+        } else if (str_ends(str(names[i]), S(".safetensors")) && !stat(p, &sb)) {
+            char line[1200];
+            int k = snprintf(line, sizeof line, "%s %lld %lld.%09ld\n", names[i], (long long)sb.st_size, (long long)sb.st_mtimespec.tv_sec,
+                             sb.st_mtimespec.tv_nsec);
+            sha256_update(&h, line, (size_t)k);
+            int fd = open(p, O_RDONLY);
+            if (fd >= 0) {
+                uint64_t hl = 0, size = (uint64_t)sb.st_size, mb = 1u << 20;
+                if (pread(fd, &hl, 8, 0) == 8 && hl <= size - 8 && hl <= (64u << 20)) hash_range(&h, fd, 8, (size_t)hl);
+                hash_range(&h, fd, 0, (size_t)MIN(mb, size));
+                hash_range(&h, fd, size > mb ? size - mb : 0, (size_t)MIN(mb, size));
+                close(fd);
+            }
+        }
+        free(names[i]);
+    }
+    free(names);
+    sha256_final(&h, out);
+}
+
+Err server_engine_state_enable(Engine *e, const char *root, const char *version) {
+    _Static_assert(sizeof(SpecSaved) <= ST_EXTRA_MAX, "controller blob");
+    StLayout lay;
+    if (!session_state_layout(e->s, 1, 0, &lay)) return "StateUnsupported";
+    uint8_t ident[32], shape[32];
+    pack_identity(e->dir, ident);
+    // the state's shape: the engine build (a hash of its sources and flags, SAETTA_ENGINE_ID from
+    // the Makefile: a state is this build's own numbers), the format, the version, and the shapes
+    // the rows and the recurrent state are written with; it names the store's folder
+    Sha256 h;
+    sha256_init(&h);
+    char line[512];
+    int k = snprintf(line, sizeof line, "saetta state %u %s %s %s %zu %zu\n", ST_FORMAT, SAETTA_ENGINE_ID, version,
+                     model_info(e->m)->model_type, lay.nreg, lay.nrec);
+    sha256_update(&h, line, (size_t)k);
+    for (size_t i = 0; i < lay.nreg; i++) {
+        k = snprintf(line, sizeof line, "%zu %zu %zu\n", lay.reg[i].planes, lay.reg[i].row_bytes, lay.reg[i].per_row);
+        sha256_update(&h, line, (size_t)k);
+    }
+    for (size_t i = 0; i < lay.nrec; i++) {
+        k = snprintf(line, sizeof line, "%zu\n", lay.rec_bytes[i]);
+        sha256_update(&h, line, (size_t)k);
+    }
+    // the runtime choices that change the numbers: every switch src/engine_env.h lists as one,
+    // whether the accelerator prompt path is in use (it falls back to the simdgroup kernels when it
+    // does not compile), the MTP head, the macOS build (its Metal compiler), the chip and the GPU
+    // (its name and family)
+    for (size_t i = 0; i < COUNT(engine_env_rows); i++) {
+        const char *v = getenv(engine_env_rows[i]);
+        k = snprintf(line, sizeof line, "%s=%s\n", engine_env_rows[i], v ? v : "");
+        sha256_update(&h, line, (size_t)k);
+    }
+    char osv[64] = "";
+    size_t ol = sizeof osv - 1;
+    if (sysctlbyname("kern.osversion", osv, &ol, NULL, 0) != 0) osv[0] = 0;
+    char chip[256] = "", gpu[256] = "";
+    size_t cl = sizeof chip - 1;
+    if (sysctlbyname("machdep.cpu.brand_string", chip, &cl, NULL, 0) != 0) chip[0] = 0;
+    sx_device_name(e->g->dev, gpu, sizeof gpu);
+    k = snprintf(line, sizeof line, "accel %d mtp %d os %s chip %s gpu %s apple10 %d\n", model_fast_prefill(e->m) ? 1 : 0,
+                 model_has_mtp(e->m) ? 1 : 0, osv, chip, gpu, sx_device_supports_apple10(e->g->dev));
+    sha256_update(&h, line, (size_t)k);
+    sha256_final(&h, shape);
+    Err err = state_store_open(root, ident, shape, &e->store);
+    if (!err) dbg("state: store %s (engine %s)\n", state_store_dir(e->store), SAETTA_ENGINE_ID);
+    return err;
+}
+
+static void state_save_active(Engine *e);
+
+void server_engine_state_save(Engine *e) {
+    if (!e->store || !last_conv.set || last_conv.e != e) return;
+    // in the engine's turn (other threads run requests: subagents, shared sessions), on the
+    // conversation this caller's last request used, if no request used it since
+    uint64_t t = turn_take(e);
+    while (!turn_wait(e, t, 1000)) {}
+    if (last_conv.conv < e->n_conv && e->conv_gen[last_conv.conv] == last_conv.gen) {
+        activate(e, last_conv.conv);
+        state_save_active(e);
+    }
+    turn_done(e);
+}
+
+// The save of the active conversation (in the engine's turn).
+static void state_save_active(Engine *e) {
+    if (e->conv_lora[e->active] != -1) return;
+    Session *s = e->s;
+    size_t slot = s->ck[1].tokens.len >= s->ck[0].tokens.len ? 1 : 0;
+    const Ckpt *k = &s->ck[slot];
+    if (k->tokens.len == 0) return;
+    StLayout lay;
+    if (!session_state_layout(s, slot, k->tokens.len, &lay)) return;
+    void *hold[3];
+    size_t nh = 0;
+    hold[nh++] = sx_buffer_retain(s->kv);
+    if (s->ixk) hold[nh++] = sx_buffer_retain(s->ixk);
+    if (s->bk) hold[nh++] = sx_buffer_retain(s->bk);
+    size_t i = e->active;
+    if (!e->lin_set[i]) {
+        arc4random_buf(e->lin[i], 16);
+        e->lin_set[i] = true;
+    }
+    if (k->tokens.len > e->lin_hw[i]) e->lin_hw[i] = k->tokens.len;
+    StMeta meta = {.prev = {k->prev[0], k->prev[1]}, .since_eos = k->since_eos, .extra_len = sizeof(SpecSaved)};
+    memcpy(meta.lineage, e->lin[i], 16);
+    SpecSaved sv = {SPEC_SAVED_MAGIC, e->gate[i], e->depth[i]};
+    memcpy(meta.extra, &sv, sizeof sv);
+    (void)state_store_save(e->store, &lay, k->tokens.ptr, k->tokens.len, &meta, (const uint8_t (*)[32])e->inh[i], e->ninh[i], hold, nh,
+                           release_buf);
+}
+
+void server_engine_state_flush(Engine *e) {
+    if (e->store) state_store_wait(e->store);
+}
+
+bool server_engine_controller(const Engine *e, size_t i, Gate *gate, Depth *depth) {
+    if (i >= e->n_conv) return false;
+    *gate = e->gate[i];
+    *depth = e->depth[i];
+    return true;
+}
+
 static Err handle(Engine *e, Arena *a, Conn *c, Req *h, Str body, Fmt fmt, Work *w) {
     JValue *r;
     Str model_name;
@@ -1123,6 +1442,10 @@ static Err handle(Engine *e, Arena *a, Conn *c, Req *h, Str body, Fmt fmt, Work 
     TRY(server_request_numbers(r, &rn));
     size_t asked = rn.max_tokens;
     Sampling sp = rn.sp;
+    // SAETTA_BENCH_GREEDY=1, for benchmarks only (tools/code/session_bench.py): greedy decoding
+    // whatever the request asks, and the MTP depth controller fed no measured times (depth_ms), so a
+    // scripted session repeats token for token across runs
+    if (bench_greedy()) sp.temperature = 0;
     if (rn.has_seed) qgen_prng_init(&e->rng, rn.seed);
     Str *stops = NULL;
     size_t n_stops = 0;
@@ -1157,10 +1480,12 @@ static Err handle(Engine *e, Arena *a, Conn *c, Req *h, Str body, Fmt fmt, Work 
     route(e, w->ids.ptr, n, lora);
     reply_id = lora >= 0 ? model_lora_name(e->m, (size_t)lora) : base_id;
     TRY(ensure(e, n + max_tokens + CAP_SLACK));
+    if (e->store && lora < 0) state_restore(e, w->ids.ptr, n);
     Start start = plan(e, w->ids.ptr, n);
     stats_begin(e->st, fmt == FMT_ANTHROPIC, n, start.n, max_tokens);
     Err err = generate_reply(e, a, c, h, w, r, model_name, fmt, forced, thinking, sp, stops, n_stops, stream, tools, id, created,
                              start, max_tokens);
+    last_conv = (LastConv){e, e->active, e->conv_gen[e->active], true};
     if (err) atomic_store_explicit(&e->st->state, STATE_IDLE, memory_order_release);
     return err;
 }
@@ -1491,9 +1816,11 @@ static Err engine_open(Arena *arena, const char *dir, const char *const *loras, 
     e->tok = tok;
     qgen_prng_init(&e->rng, (uint64_t)(int64_t)wall_ns());
     if (model_info(m)->chat == CHAT_QWEN && !tokenizer_token_id(tok, S("</think>"), &e->think_end)) return "BadTokenizer";
-    e->gate = GATE_INIT;
-    e->depth = DEPTH_INIT;
-    if (model_info(m)->depth_ms) memcpy(e->depth.ms, model_info(m)->depth_ms, sizeof e->depth.ms);
+    for (size_t i = 0; i < MAX_CONV; i++) {
+        e->gate[i] = GATE_INIT;
+        e->depth[i] = DEPTH_INIT;
+        if (model_info(m)->depth_ms) memcpy(e->depth[i].ms, model_info(m)->depth_ms, sizeof e->depth[i].ms);
+    }
     e->n_conv = 1;
     e->active = 0;
     for (size_t i = 0; i < MAX_CONV; i++) e->conv_lora[i] = -1;
@@ -1501,6 +1828,7 @@ static Err engine_open(Arena *arena, const char *dir, const char *const *loras, 
     turns_init(&e->turns);
     st->ctx = e->s->max_cap;
     e->opened_ns = t0;
+    e->dir = arena_strdup(arena, dir);
     *out = e;
     return OK;
 }

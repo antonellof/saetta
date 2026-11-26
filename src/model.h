@@ -24,6 +24,7 @@
 #include "gpu.h"
 #include "metal/shim.h"
 #include "safetensors.h"
+#include "state_store.h"
 #include "weights.h"
 
 // Prefill chunk: tokens per pass.
@@ -75,11 +76,14 @@ typedef struct {
     VecU32 tokens;
 } Ckpt;
 
-// A prefix point; absent while gdn is NULL.
+// A prefix point; absent while gdn is NULL. valid: saved for the conversation's current prefix
+// tokens (ptoks); cleared whenever its position or anything below it is read again or replaced
+// (session_keep_points), so a buffer left by an earlier occupant of the slot is never used.
 typedef struct {
     sx_buffer *gdn, *conv, *ple;
     uint32_t prev[2];
     size_t since_eos;
+    bool valid;
 } Point;
 
 // The per-conversation part of a session: KV cache, indexer keys, pooled block keys and the
@@ -320,13 +324,15 @@ void session_swap_conv(Session *s, Conv *cv);
 // at least p). Returns false when p is outside that chunk.
 bool session_roll_to(Session *s, size_t p, const uint32_t *toks);
 
-// Keeps the prefix points within the first n tokens.
+// Keeps the prefix points within the first n tokens (the others are no longer valid).
 void session_keep_points(Session *s, size_t n);
 // Saves prefix point k (at position (k+1) * PT_EVERY == s->pos), allocating it on first use;
 // the prefix tokens are toks[0..n) (n == s->pos).
 Err session_save_point(Session *s, Gpu *g, const uint32_t *toks, size_t n);
-// The prefix point usable for prompt: its position (a multiple of PT_EVERY, shorter than the
-// prompt), 0 if none.
+// The prefix point usable for prompt: the highest valid point within the prompt's common prefix
+// with ptoks (a valid point's state and every KV row below it are this conversation's for those
+// tokens, so the points below it need not be valid): its position (a multiple of PT_EVERY,
+// shorter than the prompt), 0 if none.
 size_t session_shared_point(const uint32_t *ptoks, size_t nptoks, const Point pts[PT_MAX], const uint32_t *prompt,
                             size_t n);
 // Starts at this conversation's own prefix point at position n (its KV rows below n are in place).
@@ -336,7 +342,11 @@ void session_start_at_own_point(Session *s, size_t n);
 void session_invalidate_from(Session *s, size_t n);
 // Starts this (reset) session at position n of a prefix it shares with src: copies the KV,
 // indexer-key and block-key rows below n and the recurrent state of src's prefix point there,
-// and adopts src's points up to n by copying them.
+// and adopts src's valid points up to n by copying them. Its own restore points are dropped (they
+// were for the rows replaced): a restore point holds only while every row below its length is
+// this conversation's computation for its tokens; the other paths that replace rows below one
+// drop it as well (session_invalidate_from past its length, session_conv_shrink, a restore
+// from the state store, a LoRA switch, which invalidates from 0).
 Err session_start_from(Session *s, Gpu *g, const Conv *src, size_t n);
 // Back to the restore point session_reusable picked.
 void session_restore(Session *s);
@@ -344,5 +354,15 @@ void session_restore(Session *s);
 void session_push_history(Session *s, uint32_t token);
 // Back to an empty context, keeping the allocations.
 void session_reset(Session *s);
+// The active conversation's row buffers (KV; Flash-Next also its indexer and pooled block keys)
+// and restore point slot's recurrent buffers, as a state layout for the state store
+// (src/state_store.h), for a state of n tokens: the rec entries also hold the MTP head's rows at
+// position n (its K and V rows; Flash-Next also its indexer-key row and the pooled block holding
+// n). Flash-Next's first prompt chunk after a restore (mtp_ok false) skips the head's row n and
+// then reads it: saved with the state, it leaves a restored conversation's head as the resident
+// one's. The 27B's first chunk after a restore rewrites row n and keeps row n - 1 (in the state's
+// rows below n), so there the saved row n is only overwritten. False when the model keeps no such
+// state (DeepSeek-V4-Flash, Inkling 2 Mini).
+bool session_state_layout(const Session *s, size_t slot, size_t n, StLayout *out);
 
 #endif

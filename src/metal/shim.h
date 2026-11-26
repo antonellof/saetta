@@ -55,6 +55,8 @@ sx_buffer *sx_buffer_wrap(sx_device *d, const void *ptr, size_t len);
 // Allocates a new shared buffer, zero filled.
 sx_buffer *sx_buffer_new(sx_device *d, size_t len);
 void sx_buffer_release(sx_buffer *b);
+// One more reference to b (released by sx_buffer_release); returns b.
+sx_buffer *sx_buffer_retain(sx_buffer *b);
 void *sx_buffer_contents(sx_buffer *b);
 size_t sx_buffer_length(const sx_buffer *b);
 

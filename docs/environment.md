@@ -44,3 +44,4 @@ Saetta Code reads these variables of pi's as pi does, along with its own.
 | `PI_TUI_ESC_TIMEOUT` | 10 (100 over SSH) | milliseconds to tell Escape from an escape sequence |
 | `PI_CACHE_RETENTION` | unset | `long` asks providers that support it for 24-hour prompt caching |
 | `VISUAL`, `EDITOR` | nano | the editor Ctrl+G opens, when settings.json has no `externalEditor` |
+| `SAETTA_STATE` | 1 | `0` turns off the conversation state on disk (`~/.saetta/state`): a resumed session then reads its history again |

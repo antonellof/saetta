@@ -396,6 +396,8 @@ typedef struct {
     const char *(*resume)(CodeUiHost *h, const char *path, bool stay);
     // /compact, run on the agent thread; compaction_start and compaction_end arrive as events.
     void (*compact)(CodeUiHost *h, const char *instructions);
+    // The run a crash interrupted, resumed on the agent thread at start (CodeUiConfig.recover).
+    void (*recover)(CodeUiHost *h);
 } CodeUiOps;
 typedef struct {
     const char *cwd, *home, *agent_dir;
@@ -408,6 +410,7 @@ typedef struct {
     const char *default_provider, *default_model; // settings.json
     const JValue *settings; // settings.json, or NULL
     bool resumed; // a continued session: its messages are drawn at start
+    bool recover; // an interrupted run is resumed at start (CodeUiOps.recover)
     const char *version; // saetta's version, for the header
     bool engine;          // the model runs in this process (a pack)
     const char *self_exe; // this program, for `saetta download` from /model
@@ -431,6 +434,8 @@ char *code_ui_take_thinking(void);
 // A message the user queued while the run goes on (malloc'd), or NULL: a steering message only
 // when steering_only (between tool calls), else a follow-up too (when the run would end).
 char *code_ui_take_queued(bool steering_only);
+// A queued message of an interrupted run put back in the queue (code_durable.c), shown as queued.
+void code_ui_queue_restore(const char *text, bool steer);
 bool code_ui_has_queued(void); // code_autocompact.c: a message is waiting
 
 #endif

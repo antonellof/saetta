@@ -109,6 +109,8 @@
 <tr><td><code>PI_CLIPBOARD_OSC52</code></td><td>unset</td><td><code>1</code> copies through the terminal (OSC 52), as over SSH</td></tr>
 <tr><td><code>PI_TUI_ESC_TIMEOUT</code></td><td>10 (100 over SSH)</td><td>milliseconds to tell Escape from an escape sequence</td></tr>
 <tr><td><code>PI_CACHE_RETENTION</code></td><td>unset</td><td><code>long</code> asks providers that support it for 24-hour prompt caching</td></tr>
+<tr><td><code>SAETTA_DURABLE</code></td><td><code>1</code></td><td><code>0</code> keeps no journal of the run, so an interrupted run cannot be resumed (<a href="/docs/sessions/#interrupted-runs">Interrupted runs</a>)</td></tr>
+<tr><td><code>SAETTA_DURABLE_SYNC</code></td><td><code>barrier</code></td><td>how a journal record reaches the disk before a tool that is never run again starts: <code>barrier</code> (F_BARRIERFSYNC), <code>full</code> (F_FULLFSYNC), <code>none</code> (survives a crash of the process, not a power loss)</td></tr>
 <tr><td><code>VISUAL</code>, <code>EDITOR</code></td><td>nano</td><td>the editor Ctrl+G opens, when settings.json has no <code>externalEditor</code></td></tr>
 <tr><td><code>SAETTA_STATE</code></td><td>1</td><td><code>0</code> turns off the conversation state on disk (<code>~/.saetta/state</code>): a resumed session then reads its history again</td></tr></tbody></table></div>
       </article>

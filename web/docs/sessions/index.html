@@ -93,6 +93,21 @@ saetta code --no-session                  <span class="hljs-comment"># do not sa
 <p>In the agent, <code>/resume</code> opens a picker of earlier sessions, searchable by their messages and names, and <code>/new</code> starts a fresh one.</p>
 <p>With the model in the agent&#39;s process, the engine&#39;s state of the conversation (its KV cache and recurrent state) is saved to <code>~/.saetta/state</code> in the background at the end of each turn. A session resumed later, or forked from an earlier message with <code>/fork</code>, continues from that state instead of reading its whole history again: only the new message is read. A session another terminal joins (<code>saetta start code</code> beside a running one) resumes from saved states but does not save its own. The folder keeps up to 20 GB in all and nothing unused for 7 days; states are tied to the pack, the engine build and this Mac, and checked at every read. <code>SAETTA_STATE=0</code> turns it off. Not yet for Inkling 2 Mini or with a LoRA adapter.</p>
 <p><img src="/assets/code/resume.png" alt="/resume: the session picker" loading="lazy"></p>
+<h2 id="interrupted-runs"><a class="anchor" href="#interrupted-runs" aria-hidden="true" tabindex="-1">#</a>Interrupted runs</h2>
+<p>A run that stops in the middle (a crash, a kill, a closed terminal, a reboot) can be resumed. While the agent works, Saetta Code keeps a journal of the run beside the session file (<code>&lt;session&gt;.jsonl.run</code>, which pi does not list): the prompt, each message before it reaches the session file, each tool call before it starts and its result when it ends, the output a running command printed (once a second), and the messages queued meanwhile. The journal is removed when the run ends, so one exists only for a run that is going on or was cut off. The session file itself stays pi&#39;s.</p>
+<p>At the next start in that folder (with or without <code>-c</code>), Saetta Code offers the interrupted run:</p>
+<div class="code doc-code"><div class="code-head"><span>text</span><button class="copy" type="button">Copy</button></div><pre><code>The last run in this folder was interrupted 4 minutes ago (session &quot;fix the parser&quot;).
+It was running: bash  npm test
+&gt; Resume the run
+  Open the session without resuming
+  Discard the run</code></pre></div>
+<ul>
+<li><strong>Resume the run</strong>: messages the session file lost are written back, tool calls that finished keep their result, and the run goes on from where it stopped. read, grep, find and ls calls that were running run again. A bash, write, edit, MCP or subagent call that was running is never run again on its own: Saetta Code asks (&quot;Run it again?&quot;, with a hint for write and edit saying whether the change looks applied). The default reports it to the model as interrupted, with the output it printed, and the model decides what to do. Messages queued before the crash are sent with the resumed run.</li>
+<li><strong>Open the session without resuming</strong>: the running calls are reported as interrupted in the session, nothing runs and nothing is sent.</li>
+<li><strong>Discard the run</strong>: the journal is removed and the session stays as pi leaves it.</li>
+<li>Escape leaves the choice for the next start.</li>
+</ul>
+<p>A run interrupted 3 times in a row without progress is not resumed again: its open calls are reported as interrupted. A run whose session was continued meanwhile (by pi or another Saetta Code) is not offered. Without a terminal, <code>saetta code --recover</code> resumes the run (calls that may have had effects are reported as interrupted), in print and JSON mode.</p>
 <h2 id="the-session-tree"><a class="anchor" href="#the-session-tree" aria-hidden="true" tabindex="-1">#</a>The session tree</h2>
 <p>A session is a tree, not a list: going back to an earlier message and continuing from there adds a branch, and the old branch stays in the file.</p>
 <ul>
@@ -127,7 +142,7 @@ saetta code --no-session                  <span class="hljs-comment"># do not sa
       <p class="doc-edit"><a href="https://github.com/antonellof/saetta/blob/main/docs/sessions.md" rel="noopener">Edit this page on GitHub</a></p>
       <nav class="doc-pager" aria-label="Previous and next"><a class="prev" href="/docs/interactive-mode/"><span>Previous</span>Interactive mode</a><a class="next" href="/docs/models-and-providers/"><span>Next</span>Models and providers</a></nav>
     </main>
-    <nav class="doc-toc" aria-label="On this page"><p class="ds-title">On this page</p><ul><li class="d2"><a href="#continue-and-resume">Continue and resume</a></li><li class="d2"><a href="#the-session-tree">The session tree</a></li><li class="d2"><a href="#compaction">Compaction</a></li><li class="d2"><a href="#export-import-and-share">Export, import and share</a></li></ul></nav>
+    <nav class="doc-toc" aria-label="On this page"><p class="ds-title">On this page</p><ul><li class="d2"><a href="#continue-and-resume">Continue and resume</a></li><li class="d2"><a href="#interrupted-runs">Interrupted runs</a></li><li class="d2"><a href="#the-session-tree">The session tree</a></li><li class="d2"><a href="#compaction">Compaction</a></li><li class="d2"><a href="#export-import-and-share">Export, import and share</a></li></ul></nav>
   </div>
   <div class="ds-scrim" hidden></div>
 

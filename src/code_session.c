@@ -116,8 +116,21 @@ static bool has_conversation(const JValue *entries) {
     return false;
 }
 
+void (*code_session_wal)(const CodeSession *s, const JValue *entry, bool after);
+
+static Err persist_file(CodeSession *s, const JValue *entry);
+
+// The write-ahead hook (code_durable.c) around each append to a file-backed session: before the
+// write (the entry journalled first) and after it.
 static Err persist(CodeSession *s, const JValue *entry) {
     if (!s->path) return OK;
+    if (code_session_wal) code_session_wal(s, entry, false);
+    Err e = persist_file(s, entry);
+    if (!e && code_session_wal) code_session_wal(s, entry, true);
+    return e;
+}
+
+static Err persist_file(CodeSession *s, const JValue *entry) {
     Buf b = {0};
     Err e = OK;
     if (!s->flushed) {
@@ -571,6 +584,20 @@ Err code_session_from_entries(Arena *a, const char *path, JValue *entries, CodeS
     }
     *out = s;
     return OK;
+}
+
+// An entry made elsewhere (a run's journal, code_durable.c), appended as it is: its id, parentId and
+// timestamp kept. The leaf moves to it.
+Err code_session_append_raw(CodeSession *s, JValue *entry) {
+    json_push(s->a, s->entries, entry);
+    const char *prev = s->leaf;
+    s->leaf = json_str(json_get(entry, "id"));
+    Err err = persist(s, entry);
+    if (err) {
+        s->entries->arr.len--;
+        s->leaf = prev;
+    }
+    return err;
 }
 
 // appendCompaction's entry: its timestamp is also its system message's (ms), so the caller gives it.

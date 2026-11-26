@@ -99,6 +99,8 @@ bool code_trust_has_project_resources(Arena *a, const char *cwd, const char *hom
 // code_trust_trusted for an env->cwd other than the last one resolves that folder's trust
 // (without a prompt) and makes it the current runtime's.
 void code_trust_override(int trusted); // -1 none, 0 --no-approve, 1 --approve
+// The startup selector of the trust prompt with other choices (at most 5): the index, -1 cancelled.
+int code_trust_select(const char *title, const char *const *labels, size_t n, const char *theme);
 void code_trust_resolve(const CodeEnv *env, bool interactive);
 bool code_trust_trusted(const CodeEnv *env);
 // Before a restart on another model (exec of saetta code): the current folder's decision handed to

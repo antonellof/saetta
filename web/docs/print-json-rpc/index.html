@@ -90,6 +90,7 @@
 saetta code -p --pack 27b-turbo <span class="hljs-string">&quot;summarize what src/server.c does&quot;</span>
 git <span class="hljs-built_in">log</span> -20 --oneline | saetta code -p <span class="hljs-string">&quot;write release notes from these commits&quot;</span></code></pre></div>
 <p>Piped input is joined to the prompt, and makes the run a print run even without <code>-p</code>. The session is saved as usual (<code>--no-session</code> skips it), so <code>saetta code -c</code> can continue it in the terminal UI.</p>
+<p>A run that a crash or a kill cut off is resumed with <code>--recover</code> (in this folder, or the session given with <code>--session</code>): read-only tool calls that were running run again, the others are reported to the model as interrupted, and the run goes on. See <a href="/docs/sessions/#interrupted-runs">Interrupted runs</a>.</p>
 <p>In a project that is not yet trusted there is no prompt to ask in, so project resources stay off; pass <code>--approve</code> to trust it for the run. See <a href="/docs/context-and-skills/#project-trust">Context and skills</a>.</p>
 <h2 id="json-mode"><a class="anchor" href="#json-mode" aria-hidden="true" tabindex="-1">#</a>JSON mode</h2>
 <p><code>--mode json</code> prints pi&#39;s event stream instead of the text, one JSON object per line: the session header first, then the agent&#39;s events as they happen.</p>

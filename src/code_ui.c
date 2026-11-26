@@ -10,6 +10,7 @@
 // core/compaction/compaction.ts (the context estimate the footer shows).
 #include "code_tui.h"
 #include "code_cfg.h"
+#include "code_durable.h"
 #include "code_mcp_ui.h"
 #include "code_oai.h"
 #include "code_monitor.h"
@@ -200,6 +201,13 @@ char *code_ui_take_queued(bool steering_only) {
     return t;
 }
 
+void code_ui_queue_restore(const char *text, bool steer) {
+    pthread_mutex_lock(&g_mlock);
+    vec_push(&g_msgq, ((Queued){strdup(text), steer}));
+    pthread_mutex_unlock(&g_mlock);
+    q_post("{\"type\":\"queue_update\"}");
+}
+
 // agent.hasQueuedMessages(): a steering or follow-up message waiting (the auto-compaction's continue)
 bool code_ui_has_queued(void) {
     pthread_mutex_lock(&g_mlock);
@@ -274,6 +282,10 @@ typedef struct {
     bool busy, working;
     AsstView *streaming;
     VEC(ToolView *) pending_tools;
+    // the history's calls without a result, kept for a resumed run (code_durable.c) to finish in
+    // place; only while it starts (cleared at its agent_end)
+    VEC(ToolView *) history_open;
+    bool keep_history_open;
     bool bug_hint_shown;
     uint64_t last_ctrl_c_ns, last_esc_ns;
     bool quit;
@@ -4034,6 +4046,9 @@ static void render_history(void) {
                 }
         }
     }
+    U->history_open.len = 0;
+    if (U->keep_history_open)
+        for (size_t k = 0; k < open.len; k++) vec_push(&U->history_open, open.ptr[k]);
     vec_free(&open);
     arena_reset(&ha);
     sess_ui_history_done();
@@ -4445,6 +4460,7 @@ static void *agent_main(void *arg) {
         g_job = NULL;
         pthread_mutex_unlock(&g_tlock);
         if (job[0] == '\x01' && ops->compact) ops->compact(host, job + 1); // /compact (uix_start_compact)
+        else if (job[0] == '\x02' && !job[1] && ops->recover) ops->recover(host); // an interrupted run (code_durable.c)
         else ops->prompt(host, job);
         free(job);
         q_post("{\"type\":\"ui_idle\"}");
@@ -4755,6 +4771,10 @@ static void handle_event(const JValue *ev) {
         show_error(json_str(json_get(ev, "message")) ? json_str(json_get(ev, "message")) : "error");
         return;
     }
+    if (str_eqz(type, "ui_status")) { // the agent's side's own notes (a resumed run's decisions)
+        show_status(json_str(json_get(ev, "message")) ? json_str(json_get(ev, "message")) : "");
+        return;
+    }
     if (str_eqz(type, "queue_update")) {
         pending_display();
     } else if (str_eqz(type, "agent_start")) {
@@ -4810,6 +4830,13 @@ static void handle_event(const JValue *ev) {
     } else if (str_eqz(type, "tool_execution_start")) {
         const char *id = json_str(json_get(ev, "toolCallId"));
         ToolView *v = id ? find_pending(id) : NULL;
+        for (size_t k = 0; !v && id && k < U->history_open.len; k++) // a resumed run's call, drawn by the history
+            if (!strcmp(U->history_open.ptr[k]->id, id)) {
+                v = U->history_open.ptr[k];
+                memmove(U->history_open.ptr + k, U->history_open.ptr + k + 1, (U->history_open.len - k - 1) * sizeof(ToolView *));
+                U->history_open.len--;
+                vec_push(&U->pending_tools, v);
+            }
         if (!v) {
             v = tool_new(json_str(json_get(ev, "toolName")), id, json_get(ev, "args"));
             chat_add(&v->base);
@@ -4845,6 +4872,8 @@ static void handle_event(const JValue *ev) {
         }
         stream_reset();
         U->pending_tools.len = 0;
+        U->history_open.len = 0;
+        U->keep_history_open = false;
     } else if (str_eqz(type, "auto_retry_start")) {
         // RetryStatusIndicator: the retry countdown in the editor's border
         Buf m = {0};
@@ -5116,6 +5145,7 @@ static void submit(char *text) {
         pthread_mutex_lock(&g_mlock);
         vec_push(&g_msgq, ((Queued){strdup(s), !g_follow_up}));
         pthread_mutex_unlock(&g_mlock);
+        code_durable_queue(!g_follow_up, s); // the run's journal keeps it (code_durable.c)
         pending_display();
     } else start_prompt(s);
     free(s);
@@ -5516,10 +5546,12 @@ Err code_ui_run(const CodeUiConfig *cfg, const CodeUiOps *ops, CodeUiHost *host,
                         .set_thinking = set_thinking, .theme_name = cmds_theme, .term_colors = cmds_colors,
                         .appearance = cmds_appearance, .toggle_tools = toggle_tools, .set_cwd = cmds_set_cwd});
     screen_start(&ui.scr);
+    ui.keep_history_open = cfg->recover;
     if (cfg->resumed) render_history();
     code_startup_notices(cfg->resumed); // the changelog notice and the trust warning (code_changelog.c)
     code_update_check_start(g_wake[1]); // the version check, off the UI thread (code_update.c)
     draw(true);
+    if (cfg->recover && ops->recover) start_prompt("\x02"); // the interrupted run first, then the prompts given
     if (ninitial) {
         ui.initial = xcalloc(ninitial, sizeof *ui.initial);
         for (size_t i = 0; i < ninitial; i++) ui.initial[i] = strdup(initial[i]);
@@ -5695,6 +5727,7 @@ Err code_ui_run(const CodeUiConfig *cfg, const CodeUiOps *ops, CodeUiHost *host,
     buf_free(&ui.search.value);
     vec_free(&ui.stats);
     vec_free(&ui.pending_tools);
+    vec_free(&ui.history_open);
     pthread_mutex_lock(&g_mlock);
     for (size_t i = 0; i < g_msgq.len; i++) free(g_msgq.ptr[i].text);
     vec_free(&g_msgq);

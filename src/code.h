@@ -184,6 +184,11 @@ const char *code_session_leaf(const CodeSession *s);
 const JValue *code_session_entry_last(const CodeSession *s);
 // True when the session has no entry yet besides its header.
 bool code_session_is_new(const CodeSession *s);
+// An entry made elsewhere (a run's journal), appended as it is (id, parentId, timestamp kept).
+Err code_session_append_raw(CodeSession *s, JValue *entry);
+// The write-ahead hook of a run's journal (code_durable.c): called before (after false) and after
+// (after true) each entry is written to a session file. NULL: none.
+extern void (*code_session_wal)(const CodeSession *s, const JValue *entry, bool after);
 
 // s with each maximal ill-formed UTF-8 subpart replaced by U+FFFD (TextDecoder's replacement),
 // s itself when it is well formed.

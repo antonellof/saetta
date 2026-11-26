@@ -21,6 +21,7 @@
 #include "code_autocompact.h"
 #include "code_cfg.h"
 #include "code_cmds.h"
+#include "code_durable.h"
 #include "code_oai.h"
 #include "code_res.h"
 #include "code_sessions.h"
@@ -1030,6 +1031,7 @@ static void queue(Arena *a, bool steering, const char *text) {
     const char *t = code_skill_expand(R.ops->arena(R.h), R.ops->env(R.h), text, NULL);
     vec_push(steering ? &R.disp_steer : &R.disp_follow, strdup(t));
     vec_push(steering ? &R.steer : &R.follow, strdup(t));
+    code_durable_queue(steering, t); // the run's journal keeps it (code_durable.c)
     queue_update(a);
 }
 

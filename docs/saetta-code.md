@@ -57,6 +57,8 @@ saetta code [options] [prompt ...]
   -c, --continue           continue the most recent session in this folder
   --session FILE           continue this session file
   --no-session             do not save the session
+  --recover                resume the run a crash interrupted in this folder (or --session's):
+                           read-only tools run again, the others are reported as interrupted
   --provider P --model M   the model (M may be provider/id and end in :thinking)
   --thinking LEVEL         off, minimal, low, medium, high, xhigh, max
   --tools a,b,c | --no-tools   the tool set

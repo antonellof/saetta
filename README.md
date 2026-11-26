@@ -167,6 +167,8 @@ In process, the engine's state of the conversation (its KV cache and recurrent s
 
 <p align="center"><img src="web/assets/code/model.png" width="900" alt="/model: a saetta server model, two packs on this Mac, one greyed out as too big for its memory, and the others with their download size"></p>
 
+A run cut off by a crash, a kill or a closed terminal is resumed at the next start: finished tool calls keep their result, read-only ones run again, and a command or edit that was running is never run again without asking. See [Interrupted runs](docs/sessions.md#interrupted-runs).
+
 Coming next: prompts read while tools run; a cheaper DSpark verify pass and the M5's neural accelerators for Inkling 2 Mini; the agent's commands confined to the project by macOS's Seatbelt.
 
 ## Other agents and clients

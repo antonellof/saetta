@@ -96,6 +96,29 @@ saetta start code --pack inkling
 saetta download 27b-qwopus              <span class="hljs-comment"># Qwopus, a Qwen3.8-27B coding fine-tune, 16 GB</span>
 saetta start code --pack 27b-qwopus</code></pre></div>
 <p>Inside the agent, <code>/model</code> lists the packs on this Mac and the ones you can download (with their size and the free disk), downloads the one you pick and switches to it in the running session. Inkling 2 Mini is Thinking Machines&#39; 26B mixture of experts with 3.4B active per token; it is not picked automatically. See <a href="/docs/choosing-a-model/">Choosing a model</a>.</p>
+<h2 id="every-model-in-one-place"><a class="anchor" href="#every-model-in-one-place" aria-hidden="true" tabindex="-1">#</a>Every model in one place</h2>
+<div class="code doc-code"><div class="code-head"><span>shell</span><button class="copy" type="button">Copy</button></div><pre><code><span class="hljs-comment"># Qwen3.8-Flash-Next (96 GB+) and Qwen3.8-27B (32 GB+)</span>
+saetta download coder &amp;&amp; saetta start code --pack coder
+saetta download 27b-4bit &amp;&amp; saetta start code --pack 27b-4bit
+
+<span class="hljs-comment"># Qwen3.8-27B coding fine-tunes (converted from their GGUF on download, with a draft head)</span>
+saetta download 27b-turbo &amp;&amp; saetta start code --pack 27b-turbo
+saetta download 27b-qwopus &amp;&amp; saetta start code --pack 27b-qwopus
+
+<span class="hljs-comment"># LoRA adapters on the 27B 8-bit, in the agent&#x27;s own process</span>
+saetta download 27b-8bit &amp;&amp; saetta download 27b-pi
+saetta start code --pack 27b-8bit --lora-modules qwen3.8-pi=27b-pi
+
+<span class="hljs-comment"># Inkling 2 Mini (32 GB+), optionally with its DSpark drafter</span>
+saetta download inkling &amp;&amp; saetta start code --pack inkling
+saetta download inkling-dspark &amp;&amp; SAETTA_DSPARK=1 saetta start code --pack inkling
+
+<span class="hljs-comment"># Any Qwen3.8-27B GGUF, imported into a pack (the folder holds the model&#x27;s config.json and tokenizer)</span>
+saetta import my-finetune.gguf ~/Models/my-finetune &amp;&amp; saetta start code --pack ~/Models/my-finetune
+
+<span class="hljs-comment"># A remote OpenAI-compatible model: add it in /model, or in ~/.pi/agent/models.json, then</span>
+saetta code --model myprovider/my-model</code></pre></div>
+<p>See <a href="/docs/choosing-a-model/">Choosing a model</a>, <a href="/docs/lora/">LoRA adapters</a>, <a href="/docs/gguf-import/">GGUF import</a> and <a href="/docs/models-and-providers/">Models and providers</a>.</p>
 <h2 id="trust-the-project"><a class="anchor" href="#trust-the-project" aria-hidden="true" tabindex="-1">#</a>Trust the project</h2>
 <p>When the folder has project resources (a <code>.pi</code> folder with settings, skills or MCP servers), the agent asks whether to trust it before loading them. Context files such as <code>AGENTS.md</code> load either way. See <a href="/docs/context-and-skills/">Context and skills</a>.</p>
 <h2 id="ask-for-something"><a class="anchor" href="#ask-for-something" aria-hidden="true" tabindex="-1">#</a>Ask for something</h2>
@@ -121,7 +144,7 @@ saetta start code --pack 27b-qwopus</code></pre></div>
       <p class="doc-edit"><a href="https://github.com/antonellof/saetta/blob/main/docs/quickstart.md" rel="noopener">Edit this page on GitHub</a></p>
       <nav class="doc-pager" aria-label="Previous and next"><a class="prev" href="/docs/install/"><span>Previous</span>Install</a><a class="next" href="/docs/choosing-a-model/"><span>Next</span>Choosing a model</a></nav>
     </main>
-    <nav class="doc-toc" aria-label="On this page"><p class="ds-title">On this page</p><ul><li class="d2"><a href="#open-the-agent">Open the agent</a></li><li class="d2"><a href="#pick-a-model">Pick a model</a></li><li class="d2"><a href="#trust-the-project">Trust the project</a></li><li class="d2"><a href="#ask-for-something">Ask for something</a></li><li class="d2"><a href="#come-back-later">Come back later</a></li><li class="d2"><a href="#without-the-terminal-ui">Without the terminal UI</a></li></ul></nav>
+    <nav class="doc-toc" aria-label="On this page"><p class="ds-title">On this page</p><ul><li class="d2"><a href="#open-the-agent">Open the agent</a></li><li class="d2"><a href="#pick-a-model">Pick a model</a></li><li class="d2"><a href="#every-model-in-one-place">Every model in one place</a></li><li class="d2"><a href="#trust-the-project">Trust the project</a></li><li class="d2"><a href="#ask-for-something">Ask for something</a></li><li class="d2"><a href="#come-back-later">Come back later</a></li><li class="d2"><a href="#without-the-terminal-ui">Without the terminal UI</a></li></ul></nav>
   </div>
   <div class="ds-scrim" hidden></div>
 

@@ -77,6 +77,32 @@ By memory it picks `coder` (Qwen3.8-Flash-Next, 76 GB) from 96 GB, `27b-turbo` (
 | `inkling` | [Inkling 2 Mini](https://huggingface.co/mlx-community/Inkling-2-Mini-4bit), dense 4-bit, experts NVFP4 / MXFP8 | 17 GB | 32 GB | prompt lookup; 1M context | Verified 79.2 ⁴ | 71.6 ⁴ |
 | `inkling-dspark` | [DSpark drafter](https://huggingface.co/thinkingmachines/Inkling-2-Mini) for `inkling` | 0.6 GB | | opt-in, `SAETTA_DSPARK=1` | | |
 
+How to run each one:
+
+```sh
+# Qwen3.8-Flash-Next (96 GB+) and Qwen3.8-27B (32 GB+)
+saetta download coder && saetta start code --pack coder
+saetta download 27b-4bit && saetta start code --pack 27b-4bit
+
+# Qwen3.8-27B coding fine-tunes (converted from their GGUF on download, with a draft head)
+saetta download 27b-turbo && saetta start code --pack 27b-turbo
+saetta download 27b-qwopus && saetta start code --pack 27b-qwopus
+
+# LoRA adapters on the 27B 8-bit, in the agent's own process
+saetta download 27b-8bit && saetta download 27b-pi
+saetta start code --pack 27b-8bit --lora-modules qwen3.8-pi=27b-pi
+
+# Inkling 2 Mini (32 GB+), optionally with its DSpark drafter
+saetta download inkling && saetta start code --pack inkling
+saetta download inkling-dspark && SAETTA_DSPARK=1 saetta start code --pack inkling
+
+# Any Qwen3.8-27B GGUF, imported into a pack (the folder holds the model's config.json and tokenizer)
+saetta import my-finetune.gguf ~/Models/my-finetune && saetta start code --pack ~/Models/my-finetune
+
+# A remote OpenAI-compatible model: add it in /model, or in ~/.pi/agent/models.json, then
+saetta code --model myprovider/my-model
+```
+
 **Bold**: what `saetta download` picks by memory. The GGUF fine-tunes are converted on download ([GGUF import](docs/gguf-import.md)); LoRA adapters run in process ([LoRA](docs/lora.md)); Inkling's DSpark drafter is opt-in ([Choosing a model](docs/choosing-a-model.md)). A pack too big for this Mac is refused and the context is sized to the memory left (about 37K tokens with `27b-4bit` on 32 GB). Every model is checked layer by layer against a numpy reference built from the same weights.
 
 <sub>SWE-bench and Terminal-Bench are the publishers' scores for the full-precision model, each with its own harness, not measured by Saetta on these packs: ¹ [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF) (SWE-bench Verified, xhigh reasoning; the Coder against the full model), ² [Qwen](https://huggingface.co/Qwen/Qwen3.8-27B) ([Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next); SWE-bench Pro with Claude Code, Terminal-Bench 2.1 with Terminus), ³ [harness-hub](https://huggingface.co/harness-hub/Qwen3.8-27B-pi-adapted) (the adapter under pi, SWE-bench Pro's hard 51 tasks; the base model scores 39.2 and 39.5 there). ⁴ [Thinking Machines](https://huggingface.co/thinkingmachines/Inkling-2-Mini) (SWE-bench Verified with bash only, Terminal-Bench 2.1 with pi). ⁵ [Jackrong](https://huggingface.co/Jackrong/Qwopus3.8-27B-Coder-Flash) publishes only its own local tests (an MMLU-Pro subset of 1,500 questions, 93.87; 9 of 9 runs of a 3-task coding-agent test). n/p: not published (Qwen publishes no Terminal-Bench score for Flash-Next; the fine-tunes publish none for either). Licenses: Flash-Next Qwen Community License 1.0; the others Apache-2.0. No weights are part of this repository.</sub>

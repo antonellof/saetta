@@ -28,6 +28,34 @@ saetta start code --pack 27b-qwopus
 
 Inside the agent, `/model` lists the packs on this Mac and the ones you can download (with their size and the free disk), downloads the one you pick and switches to it in the running session. Inkling 2 Mini is Thinking Machines' 26B mixture of experts with 3.4B active per token; it is not picked automatically. See [Choosing a model](choosing-a-model.md).
 
+## Every model in one place
+
+```sh
+# Qwen3.8-Flash-Next (96 GB+) and Qwen3.8-27B (32 GB+)
+saetta download coder && saetta start code --pack coder
+saetta download 27b-4bit && saetta start code --pack 27b-4bit
+
+# Qwen3.8-27B coding fine-tunes (converted from their GGUF on download, with a draft head)
+saetta download 27b-turbo && saetta start code --pack 27b-turbo
+saetta download 27b-qwopus && saetta start code --pack 27b-qwopus
+
+# LoRA adapters on the 27B 8-bit, in the agent's own process
+saetta download 27b-8bit && saetta download 27b-pi
+saetta start code --pack 27b-8bit --lora-modules qwen3.8-pi=27b-pi
+
+# Inkling 2 Mini (32 GB+), optionally with its DSpark drafter
+saetta download inkling && saetta start code --pack inkling
+saetta download inkling-dspark && SAETTA_DSPARK=1 saetta start code --pack inkling
+
+# Any Qwen3.8-27B GGUF, imported into a pack (the folder holds the model's config.json and tokenizer)
+saetta import my-finetune.gguf ~/Models/my-finetune && saetta start code --pack ~/Models/my-finetune
+
+# A remote OpenAI-compatible model: add it in /model, or in ~/.pi/agent/models.json, then
+saetta code --model myprovider/my-model
+```
+
+See [Choosing a model](choosing-a-model.md), [LoRA adapters](lora.md), [GGUF import](gguf-import.md) and [Models and providers](models-and-providers.md).
+
 ## Trust the project
 
 When the folder has project resources (a `.pi` folder with settings, skills or MCP servers), the agent asks whether to trust it before loading them. Context files such as `AGENTS.md` load either way. See [Context and skills](context-and-skills.md).

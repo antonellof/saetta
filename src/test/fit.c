@@ -40,7 +40,8 @@ TEST(fit_rules_by_mac_memory) {
         const char *name;
         double gib;
     } sizes[] = {{"coder", 75.7}, {"full", 105.5}, {"27b-8bit", 27.5}, {"27b-4bit", 15.0}, {"27b-turbo", 18.6}, {"27b-turbo-8bit", 28.6},
-                 {"27b-coder390", 21.8}, {"27b-coder390-8bit", 28.6}, {"27b-fable5", 18.5}, {"27b-fable5-8bit", 28.6}};
+                 {"27b-coder390", 21.8}, {"27b-coder390-8bit", 28.6}, {"27b-fable5", 18.5}, {"27b-fable5-8bit", 28.6},
+                 {"27b-qwopus", 15.0}, {"27b-qwopus-8bit", 27.5}};
     for (size_t i = 0; i < COUNT(sizes); i++) {
         const DownloadPack *d = download_find(sizes[i].name);
         EXPECT(d != NULL);

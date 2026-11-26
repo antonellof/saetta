@@ -25,6 +25,8 @@ When no pack is named, `saetta start` uses the first downloaded pack that fits t
 | `27b-coder390-8bit` (with MTP) | the same, from its Q8_0 GGUF | 31 GB | 48 GB | n/p | n/p |
 | `27b-fable5` (with MTP) | [Fable-5 Coding Distilled](https://huggingface.co/khazarai/Qwen3.8-27B-Fable-5-Coding-Distilled), a Qwen3.8-27B coding distill, from [mradermacher's](https://huggingface.co/mradermacher/Qwen3.8-27B-Fable-5-Coding-Distilled-i1-GGUF) imatrix Q4_K_M GGUF | 20 GB | 36 GB | n/p | n/p |
 | `27b-fable5-8bit` (with MTP) | the same, from its Q8_0 GGUF | 31 GB | 48 GB | n/p | n/p |
+| `27b-qwopus` | [Qwopus3.8-27B Coder-Flash](https://huggingface.co/mlx-community/Qwopus3.8-27B-Coder-Flash-4bit) (Jackrong), a Qwen3.8-27B coding fine-tune distilled from Qwen3.8-Flash-Max, dense, 4-bit | 16 GB | 32 GB | n/p ⁵ | n/p ⁵ |
+| `27b-qwopus-8bit` | [the same](https://huggingface.co/mlx-community/Qwopus3.8-27B-Coder-Flash-8bit), 8-bit | 29 GB | 48 GB | n/p ⁵ | n/p ⁵ |
 | `inkling` | [Inkling 2 Mini](https://huggingface.co/mlx-community/Inkling-2-Mini-4bit) (Thinking Machines), 128 experts, 8 active, dense layers 4-bit, experts NVFP4 / MXFP8 | 17 GB | 32 GB | Verified 79.2 ⁴ | 71.6 ⁴ |
 
 SWE-bench and Terminal-Bench are the publishers' scores for the full-precision model, each with its own harness, not measured by Saetta on these packs:
@@ -32,6 +34,8 @@ SWE-bench and Terminal-Bench are the publishers' scores for the full-precision m
 1. [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF) (SWE-bench Verified, xhigh reasoning; the Coder against the full model).
 2. [Qwen](https://huggingface.co/Qwen/Qwen3.8-27B) ([Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next); SWE-bench Pro with Claude Code, Terminal-Bench 2.1 with Terminus).
 3. [harness-hub](https://huggingface.co/harness-hub/Qwen3.8-27B-pi-adapted) (the adapter under pi, SWE-bench Pro's hard 51 tasks; the base model scores 39.2 and 39.5 there).
+4. [Thinking Machines](https://huggingface.co/thinkingmachines/Inkling-2-Mini) (Inkling 2 Mini: SWE-bench Verified with bash only, Terminal-Bench 2.1 with pi).
+5. [Jackrong](https://huggingface.co/Jackrong/Qwopus3.8-27B-Coder-Flash) publishes only its own local tests for Qwopus (an MMLU-Pro subset of 1,500 questions, 93.87; 9 of 9 runs of a 3-task coding-agent test), not comparable with these.
 
 n/p: not published (Qwen publishes no Terminal-Bench score for Flash-Next; the fine-tunes publish none for either).
 
@@ -50,4 +54,4 @@ Inside Saetta Code, `/model` lists every pack, shows its size and the free disk,
 
 ## Licenses
 
-Flash-Next: Qwen Community License 1.0. Qwen3.8-27B, the pi adapter, TURBO, Coder390 and Fable-5: Apache-2.0. No weights are part of the Saetta repository.
+Flash-Next: Qwen Community License 1.0. Qwen3.8-27B, the pi adapter, TURBO, Coder390, Fable-5, Qwopus and Inkling 2 Mini: Apache-2.0. No weights are part of the Saetta repository.

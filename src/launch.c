@@ -35,7 +35,7 @@ static const char *model_label = "Qwen3.8-Flash-Next (saetta)";
 static const char *lora_arg = NULL;
 
 const char *launch_usage(void) {
-    return "usage: saetta start <claude|pi|opencode|code> [--pack coder|full|27b-turbo|27b-coder390|27b-fable5|27b-8bit|27b-4bit|<dir>] [--lora name=path] [--port N] "
+    return "usage: saetta start <claude|pi|opencode|code> [--pack coder|full|27b-turbo|27b-coder390|27b-fable5|27b-qwopus|27b-8bit|27b-4bit|<dir>] [--lora name=path] [--port N] "
            "[--ctx N] [--keep] [-- <agent args>]\n";
 }
 

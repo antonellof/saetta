@@ -22,7 +22,7 @@ Saetta puts the strongest open coding models that fit on a Mac inside a coding a
 | model | from | what it is | SWE-bench |
 |---|---|---|---|
 | [Qwen3.8-Flash-Next](#models) | 96 GB | Qwen's mixture of experts; the `coder` pack keeps the 256 experts that matter for code. The fastest here | Verified 82.8 (full), 79.2 (Coder) |
-| [Qwen3.8-27B](#models) | 32 GB | dense, 4-bit or 8-bit, with LoRA adapters and coding fine-tunes (TURBO, Coder390, Fable-5) | Pro 61.7 |
+| [Qwen3.8-27B](#models) | 32 GB | dense, 4-bit or 8-bit, with LoRA adapters and coding fine-tunes (TURBO, Coder390, Fable-5, Qwopus) | Pro 61.7 |
 | [Inkling 2 Mini](#models) | 32 GB | Thinking Machines' 26B mixture of experts with 3.4B active per token: a small model that scores like a large one. First version in Saetta | Verified 79.2 |
 
 Scores are the publishers', for the full-precision models ([sources](#models)).
@@ -169,8 +169,10 @@ Without `saetta start`, point any agent at `http://127.0.0.1:8080/v1` (OpenAI) o
 | `27b-coder390-8bit` · with MTP | the same, from its Q8_0 GGUF | 31 GB | 48 GB | n/p | n/p |
 | `27b-fable5` · with MTP | [Fable-5 Coding Distilled](https://huggingface.co/khazarai/Qwen3.8-27B-Fable-5-Coding-Distilled), a Qwen3.8-27B coding distill, from [mradermacher's](https://huggingface.co/mradermacher/Qwen3.8-27B-Fable-5-Coding-Distilled-i1-GGUF) imatrix Q4_K_M GGUF | 20 GB | 36 GB | n/p | n/p |
 | `27b-fable5-8bit` · with MTP | the same, from its Q8_0 GGUF | 31 GB | 48 GB | n/p | n/p |
+| `27b-qwopus` | [Qwopus3.8-27B Coder-Flash](https://huggingface.co/mlx-community/Qwopus3.8-27B-Coder-Flash-4bit) (Jackrong), a Qwen3.8-27B coding fine-tune distilled from Qwen3.8-Flash-Max, dense, 4-bit | 16 GB | 32 GB | n/p ⁵ | n/p ⁵ |
+| `27b-qwopus-8bit` | [the same](https://huggingface.co/mlx-community/Qwopus3.8-27B-Coder-Flash-8bit), 8-bit | 29 GB | 48 GB | n/p ⁵ | n/p ⁵ |
 
-SWE-bench and Terminal-Bench are the publishers' scores for the full-precision model, each with its own harness, not measured by Saetta on these packs: ¹ [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF) (SWE-bench Verified, xhigh reasoning; the Coder against the full model), ² [Qwen](https://huggingface.co/Qwen/Qwen3.8-27B) ([Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next); SWE-bench Pro with Claude Code, Terminal-Bench 2.1 with Terminus), ³ [harness-hub](https://huggingface.co/harness-hub/Qwen3.8-27B-pi-adapted) (the adapter under pi, SWE-bench Pro's hard 51 tasks; the base model scores 39.2 and 39.5 there). ⁴ [Thinking Machines](https://huggingface.co/thinkingmachines/Inkling-2-Mini) (SWE-bench Verified with bash only, Terminal-Bench 2.1 with pi). n/p: not published (Qwen publishes no Terminal-Bench score for Flash-Next; the fine-tunes publish none for either).
+SWE-bench and Terminal-Bench are the publishers' scores for the full-precision model, each with its own harness, not measured by Saetta on these packs: ¹ [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF) (SWE-bench Verified, xhigh reasoning; the Coder against the full model), ² [Qwen](https://huggingface.co/Qwen/Qwen3.8-27B) ([Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next); SWE-bench Pro with Claude Code, Terminal-Bench 2.1 with Terminus), ³ [harness-hub](https://huggingface.co/harness-hub/Qwen3.8-27B-pi-adapted) (the adapter under pi, SWE-bench Pro's hard 51 tasks; the base model scores 39.2 and 39.5 there). ⁴ [Thinking Machines](https://huggingface.co/thinkingmachines/Inkling-2-Mini) (SWE-bench Verified with bash only, Terminal-Bench 2.1 with pi). ⁵ [Jackrong](https://huggingface.co/Jackrong/Qwopus3.8-27B-Coder-Flash) publishes only its own local tests (an MMLU-Pro subset of 1,500 questions, 93.87; 9 of 9 runs of a 3-task coding-agent test). n/p: not published (Qwen publishes no Terminal-Bench score for Flash-Next; the fine-tunes publish none for either).
 
 With less memory the context is smaller: about 37K tokens with `27b-4bit` on 32 GB. `SAETTA_IGNORE_MEMORY=1` skips the memory checks.
 
@@ -178,7 +180,7 @@ With less memory the context is smaller: about 37K tokens with `27b-4bit` on 32 
 
 [Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) is Thinking Machines' coding model: 26B parameters in a mixture of 128 experts, 8 used per token, so each token costs about as much as a 3.4B dense model while it scores 79.2 on SWE-bench Verified. Its 24 layers run as 48 (a block of 12 is looped three times), with sliding-window attention and its own JSON tool-call format, which Saetta translates to the OpenAI and Anthropic APIs. The MLX pack keeps Thinking Machines' NVFP4 and MXFP8 experts as published. This is a first version: no speculative decoding yet, prompts on the GPU cores rather than the M5's neural accelerators, and a follow-up turn reuses the conversation only when it appends to it.
 
-Licenses: Flash-Next Qwen Community License 1.0; Qwen3.8-27B, the pi adapter, TURBO, Coder390, Fable-5 and Inkling 2 Mini Apache-2.0. No weights are part of this repository.
+Licenses: Flash-Next Qwen Community License 1.0; Qwen3.8-27B, the pi adapter, TURBO, Coder390, Fable-5, Qwopus and Inkling 2 Mini Apache-2.0. No weights are part of this repository.
 
 ### GGUF fine-tunes of Qwen3.8-27B
 

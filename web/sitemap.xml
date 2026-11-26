@@ -1,10 +1,10 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
-  <url><loc>https://www.saetta.dev/</loc><lastmod>2026-11-23</lastmod></url>
+  <url><loc>https://www.saetta.dev/</loc><lastmod>2026-11-26</lastmod></url>
   <url><loc>https://www.saetta.dev/docs/</loc><lastmod>2026-11-23</lastmod></url>
   <url><loc>https://www.saetta.dev/docs/install/</loc><lastmod>2026-11-23</lastmod></url>
   <url><loc>https://www.saetta.dev/docs/quickstart/</loc><lastmod>2026-11-23</lastmod></url>
-  <url><loc>https://www.saetta.dev/docs/choosing-a-model/</loc><lastmod>2026-11-23</lastmod></url>
+  <url><loc>https://www.saetta.dev/docs/choosing-a-model/</loc><lastmod>2026-11-26</lastmod></url>
   <url><loc>https://www.saetta.dev/docs/saetta-code/</loc><lastmod>2026-11-23</lastmod></url>
   <url><loc>https://www.saetta.dev/docs/interactive-mode/</loc><lastmod>2026-11-22</lastmod></url>
   <url><loc>https://www.saetta.dev/docs/sessions/</loc><lastmod>2026-11-22</lastmod></url>
@@ -26,6 +26,6 @@
   <url><loc>https://www.saetta.dev/docs/build-from-source/</loc><lastmod>2026-11-22</lastmod></url>
   <url><loc>https://www.saetta.dev/docs/commands/</loc><lastmod>2026-11-22</lastmod></url>
   <url><loc>https://www.saetta.dev/docs/environment/</loc><lastmod>2026-11-22</lastmod></url>
-  <url><loc>https://www.saetta.dev/docs/faq/</loc><lastmod>2026-11-23</lastmod></url>
-  <url><loc>https://www.saetta.dev/docs/changelog/</loc><lastmod>2026-11-23</lastmod></url>
+  <url><loc>https://www.saetta.dev/docs/faq/</loc><lastmod>2026-11-26</lastmod></url>
+  <url><loc>https://www.saetta.dev/docs/changelog/</loc><lastmod>2026-11-26</lastmod></url>
 </urlset>

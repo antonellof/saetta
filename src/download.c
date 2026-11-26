@@ -76,6 +76,13 @@ const DownloadPack download_packs[DOWNLOAD_NPACKS] = {
      .gguf_file = "Qwen3.8-27B-Fable-5-Coding-Distilled.Q8_0.gguf",
      .dir = "khazarai/Qwen3.8-27B-Fable-5-Coding-Distilled-Q8_0",
      .note = "the same fine-tune, Q8_0 GGUF with MTP, imported, 31 GB"},
+    // Jackrong's Qwopus3.8-27B-Coder-Flash (Apache-2.0), a coding fine-tune of Qwen3.8-27B
+    // distilled from Qwen3.8-Flash-Max: mlx-community's conversions, the 27B's exact tensors
+    // and quantization, no MTP head
+    {.name = "27b-qwopus", .title = "Qwopus3.8-27B Coder-Flash 4-bit", .disk_gb = 17, .min_ram_gb = 32, .repo = "mlx-community/Qwopus3.8-27B-Coder-Flash-4bit",
+     .rev = "15aa5286a501c8f0407c1076b5b130702e48a71d", .note = "Qwopus3.8-27B Coder-Flash fine-tune (Jackrong), dense, 4-bit, 16 GB"},
+    {.name = "27b-qwopus-8bit", .title = "Qwopus3.8-27B Coder-Flash 8-bit", .disk_gb = 30, .min_ram_gb = 48, .repo = "mlx-community/Qwopus3.8-27B-Coder-Flash-8bit",
+     .rev = "9f17e9c1dee159d7d13e62700a0d9ef817bd7143", .note = "the same fine-tune, 8-bit, 29 GB"},
     // Inkling 2 Mini (thinkingmachines, Apache-2.0): the MLX conversion, dense affine 4-bit
     // with the official NVFP4 / MXFP8 experts; 17.3 GB of weights, so 32 GB Macs (fit.h)
     {.name = "inkling", .title = "Inkling 2 Mini", .disk_gb = 18, .min_ram_gb = 32, .repo = "mlx-community/Inkling-2-Mini-4bit",
@@ -111,7 +118,7 @@ Err download_pack_dir(Arena *a, const DownloadPack *p, char **out) {
 }
 
 const char *download_usage(void) {
-    return "usage: saetta download [coder|full|all|27b-8bit|27b-4bit|27b-pi|27b-turbo|27b-turbo-8bit|27b-coder390|27b-coder390-8bit|27b-fable5|27b-fable5-8bit|inkling] [--jobs N]   (default: coder with 96 GB of memory or more, 27b-turbo with 36, 27b-4bit with 32; all = coder and "
+    return "usage: saetta download [coder|full|all|27b-8bit|27b-4bit|27b-pi|27b-turbo|27b-turbo-8bit|27b-coder390|27b-coder390-8bit|27b-fable5|27b-fable5-8bit|27b-qwopus|27b-qwopus-8bit|inkling] [--jobs N]   (default: coder with 96 GB of memory or more, 27b-turbo with 36, 27b-4bit with 32; all = coder and "
            "full; into $SAETTA_MODELS, default ~/Models)\n";
 }
 

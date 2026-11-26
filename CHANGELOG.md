@@ -3,6 +3,12 @@
 All notable changes to saetta and Saetta Code (`saetta code`), newest first. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are saetta's.
 
+## [Unreleased]
+
+### Added
+
+- `saetta download 27b-qwopus`: Jackrong's Qwopus3.8-27B Coder-Flash, a coding fine-tune of Qwen3.8-27B distilled from Qwen3.8-Flash-Max (mlx-community's 4-bit, 16 GB, Macs with 32 GB or more). `27b-qwopus-8bit`: 29 GB, 48 GB. Same architecture and quantization as `27b-4bit` and `27b-8bit`, no MTP draft head.
+
 ## [0.18.0] - 2026-11-23
 
 ### Added

@@ -26,7 +26,7 @@ No. The model runs on your Mac, inside the agent or in a server that listens onl
 
 ## Is Saetta free?
 
-Yes. Saetta is open source under the MIT license. The models keep their own licenses: Qwen3.8-27B and its TURBO, Coder390 and Fable-5 fine-tunes are Apache-2.0, Qwen3.8-Flash-Next uses the Qwen Community License.
+Yes. Saetta is open source under the MIT license. The models keep their own licenses: Qwen3.8-27B and its TURBO, Coder390, Fable-5 and Qwopus fine-tunes are Apache-2.0, Qwen3.8-Flash-Next uses the Qwen Community License.
 
 ## How fast is it?
 
@@ -34,7 +34,7 @@ On an M5 Max with 128 GB, Qwen3.8-Flash-Next reads prompts at 1,600 to 1,950 tok
 
 ## Which models does it run?
 
-Qwen3.8-Flash-Next (the pruned Coder variant and the full model) and Qwen3.8-27B in 4-bit and 8-bit, with LoRA adapters and the TURBO, Coder390 and Fable-5 coding fine-tunes. Any Qwen3.8-27B GGUF can be converted with `saetta import`. See [GGUF import](gguf-import.md).
+Qwen3.8-Flash-Next (the pruned Coder variant and the full model) and Qwen3.8-27B in 4-bit and 8-bit, with LoRA adapters and the TURBO, Coder390, Fable-5 and Qwopus coding fine-tunes. Any Qwen3.8-27B GGUF can be converted with `saetta import`. See [GGUF import](gguf-import.md).
 
 ## Can two agents use the model at once?
 

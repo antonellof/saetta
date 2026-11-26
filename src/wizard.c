@@ -256,6 +256,8 @@ static const Choice models[] = {
     {"27b-coder390-8bit", "Qwen3.8-27B Coder390 fine-tune, 8-bit"},
     {"27b-fable5", "Qwen3.8-27B Fable-5 coding distill, MTP drafts"},
     {"27b-fable5-8bit", "Qwen3.8-27B Fable-5 coding distill, 8-bit"},
+    {"27b-qwopus", "Qwopus3.8-27B Coder-Flash, coding fine-tune distilled from Qwen3.8-Flash-Max"},
+    {"27b-qwopus-8bit", "Qwopus3.8-27B Coder-Flash, 8-bit"},
     {"27b-8bit", "Qwen3.8-27B, 8-bit, takes LoRA adapters"},
     {"27b-4bit", "Qwen3.8-27B, 4-bit, the smallest"},
 };

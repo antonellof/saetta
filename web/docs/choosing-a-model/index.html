@@ -99,12 +99,16 @@
 <tr><td><code>27b-coder390-8bit</code> (with MTP)</td><td>the same, from its Q8_0 GGUF</td><td>31 GB</td><td>48 GB</td><td>n/p</td><td>n/p</td></tr>
 <tr><td><code>27b-fable5</code> (with MTP)</td><td><a href="https://huggingface.co/khazarai/Qwen3.8-27B-Fable-5-Coding-Distilled" rel="noopener">Fable-5 Coding Distilled</a>, a Qwen3.8-27B coding distill, from <a href="https://huggingface.co/mradermacher/Qwen3.8-27B-Fable-5-Coding-Distilled-i1-GGUF" rel="noopener">mradermacher&#39;s</a> imatrix Q4_K_M GGUF</td><td>20 GB</td><td>36 GB</td><td>n/p</td><td>n/p</td></tr>
 <tr><td><code>27b-fable5-8bit</code> (with MTP)</td><td>the same, from its Q8_0 GGUF</td><td>31 GB</td><td>48 GB</td><td>n/p</td><td>n/p</td></tr>
+<tr><td><code>27b-qwopus</code></td><td><a href="https://huggingface.co/mlx-community/Qwopus3.8-27B-Coder-Flash-4bit" rel="noopener">Qwopus3.8-27B Coder-Flash</a> (Jackrong), a Qwen3.8-27B coding fine-tune distilled from Qwen3.8-Flash-Max, dense, 4-bit</td><td>16 GB</td><td>32 GB</td><td>n/p ⁵</td><td>n/p ⁵</td></tr>
+<tr><td><code>27b-qwopus-8bit</code></td><td><a href="https://huggingface.co/mlx-community/Qwopus3.8-27B-Coder-Flash-8bit" rel="noopener">the same</a>, 8-bit</td><td>29 GB</td><td>48 GB</td><td>n/p ⁵</td><td>n/p ⁵</td></tr>
 <tr><td><code>inkling</code></td><td><a href="https://huggingface.co/mlx-community/Inkling-2-Mini-4bit" rel="noopener">Inkling 2 Mini</a> (Thinking Machines), 128 experts, 8 active, dense layers 4-bit, experts NVFP4 / MXFP8</td><td>17 GB</td><td>32 GB</td><td>Verified 79.2 ⁴</td><td>71.6 ⁴</td></tr></tbody></table></div>
 <p>SWE-bench and Terminal-Bench are the publishers&#39; scores for the full-precision model, each with its own harness, not measured by Saetta on these packs:</p>
 <ol>
 <li><a href="https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF" rel="noopener">ISTA-DASLab</a> (SWE-bench Verified, xhigh reasoning; the Coder against the full model).</li>
 <li><a href="https://huggingface.co/Qwen/Qwen3.8-27B" rel="noopener">Qwen</a> (<a href="https://huggingface.co/Qwen/Qwen3.8-Flash-Next" rel="noopener">Flash-Next</a>; SWE-bench Pro with Claude Code, Terminal-Bench 2.1 with Terminus).</li>
 <li><a href="https://huggingface.co/harness-hub/Qwen3.8-27B-pi-adapted" rel="noopener">harness-hub</a> (the adapter under pi, SWE-bench Pro&#39;s hard 51 tasks; the base model scores 39.2 and 39.5 there).</li>
+<li><a href="https://huggingface.co/thinkingmachines/Inkling-2-Mini" rel="noopener">Thinking Machines</a> (Inkling 2 Mini: SWE-bench Verified with bash only, Terminal-Bench 2.1 with pi).</li>
+<li><a href="https://huggingface.co/Jackrong/Qwopus3.8-27B-Coder-Flash" rel="noopener">Jackrong</a> publishes only its own local tests for Qwopus (an MMLU-Pro subset of 1,500 questions, 93.87; 9 of 9 runs of a 3-task coding-agent test), not comparable with these.</li>
 </ol>
 <p>n/p: not published (Qwen publishes no Terminal-Bench score for Flash-Next; the fine-tunes publish none for either).</p>
 <h2 id="downloading"><a class="anchor" href="#downloading" aria-hidden="true" tabindex="-1">#</a>Downloading</h2>
@@ -115,7 +119,7 @@ saetta info coder                <span class="hljs-comment"># what a downloaded 
 <p>Downloads are resumable and hash-checked, with 4 parallel file downloads by default (<code>--jobs N</code>). <code>27b-turbo</code>, <code>27b-coder390</code> and <code>27b-fable5</code> (and their 8-bit variants) fetch a GGUF, convert it into a Saetta pack and delete it; see <a href="/docs/gguf-import/">GGUF import</a>.</p>
 <p>Inside Saetta Code, <code>/model</code> lists every pack, shows its size and the free disk, and downloads the one you pick.</p>
 <h2 id="licenses"><a class="anchor" href="#licenses" aria-hidden="true" tabindex="-1">#</a>Licenses</h2>
-<p>Flash-Next: Qwen Community License 1.0. Qwen3.8-27B, the pi adapter, TURBO, Coder390 and Fable-5: Apache-2.0. No weights are part of the Saetta repository.</p>
+<p>Flash-Next: Qwen Community License 1.0. Qwen3.8-27B, the pi adapter, TURBO, Coder390, Fable-5, Qwopus and Inkling 2 Mini: Apache-2.0. No weights are part of the Saetta repository.</p>
       </article>
       <p class="doc-edit"><a href="https://github.com/antonellof/saetta/blob/main/docs/choosing-a-model.md" rel="noopener">Edit this page on GitHub</a></p>
       <nav class="doc-pager" aria-label="Previous and next"><a class="prev" href="/docs/quickstart/"><span>Previous</span>Quickstart</a><a class="next" href="/docs/saetta-code/"><span>Next</span>Overview</a></nav>

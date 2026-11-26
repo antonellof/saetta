@@ -112,6 +112,7 @@ typedef struct {
     sx_pipeline *mv, *mm; // qgen: qmatvec_gen, qmm_gen
     // prompt chunks on the tensor ops (inkling_mpp.metal; NULL where they do not run)
     sx_pipeline *im_plan, *im_gather, *im_gu_nv, *im_gu_mx, *im_dn_nv, *im_dn_mx;
+    sx_pipeline *im_half, *im_dq, *im_mm; // to_half, dq_f16_gen, mmh_dense (qmm_mpp.metal, qgen_mpp.metal)
 } Pipes;
 
 // Scratch regions, floats per token (each region holds PCH rows).
@@ -194,6 +195,8 @@ struct Model {
     // plan), their half inputs xs_h [rows][H] and activations hs_h [rows][FF].
     bool accel, half_prefill;
     sx_buffer *xs_h, *hs_h, *msrt, *mtiles, *mmeta;
+    // the dense projections: their input in half (xh [PCH][QD]), the weights unpacked to f16 (wh)
+    sx_buffer *xh, *wh;
     // SAETTA_INK_ROUTES=<golden dir>, read at load (verify, src/inkling.h): the reference's
     // experts of every token at every visit and their margins, so the routers' own choices are
     // checked against them and the engine can be run on them: f32 rounding flips the router at
@@ -475,6 +478,9 @@ static const char ink_src[] = {
 static const char ink_mpp_src[] = {
 #embed "kernels/inkling_mpp.metal"
     , 0};
+static const char qmm_mpp_src[] = {
+#embed "kernels/qmm_mpp.metal"
+    , 0};
 
 // The tensor-op prompt kernels, all or none (gpu_pipeline refuses them without neural
 // accelerators or with SAETTA_NO_ACCEL=1): true when they loaded.
@@ -490,12 +496,26 @@ static bool load_mpp(Gpu *g, Pipes *pp) {
         ok = gpu_pipeline(g, ink_mpp_src, kn[i].name, (sx_pipeline **)((char *)pp + kn[i].off)) == OK;
         kernel_names[kn[i].off / sizeof(sx_pipeline *)] = kn[i].name;
     }
+    if (ok) {
+        ok = gpu_pipeline(g, qmm_mpp_src, "to_half", &pp->im_half) == OK && gpu_pipeline(g, qmm_mpp_src, "mmh_dense", &pp->im_mm) == OK &&
+             gpu_pipeline(g, qgen_mpp_src, "dq_f16_gen", &pp->im_dq) == OK;
+        kernel_names[offsetof(Pipes, im_half) / sizeof(sx_pipeline *)] = "to_half";
+        kernel_names[offsetof(Pipes, im_mm) / sizeof(sx_pipeline *)] = "mmh_dense";
+        kernel_names[offsetof(Pipes, im_dq) / sizeof(sx_pipeline *)] = "dq_f16_gen";
+    }
     if (!ok)
         for (size_t i = 0; i < COUNT(kn); i++) {
             sx_pipeline **q = (sx_pipeline **)((char *)pp + kn[i].off);
             if (*q) sx_pipeline_release(*q);
             *q = NULL;
         }
+    if (!ok) {
+        sx_pipeline **q[3] = {&pp->im_half, &pp->im_mm, &pp->im_dq};
+        for (size_t i = 0; i < 3; i++) {
+            if (*q[i]) sx_pipeline_release(*q[i]);
+            *q[i] = NULL;
+        }
+    }
     return ok;
 }
 
@@ -554,6 +574,8 @@ Err model_load(Arena *arena, const Pack *pack, Gpu *g, Model **out) {
         TRY(gpu_new_buffer(g, (size_t)MPP_ROWS * 4, &m->msrt));
         TRY(gpu_new_buffer(g, (size_t)MPP_TILES * 16, &m->mtiles));
         TRY(gpu_new_buffer(g, 16, &m->mmeta));
+        TRY(gpu_new_buffer(g, (size_t)PCH * QD * 2, &m->xh));
+        TRY(gpu_new_buffer(g, (size_t)QD * QD * 2, &m->wh));
     } else
         dbg("model: accelerator kernels unavailable, Inkling prompt chunks on f32 tiles\n");
 
@@ -655,10 +677,28 @@ static_assert(sizeof(MoeP) == 48);
 // y = W x over T rows: the run-time affine kernels (decode and verification chunks, T <= KMAX:
 // one simdgroup per output row and token, the same bits for a token in either; prompt chunks: f32
 // tiles). out rows of W (lm_head: the unpadded vocabulary).
+// The input of the half matmuls: x [T][in] (f32) to half in Model.xh, once for the projections
+// that share it (xh_of: the input it holds).
+static sx_arg xh_of;
+static void enc_xh(Model *m, Enc *c, sx_arg x, uint32_t n) {
+    if (xh_of.buffer == x.buffer && xh_of.offset == x.offset) return;
+    DISP(c, m->p.im_half, (n + 255) / 256, 1, 1, 256, x, B(m->xh), BYTES(n));
+    xh_of = x;
+}
 static void enc_lin(Model *m, Enc *c, const Linear *l, sx_arg x, sx_arg y, uint32_t T, uint32_t out) {
     uint32_t sh[3], q[2] = {l->bits, l->group_size}, in = (uint32_t)l->in_features;
     sx_arg w = gpu_tensor_arg(m->g, &l->weight, &sh[0]), s = gpu_tensor_arg(m->g, &l->scales, &sh[1]),
            b = gpu_tensor_arg(m->g, &l->biases, &sh[2]);
+    if (T > KMAX && m->half_prefill && out == l->out_features && (size_t)in * out <= (size_t)QD * QD) {
+        // a prompt chunk on the tensor ops (after qwental / Strata, src/kernels/qmm_mpp.metal):
+        // the weights unpacked to f16, then the f16 GEMM with f32 sums; the input in half
+        enc_xh(m, c, x, T * in);
+        uint32_t d2[2] = {in, out}, dims[3] = {in, out, T};
+        DISP(c, m->p.im_dq, ((size_t)out * in / 8 + 255) / 256, 1, 1, 256, w, s, b, B(m->wh), gpu_bytes_arg(d2, 8), gpu_bytes_arg(sh, 12),
+             BYTES(q));
+        DISP(c, m->p.im_mm, (out + 31) / 32, (T + 63) / 64, 1, 32, B(m->xh), B(m->wh), y, gpu_bytes_arg(dims, 12));
+        return;
+    }
     if (T <= KMAX) {
         DISP(c, m->p.mv, out, T, 1, 32, w, s, b, x, y, BYTES(in), BYTES(out), gpu_bytes_arg(sh, 12), BYTES(q));
     } else {
@@ -704,6 +744,7 @@ static void enc_visit(Model *m, InkSession *d, Enc *c, size_t v, uint32_t T, uin
     const bool msg = vis_pass[v] > 0, boundary = li % NBLK == 0, full = L->full;
     const uint32_t PH = PCH * H; // stride of the block-state planes
     const sx_arg h = reg(m, R_H), bs = reg(m, R_BS), conv = AT(d->bk, v * CONV_VIS * 4);
+    xh_of = (sx_arg){0};
     // the messages of this loop layer from the previous pass's states (M:1407, 145-173)
     if (msg) {
         sx_arg q = OFF(m->msg_q, (li - LS) * 4 * H);
@@ -815,7 +856,9 @@ static void enc_visit(Model *m, InkSession *d, Enc *c, size_t v, uint32_t T, uin
             DISP(c, d->kv_half ? m->p.kv_store_h : m->p.kv_store, KVD / 256, T, 1, 256, reg(m, R_KN), reg(m, R_VN), kc, vc, BYTES(sp));
         }
     }
+    xh_of = (sx_arg){0};
     enc_lin(m, c, &L->o, reg(m, R_ATT), reg(m, R_A), T, H);
+    xh_of = (sx_arg){0};
     // post-attention conv and the residual (M:899-905)
     {
         CrP p = {H, boundary, T == 1 && !m->spec_chunk, sqrtf(5.0f)};

@@ -1,6 +1,10 @@
 # Performance
 
-Saetta is tuned and measured on an M5 Max with 128 GB. M1 to M4 run the same kernels on their GPU cores; they are not yet measured (reports welcome).
+Saetta is tuned and measured on an M5 Max with 128 GB. M1 to M4 have half-precision kernels of their own on their GPU cores; they are not measured on real hardware yet (reports welcome).
+
+![Qwen3.8 on an M5 Max: prompt reading and answering speed per pack](../web/assets/perf/qwen.svg)
+
+![Time to the first token: cold 64K and 16K prompts against a follow-up turn](../web/assets/perf/resume.svg)
 
 ## Flash-Next on an M5 Max
 
@@ -33,3 +37,15 @@ Packs with an MTP head (Flash-Next, and the 27B fine-tunes marked "with MTP" on 
 ## Watching it
 
 `saetta monitor` (or `/monitor` in Saetta Code) shows speed, prompt-cache reuse and speculation live. See [monitor, status, stop](server.md).
+
+## Inkling 2 Mini against llama.cpp and Strata
+
+![Inkling 2 Mini on an M5 Max at a 4K prompt: Saetta, llama.cpp and Strata](../web/assets/perf/inkling.svg)
+
+The same 4,096-token prompt and 128 answer tokens, median of 3 interleaved runs (2026-11-26). Saetta answers at 58.6 tokens/s (85.3 with its default prompt lookup), Strata at 54.2 (36.7 with DSpark, on its synthetic benchmark prompt), llama.cpp at 47.2. Strata reads prompts at 2,990 tokens/s, llama.cpp at 685, Saetta at 473: Strata runs Inkling's prompt on the M5's tensor ops, which Saetta does not do for Inkling yet. Each engine uses its own weights: Saetta the mlx-community 4-bit pack (17 GB), llama.cpp Unsloth's UD-Q4_K_XL (17.6 GB), Strata its lossless SQ-20 (19.3 GB).
+
+## M1 to M4
+
+![Prompt reading at 4K on the M1 to M4 kernels, measured on the M5 Max](../web/assets/perf/m14.svg)
+
+`SAETTA_NO_ACCEL=1` makes the M5 Max run the kernels M1 to M4 use. On it, a 4K prompt reads at 256 tokens/s on the 27B 4-bit and 742 on the Coder (before 0.18: 152 and 487), against 961 and 1,538 with the M5's neural accelerators.

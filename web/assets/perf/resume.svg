@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="202" viewBox="0 0 900 202" font-family="-apple-system, Segoe UI, Helvetica, Arial, sans-serif"><defs><linearGradient id="g" x1="0" x2="1"><stop offset="0" stop-color="#b26bff"/><stop offset="1" stop-color="#ff8a2b"/></linearGradient><style>.t{font-size:16px;font-weight:600;fill:#c9c9d1}.c{font-size:12px;fill:#8a8a95}.n{font-size:13px;fill:#c9c9d1}.v{font-size:12px;fill:#c9c9d1;font-family:ui-monospace,Menlo,monospace}.f{font-size:11px;fill:#8a8a95}</style></defs><rect width="900" height="202" rx="12" fill="#0d0b12"/>
+<text x="30" y="40" class="t">Time to the first token</text>
+<text x="30" y="60" class="c">Qwen3.8-Flash-Next Coder, seconds, lower is better</text>
+<text x="30" y="97" class="n">cold 64K prompt</text>
+<rect x="200" y="86" width="485.0" height="14" rx="2" fill="#8a8a95"/>
+<text x="691.0" y="97" class="v">37.31 s</text>
+<text x="30" y="125" class="n">cold 16K prompt</text>
+<rect x="200" y="114" width="107.1" height="14" rx="2" fill="#8a8a95"/>
+<text x="313.1" y="125" class="v">8.24 s</text>
+<text x="30" y="153" class="n">follow-up on 16K</text>
+<rect x="200" y="142" width="2.6" height="14" rx="2" fill="url(#g)"/>
+<text x="208.6" y="153" class="v">0.20 s</text>
+<text x="30" y="188" class="f">A follow-up turn reads only what is new: the engine keeps the conversation and, with Saetta Code, saves it with the session for the next start.</text>
+</svg>

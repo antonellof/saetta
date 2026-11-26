@@ -6,7 +6,7 @@
 <p align="center">A coding agent for Apple Silicon Macs with the model inside it: a C port of pi that runs Qwen3.8 and Inkling 2 Mini in its own process, on its own Metal inference engine, without Python, Node or a server. <a href="https://saetta.dev">saetta.dev</a></p>
 
 <p align="center">
-  <a href="#start"><b>Start</b></a> · <a href="#models"><b>Models</b></a> · <a href="#what-the-agent-does"><b>The agent</b></a> ·
+  <a href="#start"><b>Start</b></a> · <a href="#models"><b>Models</b></a> · <a href="#the-agent"><b>The agent</b></a> ·
   <a href="#other-agents-and-clients">Other agents</a> · <a href="#performance">Performance</a> · <a href="#build-from-source">Build from source</a>
 </p>
 
@@ -17,54 +17,30 @@
   <img src="https://img.shields.io/badge/Apple%20Silicon-M1%20to%20M5%2C%2032%20GB%2B-111" alt="Apple Silicon M1 to M5, 32 GB or more">
 </p>
 
-Saetta Code is the agent inside the `saetta` binary, a 2.3 MB program. It has pi's tools, sessions, skills, MCP servers and terminal UI, and the model runs in the same process, so nothing goes over HTTP between the two. The engine is written in C and hand-written Metal for agent work: long prompts that share a prefix (20K to 200K tokens), short answers and tool calls. It runs on any Apple Silicon Mac with 32 GB of memory or more and picks the model that fits.
+Saetta Code is a C port of the [pi](https://pi.dev) coding agent with the model running in the same process: one 2.3 MB binary, no Python, no Node, no server. Its inference engine (C and hand-written Metal) is built for agent work: long shared-prefix prompts, short answers, tool calls. Any Apple Silicon Mac with 32 GB of memory or more; it picks the model that fits.
 
 <p align="center">
   <img src="docs/assets/demo-code.gif" width="900" alt="saetta start code: the agent loads the model, writes a one-page site for a coffee roastery, checks and fixes it; the page it wrote at the end">
-  <br><sub><code>saetta start code</code> loads the model, writes a landing page for a coffee roastery in one HTML file, checks it and fixes what it finds; then the page as a browser shows it. The typing, the thinking and the waits are cut, the checks play at 8x.</sub>
+  <br><sub><code>saetta start code</code> writes a landing page in one HTML file, checks it and fixes what it finds (waits cut, checks at 8x).</sub>
 </p>
 
 ## Start
 
 ```sh
-curl -fsSL https://saetta.dev/install.sh | sh    # into ~/.local/bin
-cd ~/src/my-project
-saetta start code
+curl -fsSL https://saetta.dev/install.sh | sh    # into ~/.local/bin; later: saetta update
+cd ~/src/my-project && saetta start code          # downloads the model that fits this Mac, then opens the agent
+saetta download inkling && saetta start code --pack inkling     # or name a pack
 ```
 
-On the first run `saetta start code` shows the model that fits this Mac, downloads it after you confirm (resumable, hash-checked, into `~/Models`) and opens the agent on it. By memory it picks `coder` (Qwen3.8-Flash-Next, 76 GB) with 96 GB or more, `27b-turbo` (a Qwen3.8-27B fine-tune, 20 GB, converted from its GGUF: about 40 GB free disk while it runs) with 36 GB, and `27b-4bit` (16 GB) with 32 GB.
-
-To run another model, download its pack and name it:
-
-```sh
-saetta download inkling                 # Inkling 2 Mini, 17 GB, from 32 GB of memory
-saetta download inkling-dspark          # its DSpark drafter, 0.6 GB (optional; used with SAETTA_DSPARK=1)
-saetta start code --pack inkling
-saetta download 27b-qwopus              # Qwopus, a Qwen3.8-27B coding fine-tune, 16 GB
-saetta start code --pack 27b-qwopus
-```
-
-Inside the agent, `/model` lists the packs on this Mac and the ones you can download (with their size, the free disk, and the ones too big for this Mac greyed out), downloads the one you pick and switches to it without leaving the session.
-
-`saetta` alone is a guided start: it shows the chip, memory and free disk, lists the models best first, downloads the one you pick and starts Saetta Code or one of the other agents it finds on this Mac.
-
-Needs an Apple Silicon Mac (M1 or later) with 32 GB of memory or more, and macOS 26 or later. Update with `saetta update`. `SAETTA_PREFIX` changes the install folder, `SAETTA_VERSION=0.17.1` pins a release, `HF_TOKEN` raises Hugging Face's limits. The documentation is at [saetta.dev/docs](https://saetta.dev/docs/) (source in [`docs/`](docs)).
+By memory it picks `coder` (Qwen3.8-Flash-Next, 76 GB) from 96 GB, `27b-turbo` (20 GB) from 36 GB, `27b-4bit` (16 GB) from 32 GB. Inside the agent, `/model` downloads and switches packs. Needs macOS 26 or later. Docs: [saetta.dev/docs](https://saetta.dev/docs/).
 
 ## Models
-
-### Model families
 
 | family | Mac memory | good for | packs | published scores |
 |---|---|---|---|---|
 | **Qwen3.8-Flash-Next** | 96 GB (`coder`), 128 GB (`full`) | the fastest here and the highest published scores; `coder` keeps the 256 of 512 experts that matter for code | `coder`, `full` | SWE-bench Verified 82.8 (full), 79.2 (Coder) |
 | **Qwen3.8-27B** | 32 GB (4-bit), 48 GB (8-bit) | dense, fits a 32 GB Mac; LoRA adapters on the 8-bit pack; coding fine-tunes with a draft head that answers faster | `27b-4bit`, `27b-8bit`, fine-tunes | SWE-bench Pro 61.7, Terminal-Bench 2.1 73.0 |
 | **Inkling 2 Mini** | 32 GB | Thinking Machines' 26B mixture of experts, 3.4B active per token; context up to 1M tokens where memory allows | `inkling` | SWE-bench Verified 79.2, Terminal-Bench 2.1 71.6 |
-
-The scores are the publishers', for the full-precision models, each with its own harness; Saetta has not measured them on these packs (sources below).
-
-### All packs
-
-`saetta download <name>` fetches a pack at a pinned revision into `~/Models` (or `SAETTA_MODELS`); `--pack <name>` and `/model` take the same names.
 
 | name | weights | on disk | Mac memory | options | SWE-bench | Terminal-Bench 2.1 |
 |---|---|---|---|---|---|---|
@@ -87,99 +63,36 @@ The scores are the publishers', for the full-precision models, each with its own
 | `inkling` | [Inkling 2 Mini](https://huggingface.co/mlx-community/Inkling-2-Mini-4bit), dense 4-bit, experts NVFP4 / MXFP8 | 17 GB | 32 GB | prompt lookup; 1M context | Verified 79.2 ⁴ | 71.6 ⁴ |
 | `inkling-dspark` | [DSpark drafter](https://huggingface.co/thinkingmachines/Inkling-2-Mini) for `inkling` | 0.6 GB | | opt-in, `SAETTA_DSPARK=1` | | |
 
-The GGUF fine-tunes are converted into packs on download (about 40 GB of free disk while it runs). In **bold**: what `saetta download` picks by memory.
+**Bold**: what `saetta download` picks by memory. The GGUF fine-tunes are converted on download ([GGUF import](docs/gguf-import.md)); LoRA adapters run in process ([LoRA](docs/lora.md)); Inkling's DSpark drafter is opt-in ([Choosing a model](docs/choosing-a-model.md)). A pack too big for this Mac is refused and the context is sized to the memory left (about 37K tokens with `27b-4bit` on 32 GB). Every model is checked layer by layer against a numpy reference built from the same weights.
 
-SWE-bench and Terminal-Bench are the publishers' scores for the full-precision model, each with its own harness, not measured by Saetta on these packs: ¹ [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF) (SWE-bench Verified, xhigh reasoning; the Coder against the full model), ² [Qwen](https://huggingface.co/Qwen/Qwen3.8-27B) ([Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next); SWE-bench Pro with Claude Code, Terminal-Bench 2.1 with Terminus), ³ [harness-hub](https://huggingface.co/harness-hub/Qwen3.8-27B-pi-adapted) (the adapter under pi, SWE-bench Pro's hard 51 tasks; the base model scores 39.2 and 39.5 there). ⁴ [Thinking Machines](https://huggingface.co/thinkingmachines/Inkling-2-Mini) (SWE-bench Verified with bash only, Terminal-Bench 2.1 with pi). ⁵ [Jackrong](https://huggingface.co/Jackrong/Qwopus3.8-27B-Coder-Flash) publishes only its own local tests (an MMLU-Pro subset of 1,500 questions, 93.87; 9 of 9 runs of a 3-task coding-agent test). n/p: not published (Qwen publishes no Terminal-Bench score for Flash-Next; the fine-tunes publish none for either).
+<sub>SWE-bench and Terminal-Bench are the publishers' scores for the full-precision model, each with its own harness, not measured by Saetta on these packs: ¹ [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF) (SWE-bench Verified, xhigh reasoning; the Coder against the full model), ² [Qwen](https://huggingface.co/Qwen/Qwen3.8-27B) ([Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next); SWE-bench Pro with Claude Code, Terminal-Bench 2.1 with Terminus), ³ [harness-hub](https://huggingface.co/harness-hub/Qwen3.8-27B-pi-adapted) (the adapter under pi, SWE-bench Pro's hard 51 tasks; the base model scores 39.2 and 39.5 there). ⁴ [Thinking Machines](https://huggingface.co/thinkingmachines/Inkling-2-Mini) (SWE-bench Verified with bash only, Terminal-Bench 2.1 with pi). ⁵ [Jackrong](https://huggingface.co/Jackrong/Qwopus3.8-27B-Coder-Flash) publishes only its own local tests (an MMLU-Pro subset of 1,500 questions, 93.87; 9 of 9 runs of a 3-task coding-agent test). n/p: not published (Qwen publishes no Terminal-Bench score for Flash-Next; the fine-tunes publish none for either). Licenses: Flash-Next Qwen Community License 1.0; the others Apache-2.0. No weights are part of this repository.</sub>
 
-A pack that cannot run on this Mac is refused, and the context shrinks to what memory holds: about 37K tokens with `27b-4bit` on 32 GB. `SAETTA_IGNORE_MEMORY=1` skips the memory checks. Every model is checked layer by layer against a numpy reference built from the same weights.
+## The agent
 
-### Inkling 2 Mini
-
-[Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) is Thinking Machines' coding model: 26B parameters in a mixture of 128 experts, 8 used per token. Its 24 layers run as 48 (a block of 12 is looped three times), with sliding-window attention and its own JSON tool-call format, which Saetta translates for the agent and for the OpenAI and Anthropic APIs. The MLX pack keeps Thinking Machines' NVFP4 and MXFP8 experts as published. Its context goes to 1,048,576 tokens (32 KB per token in the f16 cache, 36 KB with the drafter), as far as memory allows. Saetta speeds up Inkling's answers with prompt lookup by default (on an M5 Max at a 4K prompt: 58.6 tokens/s without it, 85.3 with it). Thinking Machines' DSpark block drafter is opt-in: `saetta download inkling-dspark`, then start with `SAETTA_DSPARK=1`. Drafts are checked in one pass of the model, so greedy output is token for token the same as without them and sampled output follows the same distribution; at 4K, lookup with the drafter measured 79 tokens/s, below lookup alone, so it stays off until its verify pass gets cheaper. `/model` in Saetta Code shows whether the drafter is downloaded and downloads it. This is a first version: prompts on the GPU cores rather than the M5's neural accelerators, and a follow-up turn reuses the conversation only when it appends to it.
-
-### GGUF fine-tunes of Qwen3.8-27B
-
-`saetta download 27b-turbo` (or `27b-coder390`, `27b-fable5`) fetches the GGUF, converts it into a Saetta pack and deletes it. `saetta import <file.gguf> <folder>` does the same for any Qwen3.8-27B GGUF (llama.cpp `qwen35`; Q8_0, Q4_K, Q5_K, Q6_K, F16 or BF16 tensors), with the model's `config.json` and tokenizer files in the folder. A GGUF's MTP layer becomes the draft head: Qwen3.8-27B speculates with it as Flash-Next does (`SAETTA_MTP=0` turns it off).
-
-### LoRA adapters
-
-PEFT LoRA adapters run on Qwen3.8-27B at run time, with vLLM's flags, in the agent's own process. The [pi adapter](https://huggingface.co/harness-hub/Qwen3.8-27B-pi-adapted) is trained to drive the [pi](https://pi.dev) agent, whose tools and prompt Saetta Code shares (its card: SWE-bench Pro hard 39.2% to 64.7% over the base model).
+pi 1.5.2's tools, system prompt, `AGENTS.md`/`CLAUDE.md`, skills, prompt files, sessions and terminal UI, sharing pi's `~/.pi/agent` setup: each continues the other's sessions. Requests and session files match pi's byte for byte on 63 recorded scenarios, the interactive screens on 82, rpc mode on 12. Not supported: pi's TypeScript extensions, image input.
 
 ```sh
-saetta download 27b-8bit && saetta download 27b-pi
-saetta start code --pack 27b-8bit --lora-modules qwen3.8-pi=27b-pi
+saetta code -c                          # continue this folder's last session
+saetta code -p "fix the failing test"   # print mode (--mode json, --mode rpc as pi)
+saetta code --subagents                 # up to 3 child agents at once
 ```
 
-The session runs on the first adapter (`--model NAME` picks another, or the base model). `/model` lists the downloaded adapters under each base model they fit, downloads the others and switches between them. An adapter that does not fit the base model (its base, rank or target modules) is refused with the reason. Supported: LoRA on attention and MLP projections, rank a multiple of 8 up to 128, rsLoRA. See [LoRA adapters](docs/lora.md).
-
-Licenses: Flash-Next Qwen Community License 1.0; Qwen3.8-27B, the pi adapter, TURBO, Coder390, Fable-5, Qwopus and Inkling 2 Mini Apache-2.0. No weights are part of this repository.
-
-## What the agent does
-
-Saetta Code is a port of the [pi](https://pi.dev) coding agent 1.5.2 (MIT). It has pi's tools (read, bash, edit, write; grep, find and ls with `--tools`), its system prompt, `AGENTS.md` and `CLAUDE.md` context files, skills (and `/skill:name`), prompt files and session files. It reads and writes pi's `settings.json`, `models.json`, `trust.json` and `mcp.json` in `~/.pi/agent`, so the two share one setup, and each continues the other's sessions, compacted ones included.
-
-Its requests and session files match pi's byte for byte on 63 recorded print and JSON scenarios (tool errors, edits, truncation, sessions, compaction, retries, skills), apart from its own system prompt preamble. Its interactive screens are compared with pi's on 75 recorded scenarios, and its rpc mode with pi's, driven by pi's own rpc client, on 12. pi's TypeScript extensions and packages are not supported, and there is no image input.
-
-```sh
-saetta start code                       # the model inside the agent
-saetta code --pack coder                # the same with a chosen pack; Escape stops a turn
-saetta code -c                          # continue this folder's last session (pi's too)
-saetta code -p "fix the failing test"   # print mode, as pi -p
-saetta code --mode json -p "..."        # pi's JSON event stream
-saetta code --mode rpc                  # pi's rpc protocol: JSON commands on stdin, events on stdout
-saetta code --subagents                 # a subagent tool: up to 3 child agents at once
-```
-
-### The terminal UI
-
-The interactive view is pi's terminal UI ported to C: differential rendering, an editor with "/" commands and "@" file completion, markdown with highlighted code, tool views with word diffs for edits, bash output shown as it runs, and the model, settings, thinking and session tree selectors. While the agent works, Enter queues a message that steers the current turn and Option+Enter a follow-up for after it. Saetta adds a default theme with macOS's colors (`/theme` switches to pi's themes, with a live preview), a footer like a starship prompt (the folder as `~/...`, the git branch and status, the time of the last turn, the last turn's generation speed in tok/s, the model's full name and quantization), and a 3D lightning loader drawn inline while the model loads. The agent checks for a new release at start.
+- **Sessions resume instantly**: the engine's state is saved with each session, so `-c`, `/resume` and `/fork` read only what is new ([Sessions](docs/sessions.md)).
+- **Interrupted runs come back**: after a crash, a kill or a closed terminal, the next start offers to resume; commands and edits that were running are never re-run without asking.
+- **Parallel agents** share one loaded model ([Parallel agents](docs/parallel-agents.md)); **MCP** servers over stdio or HTTP with OAuth ([MCP](docs/mcp.md)).
+- **The terminal UI** is pi's, in C, with a footer showing the branch, the last turn's time and tok/s, and the model; `/monitor` shows the engine live. All commands: [Commands](docs/commands.md).
 
 <p align="center"><img src="web/assets/code/tools.png" width="900" alt="An edit of src/duration.ts shown as a diff, node --test with 5 tests passing, and the model's summary"></p>
 
-### Commands
-
-| command | what it does |
-|---|---|
-| `/model` | switch between downloaded packs and LoRA adapters in process (adapters listed under their base model), download a pack or an adapter from the list (its size and the free disk shown first), add or edit OpenAI-compatible models |
-| `/monitor` | the engine's live stats inside the agent: speed, GPU, memory, prompt-cache reuse, speculation, recent requests |
-| `/compact`, `/resume`, `/new` | compact the context, open another session, start a new one |
-| `/fork`, `/clone`, `/tree` | branch from an earlier message, duplicate the session, move through its tree |
-| `/name`, `/session` | name the session, show its info and stats |
-| `/export`, `/import`, `/share`, `/copy` | the session as HTML or JSONL, a JSONL session back in, a secret GitHub gist, the last answer to the clipboard |
-| `/settings`, `/theme`, `/thinking`, `/scoped-models`, `/hotkeys` | settings, theme, thinking level, the models Ctrl+P cycles through, keyboard shortcuts |
-| `/trust`, `/reload`, `/mcp`, `/changelog` | project trust, reload skills, prompts and context files, MCP servers, release notes |
-
-<p align="center"><img src="web/assets/code/tree.png" width="900" alt="/tree: a session with two branches from the first answer, the current one highlighted"></p>
-
-### MCP
-
-MCP servers come from pi's `mcp.json` (global, or `.pi/mcp.json` in a trusted project), over stdio or Streamable HTTP, with OAuth sign-in for HTTP servers as pi does it. Their tools are offered to the model as `mcp__server__tool`, along with tools to read the servers' resources. `/mcp` reconnects, enables or disables a server and changes its exposure; `--no-mcp` turns them all off.
-
-### Parallel agents
-
-Several Saetta Code sessions share one model: a `saetta start code` in another terminal uses the model the first one loaded, each session in its own conversation. `--subagents` (or `"subagents": true` in `settings.json`) gives the model a tool that hands self-contained tasks to child agents, up to 3 at once; it is off by default, which keeps the prompt pi's. See [Parallel agents](docs/parallel-agents.md).
-
-### Other models
-
-By default the model runs inside the agent. Saetta Code can also use a running Saetta server, or any OpenAI-compatible chat completions server listed in `models.json`; `/model` adds one.
-
-In process, the engine's state of the conversation (its KV cache and recurrent state) is saved to `~/.saetta/state` in the background at the end of each turn, so a session reopened later (`--session`, `--continue`, `/resume`) or forked from an earlier message (`/fork`) continues from it instead of reading its whole history again. The folder keeps up to 20 GB and nothing unused for 7 days; `SAETTA_STATE=0` turns it off. Not yet for Inkling 2 Mini or with a LoRA adapter. Next: prompts read while tools run.
-
-<p align="center"><img src="web/assets/code/model.png" width="900" alt="/model: a saetta server model, two packs on this Mac, one greyed out as too big for its memory, and the others with their download size"></p>
-
-A run cut off by a crash, a kill or a closed terminal is resumed at the next start: finished tool calls keep their result, read-only ones run again, and a command or edit that was running is never run again without asking. See [Interrupted runs](docs/sessions.md#interrupted-runs).
-
-Coming next: prompts read while tools run; a cheaper DSpark verify pass and the M5's neural accelerators for Inkling 2 Mini; the agent's commands confined to the project by macOS's Seatbelt.
+Coming next: prompts read while tools run; the M5's neural accelerators for Inkling 2 Mini; commands confined to the project by macOS's Seatbelt.
 
 ## Other agents and clients
 
-The engine inside Saetta Code also runs as a local server with OpenAI- and Anthropic-compatible APIs, and `saetta start` points Claude Code, pi or opencode at it:
+The same engine serves Claude Code, pi and opencode over OpenAI- and Anthropic-compatible APIs:
 
 ```sh
-saetta start claude      # Claude Code
-saetta start pi          # pi
-saetta start opencode    # opencode
-saetta start claude -- -p "fix the failing test"   # anything after -- goes to the agent
+saetta start claude                      # or: saetta start pi, saetta start opencode
+saetta serve coder                       # any client: http://127.0.0.1:8080/v1 (OpenAI) or :8080 (Anthropic)
 ```
 
 <p align="center">
@@ -187,94 +100,26 @@ saetta start claude -- -p "fix the failing test"   # anything after -- goes to t
   <br><sub><code>saetta start claude</code>: Claude Code on the local model writes a snake game and checks it. Real time, no cloud.</sub>
 </p>
 
-`saetta start` joins the server on this machine or starts one, waits for the model and runs the agent pointed at it, without touching your agent configuration; the server it started stops with the last session. Several sessions share one server (up to 4 conversations, `SAETTA_CONVERSATIONS`).
-
-| option | effect |
-|---|---|
-| `<pack>`, `--pack <name or dir>` | the model (default: the first downloaded pack that fits this Mac: coder, full, then the 27B packs) |
-| `--lora-modules name=adapter ...` | LoRA adapters on a 27B pack, as `saetta serve` takes them (`--lora name=adapter` for one) |
-| `--default-chat-template-kwargs JSON` | chat template values a request leaves out (with adapters: thinking off unless given) |
-| `--port N`, `--ctx N` | server port (8080) and context (204800 tokens) |
-| `--keep` | leave the server running when the agent exits |
-
-<p align="center">
-  <img src="docs/assets/demo-pi.gif" width="900" alt="saetta start pi: pi on Saetta writes a Mandelbrot renderer, which then draws the set in color">
-  <br><sub><code>saetta start pi</code>: pi writes a Mandelbrot renderer, then it runs.</sub>
-</p>
-
-Without `saetta start`, point any agent at `http://127.0.0.1:8080/v1` (OpenAI) or `http://127.0.0.1:8080` (Anthropic), any API key: configs in [`config/`](config) ([Claude Code](docs/claude-code.md), [opencode](docs/opencode.md)).
-
-### Server
-
-```sh
-SAETTA_CTX=204800 saetta serve coder     # loads in 5 to 10 s, one request at a time, Ctrl-C stops
-saetta serve 27b-8bit --lora-modules qwen3.8-pi=27b-pi \
-    --default-chat-template-kwargs '{"enable_thinking": false}'   # a request whose model is the adapter's name runs with it
-saetta monitor | status | stop           # live view, state, stop
-```
-
-Endpoints: `POST /v1/chat/completions` (streaming, `tool_calls`, `reasoning_content`; `enable_thinking`, `reasoning_effort` in `chat_template_kwargs`), `POST /v1/messages` and `/v1/messages/count_tokens` (Anthropic), `GET /v1/models`, `GET /health`. Model ids: `qwen3.8-flash-next`, `qwen3.8-27b`, `inkling-2-mini`.
-
-| variable | default | effect |
-|---|---|---|
-| `SAETTA_CTX` | 32768 | context in tokens, 1024 to 262144 (Inkling 2 Mini 1048576), rounded down to a multiple of 128 (Flash-Next about 35 KB per token, 27B 64 KB, Inkling 32 KB) |
-| `SAETTA_SPEC` / `SAETTA_MTP` | 1 / 1 | `0` turns speculative decoding / the MTP head (Inkling: the DSpark drafter) off |
-| `SAETTA_DSPARK` | unset | Inkling 2 Mini: `1` loads the downloaded DSpark drafter (or a path to its `mtp.safetensors`); off by default |
-| `SAETTA_KV_F32` | unset | f32 KV cache |
-| `SAETTA_IGNORE_MEMORY` | unset | `1` loads or downloads a pack this Mac's memory is too small for, and keeps the asked context |
-| `SAETTA_NO_ACCEL` | unset | `1` runs without the tensor-op (neural accelerator) kernels on an M5 (M1 to M4 never use them; `SAETTA_ACCEL=1` forces them there, for testing) |
-| `SAETTA_EXPERT_CACHE_GB` | unset | experimental: keep this many GB of experts in memory, read the rest from the SSD (Flash-Next: slower than resident, same output) |
-
-`saetta monitor` shows the server live: model state, speed, GPU load, memory, prompt cache, speculation, sessions and recent requests. `/monitor` shows the same view inside Saetta Code.
-
-<p align="center">
-  <img src="docs/assets/monitor.png" width="900" alt="saetta monitor: model state, speed, GPU load, memory, prompt cache, speculation, sessions and recent requests">
-</p>
+Options, endpoints and environment variables: [Server](docs/server.md), [HTTP API](docs/http-api.md), [Environment](docs/environment.md).
 
 ## Performance
 
-### Inkling 2 Mini against llama.cpp and Strata
+All on an M5 Max with 128 GB; every number is a measured run.
 
-<p align="center"><img src="docs/assets/inkling-bench.svg" width="900" alt="Inkling 2 Mini on an M5 Max, 4K prompt: answering at 85.3 tokens/s in Saetta with prompt lookup and 58.6 without, Strata 54.2, llama.cpp 47.2, Strata with DSpark 36.7; prompt reading Strata 2,990, llama.cpp 685, Saetta 473 tokens/s"></p>
+<p align="center"><img src="web/assets/perf/qwen.svg" width="900" alt="Qwen3.8 on an M5 Max: prompt reading Coder 1,656 to 1,927 tokens/s, full 1,738 to 1,808, 27B 940 to 787; answering full 142 and Coder 139 tokens/s on a code edit, full 85 and Coder 66 at 16K, 27B TURBO 52, 27B 4-bit 32"></p>
 
-Saetta answers fastest; Strata reads prompts about six times faster, because it runs Inkling's prompt on the M5's tensor ops, which Saetta does not do for Inkling yet (next on its list).
+<p align="center"><img src="web/assets/perf/resume.svg" width="900" alt="Time to the first token with the Coder pack: 37.31 s on a cold 64K prompt, 8.24 s on a cold 16K prompt, 0.20 s on a follow-up turn"></p>
 
-### Qwen3.8
+<p align="center"><img src="web/assets/perf/inkling.svg" width="900" alt="Inkling 2 Mini on an M5 Max, 4K prompt: answering at 85.3 tokens/s in Saetta with prompt lookup and 58.6 without, Strata 54.2, llama.cpp 47.2, Strata with DSpark 36.7; prompt reading Strata 2,990, llama.cpp 685, Saetta 473 tokens/s"></p>
 
+<p align="center"><img src="web/assets/perf/m14.svg" width="900" alt="Prompt reading at 4K on the M1 to M4 kernels, measured on the M5 Max: 27B 152 before 0.18, 256 now, 961 with the M5's accelerators; Coder 487, 742 and 1,538"></p>
 
-Tuned and measured on an M5 Max with 128 GB, whose neural accelerators read prompts fastest. M1 to M4 read prompts with half-precision kernels of their own on their GPU cores and are not measured yet (reports welcome).
-
-Flash-Next on the M5 Max, a six-request coding-agent workload through the HTTP API, seconds (first token / total):
-
-| request | prompt tokens | full | Coder |
-|---|---:|---:|---:|
-| cold 4K | 3,335 | 2.06 / 3.66 | 2.01 / 3.90 |
-| cold 16K | 15,873 | 8.78 / 10.61 | 8.24 / 10.86 |
-| cold 64K | 69,923 | 40.23 / 42.16 | 37.31 / 39.87 |
-| turn 1 | 15,867 | 8.68 / 9.39 | 8.07 / 8.81 |
-| turn 2 (reuses turn 1) | 15,951 | 0.20 / 0.87 | 0.20 / 0.79 |
-| edit (tool call, 400 tokens out) | 18,243 | 10.09 / 12.91 | 9.37 / 12.25 |
-| sum of totals | | 79.6 | 76.5 |
-
-Prompts at 1,620 to 1,930 tokens/s; answers at 78 to 85 (full) and 66 to 75 (Coder) tokens/s, 142 and 139 tokens/s on the edit with speculation. A follow-up turn reads only what is new: turn 2 above answers in 0.2 s. Qwen3.8-27B: prompts at 940 tokens/s (4K) to 787 (64K); answers at 31 ms/token on the 4-bit pack, 19 ms/token on `27b-turbo` with its MTP head (short prompts; 25 ms/token at 16K).
-
-Inkling 2 Mini, 4K prompt: 470 tokens/s reading, 58 tokens/s answering without speculation. 32K prompt: 419 tokens/s reading, 52 tokens/s answering without speculation.
-
-On the M5 Max forced onto the M1 to M4 prompt kernels, the 27B reads a 4K prompt at 256 tokens/s and the Coder at 742, against 961 and 1,538 with the neural accelerators on the same prompt.
+Strata reads Inkling prompts faster because it runs them on the M5's tensor ops, which Saetta does not do for Inkling yet. M1 to M4 are not measured on real hardware yet (reports welcome). Details: [Performance](docs/performance.md).
 
 ## Build from source
 
-Needs full Xcode with the Metal Toolchain (`xcodebuild -downloadComponent MetalToolchain`) and Apple clang 21 or later (C23).
-
-```sh
-git clone https://github.com/antonellof/saetta.git && cd saetta
-make                                    # ./build/bin/saetta
-make test                               # unit tests (SAETTA_PACK=<pack> for real tensors)
-make verify GOLDEN=<dir>/golden         # development: against reference outputs (not in this repository)
-```
-
-`src/`: `code*.c` Saetta Code; `model.c` (Flash-Next), `dense.c` (27B), `inkling.c` (Inkling 2 Mini), `model_api.c` picks one per pack; `kernels/` Metal; `server.c`, `tokenizer.c`, `chat.c`, `toolcall.c`. `saetta help` lists every command.
+Needs full Xcode with the Metal Toolchain and Apple clang 21 or later (C23): `make`, then `make test`. See [Build from source](docs/build-from-source.md). `src/`: `code*.c` Saetta Code; `model.c` (Flash-Next), `dense.c` (27B), `inkling.c` (Inkling 2 Mini); `kernels/` Metal; `server.c`.
 
 ## License
 
-[MIT](LICENSE). The engine adapts parts of the MIT-licensed projects sushi, qwental, Strata, ds4, llama.cpp and MLX. Saetta Code is a port of pi (MIT) and adapts parts of the libraries pi builds on (jsdiff, TypeBox, openai-node, highlight.js, marked, OpenTUI). Each adapted file names its source, and every notice is in [LICENSE](LICENSE).
+[MIT](LICENSE). The engine adapts parts of the MIT-licensed sushi, qwental, Strata, ds4, llama.cpp and MLX; Saetta Code is a port of pi (MIT) and adapts the libraries pi builds on. Each adapted file names its source; every notice is in [LICENSE](LICENSE).

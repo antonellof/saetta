@@ -10,14 +10,14 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Performance · Saetta docs</title>
-  <meta name="description" content="Saetta is tuned and measured on an M5 Max with 128 GB. M1 to M4 run the same kernels on their GPU cores; they are not yet measured (reports welcome).">
+  <meta name="description" content="Saetta is tuned and measured on an M5 Max with 128 GB. M1 to M4 have half-precision kernels of their own on their GPU cores; they are not measured on real hardware yet (reports welcome).">
   <link rel="canonical" href="https://www.saetta.dev/docs/performance/">
   <meta name="robots" content="index, follow">
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
   <meta property="og:type" content="article">
   <meta property="og:site_name" content="Saetta">
   <meta property="og:title" content="Performance · Saetta docs">
-  <meta property="og:description" content="Saetta is tuned and measured on an M5 Max with 128 GB. M1 to M4 run the same kernels on their GPU cores; they are not yet measured (reports welcome).">
+  <meta property="og:description" content="Saetta is tuned and measured on an M5 Max with 128 GB. M1 to M4 have half-precision kernels of their own on their GPU cores; they are not measured on real hardware yet (reports welcome).">
   <meta property="og:image" content="https://www.saetta.dev/assets/og-card.png">
   <meta property="og:image:width" content="1200">
   <meta property="og:image:height" content="630">
@@ -25,7 +25,7 @@
   <meta property="og:url" content="https://www.saetta.dev/docs/performance/">
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="Performance · Saetta docs">
-  <meta name="twitter:description" content="Saetta is tuned and measured on an M5 Max with 128 GB. M1 to M4 run the same kernels on their GPU cores; they are not yet measured (reports welcome).">
+  <meta name="twitter:description" content="Saetta is tuned and measured on an M5 Max with 128 GB. M1 to M4 have half-precision kernels of their own on their GPU cores; they are not measured on real hardware yet (reports welcome).">
   <meta name="twitter:image" content="https://www.saetta.dev/assets/og-card.png">
   <script>
     // theme before paint: saved choice, else the system's
@@ -82,7 +82,9 @@
     <main class="doc" id="top">
       <article class="doc-body">
 <h1>Performance</h1>
-<p>Saetta is tuned and measured on an M5 Max with 128 GB. M1 to M4 run the same kernels on their GPU cores; they are not yet measured (reports welcome).</p>
+<p>Saetta is tuned and measured on an M5 Max with 128 GB. M1 to M4 have half-precision kernels of their own on their GPU cores; they are not measured on real hardware yet (reports welcome).</p>
+<p><img src="/assets/perf/qwen.svg" alt="Qwen3.8 on an M5 Max: prompt reading and answering speed per pack" loading="lazy"></p>
+<p><img src="/assets/perf/resume.svg" alt="Time to the first token: cold 64K and 16K prompts against a follow-up turn" loading="lazy"></p>
 <h2 id="flash-next-on-an-m5-max"><a class="anchor" href="#flash-next-on-an-m5-max" aria-hidden="true" tabindex="-1">#</a>Flash-Next on an M5 Max</h2>
 <p>A six-request coding-agent workload through the HTTP API, seconds (first token / total):</p>
 <div class="doc-table"><table><thead><tr><th>request</th><th style="text-align:right">prompt tokens</th><th style="text-align:right">full</th><th style="text-align:right">Coder</th></tr></thead><tbody><tr><td>cold 4K</td><td style="text-align:right">3,335</td><td style="text-align:right">2.06 / 3.66</td><td style="text-align:right">2.01 / 3.90</td></tr>
@@ -101,11 +103,17 @@
 <p>Packs with an MTP head (Flash-Next, and the 27B fine-tunes marked &quot;with MTP&quot; on <a href="/docs/choosing-a-model/">Choosing a model</a>) draft tokens with it; the server also drafts from text already in the prompt. Greedy requests (<code>temperature</code> 0) get the same output as without speculation, and sampled ones use speculative sampling, which keeps the same output distribution. <code>SAETTA_SPEC=0</code> and <code>SAETTA_MTP=0</code> turn it off.</p>
 <h2 id="watching-it"><a class="anchor" href="#watching-it" aria-hidden="true" tabindex="-1">#</a>Watching it</h2>
 <p><code>saetta monitor</code> (or <code>/monitor</code> in Saetta Code) shows speed, prompt-cache reuse and speculation live. See <a href="/docs/server/">monitor, status, stop</a>.</p>
+<h2 id="inkling-2-mini-against-llamacpp-and-strata"><a class="anchor" href="#inkling-2-mini-against-llamacpp-and-strata" aria-hidden="true" tabindex="-1">#</a>Inkling 2 Mini against llama.cpp and Strata</h2>
+<p><img src="/assets/perf/inkling.svg" alt="Inkling 2 Mini on an M5 Max at a 4K prompt: Saetta, llama.cpp and Strata" loading="lazy"></p>
+<p>The same 4,096-token prompt and 128 answer tokens, median of 3 interleaved runs (2026-11-26). Saetta answers at 58.6 tokens/s (85.3 with its default prompt lookup), Strata at 54.2 (36.7 with DSpark, on its synthetic benchmark prompt), llama.cpp at 47.2. Strata reads prompts at 2,990 tokens/s, llama.cpp at 685, Saetta at 473: Strata runs Inkling&#39;s prompt on the M5&#39;s tensor ops, which Saetta does not do for Inkling yet. Each engine uses its own weights: Saetta the mlx-community 4-bit pack (17 GB), llama.cpp Unsloth&#39;s UD-Q4_K_XL (17.6 GB), Strata its lossless SQ-20 (19.3 GB).</p>
+<h2 id="m1-to-m4"><a class="anchor" href="#m1-to-m4" aria-hidden="true" tabindex="-1">#</a>M1 to M4</h2>
+<p><img src="/assets/perf/m14.svg" alt="Prompt reading at 4K on the M1 to M4 kernels, measured on the M5 Max" loading="lazy"></p>
+<p><code>SAETTA_NO_ACCEL=1</code> makes the M5 Max run the kernels M1 to M4 use. On it, a 4K prompt reads at 256 tokens/s on the 27B 4-bit and 742 on the Coder (before 0.18: 152 and 487), against 961 and 1,538 with the M5&#39;s neural accelerators.</p>
       </article>
       <p class="doc-edit"><a href="https://github.com/antonellof/saetta/blob/main/docs/performance.md" rel="noopener">Edit this page on GitHub</a></p>
       <nav class="doc-pager" aria-label="Previous and next"><a class="prev" href="/docs/lora/"><span>Previous</span>LoRA adapters</a><a class="next" href="/docs/build-from-source/"><span>Next</span>Build from source</a></nav>
     </main>
-    <nav class="doc-toc" aria-label="On this page"><p class="ds-title">On this page</p><ul><li class="d2"><a href="#flash-next-on-an-m5-max">Flash-Next on an M5 Max</a></li><li class="d2"><a href="#qwen38-27b">Qwen3.8-27B</a></li><li class="d2"><a href="#what-makes-follow-up-turns-fast">What makes follow-up turns fast</a></li><li class="d2"><a href="#speculative-decoding">Speculative decoding</a></li><li class="d2"><a href="#watching-it">Watching it</a></li></ul></nav>
+    <nav class="doc-toc" aria-label="On this page"><p class="ds-title">On this page</p><ul><li class="d2"><a href="#flash-next-on-an-m5-max">Flash-Next on an M5 Max</a></li><li class="d2"><a href="#qwen38-27b">Qwen3.8-27B</a></li><li class="d2"><a href="#what-makes-follow-up-turns-fast">What makes follow-up turns fast</a></li><li class="d2"><a href="#speculative-decoding">Speculative decoding</a></li><li class="d2"><a href="#watching-it">Watching it</a></li><li class="d2"><a href="#inkling-2-mini-against-llamacpp-and-strata">Inkling 2 Mini against llama.cpp and Strata</a></li><li class="d2"><a href="#m1-to-m4">M1 to M4</a></li></ul></nav>
   </div>
   <div class="ds-scrim" hidden></div>
 

@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="202" viewBox="0 0 900 202" font-family="-apple-system, Segoe UI, Helvetica, Arial, sans-serif"><defs><linearGradient id="g" x1="0" x2="1"><stop offset="0" stop-color="#b26bff"/><stop offset="1" stop-color="#ff8a2b"/></linearGradient><style>.t{font-size:16px;font-weight:600;fill:#c9c9d1}.c{font-size:12px;fill:#8a8a95}.n{font-size:13px;fill:#c9c9d1}.v{font-size:12px;fill:#c9c9d1;font-family:ui-monospace,Menlo,monospace}.f{font-size:11px;fill:#8a8a95}</style></defs><rect width="900" height="202" rx="12" fill="#0d0b12"/>
+<text x="30" y="40" class="t">Qwen3.8-27B 4-bit</text>
+<text x="30" y="60" class="c">4K prompt, tokens per second</text>
+<text x="30" y="97" class="n">M5 accelerators</text>
+<rect x="200" y="86" width="126.1" height="14" rx="2" fill="#8a8a95"/>
+<text x="332.1" y="97" class="v">961</text>
+<text x="30" y="125" class="n">M1-M4 kernels, 0.18</text>
+<rect x="200" y="114" width="33.6" height="14" rx="2" fill="url(#g)"/>
+<text x="239.6" y="125" class="v">256</text>
+<text x="30" y="153" class="n">before 0.18</text>
+<rect x="200" y="142" width="19.9" height="14" rx="2" fill="#5b5b66"/>
+<text x="225.9" y="153" class="v">152</text>
+<text x="470" y="40" class="t">Flash-Next Coder</text>
+<text x="470" y="60" class="c">4K prompt, tokens per second</text>
+<text x="470" y="97" class="n">M5 accelerators</text>
+<rect x="640" y="86" width="201.9" height="14" rx="2" fill="#8a8a95"/>
+<text x="847.9" y="97" class="v">1,538</text>
+<text x="470" y="125" class="n">M1-M4 kernels, 0.18</text>
+<rect x="640" y="114" width="97.4" height="14" rx="2" fill="url(#g)"/>
+<text x="743.4" y="125" class="v">742</text>
+<text x="470" y="153" class="n">before 0.18</text>
+<rect x="640" y="142" width="63.9" height="14" rx="2" fill="#5b5b66"/>
+<text x="709.9" y="153" class="v">487</text>
+<text x="30" y="188" class="f">Measured on the M5 Max with SAETTA_NO_ACCEL=1, which runs the kernels M1 to M4 use; real M1 to M4 speeds are not measured yet.</text>
+</svg>

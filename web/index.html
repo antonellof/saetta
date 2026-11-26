@@ -548,6 +548,10 @@ saetta code --mode json -p "list the TODOs"</pre>
           <div class="cell"><div class="k">Context</div><div class="v">204,800 tokens on 128 GB, sized down to fit smaller Macs</div></div>
         </div>
         <a class="more" href="https://github.com/antonellof/saetta#performance">All results and method <span aria-hidden="true">&rarr;</span></a>
+        <h3 class="subhead">Follow-up turns and the M1 to M4 kernels</h3>
+        <p class="sub">A follow-up turn reads only what is new, and Saetta Code saves that state with the session. M1 to M4 have prompt kernels of their own, measured here on the M5 Max forced onto them.</p>
+        <p style="margin: 0 0 16px"><img src="/assets/perf/resume.svg" alt="Time to the first token with the Coder pack: 37.31 s on a cold 64K prompt, 8.24 s on a cold 16K prompt, 0.20 s on a follow-up turn" style="width: 100%; height: auto; border-radius: 12px" loading="lazy"></p>
+        <p style="margin: 0"><img src="/assets/perf/m14.svg" alt="Prompt reading at 4K on the M1 to M4 kernels: 27B 152 before 0.18, 256 now, 961 with the M5's accelerators; Coder 487, 742 and 1,538" style="width: 100%; height: auto; border-radius: 12px" loading="lazy"></p>
       </div>
     </section>
 

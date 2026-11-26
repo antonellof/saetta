@@ -272,3 +272,33 @@ TEST(points_chunks_follow_cuts) {
     EXPECT_EQ(prefill_chunk_len(&h2, 1000, 20000, 6000), 3000);
     EXPECT_EQ(prefill_chunk_len(&h2, 1000, 20000, 9000), 3667); // 11000 after it: 3 x 3667
 }
+
+// A restore point with its next token known is reused only by a prompt that has that token after it
+// (its MTP row at its length pairs it); without one, by its ids alone.
+TEST(points_restore_point_next_token) {
+    Ckpt ck[2] = {0};
+    uint32_t ids[100];
+    for (size_t i = 0; i < 100; i++) ids[i] = 10 + (uint32_t)i;
+    vec_reserve(&ck[1].tokens, 50);
+    memcpy(ck[1].tokens.ptr, ids, 50 * 4);
+    ck[1].tokens.len = 50;
+    EXPECT_EQ(session_reusable_in(ck, ids, 100).n, 50);
+    ck[1].has_next = true;
+    ck[1].next = ids[50];
+    EXPECT_EQ(session_reusable_in(ck, ids, 100).n, 50);
+    ck[1].next = 5;
+    EXPECT_EQ(session_reusable_in(ck, ids, 100).n, 0);
+    vec_free(&ck[1].tokens);
+}
+
+// An inactive conversation keeps its PT_HELD most recent checkpoints (session_conv_trim_points);
+// the fit's reserve covers PT_MAX for the active one and PT_HELD for each other one.
+TEST(points_trim_and_reserve) {
+    Conv cv = {0};
+    // markers stand for buffers: trimming releases them, so only the slots to keep get markers
+    // here and the release path is covered by the GPU test (state_session)
+    size_t pos[] = {3000, 9000, 6000, 12000};
+    for (size_t i = 0; i < 4; i++) cv.pts[i] = (Point){.gdn = (sx_buffer *)(uintptr_t)0x1000, .pos = pos[i], .valid = true};
+    EXPECT_EQ(session_conv_trim_points(&cv, 4), 0);
+    EXPECT_EQ(PT_HELD, 3);
+}

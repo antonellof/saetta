@@ -238,3 +238,48 @@ TEST(state_session_start_from_unaligned_point) {
     gpu_deinit(&g);
     arena_reset(&arena);
 }
+
+// Trimming a held conversation releases every checkpoint slot but keep of them (the most recent, the
+// last request's start, the oldest), and the reserve for 4 conversations is 16 + 3 x 3 checkpoints
+// (the 27B's 157 MB each).
+TEST(state_session_trim_points) {
+    if (!getenv("SAETTA_PACK")) SKIP("SAETTA_PACK not set (allocates session buffers)");
+    Arena arena = {0};
+    Pack empty = {0};
+    Gpu g;
+    EXPECT_OK(gpu_init(&arena, &empty, &g));
+    Session *s;
+    EXPECT_OK(dense_arch.s_create_cap(&g, true, 8192, 8192, &s));
+    EXPECT_EQ(session_point_bytes(s), 156893184);
+    EXPECT_EQ(session_points_reserve(s, 4), (uint64_t)(16 + 3 * 3) * 156893184);
+    uint32_t *X = ids_from(1000, 8000);
+    for (size_t p = 300; p <= 300 * 18; p += 300) {
+        s->pos = p;
+        EXPECT_OK(session_save_point(s, &g, X, p, true));
+        // the request starts: 3000 (then a later one at 4500)
+        if (p == 3000 || p == 4500) s->pts[session_point_at(s->pts, p)].start = true;
+    }
+    Conv held;
+    EXPECT_OK(session_new_conv(s, &g, 8192, &held));
+    session_swap_conv(s, &held); // held: the 16 checkpoints
+    size_t n = 0;
+    for (size_t k = 0; k < PT_MAX; k++) n += held.pts[k].gdn != NULL;
+    EXPECT_EQ(n, PT_MAX);
+    EXPECT_EQ(session_conv_trim_points(&held, PT_HELD), PT_MAX - PT_HELD);
+    size_t left = 0;
+    bool has[3] = {false};
+    for (size_t k = 0; k < PT_MAX; k++)
+        if (held.pts[k].gdn) {
+            left++;
+            EXPECT(held.pts[k].valid && held.pts[k].conv != NULL);
+            has[0] |= held.pts[k].pos == 5400; // the most recent
+            has[1] |= held.pts[k].pos == 4500; // the last request's start
+            has[2] |= held.pts[k].pos == 300;  // the oldest
+        }
+    EXPECT_EQ(left, PT_HELD);
+    EXPECT(has[0] && has[1] && has[2]);
+    EXPECT_EQ(session_conv_trim_points(&held, 0), PT_HELD);
+    free(X);
+    gpu_deinit(&g);
+    arena_reset(&arena);
+}

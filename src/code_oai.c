@@ -2506,7 +2506,9 @@ static int on_engine(void *ctx, int status, const void *p, size_t n) {
 
 static Err complete_in_process(Arena *a, const CodeModel *m, CodeOaiStream *s, const CodeEnv *env, Str body, JValue **assistant) {
     HttpCtx hc = {.s = s, .abort = env ? env->abort : NULL};
-    TRY(server_engine_chat(m->engine, body, on_engine, &hc));
+    // the session id keys the engine's in-place restarts (a retry or /fork within this session; a
+    // request of another session, after /new, /resume or a /fork to a new file, copies instead)
+    TRY(server_engine_chat_session(m->engine, body, env ? env->session_id : NULL, on_engine, &hc));
     if (s->failed) *assistant = code_oai_stream_end(s, NULL);
     // Ctrl-C: the error path, as over HTTP (a cancelled transfer) and in pi's catch: open blocks
     // are not finished and partial tool arguments are not parsed

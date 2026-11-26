@@ -127,14 +127,34 @@ static bool turn_wait(Engine *e, uint64_t t, int ms) { return turns_wait(&e->tur
 static void turn_done(Engine *e) { turns_done(&e->turns); }
 static void turn_leave(Engine *e, uint64_t t) { turns_leave(&e->turns, t); }
 // Makes conversation i the active one.
+// The conversation going inactive keeps PT_HELD checkpoints (inside the fit's reserve).
 static void activate(Engine *e, size_t i) {
     if (i == e->active) return;
     session_swap_conv(e->s, &e->held[i]);
     e->held[e->active] = e->held[i];
     e->has[e->active] = true;
+    (void)session_conv_trim_points(&e->held[e->active], PT_HELD);
     memset(&e->held[i], 0, sizeof(Conv));
     e->has[i] = false;
     e->active = i;
+}
+
+// When memory is short: the checkpoints of the least recently used inactive conversation that
+// holds some go (its restore points stay). False when none holds any.
+static bool drop_held_points(Engine *e) {
+    bool found = false;
+    size_t pick = 0;
+    for (size_t i = 0; i < e->n_conv; i++) {
+        if (!e->has[i]) continue;
+        bool any = false;
+        for (size_t k = 0; k < PT_MAX; k++) any |= e->held[i].pts[k].gdn != NULL;
+        if (any && (!found || e->used[i] < e->used[pick])) {
+            pick = i;
+            found = true;
+        }
+    }
+    if (found) (void)session_conv_trim_points(&e->held[pick], 0);
+    return found;
 }
 
 static const Ckpt *ck_of(Engine *e, size_t i) { return i == e->active ? e->s->ck : e->held[i].ck; }
@@ -173,8 +193,11 @@ typedef struct {
     size_t conv;
     uint64_t gen;
     bool set;
+    char session[96]; // the agent session of that request (server_engine_chat_session), "" none
 } LastConv;
 static _Thread_local LastConv last_conv;
+// The agent session of the request this thread is running (server_engine_chat_session), "" none.
+static _Thread_local char req_session[96];
 
 // Picks the conversation for a prompt: the one it continues; else, for an in-process caller
 // (inproc: server_engine_chat, where each caller runs on its own thread: Saetta Code's agent, each
@@ -196,8 +219,8 @@ static void route(Engine *e, const uint32_t *ids, size_t nids, int lora, bool in
             best = i;
         }
     }
-    if (best_n == 0 && inproc && last_conv.set && last_conv.e == e && last_conv.conv < e->n_conv && e->conv_lora[last_conv.conv] == lora &&
-        e->conv_gen[last_conv.conv] == last_conv.gen) {
+    if (best_n == 0 && inproc && req_session[0] && !strcmp(req_session, last_conv.session) && last_conv.set && last_conv.e == e &&
+        last_conv.conv < e->n_conv && e->conv_lora[last_conv.conv] == lora && e->conv_gen[last_conv.conv] == last_conv.gen) {
         size_t i = last_conv.conv;
         const Session *s = e->s;
         size_t p = i == e->active ? session_shared_point(s->ptoks.ptr, s->ptoks.len, s->pts, ids, nids)
@@ -345,8 +368,9 @@ static bool evict_one(Engine *e) {
 static Err ensure(Engine *e, size_t need) {
     if (need <= e->s->cap) return OK;
     size_t cap = MIN(e->s->max_cap, ALIGN_UP(need, CAP_STEP));
+    // inactive conversations' checkpoints go first, then whole conversations
     while (!room_for(e, session_kv_bytes(e->s, cap), 2ull << 30))
-        if (!evict_one(e)) break;
+        if (!drop_held_points(e) && !evict_one(e)) break;
     return session_grow(e->s, e->g, cap);
 }
 
@@ -365,8 +389,13 @@ static void publish_convs(Engine *e) {
     stats_set_convs(e->st, info, e->n_conv);
 }
 
-// Room for one more checkpoint's buffers (2 GB kept free under the GPU working-set limit).
-static bool point_room(Engine *e) { return room_for(e, session_point_bytes(e->s), 2ull << 30); }
+// Room for one more checkpoint's buffers (2 GB kept free under the GPU working-set limit), after
+// dropping inactive conversations' checkpoints when short.
+static bool point_room(Engine *e) {
+    while (!room_for(e, session_point_bytes(e->s), 2ull << 30))
+        if (!drop_held_points(e)) return false;
+    return true;
+}
 
 static Err json_respond(Conn *c, Req *h, int status, Str body) {
     return http_respond(c, h, status, body, "application/json");
@@ -846,7 +875,11 @@ static Err generate_reply(Engine *e, Arena *a, Conn *c, Req *h, Work *w, JValue 
         // its start only, so a resumed conversation reads it as the resident one would)
         size_t *cuts = NULL, ncuts = 0;
         if (points_on && model_info(e->m)->chat == CHAT_QWEN) {
-            if (reused > 0) TRY(session_save_point(e->s, e->g, ids, reused, point_room(e)));
+            if (reused > 0) {
+                TRY(session_save_point(e->s, e->g, ids, reused, point_room(e)));
+                int k = session_point_at(e->s->pts, reused);
+                if (k >= 0) e->s->pts[k].start = true;
+            }
             size_t cap = (n - 1 - reused) / PT_GAP + 4;
             cuts = ARENA_ARRAY(a, size_t, cap);
             ncuts = session_point_cuts(ids, n, reused, e->im_start, cuts, cap);
@@ -856,7 +889,11 @@ static Err generate_reply(Engine *e, Arena *a, Conn *c, Req *h, Work *w, JValue 
         float *lg;
         TRY(model_prefill_with(e->m, e->s, ids + reused, n - 1 - reused, NULL, &ph, &lg));
     }
-    if (n - 1 != reused) TRY(session_save_checkpoint(e->s, ids, n - 1));
+    if (n - 1 != reused) {
+        TRY(session_save_checkpoint(e->s, ids, n - 1));
+        e->s->ck[0].next = ids[n - 1]; // the prompt's last token, which its MTP row at n - 1 pairs
+        e->s->ck[0].has_next = true;
+    }
     float *logits;
     TRY(model_prefill(e->m, e->s, ids + n - 1, 1, NULL, &logits));
     uint64_t t1 = now_ns();
@@ -975,6 +1012,12 @@ static Err generate_reply(Engine *e, Arena *a, Conn *c, Req *h, Work *w, JValue 
         memcpy(all, ids, n * sizeof(uint32_t));
         memcpy(all + n, gen_ids, consumed * sizeof(uint32_t));
         (void)session_save_checkpoint_at(e->s, 1, all, n + consumed);
+        // the first generated token not consumed (the next prompt repeats it after the reply); after
+        // a rollback to every emitted token, none is known and the point is reused on its ids alone
+        if (consumed < n_gen_ids) {
+            e->s->ck[1].next = gen_ids[consumed];
+            e->s->ck[1].has_next = true;
+        }
     }
     int64_t pre_ms = (int64_t)(t1 - t0) / 1000000;
     int64_t dec_ms = (int64_t)(t2 - t1) / 1000000;
@@ -1251,6 +1294,9 @@ static void state_restore(Engine *e, const uint32_t *ids, size_t n) {
         k->prev[0] = meta.snap[s].prev[0];
         k->prev[1] = meta.snap[s].prev[1];
         k->since_eos = (size_t)meta.snap[s].since_eos;
+        // the token after it: snapshot 0's as saved, snapshot 1's the prompt's (the find checked it)
+        k->has_next = s == 0 ? meta.snap[s].has_next : true;
+        k->next = s == 0 ? meta.snap[s].next : ids[p];
         k->tokens.len = 0;
         vec_reserve(&k->tokens, p);
         memcpy(k->tokens.ptr, ids, p * sizeof(uint32_t));
@@ -1431,7 +1477,7 @@ static void state_save_active(Engine *e) {
     if (k->tokens.len > e->lin_hw[i]) e->lin_hw[i] = k->tokens.len;
     size_t n = k->tokens.len;
     StMeta meta = {.nsnap = 1, .extra_len = sizeof(SpecSaved)};
-    meta.snap[0] = (StSnap){n, {k->prev[0], k->prev[1]}, k->since_eos, false};
+    meta.snap[0] = (StSnap){n, {k->prev[0], k->prev[1]}, k->since_eos, false, k->has_next, k->next};
     // the second snapshot: the conversation's last checkpoint before n on the same rows (the other
     // restore point when its tokens are a prefix of these, or a checkpoint within the prefix ptoks
     // shares with them)
@@ -1455,7 +1501,7 @@ static void state_save_active(Engine *e) {
         memcpy(lay.xrec, l2.rec, sizeof lay.xrec);
         const uint32_t *pv = bslot < 2 ? s->ck[bslot].prev : s->pts[bslot - 2].prev;
         size_t se = bslot < 2 ? s->ck[bslot].since_eos : s->pts[bslot - 2].since_eos;
-        meta.snap[1] = (StSnap){best, {pv[0], pv[1]}, se, false};
+        meta.snap[1] = (StSnap){best, {pv[0], pv[1]}, se, false, true, k->tokens.ptr[best]};
         meta.nsnap = 2;
     }
     memcpy(meta.lineage, e->lin[i], 16);
@@ -1467,6 +1513,18 @@ static void state_save_active(Engine *e) {
 
 void server_engine_state_flush(Engine *e) {
     if (e->store) state_store_wait(e->store);
+}
+
+size_t server_engine_point_slots(const Engine *e, size_t *active, uint64_t *reserved) {
+    size_t all = 0, act = 0;
+    for (size_t k = 0; k < PT_MAX; k++) act += e->s->pts[k].gdn != NULL;
+    all = act;
+    for (size_t i = 0; i < e->n_conv; i++)
+        if (e->has[i])
+            for (size_t k = 0; k < PT_MAX; k++) all += e->held[i].pts[k].gdn != NULL;
+    if (active) *active = act;
+    if (reserved) *reserved = session_points_reserve(e->s, e->max_conv);
+    return all;
 }
 
 bool server_engine_controller(const Engine *e, size_t i, Gate *gate, Depth *depth) {
@@ -1577,7 +1635,8 @@ static Err handle(Engine *e, Arena *a, Conn *c, Req *h, Str body, Fmt fmt, Work 
     stats_begin(e->st, fmt == FMT_ANTHROPIC, n, start.n, max_tokens);
     Err err = generate_reply(e, a, c, h, w, r, model_name, fmt, forced, thinking, sp, stops, n_stops, stream, tools, id, created,
                              start, max_tokens);
-    last_conv = (LastConv){e, e->active, e->conv_gen[e->active], true};
+    last_conv = (LastConv){e, e->active, e->conv_gen[e->active], true, {0}};
+    if (c->sink) snprintf(last_conv.session, sizeof last_conv.session, "%s", req_session);
     if (err) atomic_store_explicit(&e->st->state, STATE_IDLE, memory_order_release);
     return err;
 }
@@ -1892,9 +1951,10 @@ static Err engine_open(Arena *arena, const char *dir, const char *const *loras, 
             const uint64_t budget = ram > used + (uint64_t)FIT_KV_RESERVE_GB * gib ? ram - used - (uint64_t)FIT_KV_RESERVE_GB * gib : 0;
             const size_t c0 = MIN(CAP0, max_cap), have = session_conv_bytes(e->s, c0);
             // growing a conversation allocates the new buffers before it frees the old ones
-            // (session_grow), so the last step holds about twice the final size; its checkpoints
-            // (PT_MAX of them, 118 MB each on Flash-Next, 157 MB on the 27B) come out of the budget
-            const uint64_t pts = model_info(m)->chat == CHAT_QWEN ? (uint64_t)PT_MAX * session_point_bytes(e->s) : 0;
+            // (session_grow), so the last step holds about twice the final size; the checkpoints
+            // (PT_MAX for it, PT_HELD for each other conversation; 118 MB each on Flash-Next, 157 MB
+            // on the 27B) come out of the budget
+            const uint64_t pts = model_info(m)->chat == CHAT_QWEN ? session_points_reserve(e->s, e->max_conv) : 0;
             size_t fit = max_cap;
             while (fit > c0 && 2 * session_conv_bytes(e->s, fit) - have + pts > budget) fit -= SESSION_CTX_ALIGN;
             if (budget == 0)
@@ -1959,6 +2019,14 @@ size_t server_engine_context(const Engine *e) { return e->s->max_cap; }
 Stats *server_engine_stats(Engine *e) { return e->st; }
 
 Err server_engine_chat(Engine *e, Str body, int (*sink)(void *ctx, int status, const void *p, size_t n), void *ctx) {
+    return server_engine_chat_session(e, body, NULL, sink, ctx);
+}
+
+Err server_engine_chat_session(Engine *e, Str body, const char *session,
+                               int (*sink)(void *ctx, int status, const void *p, size_t n), void *ctx) {
+    // a longer id than the key holds counts as none (no in-place restart): never a false match
+    if (session && strlen(session) < sizeof req_session) snprintf(req_session, sizeof req_session, "%s", session);
+    else req_session[0] = 0;
     Conn *c = xcalloc(1, sizeof(Conn));
     conn_init(c, -1);
     c->sink = sink;

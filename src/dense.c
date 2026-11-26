@@ -1278,6 +1278,7 @@ Err session_save_checkpoint_at(Session *s, size_t slot, const uint32_t *toks, si
     if (n != s->pos) die("session_save_checkpoint_at: %zu tokens at position %zu\n", n, s->pos);
     Ckpt *k = &s->ck[slot];
     save_state(s, k->gdn, k->conv);
+    k->has_next = false;
     vec_set(&k->tokens, toks, n);
     return OK;
 }
@@ -1362,6 +1363,7 @@ Err session_save_point(Session *s, Gpu *g, const uint32_t *toks, size_t n, bool 
     pt->valid = false;
     save_state(s, pt->gdn, pt->conv);
     pt->pos = n;
+    pt->start = false;
     pt->valid = true;
     vec_set(&s->ptoks, toks, n + 1);
     return OK;
@@ -1418,6 +1420,7 @@ Err session_start_from(Session *s, Gpu *g, const Conv *src, size_t n, size_t all
         memcpy(gpu_floats(d->gdn), gpu_floats(sp->gdn), GDN_STATE_N * 4);
         memcpy(gpu_floats(d->conv), gpu_floats(sp->conv), GDN_CONV_N * 4);
         d->pos = sp->pos;
+        d->start = sp->start;
         d->valid = true;
     }
     vec_set(&s->ptoks, src->ptoks.ptr, MIN(src->ptoks.len, n + 1));

@@ -742,7 +742,7 @@ TEST(state_store_two_snapshots) {
     a.lay.xrec[1] = x1;
     StMeta ma = meta_of(0xB2, 1, 2, 3);
     ma.nsnap = 2;
-    ma.snap[1] = (StSnap){p1, {4, 5}, 6, false};
+    ma.snap[1] = (StSnap){p1, {4, 5}, 6, false, true, ids[p1]};
     // a second snapshot not before n is refused
     StMeta bad = ma;
     bad.snap[1].pos = n;
@@ -815,6 +815,29 @@ TEST(state_store_two_snapshots) {
     other[8000] ^= 1;
     other[100] ^= 1;
     EXPECT_EQ(state_store_find(st, other, 12000, 0, name, at), 0);
+    // a snapshot at n with its next token: used only when the prompt has that token at n (else the
+    // second snapshot)
+    // (ids of its own, leaving the first state at 50)
+    uint32_t *nx = malloc(20000 * 4);
+    memcpy(nx, ids, 20000 * 4);
+    nx[50] ^= 3;
+    StMeta mn = ma;
+    mn.lineage[0] ^= 0x55;
+    mn.snap[0].has_next = true;
+    mn.snap[0].next = 777;
+    mn.snap[1].next = nx[p1];
+    EXPECT(state_store_save(st, &a.lay, nx, n, &mn, NULL, 0, NULL, 0, noop_release));
+    state_store_wait(st);
+    nx[n] = 777;
+    EXPECT_EQ(state_store_find(st, nx, n + 5, 0, name, at), n);
+    EXPECT_EQ(at[0], n);
+    nx[n] = 778;
+    EXPECT_EQ(state_store_find(st, nx, n + 5, 0, name, at), p1);
+    EXPECT_EQ(at[0], 0);
+    EXPECT_OK(state_store_load(st, name, nx, n + 5, &c.lay, &got, &mb, &kk, &nk, &bytes, &tch));
+    free(kk);
+    EXPECT_EQ(got, p1);
+    free(nx);
     state_store_close(st);
     char cmd[200];
     snprintf(cmd, sizeof cmd, "rm -rf '%s'", root);

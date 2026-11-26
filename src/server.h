@@ -56,12 +56,21 @@ void server_engine_state_flush(Engine *e);
 // For tests: conversation i's speculation controller (one per conversation); false for a
 // conversation not open.
 bool server_engine_controller(const Engine *e, size_t i, Gate *gate, Depth *depth);
+// For tests: checkpoint slots holding buffers over every conversation (*active: the active one's),
+// and the bytes the context fit reserved for checkpoints.
+size_t server_engine_point_slots(const Engine *e, size_t *active, uint64_t *reserved);
 // One POST /v1/chat/completions with this body, on the caller's thread: the response body
 // bytes (the SSE stream, or the JSON answer or error) go to sink as they are produced, with the
 // response status; sink returns nonzero to stop (the request ends as when a client leaves), and
 // is also called with p NULL, n 0 to ask whether the caller is gone. Errors: harness failures
 // only (a failed request is an error answer through sink).
 Err server_engine_chat(Engine *e, Str body, int (*sink)(void *ctx, int status, const void *p, size_t n), void *ctx);
+// server_engine_chat for an agent session (Saetta Code's session id; NULL or "": none): a prompt
+// that no restore point continues restarts in place, at a checkpoint of the conversation this
+// thread's last request of the same session used; a request of another session (or none) gets
+// another conversation, copying rows, and never overwrites that one.
+Err server_engine_chat_session(Engine *e, Str body, const char *session,
+                               int (*sink)(void *ctx, int status, const void *p, size_t n), void *ctx);
 // One HTTP connection on fd (accepted on a socket of the caller's) answered as server_serve
 // answers it: the same endpoints and request path. The request is read first (the head and body
 // deadlines; the caller sets the socket's send and receive timeouts: no connection guard here),

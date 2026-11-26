@@ -204,6 +204,7 @@ Reusable session_reusable_in(const Ckpt ck[2], const uint32_t *prompt, size_t np
     for (size_t i = 0; i < 2; i++) {
         size_t n = ck[i].tokens.len;
         if (n == 0 || n >= np || n <= best) continue;
+        if (ck[i].has_next && prompt[n] != ck[i].next) continue;
         if (memcmp(ck[i].tokens.ptr, prompt, n * sizeof(uint32_t)) == 0) {
             best = n;
             pick = i;
@@ -274,6 +275,40 @@ int session_point_slot(const Point pts[PT_MAX], size_t pos, bool may_alloc) {
         }
     }
     return idx[pick];
+}
+
+uint64_t session_points_reserve(const Session *s, size_t convs) {
+    return (uint64_t)(PT_MAX + (convs > 1 ? convs - 1 : 0) * PT_HELD) * session_point_bytes(s);
+}
+
+size_t session_conv_trim_points(Conv *cv, size_t keep) {
+    bool stay[PT_MAX] = {false};
+    size_t kept = 0;
+    // pass 0: the most recent; 1: the most recent request start; 2: the oldest; 3+: the most recent
+    for (size_t pass = 0; kept < keep; pass++) {
+        int best = -1;
+        for (int i = 0; i < PT_MAX; i++) {
+            const Point *p = &cv->pts[i];
+            if (stay[i] || !point_ok(p) || (pass == 1 && !p->start)) continue;
+            bool better = best < 0 || (pass == 2 ? p->pos < cv->pts[best].pos : p->pos > cv->pts[best].pos);
+            if (better) best = i;
+        }
+        if (best >= 0) {
+            stay[best] = true;
+            kept++;
+        } else if (pass >= 3) break;
+    }
+    size_t released = 0;
+    for (int i = 0; i < PT_MAX; i++) {
+        Point *p = &cv->pts[i];
+        if (stay[i] || p->gdn == NULL) continue;
+        sx_buffer_release(p->gdn);
+        if (p->conv) sx_buffer_release(p->conv);
+        if (p->ple) sx_buffer_release(p->ple);
+        *p = (Point){0};
+        released++;
+    }
+    return released;
 }
 
 size_t session_point_bytes(const Session *s) { return (session_conv_bytes(s, s->cap) - session_kv_bytes(s, s->cap)) / 2; }

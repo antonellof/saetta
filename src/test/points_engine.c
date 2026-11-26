@@ -62,10 +62,11 @@ static int sink_keep(void *ctx, int status, const void *p, size_t n) {
     return 0;
 }
 
-// The reply's content (strdup'd) and the request's reused tokens.
-static char *chat(Engine *e, const char *b, size_t *reused) {
+// The reply's content (strdup'd) and the request's reused tokens, for agent session sess (NULL:
+// none, as another caller).
+static char *chat_s(Engine *e, const char *b, const char *sess, size_t *reused) {
     Buf out = {0};
-    Err err = server_engine_chat(e, str(b), sink_keep, &out);
+    Err err = server_engine_chat_session(e, str(b), sess, sink_keep, &out);
     *reused = atomic_load(&server_engine_stats(e)->reused);
     char *content = NULL;
     Arena a = {0};
@@ -80,6 +81,8 @@ static char *chat(Engine *e, const char *b, size_t *reused) {
     buf_free(&out);
     return content ? content : strdup("<error>");
 }
+// this thread's requests in one agent session (Saetta Code's)
+static char *chat(Engine *e, const char *b, size_t *reused) { return chat_s(e, b, "session-main", reused); }
 
 typedef struct {
     int fd;
@@ -148,13 +151,13 @@ static char *http_chat(Engine *e, const char *b, size_t *reused) {
     return content ? content : strdup("<error>");
 }
 
-// One engine for the tests below (a second model would not fit beside the first): two
+// One engine for the tests below (a second model would not fit beside the first): three
 // conversations, the state store in a temporary folder.
 static Engine *shared_engine;
 static char store_root[64];
 static Engine *engine_for(const char *pack) {
     if (shared_engine) return shared_engine;
-    setenv("SAETTA_CONVERSATIONS", "2", 1);
+    setenv("SAETTA_CONVERSATIONS", "3", 1);
     setenv("SAETTA_CTX", "32768", 1);
     static Arena a;
     snprintf(store_root, sizeof store_root, "/tmp/saetta-points-store-XXXXXX");
@@ -214,11 +217,13 @@ TEST(points_engine_store_second_snapshot) {
     size_t nB = atomic_load(&server_engine_stats(e)->prompt_total);
     server_engine_state_save(e);
     server_engine_state_flush(e);
-    // two other conversations from 0 in both slots
-    char *bX = body(77, NULL, 0, 4), *bY = body(78, NULL, 0, 4);
-    free(chat(e, bX, &r3));
+    // three other conversations from 0 in every slot (other callers: no in-place restart)
+    char *bX = body(77, NULL, 0, 4), *bY = body(78, NULL, 0, 4), *bZ = body(79, NULL, 0, 4);
+    free(chat_s(e, bX, NULL, &r3));
     EXPECT_EQ(r3, 0);
-    free(chat(e, bY, &r3));
+    free(chat_s(e, bY, NULL, &r3));
+    EXPECT_EQ(r3, 0);
+    free(chat_s(e, bZ, NULL, &r3));
     EXPECT_EQ(r3, 0);
     // B again: its saved state's restore point is past this prompt (it holds the answer); its
     // second snapshot, the prompt's own restore point one token before its end, is not
@@ -226,7 +231,7 @@ TEST(points_engine_store_second_snapshot) {
     EXPECT_EQ(r4, nB - 1);
     EXPECT_STR(str(cB2), str(cB1));
     dbg("points_engine: B %zu tokens, restored at %zu; answers %s | %s\n", nB, r4, cB1, cB2);
-    free(b1), free(bB), free(cB1), free(bX), free(bY), free(cB2);
+    free(b1), free(bB), free(cB1), free(bX), free(bY), free(bZ), free(cB2);
 }
 
 typedef struct {
@@ -238,7 +243,7 @@ typedef struct {
 
 static void *run_job(void *arg) {
     Job *j = arg;
-    j->content = chat(j->e, j->body, &j->reused);
+    j->content = chat_s(j->e, j->body, NULL, &j->reused);
     return NULL;
 }
 
@@ -259,6 +264,7 @@ TEST(points_engine_route_retry_and_shared) {
     // B read on without a restart, then A, a retry of that last user message, by the same caller
     char *cB = chat(e, bB, &r2);
     free(chat(e, bA, &r3));
+    size_t nA = atomic_load(&server_engine_stats(e)->prompt_total);
     EXPECT(r3 > r2 + PT_GAP);
     // B on another thread: its own conversation, from the rows copied at the same checkpoint (A,
     // which started there in conversation 1, kept it), and B's answer
@@ -268,8 +274,18 @@ TEST(points_engine_route_retry_and_shared) {
     pthread_join(t, NULL);
     EXPECT_EQ(j.reused, r3);
     EXPECT_STR(str(j.content), str(cB));
-    dbg("points_engine: own retry at %zu, shared start at %zu; answers %s | %s\n", r3, j.reused, cB, j.content);
-    free(b1), free(bA), free(bB), free(cB), free(j.content);
+    // the same thread in another agent session (after /new, /resume or a /fork to a new file):
+    // a prompt that A's conversation's checkpoints start does not restart there in place but in
+    // another conversation, so the first session's conversation stays as it was
+    char *bC = body5(9, a1, 10, a2, 13, 24);
+    size_t r4, r5;
+    free(chat_s(e, bC, "session-other", &r4));
+    EXPECT(r4 > r2 + PT_GAP);
+    free(chat(e, bA, &r5));
+    EXPECT_EQ(r5, nA - 1);
+    dbg("points_engine: own retry at %zu, shared start at %zu, other session at %zu, A again at %zu; answers %s | %s\n", r3,
+        j.reused, r4, r5, cB, j.content);
+    free(b1), free(bA), free(bB), free(bC), free(cB), free(j.content);
 }
 
 // Two HTTP sessions on one thread (one saetta serve, two pi sessions): Q's prompt shares P's first

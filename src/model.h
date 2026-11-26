@@ -41,6 +41,10 @@
 #define PT_MAX 16
 #define PT_GAP 1024
 #define PT_RECENT 4
+// Checkpoints an inactive conversation keeps (session_conv_trim_points: its most recent, its last
+// request's start, its oldest), so every conversation's checkpoints fit in what the context fit
+// reserves (session_points_reserve).
+#define PT_HELD 3
 
 // Chunks of at most MODEL_SMALL tokens use the decode-style kernels.
 #define MODEL_SMALL 8
@@ -75,12 +79,16 @@ typedef struct {
     ChatFormat chat; // the chat template the model was trained with
 } ModelInfo;
 
-// Per-conversation restore point.
+// Per-conversation restore point. next: the token after tokens (its MTP row at tokens.len pairs
+// it), when has_next (the server sets it after a save; a save clears it): a prompt then reuses the
+// point only when its token there is next, as for a checkpoint (session_shared_point).
 typedef struct {
     sx_buffer *gdn, *conv, *ple;
     uint32_t prev[2];
     size_t since_eos;
     VecU32 tokens;
+    uint32_t next;
+    bool has_next;
 } Ckpt;
 
 // A checkpoint (prefix point) at position pos; its buffers are absent while gdn is NULL. valid: saved
@@ -93,6 +101,7 @@ typedef struct {
     size_t since_eos;
     size_t pos;
     bool valid;
+    bool start; // saved at a request's start (the end of the history it continued)
 } Point;
 
 // The per-conversation part of a session: KV cache, indexer keys, pooled block keys and the
@@ -356,6 +365,15 @@ int session_point_slot(const Point pts[PT_MAX], size_t pos, bool may_alloc);
 int session_point_at(const Point pts[PT_MAX], size_t pos);
 // Bytes of one checkpoint's recurrent buffers (118 MB Flash-Next, 157 MB 27B).
 size_t session_point_bytes(const Session *s);
+// Bytes the checkpoints of convs conversations may hold: PT_MAX for the active one, PT_HELD for
+// each of the others (the context fit reserves them).
+uint64_t session_points_reserve(const Session *s, size_t convs);
+// Keeps keep valid checkpoints of held conversation cv and releases every other slot's buffers
+// (valid or not; its restore points stay), choosing in this order: the most recent (a retry), the
+// most recent saved at a request's start (where its last request's history ends: another caller
+// sharing that history starts there), the oldest (the system prompt's end, which subagents share),
+// then the most recent others. Returns the slots released.
+size_t session_conv_trim_points(Conv *cv, size_t keep);
 // The checkpoint usable for prompt: the highest valid point at a position pos < the prompt's common
 // prefix with ptoks (a valid point's state and every KV row below it are this conversation's for
 // those tokens, so the points below it need not be valid; the token at pos matches too, the one

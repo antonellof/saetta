@@ -2508,6 +2508,7 @@ Err session_save_checkpoint_at(Session *s, size_t slot, const uint32_t *toks, si
     k->prev[0] = s->prev[0];
     k->prev[1] = s->prev[1];
     k->since_eos = s->since_eos;
+    k->has_next = false;
     vec_set(&k->tokens, toks, n);
     return OK;
 }
@@ -2619,6 +2620,7 @@ Err session_save_point(Session *s, Gpu *g, const uint32_t *toks, size_t n, bool 
     for (size_t i = n; i > 0 && toks[i - 1] != EOS_PLE; i--) since += 1;
     pt->since_eos = since;
     pt->pos = n;
+    pt->start = false;
     pt->valid = true;
     vec_set(&s->ptoks, toks, n + 1);
     return OK;
@@ -2694,6 +2696,7 @@ Err session_start_from(Session *s, Gpu *g, const Conv *src, size_t n, size_t all
         d->prev[1] = sp->prev[1];
         d->since_eos = sp->since_eos;
         d->pos = sp->pos;
+        d->start = sp->start;
         d->valid = true;
     }
     vec_set(&s->ptoks, src->ptoks.ptr, MIN(src->ptoks.len, n + 1));

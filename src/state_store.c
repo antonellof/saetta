@@ -107,6 +107,7 @@ typedef struct {
         uint64_t pos;
         uint32_t prev[2];
         uint64_t since_eos;
+        uint32_t next, has_next; // the token after pos (snap[0]: when known)
         StSlice rec[ST_MAX_REC];
     } snap[ST_MAX_SNAP]; // snap[0] at n, snap[1] before it
     uint64_t extra_len;
@@ -729,6 +730,8 @@ static Err write_state(StateStore *st, const uint8_t *keys, size_t nchunks, cons
         h->snap[s].prev[0] = st->meta.snap[s].prev[0];
         h->snap[s].prev[1] = st->meta.snap[s].prev[1];
         h->snap[s].since_eos = st->meta.snap[s].since_eos;
+        h->snap[s].next = st->meta.snap[s].next;
+        h->snap[s].has_next = st->meta.snap[s].has_next ? 1 : 0;
         for (size_t i = 0; i < st->lay.nrec; i++) {
             h->snap[s].rec[i].off = off;
             h->snap[s].rec[i].len = st->lay.rec_bytes[i];
@@ -1017,7 +1020,9 @@ static int ids_match(int fd, const StateHead *h, const uint32_t *prompt, size_t 
         // the snapshot at n: its ids a prefix; one before n: the id at its position too (its MTP
         // rows pair it), as a resident checkpoint (session_shared_point)
         for (size_t s = 0; s < h->nsnap; s++) {
-            usable[s] = (s == 0 ? h->snap[s].pos <= lcp : h->snap[s].pos < lcp) && h->snap[s].pos < np;
+            size_t pos = (size_t)h->snap[s].pos;
+            usable[s] = (s == 0 ? pos <= lcp : pos < lcp) && pos < np;
+            if (usable[s] && s == 0 && h->snap[s].has_next && prompt[pos] != h->snap[s].next) usable[s] = false;
             if (usable[s] && (best < 0 || h->snap[s].pos > h->snap[best].pos)) best = (int)s;
         }
     }
@@ -1266,7 +1271,8 @@ Err state_store_load(StateStore *st, const char *name, const uint32_t *prompt, s
         memcpy(meta->lineage, h.lineage, 16);
         meta->nsnap = h.nsnap;
         for (size_t s = 0; s < h.nsnap; s++)
-            meta->snap[s] = (StSnap){h.snap[s].pos, {h.snap[s].prev[0], h.snap[s].prev[1]}, h.snap[s].since_eos, usable[s]};
+            meta->snap[s] = (StSnap){h.snap[s].pos, {h.snap[s].prev[0], h.snap[s].prev[1]}, h.snap[s].since_eos, usable[s],
+                                     h.snap[s].has_next != 0, h.snap[s].next};
         meta->extra_len = h.extra_len;
         memcpy(meta->extra, h.extra, h.extra_len);
         futimes(sfd, NULL);

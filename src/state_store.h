@@ -82,13 +82,16 @@ typedef struct {
     size_t rec_bytes[ST_MAX_REC];
 } StLayout;
 
-// A snapshot's position and scalars (Ckpt.prev, Ckpt.since_eos); loaded: set by state_store_load
-// for the snapshots it read (the ones the prompt extends).
+// A snapshot's position and scalars (Ckpt.prev, Ckpt.since_eos, and Ckpt.next when has_next: the
+// token after pos, which its MTP rows pair; the snapshot at n is used only when the prompt has it
+// at n); loaded: set by state_store_load for the snapshots it read (the ones the prompt extends).
 typedef struct {
     uint64_t pos;
     uint32_t prev[2];
     uint64_t since_eos;
     bool loaded;
+    bool has_next;
+    uint32_t next;
 } StSnap;
 
 // What a state carries besides rows and recurrent buffers: the lineage that writes its new chunks

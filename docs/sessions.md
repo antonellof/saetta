@@ -22,6 +22,27 @@ In the agent, `/resume` opens a picker of earlier sessions, searchable by their 
 
 ![/resume: the session picker](../web/assets/code/resume.png)
 
+## Interrupted runs
+
+A run that stops in the middle (a crash, a kill, a closed terminal, a reboot) can be resumed. While the agent works, Saetta Code keeps a journal of the run beside the session file (`<session>.jsonl.run`, which pi does not list): the prompt, each message before it reaches the session file, each tool call before it starts and its result when it ends, the output a running command printed (once a second), and the messages queued meanwhile. The journal is removed when the run ends, so one exists only for a run that is going on or was cut off. The session file itself stays pi's.
+
+At the next start in that folder (with or without `-c`), Saetta Code offers the interrupted run:
+
+```text
+The last run in this folder was interrupted 4 minutes ago (session "fix the parser").
+It was running: bash  npm test
+> Resume the run
+  Open the session without resuming
+  Discard the run
+```
+
+- **Resume the run**: messages the session file lost are written back, tool calls that finished keep their result, and the run goes on from where it stopped. read, grep, find and ls calls that were running run again. A bash, write, edit, MCP or subagent call that was running is never run again on its own: Saetta Code asks ("Run it again?", with a hint for write and edit saying whether the change looks applied). The default reports it to the model as interrupted, with the output it printed, and the model decides what to do. Messages queued before the crash are sent with the resumed run.
+- **Open the session without resuming**: the running calls are reported as interrupted in the session, nothing runs and nothing is sent.
+- **Discard the run**: the journal is removed and the session stays as pi leaves it.
+- Escape leaves the choice for the next start.
+
+A run interrupted 3 times in a row without progress is not resumed again: its open calls are reported as interrupted. A run whose session was continued meanwhile (by pi or another Saetta Code) is not offered. Without a terminal, `saetta code --recover` resumes the run (calls that may have had effects are reported as interrupted), in print and JSON mode.
+
 ## The session tree
 
 A session is a tree, not a list: going back to an earlier message and continuing from there adds a branch, and the old branch stays in the file.

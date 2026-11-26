@@ -11,6 +11,7 @@
 #include "code.h"
 #include "code_autocompact.h"
 #include "code_cfg.h"
+#include "code_durable.h"
 #include "code_mcp.h"
 #include "code_oai.h"
 #include "code_res.h"
@@ -49,7 +50,7 @@ typedef struct {
     const char *provider, *model, *thinking, *mode, *system_prompt, *tools, *pack, *ctx, *session;
     const char *kwargs;  // --default-chat-template-kwargs (with --pack)
     DownloadLoras loras; // --lora-modules and --lora (with --pack)
-    bool print, cont, no_session, no_tools, no_skills, no_mcp, subagents;
+    bool print, cont, no_session, no_tools, no_skills, no_mcp, subagents, recover;
     int approve; // --approve 1, --no-approve 0, else -1
     VEC(const char *) skills;
     VEC(const char *) prompts;
@@ -90,6 +91,13 @@ typedef struct {
     // arena of their own (the rpc thread uses a only under the lock)
     bool rpc;
     Arena *io;
+    // a run resumed after a crash (code_durable.c): its open round's calls, and the assistant
+    // message the turn loop starts from instead of a request
+    DurRecovery *recover;
+    JValue *resume_msg;
+    // the interrupted run to resume when the interactive screen starts (Resume in its prompt)
+    DurRecovery *pending;
+    bool recovered; // the session is an interrupted run's, opened at start: drawn as a continued one
 } Run;
 
 static double wall_ms(void) { return (double)(wall_ns() / 1000000); }
@@ -155,6 +163,7 @@ static Err parse_args(Arena *a, const char *const *v, size_t n, Args *o) {
         else if (!strcmp(x, "--no-approve") || !strcmp(x, "-na")) o->approve = 0;
         else if (!strcmp(x, "--no-mcp")) o->no_mcp = true;
         else if (!strcmp(x, "--subagents")) o->subagents = true;
+        else if (!strcmp(x, "--recover")) o->recover = true;
         else if (!strcmp(x, "--help") || !strcmp(x, "-h")) {
             printf("usage: saetta code [options] [prompt ...]\n"
                    "\n"
@@ -170,6 +179,8 @@ static Err parse_args(Arena *a, const char *const *v, size_t n, Args *o) {
                    "  -c, --continue           continue the most recent session in this folder\n"
                    "  --session FILE           continue this session file\n"
                    "  --no-session             do not save the session\n"
+                   "  --recover                resume the run a crash interrupted in this folder (or --session's):\n"
+                   "                           read-only tools run again, the others are reported as interrupted\n"
                    "  --provider P --model M   the model (M may be provider/id and end in :thinking)\n"
                    "  --thinking LEVEL         off, minimal, low, medium, high, xhigh, max\n"
                    "  --tools a,b,c | --no-tools   the tool set\n"
@@ -616,6 +627,7 @@ static Err stream_assistant(Run *r, JValue **out) {
         if (!str_eqz(json_strs(json_get(all->arr.items[i], "role")), "system")) json_push(a, conv, all->arr.items[i]);
     Buf body = {0};
     TRY(code_oai_body(a, &r->model, system, conv, current_tools(a, system), &body));
+    code_durable_request(code_session_leaf(r->session), buf_str(&body));
     Stream st = {.r = r};
     CodeSink sink = {.on_event = on_event, .ctx = &st};
     r->env.now_ms = wall_ms();
@@ -745,6 +757,7 @@ static void error_result(Arena *a, const JValue *call, const char *text, JValue 
 // arena (a long command sends one every 100 ms)
 static void on_tool_partial(void *ctx, const JValue *partial) {
     Run *r = ctx;
+    if (r->call) code_durable_output(r->call, partial);
     if (!r->call || (!r->ui && !r->json && !r->rpc)) return;
     if (r->rpc) code_rpc_lock();
     Arena t = {0};
@@ -829,12 +842,43 @@ static SubagentBatch *subagent_begin(Run *r) {
 // running (unknown tool, bad arguments: its result has no durationMs) ends at once, the executed
 // ones end after every start (failures first); then the results, in call order. Subagent calls
 // (code_subagent.c) run together once every call has started, on threads of their own.
+// The recovery plan's entry for a call of the round a resumed run starts with, or NULL.
+static const DurCall *recover_call(const Run *r, const JValue *call) {
+    if (!r->recover) return NULL;
+    const char *id = json_str(json_get(call, "id"));
+    for (size_t i = 0; id && i < r->recover->ncalls; i++)
+        if (r->recover->calls[i].id && !strcmp(r->recover->calls[i].id, id)) return &r->recover->calls[i];
+    return NULL;
+}
+
+// A resumed round's call that is not run: its journalled result, or the interrupted error result.
+static bool settle_recovered(Run *r, const JValue *call, JValue **msg, JValue **raw) {
+    const DurCall *dc = recover_call(r, call);
+    if (!dc) return false;
+    bool limit = r->recover->limit;
+    if (dc->state == DC_RECORDED) {
+        *msg = dc->result;
+        *raw = json_new(r->a, J_OBJECT);
+        json_put(r->a, *raw, S("content"), (JValue *)json_get(*msg, "content"));
+        json_put(r->a, *raw, S("details"), json_get(*msg, "details") ? (JValue *)json_get(*msg, "details") : json_new(r->a, J_OBJECT));
+        return true;
+    }
+    if (!limit && (dc->state == DC_NOT_STARTED || dc->state == DC_SAFE || (dc->state == DC_ASK && dc->rerun))) return false;
+    error_result(r->a, call, code_durable_interrupted_text(r->a, str(dc->name), dc->output), msg, raw);
+    code_durable_result(call, *msg);
+    return true;
+}
+
 static Err run_tools(Run *r, const JValue *assistant, JValue *results) {
     Arena *a = r->a;
     const JValue *content = json_get(assistant, "content");
     VEC(const JValue *) calls = {0};
     for (size_t i = 0; content && i < content->arr.len; i++)
-        if (str_eqz(json_strs(json_get(content->arr.items[i], "type")), "toolCall")) vec_push(&calls, content->arr.items[i]);
+        if (str_eqz(json_strs(json_get(content->arr.items[i], "type")), "toolCall")) {
+            const DurCall *dc = recover_call(r, content->arr.items[i]);
+            if (dc && dc->state == DC_HAVE) continue; // its result is in the session already
+            vec_push(&calls, content->arr.items[i]);
+        }
     JValue **msgs = arena_alloc(a, (calls.len + 1) * sizeof *msgs);
     JValue **raws = arena_alloc(a, (calls.len + 1) * sizeof *raws);
     Err err = OK;
@@ -847,6 +891,10 @@ static Err run_tools(Run *r, const JValue *assistant, JValue *results) {
         emit_tool_start(r, calls.ptr[i]);
         r->env.now_ms = wall_ms();
         Str name = json_strs(json_get(calls.ptr[i], "name"));
+        if (settle_recovered(r, calls.ptr[i], &msgs[i], &raws[i])) {
+            if (!json_get(msgs[i], "durationMs")) emit_tool_end(r, calls.ptr[i], msgs[i], raws[i]);
+            continue;
+        }
         if (!declared(r, name)) {
             error_result(a, calls.ptr[i], arena_printf(a, "Tool %.*s not found", (int)name.len, name.ptr), &msgs[i], &raws[i]);
             emit_tool_end(r, calls.ptr[i], msgs[i], raws[i]);
@@ -868,11 +916,13 @@ static Err run_tools(Run *r, const JValue *assistant, JValue *results) {
                 json_put(a, run, mb->key, str_eqz(mb->key, "arguments") ? valid : mb->val);
             }
             if (!sb) sb = subagent_begin(r);
+            code_durable_intent(calls.ptr[i], false);
             code_subagent_add(sb, r->rpc ? r->io : a, run, &msgs[i], &raws[i]); // rpc: built without its lock
             continue;
         }
         prepare_edit_in_place(a, calls.ptr[i]);
         r->call = calls.ptr[i];
+        code_durable_intent(calls.ptr[i], code_durable_safe(name));
         if (r->rpc) {
             CodeEnv env = r->env;
             code_rpc_unlock();
@@ -880,6 +930,7 @@ static Err run_tools(Run *r, const JValue *assistant, JValue *results) {
             code_rpc_lock();
         } else err = code_tool_run(a, &r->env, calls.ptr[i], &msgs[i], &raws[i]);
         r->call = NULL;
+        if (!err) code_durable_result(calls.ptr[i], msgs[i]);
         if (!err && !json_get(msgs[i], "durationMs")) emit_tool_end(r, calls.ptr[i], msgs[i], raws[i]);
     }
     if (sb) {
@@ -887,7 +938,10 @@ static Err run_tools(Run *r, const JValue *assistant, JValue *results) {
         Err se = code_subagent_wait(sb);
         if (r->rpc) code_rpc_lock();
         if (!err) err = se;
+        for (size_t i = 0; i < started && !err; i++)
+            if (str_eqz(json_strs(json_get(calls.ptr[i], "name")), SUBAGENT_TOOL) && msgs[i]) code_durable_result(calls.ptr[i], msgs[i]);
     }
+    r->recover = NULL; // the plan is for the resumed round only
     // pi runs the executed calls concurrently and ends each as it settles; a call that throws
     // (a missing file, say) settles before one that completes its I/O, so errors end first
     calls.len = started;
@@ -1003,9 +1057,32 @@ static Err run_turns(Run *r, JValue **last_out, const char **last_id);
 
 // The queued messages (the interactive mode's or the rpc mode's): the next one for the run, NULL
 // when none; more: a further one in the same turn (rpc's queue mode "all").
+// Queued messages a resumed run restored in print and json mode (the screen and the rpc mode
+// restore theirs into their own queues).
+typedef struct {
+    char *text;
+    bool steer;
+} Restored;
+static VEC(Restored) g_restored;
+
+static char *take_restored(bool steering) {
+    for (size_t i = 0; i < g_restored.len; i++)
+        if (g_restored.ptr[i].steer || !steering) {
+            char *t = g_restored.ptr[i].text;
+            memmove(g_restored.ptr + i, g_restored.ptr + i + 1, (g_restored.len - i - 1) * sizeof *g_restored.ptr);
+            g_restored.len--;
+            return t;
+        }
+    return NULL;
+}
+
 static char *take_queued(Run *r, bool steering, bool more) {
-    if (r->rpc) return code_rpc_take_queued(steering, more);
-    return r->ui && !more ? code_ui_take_queued(steering) : NULL;
+    char *t = r->rpc         ? code_rpc_take_queued(steering, more)
+              : r->ui && !more ? code_ui_take_queued(steering)
+              : !r->ui && !more ? take_restored(steering)
+                                : NULL;
+    if (t) code_durable_take(t);
+    return t;
 }
 
 static volatile int g_retry_waiting; // a retry's backoff is running (the rpc mode's abort_retry)
@@ -1071,13 +1148,17 @@ static Err prompt(Run *r, const char *text) {
     mcp_tools(r);
     if (r->rpc) code_rpc_prompt_started(); // the rpc mode's response to the prompt (preflightResult)
     r->new_messages = json_new(a, J_ARRAY);
+    // the run's journal (code_durable.c), before anything of it reaches the session
+    code_durable_begin(r->session, r->rpc ? "rpc" : r->ui ? "interactive" : r->json ? "json" : "print", text);
     emit(r, ev_new(a, "agent_start"));
     emit(r, ev_new(a, "turn_start"));
     JValue *sys;
     TRY(pending_system(r, code_session_messages(r->session), &sys));
     if (sys) TRY(add_message(r, sys));
     TRY(add_message(r, user_message(a, code_skill_expand(a, &r->env, text, NULL)))); // /skill:name
-    return run_agent(r, true);
+    TRY(run_agent(r, true));
+    code_durable_end(); // the run settled: answered, aborted or failed as pi records it
+    return OK;
 }
 
 // The agent loop until it ends, then the retry policy: a retryable error is kept in the file,
@@ -1153,6 +1234,116 @@ static Err run_agent(Run *r, bool started) {
     }
 }
 
+// ---- a run a crash interrupted (code_durable.c) ----------------------------------------------------------
+
+static void ui_note(Run *r, const char *type, const char *msg) {
+    if (r->ui) {
+        JValue *ev = ev_new(r->a, type);
+        json_put(r->a, ev, S("message"), json_string(r->a, str(msg)));
+        emit(r, ev);
+    } else if (!r->rpc) dbg("saetta code: %s\n", msg);
+}
+
+// Resumes rec on r->session (reconciled): the journal adopted, the queued messages put back, the
+// open round settled (journalled results kept, read-only calls run again, the others run again
+// only when the user said so, else reported as interrupted), then the turn loop goes on. go false
+// (Open without resuming): the round is settled with nothing run and no request is sent. Past the
+// restart limit the same, with the reason shown.
+static Err resume_run(Run *r, DurRecovery *rec, bool go) {
+    Arena *a = r->a;
+    if (rec->prompt && !go) { // nothing of the run reached the session: nothing to settle
+        code_durable_drop(rec);
+        return OK;
+    }
+    ac_bind(r);
+    mcp_tools(r);
+    code_durable_adopt(rec, r->session);
+    if (rec->prompt) { // the prompt never reached the session: it runs again, with a journal of its own
+        code_durable_end();
+        return prompt(r, rec->prompt);
+    }
+    bool stop = !go || rec->limit;
+    if (!stop)
+        for (size_t i = 0; i < rec->nqueued; i++) {
+            if (r->ui) code_ui_queue_restore(rec->queued[i], rec->queued_steer[i]);
+            else vec_push(&g_restored, ((Restored){strdup(rec->queued[i]), rec->queued_steer[i]}));
+        }
+    if (!go) rec->limit = true; // every open call settled without running
+    r->new_messages = json_new(a, J_ARRAY);
+    emit(r, ev_new(a, "agent_start"));
+    emit(r, ev_new(a, "turn_start"));
+    // what happens to each open call, said once
+    Buf note = {0};
+    buf_adds(&note, go && !rec->limit ? "Resuming the interrupted run." : "The interrupted run is not resumed.");
+    for (size_t i = 0; i < rec->ncalls; i++) {
+        const DurCall *c = &rec->calls[i];
+        if (c->state == DC_HAVE) continue;
+        const char *what = c->state == DC_RECORDED ? "finished before the interruption, its result kept"
+                           : rec->limit           ? "reported as interrupted"
+                           : c->state == DC_ASK && !c->rerun ? "reported as interrupted"
+                           : c->state == DC_NOT_STARTED ? "not started yet, runs now"
+                                                        : "runs again";
+        buf_printf(&note, "\n%s: %s", code_durable_call_summary(a, c->call), what);
+    }
+    if (rec->limit && go)
+        buf_printf(&note, "\nIt was interrupted %lld times in a row; the model is not asked again.", (long long)rec->interruptions);
+    if (go) ui_note(r, rec->limit ? "ui_error" : "ui_status", note.ptr); // Open: the transcript shows it
+    buf_free(&note);
+    const JValue *msgs = code_session_messages(r->session);
+    JValue *assistant = NULL;
+    for (size_t i = msgs->arr.len; i-- > 0;)
+        if (str_eqz(json_strs(json_get(msgs->arr.items[i], "role")), "assistant")) {
+            assistant = msgs->arr.items[i];
+            break;
+        }
+    bool open_round = false;
+    for (size_t i = 0; i < rec->ncalls; i++) open_round |= rec->calls[i].state != DC_HAVE;
+    if (open_round && assistant && rec->limit) {
+        r->recover = rec;
+        JValue *results = json_new(a, J_ARRAY);
+        TRY(run_tools(r, assistant, results));
+        JValue *te = ev_new(a, "turn_end");
+        json_put(a, te, S("message"), assistant);
+        json_put(a, te, S("toolResults"), results);
+        emit(r, te);
+        finish_agent(r, false, NULL, NULL);
+    } else if (open_round && assistant) {
+        r->recover = rec;
+        r->resume_msg = assistant;
+        TRY(run_agent(r, true));
+    } else if (rec->waiting_model && !stop) {
+        TRY(run_agent(r, true));
+    } else
+        finish_agent(r, false, NULL, NULL);
+    r->recover = NULL;
+    code_durable_end();
+    return OK;
+}
+
+// The interactive startup's questions: the run, then each call that may have had effects.
+// 0 leave it for later, 1 resume, 2 open without resuming, 3 discard.
+static int ask_recovery(Arena *a, DurRecovery *rec, const JValue *settings) {
+    const char *theme = json_str(json_get(settings, "theme"));
+    const char *running = code_durable_running(a, rec);
+    const char *title = arena_printf(a, "The last run in this folder was interrupted %s ago (session \"%s\").\n%s",
+                                     code_durable_ago(a, rec->started_ms), rec->name, running);
+    static const char *const opts[] = {"Resume the run", "Open the session without resuming", "Discard the run"};
+    int sel = code_trust_select(title, opts, COUNT(opts), theme);
+    return sel < 0 ? 0 : sel + 1;
+}
+
+static void ask_calls(Arena *a, DurRecovery *rec, const JValue *settings) {
+    const char *theme = json_str(json_get(settings, "theme"));
+    for (size_t i = 0; i < rec->ncalls && !rec->limit; i++) {
+        DurCall *c = &rec->calls[i];
+        if (c->state != DC_ASK) continue;
+        const char *title = arena_printf(a, "This call was running when Saetta Code stopped:\n  %s\n%s%sRun it again?",
+                                         code_durable_call_summary(a, c->call), c->hint ? c->hint : "", c->hint ? "\n" : "");
+        static const char *const opts[] = {"Report it as interrupted", "Run it again"};
+        c->rerun = code_trust_select(title, opts, COUNT(opts), theme) == 1;
+    }
+}
+
 // agent_end, then _handlePostAgentRun's end of the retries and _checkCompaction: true when the
 // run continues (agent.continue()), else agent_settled.
 static bool finish_agent(Run *r, bool will_retry, const JValue *last, const char *last_id) {
@@ -1221,7 +1412,11 @@ static Err run_turns(Run *r, JValue **last_out, const char **last_id) {
         ui_requests(r);
         if (code_mcp_turn_start()) mcp_tools(r); // turn_start: MCP sign-ins done elsewhere meanwhile (code_mcp.c)
         JValue *msg;
-        TRY(stream_assistant(r, &msg));
+        if (r->resume_msg) { // a resumed run: its open round's answer is in the session already
+            msg = r->resume_msg;
+            r->resume_msg = NULL;
+        } else
+            TRY(stream_assistant(r, &msg));
         *last_out = msg;
         *last_id = code_session_leaf(r->session);
         Str stop = json_strs(json_get(msg, "stopReason"));
@@ -1312,6 +1507,16 @@ static void host_new_session(CodeUiHost *h) {
 }
 
 static void host_set_thinking(CodeUiHost *h, const char *level) { apply_thinking(h->r, level); }
+
+static void host_recover(CodeUiHost *h) {
+    Run *r = h->r;
+    DurRecovery *rec = r->pending;
+    r->pending = NULL;
+    if (!rec) return;
+    g_abort = 0;
+    Err e = resume_run(r, rec, true);
+    if (e) ui_note(r, "ui_error", arena_printf(r->a, "saetta code: %s", e));
+}
 
 static void apply_thinking(Run *r, const char *level) {
     Arena *a = r->a;
@@ -2019,7 +2224,8 @@ static Err interactive(Run *r, const Args *o, const JValue *settings) {
         .default_provider = json_str(json_get(settings, "defaultProvider")),
         .default_model = json_str(json_get(settings, "defaultModel")),
         .settings = settings,
-        .resumed = (o->cont || o->session) && code_session_messages(r->session)->arr.len > 0,
+        .resumed = (o->cont || o->session || r->recovered) && code_session_messages(r->session)->arr.len > 0,
+        .recover = r->pending != NULL,
         .version = code_version,
     };
     cfg.engine = r->model.engine != NULL || code_share_holding(); // (the tests' stand-in holds no engine)
@@ -2028,7 +2234,8 @@ static Err interactive(Run *r, const Args *o, const JValue *settings) {
                      host_set_leaf, host_set_model, host_abort, host_restart, host_reload_models,
                      .session_file = host_session_file, .session_dir = host_session_dir, .session_cwd = host_session_cwd,
                      .system_prompt = host_system_prompt, .tool_decls = host_tool_decls, .open_session = host_open_session,
-                     .session = host_session, .fork = host_fork, .resume = host_resume, .compact = host_compact};
+                     .session = host_session, .fork = host_fork, .resume = host_resume, .compact = host_compact,
+                     .recover = host_recover};
     CodeUiHost host = {r};
     // a stand-in for a slow model load, for the loader's test scenario: SAETTA_CODE_LOAD_DEMO_MS
     const char *demo = getenv("SAETTA_CODE_LOAD_DEMO_MS");
@@ -2518,6 +2725,43 @@ Err code_run(const char *const *args, size_t n, int *code) {
     }
     e = o.session ? code_session_open_path(a, o.session, &r.session) : code_session_open(a, &r.env, o.cont, o.no_session, &r.session);
     if (e) goto done;
+    // a run a crash interrupted (code_durable.c): offered at an interactive start (this session's,
+    // else the most recent one in its folder), resumed with --recover; SAETTA_DURABLE=0: no journal
+    DurRecovery *rec = NULL;
+    int rchoice = 0; // 0 none (or later), 1 resume, 2 open without resuming, 3 discard
+    const char *dur_env = getenv("SAETTA_DURABLE");
+    if (!o.no_session && !(dur_env && !strcmp(dur_env, "0"))) {
+        code_durable_init(); // every mode journals its runs; only the screen and --recover resume them
+        const char *sp = code_session_path(r.session);
+        if (sp && !rpc && (tty || o.recover)) {
+            const char *slash = strrchr(sp, '/');
+            const char *dir = slash ? arena_strndup(a, sp, (size_t)(slash - sp)) : ".";
+            rec = code_durable_find(a, dir, code_session_written(r.session) ? sp : NULL);
+        }
+        if (rec) rchoice = tty ? ask_recovery(a, rec, settings) : 1;
+        if (rec && rchoice == 0) {
+            code_durable_release(rec);
+            rec = NULL;
+        } else if (rec && rchoice == 3) {
+            code_durable_drop(rec);
+            rec = NULL;
+        } else if (rec) {
+            CodeSession *s2 = NULL;
+            Err re = code_durable_reconcile(a, rec, &s2);
+            if (re) {
+                dbg("saetta code: the interrupted run cannot be resumed (%s)\n", re);
+                code_durable_release(rec);
+                rec = NULL;
+            } else {
+                if (s2) {
+                    r.session = s2;
+                    r.recovered = true;
+                }
+                if (tty && rchoice == 1) ask_calls(a, rec, settings);
+            }
+        }
+        if (!rec && o.recover && !tty) dbg("saetta code: no interrupted run to resume here\n");
+    }
     // thinking level: the flag, else the session's, else the settings' default, else medium
     const JValue *recorded = code_session_last(r.session, "thinking_level_change", "thinkingLevel");
     const char *level = o.thinking            ? o.thinking
@@ -2558,12 +2802,19 @@ Err code_run(const char *const *args, size_t n, int *code) {
         if (!e) *code = 0;
         goto done;
     }
+    if (rec && rchoice == 2) { // Open without resuming: the open calls reported, nothing sent
+        e = resume_run(&r, rec, false);
+        rec = NULL;
+        if (e) goto done;
+    }
     if (!o.print && !piped && !r.json && isatty(0) && isatty(1)) {
+        r.pending = rec;
         e = interactive(&r, &o, settings);
         if (!e) *code = 0;
         goto done;
     }
     if (r.json) emit(&r, (JValue *)code_session_header(r.session));
+    if (rec) e = resume_run(&r, rec, true); // --recover
     for (size_t i = 0; i < o.prompts.len && !e; i++) e = prompt(&r, o.prompts.ptr[i]);
     if (e) goto done;
     *code = 0;

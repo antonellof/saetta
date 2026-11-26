@@ -448,6 +448,15 @@ static int run_prompt(Prompt *p, const char *theme) {
     return result;
 }
 
+// Saetta Code's own startup questions (code_durable.c's recovery): the trust prompt's selector with
+// these choices. The selection's index, or -1 when cancelled.
+int code_trust_select(const char *title, const char *const *labels, size_t n, const char *theme) {
+    Prompt p = {.title = title};
+    p.n = MIN(n, COUNT(p.opts));
+    for (size_t i = 0; i < p.n; i++) p.opts[i].label = labels[i];
+    return run_prompt(&p, theme);
+}
+
 // ---- the session's trust (main.ts createRuntime, project-trust.ts resolveProjectTrusted) -------------
 
 static const char *trust_title(Arena *a, const char *cwd) {

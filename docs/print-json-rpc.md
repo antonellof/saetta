@@ -16,6 +16,8 @@ git log -20 --oneline | saetta code -p "write release notes from these commits"
 
 Piped input is joined to the prompt, and makes the run a print run even without `-p`. The session is saved as usual (`--no-session` skips it), so `saetta code -c` can continue it in the terminal UI.
 
+A run that a crash or a kill cut off is resumed with `--recover` (in this folder, or the session given with `--session`): read-only tool calls that were running run again, the others are reported to the model as interrupted, and the run goes on. See [Interrupted runs](sessions.md#interrupted-runs).
+
 In a project that is not yet trusted there is no prompt to ask in, so project resources stay off; pass `--approve` to trust it for the run. See [Context and skills](context-and-skills.md#project-trust).
 
 ## JSON mode

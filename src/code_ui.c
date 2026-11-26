@@ -2603,6 +2603,17 @@ static void model_filter_extra(ModelSel *ms, const char *query) {
     }
 }
 
+typedef struct {
+    size_t k; // the place in the sorted list
+    double score;
+} ModelHit;
+
+static int hit_cmp(const void *a, const void *b) {
+    const ModelHit *x = a, *y = b;
+    if (x->score != y->score) return x->score < y->score ? -1 : 1;
+    return x->k < y->k ? -1 : 1; // Array.sort is stable
+}
+
 static void model_filter(ModelSel *ms, const char *query) {
     const CodeUiModel *ms_all = U->cfg->models;
     size_t n = U->cfg->nmodels;
@@ -2613,28 +2624,37 @@ static void model_filter(ModelSel *ms, const char *query) {
     free(ms->idx);
     ms->idx = xmalloc((n + 3) * sizeof *ms->idx);
     ms->n = 0;
-    for (size_t k = 0; k < n; k++) {
-        const CodeUiModel *m = &ms_all[order[k]];
-        bool ok = true;
-        if (query && *query) {
+    bool searching = false;
+    for (const char *q = query ? query : ""; *q; q++)
+        if (*q != ' ' && *q != '/') searching = true;
+    if (!searching) {
+        for (size_t k = 0; k < n; k++) ms->idx[ms->n++] = order[k];
+    } else {
+        // fuzzyFilter: the matches best first (a scattered match in a long path ranks after a whole id)
+        ModelHit *hits = xmalloc((n + 1) * sizeof *hits);
+        size_t nh = 0;
+        for (size_t k = 0; k < n; k++) {
+            const CodeUiModel *m = &ms_all[order[k]];
             Buf hay = {0};
             buf_printf(&hay, "%s %s/%s %s %s%s%s%s%s%s", m->provider, m->provider, m->id, m->provider, m->id, m->name ? " " : "",
                        m->name ? m->name : "", is_default_model(m) ? " default" : "", m->note ? " " : "", m->note ? m->note : "");
-            for (const char *q = query; *q && ok;) {
-                while (*q == ' ') q++;
-                const char *e = q;
-                while (*e && *e != ' ') e++;
-                const char *h = hay.ptr;
-                for (const char *c = q; c < e && ok; c++) {
-                    while (*h && tolower((unsigned char)*h) != tolower((unsigned char)*c)) h++;
-                    if (!*h) ok = false;
-                    else h++;
-                }
-                q = e;
-            }
+            double sc;
+            if (tui_fuzzy_score(str(query), buf_str(&hay), &sc)) hits[nh++] = (ModelHit){k, sc};
             buf_free(&hay);
         }
-        if (ok) ms->idx[ms->n++] = order[k];
+        qsort(hits, nh, sizeof *hits, hit_cmp);
+        // isDefaultSearch: a prefix of "default" puts the default model first
+        const char *t = query;
+        while (*t == ' ') t++;
+        size_t tl = strlen(t);
+        while (tl && t[tl - 1] == ' ') tl--;
+        bool dflt = tl && tl <= 7 && !strncasecmp(t, "default", tl);
+        if (dflt)
+            for (size_t k = 0; k < n; k++)
+                if (is_default_model(&ms_all[order[k]])) ms->idx[ms->n++] = order[k];
+        for (size_t h = 0; h < nh; h++)
+            if (!dflt || !is_default_model(&ms_all[order[hits[h].k]])) ms->idx[ms->n++] = order[hits[h].k];
+        free(hits);
     }
     free(order);
     model_filter_extra(ms, query);

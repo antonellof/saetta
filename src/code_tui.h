@@ -68,6 +68,12 @@ void tui_slice(Buf *out, Str line, int start, int len, bool strict);
 void tui_strip(Buf *out, Str s);
 void tui_spaces(Buf *b, int n);
 void tui_repeat(Buf *b, const char *s, int n);
+// fuzzyMatch (pi-tui fuzzy.ts): every query character in text, in order, case folded (ASCII);
+// *score is lower for a better match (consecutive runs, word starts, early positions).
+bool tui_fuzzy_match(Str query, Str text, double *score);
+// fuzzyFilter's test for one item: query split at spaces and slashes, every token matching;
+// *score is the sum of the tokens' scores (an empty query matches with 0).
+bool tui_fuzzy_score(Str query, Str text, double *score);
 // JavaScript's string length (UTF-16 code units), for pi's estimates.
 size_t tui_js_len(Str s);
 // A code point as UTF-8 (out holds 4 bytes); returns its length.

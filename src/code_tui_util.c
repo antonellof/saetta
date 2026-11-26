@@ -2,12 +2,13 @@
 // basic components (Text, Spacer, Container) and the select list (see code_tui.h).
 // Adapted from pi (MIT, Copyright (c) 2025 Mario Zechner; github.com/earendil-works/pi at v1.5.2,
 // b4afddd): packages/tui/src/utils.ts (visibleWidth, wrapTextWithAnsi, truncateToWidth,
-// sliceWithWidth, AnsiCodeTracker), components/text.ts, spacer.ts, select-list.ts, and
+// sliceWithWidth, AnsiCodeTracker), fuzzy.ts, components/text.ts, spacer.ts, select-list.ts, and
 // packages/coding-agent/src/modes/interactive/theme/ (theme.ts, system-theme.ts indexedColors).
 #include "code_tui.h"
 #include "code_tui_theme.h"
 #include "unicode.h"
 
+#include <ctype.h>
 #include <stdlib.h>
 
 // ---- child processes -----------------------------------------------------------------------------
@@ -1356,4 +1357,110 @@ void sel_render(SelectList *s, int width, Lines *out) {
         lines_addb(out, &b);
         buf_free(&t);
     }
+}
+
+// ---- fuzzy matching (fuzzy.ts) ----------------------------------------------------------------------
+
+static double fz_positions(Str t, const size_t *pos, size_t n) {
+    double score = 0;
+    long last = -1;
+    int run = 0;
+    for (size_t k = 0; k < n; k++) {
+        long i = (long)pos[k];
+        if (last == i - 1) {
+            run++;
+            score -= run * 5;
+        } else {
+            run = 0;
+            if (last >= 0) score += (double)(i - last - 1) * 2;
+        }
+        if (i == 0 || strchr(" \t\n\r\f\v-_./:", t.ptr[i - 1])) score -= 10;
+        score += (double)i * 0.1;
+        last = i;
+    }
+    return score;
+}
+
+// matchQuery on lowered text: the greedy alignment, then every contiguous occurrence, the best kept.
+static bool fz_query(Str q, Str t, double *score) {
+    *score = 0;
+    if (!q.len) return true;
+    if (q.len > t.len) return false;
+    size_t *pos = xmalloc(q.len * sizeof *pos);
+    size_t from = 0;
+    for (size_t k = 0; k < q.len; k++) {
+        const char *c = from < t.len ? memchr(t.ptr + from, q.ptr[k], t.len - from) : NULL;
+        if (!c) {
+            free(pos);
+            return false;
+        }
+        pos[k] = (size_t)(c - t.ptr);
+        from = pos[k] + 1;
+    }
+    double s = fz_positions(t, pos, q.len);
+    for (size_t st = 0; st + q.len <= t.len; st++) {
+        if (memcmp(t.ptr + st, q.ptr, q.len)) continue;
+        for (size_t k = 0; k < q.len; k++) pos[k] = st + k;
+        double c = fz_positions(t, pos, q.len);
+        if (c < s) s = c;
+    }
+    free(pos);
+    if (q.len == t.len && !memcmp(q.ptr, t.ptr, q.len)) s -= 100;
+    *score = s;
+    return true;
+}
+
+static char *fz_lower(Str s) {
+    char *o = xmalloc(s.len + 1);
+    for (size_t i = 0; i < s.len; i++) o[i] = (char)tolower((unsigned char)s.ptr[i]);
+    o[s.len] = 0;
+    return o;
+}
+
+bool tui_fuzzy_match(Str query, Str text, double *score) {
+    char *ql = fz_lower(query), *tl = fz_lower(text);
+    Str q = str_n(ql, query.len), t = str_n(tl, text.len);
+    bool ok = fz_query(q, t, score);
+    if (!ok && q.len) {
+        // letters then digits, or digits then letters: the halves swapped ("gpt5" finds "5gpt"), +5
+        size_t i = 0;
+        bool alpha0 = q.ptr[0] >= 'a' && q.ptr[0] <= 'z', digit0 = q.ptr[0] >= '0' && q.ptr[0] <= '9';
+        while (i < q.len && (alpha0 ? q.ptr[i] >= 'a' && q.ptr[i] <= 'z' : q.ptr[i] >= '0' && q.ptr[i] <= '9')) i++;
+        size_t j = i;
+        while (j < q.len && (alpha0 ? q.ptr[j] >= '0' && q.ptr[j] <= '9' : q.ptr[j] >= 'a' && q.ptr[j] <= 'z')) j++;
+        if ((alpha0 || digit0) && i > 0 && j > i && j == q.len) {
+            char *sw = xmalloc(q.len + 1);
+            memcpy(sw, q.ptr + i, q.len - i);
+            memcpy(sw + q.len - i, q.ptr, i);
+            sw[q.len] = 0;
+            double s2;
+            if (fz_query(str_n(sw, q.len), t, &s2)) {
+                ok = true;
+                *score = s2 + 5;
+            }
+            free(sw);
+        }
+    }
+    if (!ok) *score = 0;
+    free(ql);
+    free(tl);
+    return ok;
+}
+
+bool tui_fuzzy_score(Str query, Str text, double *score) {
+    *score = 0;
+    for (size_t i = 0; i < query.len;) {
+        while (i < query.len && (isspace((unsigned char)query.ptr[i]) || query.ptr[i] == '/')) i++;
+        size_t e = i;
+        while (e < query.len && !isspace((unsigned char)query.ptr[e]) && query.ptr[e] != '/') e++;
+        if (e == i) break;
+        double s;
+        if (!tui_fuzzy_match(str_n(query.ptr + i, e - i), text, &s)) {
+            *score = 0;
+            return false;
+        }
+        *score += s;
+        i = e;
+    }
+    return true;
 }

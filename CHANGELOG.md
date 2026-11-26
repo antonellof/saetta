@@ -3,7 +3,7 @@
 All notable changes to saetta and Saetta Code (`saetta code`), newest first. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are saetta's.
 
-## [Unreleased]
+## [0.19.0] - 2026-11-26
 
 ### Added
 
@@ -15,6 +15,12 @@ All notable changes to saetta and Saetta Code (`saetta code`), newest first. The
 ### Changed
 
 - An adapter that does not fit the base model (the base its `adapter_config.json` names, its rank or target modules) is refused before the load with the reason, by `saetta serve`, `saetta start` and Saetta Code alike.
+
+### Fixed
+
+- A Saetta Code session no longer waits forever for a shared model whose session has exited: a record counts only while its holder still holds the lock, and a session exiting slowly is waited for at most 30 s.
+- `/model` filtering ranks matches the way pi does (best first), so the highlighted model is the one typed, not the current one.
+- The README and site lead with Saetta Code and its models; a new ASCII-art banner.
 
 ## [0.18.0] - 2026-11-23
 

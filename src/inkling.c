@@ -108,6 +108,8 @@ typedef struct {
     sx_pipeline *ds_mv, *ds_mix, *ds_rope, *ds_attn, *ds_attn_h, *ds_addn, *ds_silu, *ds_step, *ds_fold, *ds_argmax, *ds_fold_t,
         *ds_ring;
     sx_pipeline *mv, *mm; // qgen: qmatvec_gen, qmm_gen
+    // prompt chunks on the tensor ops (inkling_mpp.metal; NULL where they do not run)
+    sx_pipeline *im_plan, *im_gather, *im_gu_nv, *im_gu_mx, *im_dn_nv, *im_dn_mx;
 } Pipes;
 
 // Scratch regions, floats per token (each region holds PCH rows).
@@ -122,6 +124,9 @@ static const size_t region_w[R_N] = {
     [R_TAP] = 4 * H}; // R_TAP: 4 planes of [PCH][H], the drafter's trunk features
 // the expert tiles of a chunk (ink_moe_plan): at most T * TOPK / 32 + NE, 4 words each
 static_assert(PCH * TOPK / 32 + NE <= PCH);
+// the tensor-op experts' sorted rows (each expert's padded to 32) and tiles of at most 128 rows
+#define MPP_ROWS (PCH * TOPK + 31 * NE)
+#define MPP_TILES (MPP_ROWS / 128 + NE)
 static size_t region_off[R_N + 1]; // floats
 __attribute__((constructor)) static void regions(void) {
     size_t o = 0;
@@ -181,6 +186,12 @@ struct Model {
     // Prompt chunks of PCH tokens (fast_prefill, the default), else one token at a time, which
     // gives decode's streams bit for bit (verify's exact prefill).
     bool fast_prefill;
+    // Prompt chunks (T > KMAX) on the tensor ops with half activations (accel: their kernels
+    // loaded; half_prefill: in use, the default where they load; SAETTA_PREFILL_F32 and verify's
+    // exact checks turn it off): the experts' rows sorted by expert (msrt, mtiles, mmeta: the
+    // plan), their half inputs xs_h [rows][H] and activations hs_h [rows][FF].
+    bool accel, half_prefill;
+    sx_buffer *xs_h, *hs_h, *msrt, *mtiles, *mmeta;
     // SAETTA_INK_ROUTES=<golden dir>, read at load (verify, src/inkling.h): the reference's
     // experts of every token at every visit and their margins, so the routers' own choices are
     // checked against them and the engine can be run on them: f32 rounding flips the router at
@@ -459,6 +470,32 @@ static const char ink_src[] = {
     , '\n',
 #embed "kernels/inkling_dspark.metal"
     , 0};
+static const char ink_mpp_src[] = {
+#embed "kernels/inkling_mpp.metal"
+    , 0};
+
+// The tensor-op prompt kernels, all or none (gpu_pipeline refuses them without neural
+// accelerators or with SAETTA_NO_ACCEL=1): true when they loaded.
+static bool load_mpp(Gpu *g, Pipes *pp) {
+    static const struct {
+        size_t off;
+        const char *name;
+    } kn[] = {{offsetof(Pipes, im_plan), "ink_mpp_plan"},   {offsetof(Pipes, im_gather), "ink_mpp_gather"},
+              {offsetof(Pipes, im_gu_nv), "ink_mpp_gu_nv"}, {offsetof(Pipes, im_gu_mx), "ink_mpp_gu_mx"},
+              {offsetof(Pipes, im_dn_nv), "ink_mpp_dn_nv"}, {offsetof(Pipes, im_dn_mx), "ink_mpp_dn_mx"}};
+    bool ok = true;
+    for (size_t i = 0; i < COUNT(kn) && ok; i++) {
+        ok = gpu_pipeline(g, ink_mpp_src, kn[i].name, (sx_pipeline **)((char *)pp + kn[i].off)) == OK;
+        kernel_names[kn[i].off / sizeof(sx_pipeline *)] = kn[i].name;
+    }
+    if (!ok)
+        for (size_t i = 0; i < COUNT(kn); i++) {
+            sx_pipeline **q = (sx_pipeline **)((char *)pp + kn[i].off);
+            if (*q) sx_pipeline_release(*q);
+            *q = NULL;
+        }
+    return ok;
+}
 
 Err model_load(Arena *arena, const Pack *pack, Gpu *g, Model **out) {
     Model *m = ARENA_NEW(arena, Model);
@@ -507,6 +544,16 @@ Err model_load(Arena *arena, const Pack *pack, Gpu *g, Model **out) {
         TRY(gpu_pipeline(g, src, "ink_qmv_rows", &pp->mv));
     }
     TRY(gpu_pipeline(g, qgen_src, "qmm_gen", &pp->mm));
+    m->accel = load_mpp(g, pp);
+    m->half_prefill = m->accel && getenv("SAETTA_PREFILL_F32") == NULL;
+    if (m->accel) {
+        TRY(gpu_new_buffer(g, (size_t)MPP_ROWS * H * 2, &m->xs_h));
+        TRY(gpu_new_buffer(g, (size_t)MPP_ROWS * FF * 2, &m->hs_h));
+        TRY(gpu_new_buffer(g, (size_t)MPP_ROWS * 4, &m->msrt));
+        TRY(gpu_new_buffer(g, (size_t)MPP_TILES * 16, &m->mtiles));
+        TRY(gpu_new_buffer(g, 16, &m->mmeta));
+    } else
+        dbg("model: accelerator kernels unavailable, Inkling prompt chunks on f32 tiles\n");
 
     TRY(lin(pack, PFX, "embed_tokens", CONFIG_VOCAB_SIZE, H, &m->embed));
     TRY(lin(pack, "", "lm_head", CONFIG_VOCAB_SIZE, H, &m->lm_head));
@@ -805,6 +852,17 @@ static void enc_visit(Model *m, InkSession *d, Enc *c, size_t v, uint32_t T, uin
                  reg(m, R_HACT), BYTES(mp));
             DISP(c, L->mx ? m->p.dn_mx : m->p.dn_nv, H / 32, TOPK, T, 256, dw, ds, L->gfd, reg(m, R_HACT), reg(m, R_IDX),
                  reg(m, R_W), reg(m, R_YS), BYTES(dp));
+        } else if (m->half_prefill) {
+            // a prompt chunk on the tensor ops: the pairs' rows sorted by expert, their inputs in
+            // half, tiles of up to 128 rows sharing each decoded weight tile
+            uint32_t pp[2] = {NE, T * TOPK}, gp[2] = {H, TOPK};
+            DISP(c, m->p.im_plan, 1, 1, 1, 1024, reg(m, R_IDX), B(m->msrt), B(m->mtiles), B(m->mmeta), gpu_bytes_arg(pp, 8));
+            const uint32_t rows = T * TOPK + 31 * NE, maxt = rows / 128 + NE;
+            DISP(c, m->p.im_gather, rows, 1, 1, 256, reg(m, R_XM), B(m->msrt), B(m->mmeta), B(m->xs_h), gpu_bytes_arg(gp, 8));
+            DISP(c, L->mx ? m->p.im_gu_mx : m->p.im_gu_nv, 2 * FF / 64, maxt, 1, 128, gw, gs, L->gfu, B(m->xs_h), B(m->mtiles),
+                 B(m->mmeta), B(m->hs_h), BYTES(mp));
+            DISP(c, L->mx ? m->p.im_dn_mx : m->p.im_dn_nv, H / 64, maxt, 1, 128, dw, ds, L->gfd, B(m->hs_h), B(m->mtiles), B(m->mmeta),
+                 B(m->msrt), reg(m, R_W), reg(m, R_YS), BYTES(dp));
         } else {
             // a chunk: the (token, slot) pairs grouped by expert, tiles of 32 pairs, so each expert's
             // weights are read once per chunk
@@ -1700,6 +1758,9 @@ const ModelArch inkling_arch = MODEL_ARCH_TABLE({
 
 // ---- verification hooks (src/inkling.h) ---------------------------------------------------
 
+bool inkling_half_available(const Model *m) { return m->arch == &inkling_arch && m->accel; }
+void inkling_set_half(Model *m, bool on) { m->half_prefill = on && m->accel; }
+bool inkling_half(const Model *m) { return m->half_prefill; }
 bool inkling_has_routes(const Model *m) { return m->arch == &inkling_arch && m->routes != NULL; }
 void inkling_set_routes(Model *m, InkRouteMode mode) { m->replay = mode == INK_ROUTES_REPLAY; }
 InkRouteStats inkling_route_stats(Model *m) {

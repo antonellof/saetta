@@ -326,7 +326,11 @@ static Err verify_dsv4(Arena *a, FILE *out, const Pack *pack, const char *pack_d
 //   positions before its first difference from the oracle's routes, greedy argmax at every
 //   position outside near ties (at most TOL_INK_ARGMAX_SKIP_FRAC of them skipped), KL at the
 //   dumped positions; the chunked prefill's last-token KL and argmax (TOL_PREFILL_FAST_KL); a
-//   verification chunk.
+//   verification chunk;
+// - where the tensor ops run, the accelerated prompt chunks (half activations, the default there)
+//   on the f16 KV cache: last-token KL (TOL_PREFILL_FAST_KL) and argmax on both routings, and the
+//   per-visit bound TOL_PREFILL_FAST_LAYER_REL on the oracle's experts (the exact checks above run
+//   with them off).
 // Goldens longer than a prompt chunk are run in pieces (the prefill trace of a piece only).
 
 #define INK_PIECE 1024
@@ -438,6 +442,10 @@ static Err verify_inkling(Arena *a, FILE *out, const Pack *pack, const char *pac
     const ModelInfo *mi = err ? NULL : model_info(m);
     if (!err && (G->layers != mi->layers || G->width != mi->width || G->vocab != mi->vocab)) err = "GoldenShapeMismatch";
     if (!err && !inkling_has_routes(m)) err = "GoldenWithoutRoutes";
+    // the exact checks on the f32 prompt chunks; the accelerated ones (tensor ops, half
+    // activations) are gated on their own below
+    const bool half_av = !err && inkling_half_available(m);
+    if (!err) inkling_set_half(m, false);
     // a context that holds the golden (sessions of SAETTA_CTX tokens otherwise)
     const size_t capv = MAX((size_t)SESSION_CTX_DEFAULT, ALIGN_UP(G->ntok + 64, (size_t)SESSION_CTX_ALIGN));
     if (!err) err = session_create_cap(m, &g, false, capv, capv, &s);
@@ -579,6 +587,35 @@ static Err verify_inkling(Arena *a, FILE *out, const Pack *pack, const char *pac
         fprintf(out, "prefill (chunks), its own experts: worst visit rel err %s (not gated), last-token KL(ref||engine) %s, argmax %s%s\n",
                 e3(b1, pmax), e3d(b2, k), eq ? "equal" : "DIFFERENT", pok ? "" : "  FAIL");
     }
+    // the accelerated prompt chunks (the default where the tensor ops run) on the default f16 KV
+    // cache, gated as the other models' accelerated prefill: last-token KL and argmax, and on the
+    // oracle's experts the per-visit bound for gross errors (TOL_PREFILL_FAST_LAYER_REL); the
+    // routers' own choices are reported (half activations move their scores by more than the
+    // exact paths' route margins)
+    if (!err && half_av) {
+        inkling_set_half(m, true);
+        for (int own = 0; own < 2 && !err; own++) {
+            inkling_set_routes(m, own ? INK_ROUTES_OWN : INK_ROUTES_REPLAY);
+            err = ink_prefill(m, sh, tb, G, tokens, pidx, pw, &plog);
+            if (err) break;
+            const InkRouteStats hs = inkling_route_stats(m);
+            float pmax = 0;
+            for (size_t li = 0; li < L; li++) pmax = fmaxf(pmax, pw[li]);
+            const double k = kl(last, plog, V);
+            const bool eq = argmax_scan(plog, V) == want_last;
+            const bool pok = k <= TOL_PREFILL_FAST_KL && eq && (own || pmax <= TOL_PREFILL_FAST_LAYER_REL);
+            ok = ok && pok;
+            fprintf(out,
+                    "prefill (chunks), accelerated (tensor ops, half activations, f16 KV), %s: worst visit rel err %s%s, last-token "
+                    "KL(ref||engine) %s, argmax %s; routers differ from the oracle's at %u (visit, token) pairs (not gated)%s\n",
+                    own ? "its own experts" : "the oracle's experts", e3(b1, pmax), own ? " (not gated)" : "", e3d(b2, k),
+                    eq ? "equal" : "DIFFERENT", hs.flips_sure + hs.flips_near, pok ? "" : "  FAIL");
+            if (!own && getenv("SAETTA_VERIFY_LAYERS"))
+                for (size_t li = 0; li < L; li++) fprintf(out, "  accel visit %2zu: %s\n", li, e3(b1, pw[li]));
+        }
+        inkling_set_half(m, false);
+    } else if (!err)
+        fprintf(out, "prefill, accelerated: not available on this GPU (tensor ops), not checked\n");
     if (tb) sx_buffer_release(tb);
 
     // a verification chunk: every position's logits from one chunk

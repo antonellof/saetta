@@ -15,6 +15,9 @@ static const char ink_src[] = {
     , '\n',
 #embed "../kernels/inkling_moe.metal"
     , 0};
+static const char ink_mpp_src[] = {
+#embed "../kernels/inkling_mpp.metal"
+    , 0};
 
 #define BYTES(p) gpu_bytes_arg((p), sizeof(*(p)))
 static sx_arg BA(sx_buffer *b) { return gpu_buf_arg(b); }
@@ -30,9 +33,10 @@ static Err fbuf(QgenCtx *x, const float *src, size_t n, sx_buffer **b) {
     if (src) memcpy(sx_buffer_contents(*b), src, n * 4);
     return OK;
 }
-static Err run(QgenCtx *x, const char *name, const sx_arg *args, size_t nargs, size_t gx, size_t gy, size_t gz, size_t th) {
+static Err run_src(QgenCtx *x, const char *src, const char *name, const sx_arg *args, size_t nargs, size_t gx, size_t gy, size_t gz,
+                   size_t th) {
     sx_pipeline *p;
-    TRY(qgen_ctx_pipe(x, ink_src, name, &p));
+    TRY(qgen_ctx_pipe(x, src, name, &p));
     sx_cmd *c = sx_cmd_begin(x->g.dev);
     sx_cmd_dispatch3(c, p, args, nargs, gx, gy, gz, th);
     char err[512];
@@ -41,6 +45,9 @@ static Err run(QgenCtx *x, const char *name, const sx_arg *args, size_t nargs, s
         return "DispatchFailed";
     }
     return OK;
+}
+static Err run(QgenCtx *x, const char *name, const sx_arg *args, size_t nargs, size_t gx, size_t gy, size_t gz, size_t th) {
+    return run_src(x, ink_src, name, args, nargs, gx, gy, gz, th);
 }
 #define RUN(x, name, gx, gy, gz, th, ...)                                     \
     do {                                                                     \
@@ -549,4 +556,171 @@ TEST(ink_e4m3) {
         const double want = (e == 0 ? m / 8.0 * pow(2, -6) : (1 + m / 8.0) * pow(2, e - 7)) * ((b & 0x80) ? -1 : 1);
         EXPECT(v == (float)want);
     }
+}
+
+// The tensor-op chunk experts (src/kernels/inkling_mpp.metal) on random data: the plan (every
+// pair once, grouped by expert in token order, rows padded to 32, tiles of one expert), gate_up's
+// half activations against the f64 reference on the half-rounded inputs (the weights are exact in
+// half, so an activation must be the half rounding of a value within TOL_INK_KERNEL_REL of the
+// reference, relative to the largest), and down from the kernel's own activations within
+// TOL_INK_KERNEL_REL.
+static float half_ulp(float v) {
+    int e;
+    (void)frexpf(v, &e); // v in [2^(e-1), 2^e)
+    return ldexpf(1.0f, MAX(e - 11, -24));
+}
+static Err mpp_expert_case(Arena *a, QgenCtx *x, bool mx, size_t sh, size_t T, size_t E, size_t K, float *eh, float *ey) {
+    const size_t I = 1152, in_gu = H, in_dn = I;
+    const size_t gw_row = mx ? in_gu : in_gu / 2, gs_row = mx ? in_gu / 32 : in_gu / 16;
+    const size_t dw_row = mx ? in_dn : in_dn / 2, ds_row = mx ? in_dn / 32 : in_dn / 16;
+    const size_t gwE = 2 * I * gw_row, gsE = 2 * I * gs_row, dwE = H * dw_row, dsE = H * ds_row;
+    uint8_t *gw = ARENA_ARRAY(a, uint8_t, E * gwE), *gs = ARENA_ARRAY(a, uint8_t, E * gsE);
+    uint8_t *dw = ARENA_ARRAY(a, uint8_t, E * dwE), *ds = ARENA_ARRAY(a, uint8_t, E * dsE);
+    if (mx) {
+        rand_e4m3(x, gw, E * gwE, 0, 15);
+        rand_e4m3(x, dw, E * dwE, 0, 15);
+        // block scales on both sides of the kernel's half / f32 switch (105..134)
+        for (size_t i = 0; i < E * gsE; i++) gs[i] = (uint8_t)(100 + qgen_prng_next(&x->rng) % 20);
+        for (size_t i = 0; i < E * dsE; i++) ds[i] = (uint8_t)(100 + qgen_prng_next(&x->rng) % 20);
+    } else {
+        qgen_prng_bytes(&x->rng, gw, E * gwE);
+        qgen_prng_bytes(&x->rng, dw, E * dwE);
+        rand_e4m3(x, gs, E * gsE, 0, 12);
+        rand_e4m3(x, ds, E * dsE, 0, 12);
+    }
+    float *gf = ARENA_ARRAY(a, float, E), *df = ARENA_ARRAY(a, float, E);
+    for (size_t e = 0; e < E; e++) gf[e] = ur(x, 1e-4f, 1e-3f), df[e] = ur(x, 1e-4f, 1e-3f);
+    float *xs = ARENA_ARRAY(a, float, T * H), *wts = ARENA_ARRAY(a, float, T * K);
+    uint32_t *idx = ARENA_ARRAY(a, uint32_t, T * K);
+    fill(x, xs, T * H, -2, 2);
+    if (mx) // MXFP8 sums are larger: keep them in the softcaps' working range
+        for (size_t i = 0; i < T * H; i++) xs[i] *= 0.1f;
+    fill(x, wts, T * K, 0.1f, 2);
+    // distinct experts per token, skewed so some experts fill several tiles
+    for (size_t t = 0; t < T; t++)
+        for (size_t k = 0; k < K; k++) {
+            uint32_t e;
+            bool dup;
+            do {
+                const uint64_t r = qgen_prng_next(&x->rng);
+                e = (uint32_t)(r % 3 == 0 ? r / 3 % 2 : r / 3 % E);
+                dup = false;
+                for (size_t j = 0; j < k; j++) dup = dup || idx[t * K + j] == e;
+            } while (dup);
+            idx[t * K + k] = e;
+        }
+    sx_buffer *b[4];
+    const uint8_t *src[4] = {gw, gs, dw, ds};
+    const size_t len[4] = {E * gwE, E * gsE, E * dwE, E * dsE};
+    for (int k = 0; k < 4; k++) {
+        TRY(gpu_new_buffer(&x->g, len[k] + 64, &b[k]));
+        memcpy((uint8_t *)sx_buffer_contents(b[k]) + sh, src[k], len[k]);
+    }
+    const size_t n = T * K, rows_cap = n + 31 * E, tiles_cap = rows_cap / 128 + E;
+    sx_buffer *bgf, *bdf, *bx, *bi, *bw, *bsrt, *bt, *bm, *bxs, *bhs, *by;
+    TRY(fbuf(x, gf, E, &bgf));
+    TRY(fbuf(x, df, E, &bdf));
+    TRY(fbuf(x, xs, T * H, &bx));
+    TRY(gpu_new_buffer(&x->g, n * 4, &bi));
+    memcpy(sx_buffer_contents(bi), idx, n * 4);
+    TRY(fbuf(x, wts, n, &bw));
+    TRY(gpu_new_buffer(&x->g, rows_cap * 4, &bsrt));
+    TRY(gpu_new_buffer(&x->g, tiles_cap * 16, &bt));
+    TRY(gpu_new_buffer(&x->g, 16, &bm));
+    TRY(gpu_new_buffer(&x->g, rows_cap * H * 2, &bxs));
+    TRY(gpu_new_buffer(&x->g, rows_cap * I * 2, &bhs));
+    TRY(fbuf(x, NULL, n * H, &by));
+    struct { uint32_t e, n; } pp = {(uint32_t)E, (uint32_t)n};
+    uint32_t gp2[2] = {H, (uint32_t)K};
+    struct { uint32_t h, i, k, sh_w, sh_s; uint64_t wsE, ssE; float gcap, ucap; } gp = {H, I, (uint32_t)K, (uint32_t)sh, (uint32_t)sh, gwE, gsE, 4.0f, 25.0f},
+                                                                                       dp = {H, I, (uint32_t)K, (uint32_t)sh, (uint32_t)sh, dwE, dsE, 4.0f, 25.0f};
+    {
+        sx_arg ap[] = {BA(bi), BA(bsrt), BA(bt), BA(bm), BYTES(&pp)};
+        TRY(run_src(x, ink_mpp_src, "ink_mpp_plan", ap, COUNT(ap), 1, 1, 1, 1024));
+        sx_arg ag0[] = {BA(bx), BA(bsrt), BA(bm), BA(bxs), gpu_bytes_arg(gp2, 8)};
+        TRY(run_src(x, ink_mpp_src, "ink_mpp_gather", ag0, COUNT(ag0), rows_cap, 1, 1, 256));
+        sx_arg ag[] = {BA(b[0]), BA(b[1]), BA(bgf), BA(bxs), BA(bt), BA(bm), BA(bhs), BYTES(&gp)};
+        TRY(run_src(x, ink_mpp_src, mx ? "ink_mpp_gu_mx" : "ink_mpp_gu_nv", ag, COUNT(ag), 2 * I / 64, tiles_cap, 1, 128));
+        sx_arg ad[] = {BA(b[2]), BA(b[3]), BA(bdf), BA(bhs), BA(bt), BA(bm), BA(bsrt), BA(bw), BA(by), BYTES(&dp)};
+        TRY(run_src(x, ink_mpp_src, mx ? "ink_mpp_dn_mx" : "ink_mpp_dn_nv", ad, COUNT(ad), H / 64, tiles_cap, 1, 128));
+    }
+    // the plan
+    const int32_t *srt = sx_buffer_contents(bsrt);
+    const uint32_t *meta = sx_buffer_contents(bm), (*tl)[4] = sx_buffer_contents(bt);
+    const size_t rows = meta[1], ntl = meta[0];
+    if (rows > rows_cap || ntl > tiles_cap || rows % 32) return "BadPlan";
+    size_t *row_of = ARENA_ARRAY(a, size_t, n);
+    for (size_t i = 0; i < n; i++) row_of[i] = SIZE_MAX;
+    int64_t prev = -1;
+    uint32_t pe = 0;
+    for (size_t r = 0; r < rows; r++) {
+        if (srt[r] < 0) continue;
+        const size_t i = (size_t)srt[r];
+        if (i >= n || row_of[i] != SIZE_MAX) return "BadPlan";
+        row_of[i] = r;
+        if (prev >= 0 && (idx[i] < pe || (idx[i] == pe && (int64_t)i <= prev))) return "BadPlan";
+        prev = (int64_t)i, pe = idx[i];
+    }
+    for (size_t i = 0; i < n; i++)
+        if (row_of[i] == SIZE_MAX) return "BadPlan";
+    size_t covered = 0;
+    for (size_t j = 0; j < ntl; j++) {
+        if (tl[j][3] - tl[j][1] > 128 || (tl[j][3] - tl[j][1]) % 32 || tl[j][2] > tl[j][3]) return "BadPlan";
+        for (size_t r = tl[j][1]; r < tl[j][3]; r++)
+            if (srt[r] >= 0 && idx[srt[r]] != tl[j][0]) return "BadPlan";
+        covered += tl[j][3] - tl[j][1];
+    }
+    if (covered != rows) return "BadPlan";
+    // activations and down
+    float *row = ARENA_ARRAY(a, float, H), *hr = ARENA_ARRAY(a, float, I), *hg = ARENA_ARRAY(a, float, I), *yr = ARENA_ARRAY(a, float, H);
+    const _Float16 *hs = sx_buffer_contents(bhs);
+    *eh = *ey = 0;
+    for (size_t i = 0; i < n; i++) {
+        const size_t t = i / K, e = idx[i], r = row_of[i];
+        float hmax = 0;
+        for (size_t j = 0; j < I; j++) {
+            double g = 0, u = 0;
+            if (mx) ink_ref_row_mx(gw + e * gwE, gs + e * gsE, H, 2 * j, row);
+            else ink_ref_row_nv(gw + e * gwE, gs + e * gsE, gf[e], H, 2 * j, row);
+            for (size_t c = 0; c < H; c++) g += (double)row[c] * (float)(_Float16)xs[t * H + c];
+            if (mx) ink_ref_row_mx(gw + e * gwE, gs + e * gsE, H, 2 * j + 1, row);
+            else ink_ref_row_nv(gw + e * gwE, gs + e * gsE, gf[e], H, 2 * j + 1, row);
+            for (size_t c = 0; c < H; c++) u += (double)row[c] * (float)(_Float16)xs[t * H + c];
+            hr[j] = ink_ref_swiglu((float)g, (float)u, 4.0f, 25.0f);
+            hmax = fmaxf(hmax, fabsf(hr[j]));
+            hg[j] = (float)hs[r * I + j];
+        }
+        for (size_t j = 0; j < I; j++) {
+            const float d = TOL_INK_KERNEL_REL * hmax, bound = 0.5f * half_ulp(fabsf(hr[j]) + d) + d;
+            const float over = fabsf(hg[j] - hr[j]) - bound;
+            *eh = fmaxf(*eh, over > 0 ? over / fmaxf(hmax, 1e-30f) + TOL_INK_KERNEL_REL : 0);
+        }
+        for (size_t c = 0; c < H; c++) {
+            if (mx) ink_ref_row_mx(dw + e * dwE, ds + e * dsE, I, c, row);
+            else ink_ref_row_nv(dw + e * dwE, ds + e * dsE, df[e], I, c, row);
+            double acc = 0;
+            for (size_t j = 0; j < I; j++) acc += (double)row[j] * hg[j];
+            yr[c] = (float)(acc * wts[i]);
+        }
+        *ey = fmaxf(*ey, rel(gpu_floats(by) + i * H, yr, H));
+    }
+    return OK;
+}
+
+TEST(ink_mpp_experts) {
+    Arena a = {0};
+    QgenCtx x;
+    EXPECT_OK(qgen_ctx_init(&a, &x));
+    sx_pipeline *p;
+    if (qgen_ctx_pipe(&x, ink_mpp_src, "ink_mpp_plan", &p)) SKIP("accelerator kernels do not compile");
+    static const struct { size_t T, E, K; } cs[] = {{1, 3, 2}, {40, 5, 3}, {300, 9, 8}};
+    for (int mx = 0; mx < 2; mx++)
+        for (size_t c = 0; c < COUNT(cs); c++) {
+            const size_t sh = (c * 5 + (size_t)mx * 3) % 16;
+            float eh, ey;
+            EXPECT_OK(mpp_expert_case(&a, &x, mx, sh, cs[c].T, cs[c].E, cs[c].K, &eh, &ey));
+            dbg("ink_mpp experts %s T %zu shift %zu: gate_up beyond the half rounding %.3g, down rel err %.3g\n", mx ? "mxfp8" : "nvfp4",
+                cs[c].T, sh, (double)eh, (double)ey);
+            if (!(eh <= TOL_INK_KERNEL_REL && ey <= TOL_INK_KERNEL_REL)) EXPECT(0);
+        }
 }

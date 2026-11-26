@@ -110,9 +110,20 @@ int code_share_join(Arena *a, const char *dir, CodeModel *m) {
     return code_share_join_until(a, dir, m, now_ns() + 600ull * 1000000000ull, NULL);
 }
 
+// How long a live holder may stay closing or restarting before a joining session gives up: its
+// exit (or the exec of a /model restart) takes a few seconds at most; past this it is stuck.
+// SAETTA_CODE_SHARE_CLOSING_MS sets it (the tests).
+static uint64_t closing_limit_ns(void) {
+    const char *v = getenv("SAETTA_CODE_SHARE_CLOSING_MS");
+    long ms = v && *v ? atol(v) : 0;
+    return (uint64_t)(ms > 0 ? ms : 30000) * 1000000ull;
+}
+
 int code_share_join_until(Arena *a, const char *dir, CodeModel *m, uint64_t deadline_ns, volatile int *abort) {
     snprintf(S.dir, sizeof S.dir, "%s", dir);
-    bool told = false;
+    bool told = false, told_closing = false;
+    uint64_t closing_since = 0; // when this holder was first seen closing or restarting (0: not)
+    char closing_holder[40] = "";
     for (;;) {
         if (abort && *abort) return -1;
         Inproc in;
@@ -147,7 +158,27 @@ int code_share_join_until(Arena *a, const char *dir, CodeModel *m, uint64_t dead
             dbg("saetta code: using the model of Saetta Code pid %d at %s\n", in.pid, in.sock);
             return 1;
         }
-        // loading or restarting (or exiting: then the lock frees and this process loads the model)
+        // loading or restarting (or exiting: then the lock frees and this process loads the model).
+        // The record is live (instance_inproc_info probes the lock and the pid on every turn): a
+        // holder that stays closing or restarting longer than any exit or restart takes is stuck
+        if (in.state == INPROC_CLOSING || in.state == INPROC_RESTARTING) {
+            uint64_t t = now_ns();
+            if (!closing_since || strcmp(closing_holder, in.holder)) {
+                closing_since = t;
+                snprintf(closing_holder, sizeof closing_holder, "%s", in.holder);
+            }
+            if (t - closing_since > closing_limit_ns()) {
+                say("Saetta Code (pid %d) has been %s for %llu s and still holds the model; it may be stuck.\n"
+                    "Close it (kill %d), then start this one again.", in.pid, in.state == INPROC_CLOSING ? "exiting" : "restarting",
+                    (unsigned long long)(closing_limit_ns() / 1000000000ull), in.pid);
+                return -1;
+            }
+            // an exit says nothing unless it takes a while (a normal one ends in a moment)
+            if (!told_closing && in.state == INPROC_CLOSING && t - closing_since > 3000000000ull && (S.notice || isatty(2))) {
+                say("waiting for Saetta Code (pid %d) to exit ...", in.pid);
+                told_closing = true;
+            }
+        } else closing_since = 0;
         if (!told && (in.state == INPROC_LOADING || in.state == INPROC_RESTARTING) && (S.notice || isatty(2)))
             say("waiting for the model that Saetta Code (pid %d) is loading ...", in.pid);
         told = true;

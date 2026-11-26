@@ -27,8 +27,10 @@ Err instance_acquire(uint16_t port, int *fd);
 // identity and token and writes the record (loading, the pack folder dir). A /model restart hands
 // the lock to the next image (instance_inproc_restarting). Errors: "EngineBusy" (another holds it).
 Err instance_inproc_acquire(const char *dir, int *fd);
-// True when a Saetta Code holds the model in its process (*pid its pid, may be NULL): its record
-// names a live process with the start time it had (no lock is probed).
+// True when a Saetta Code holds the model in its process (*pid its pid, may be NULL): the lock is
+// held (a non-blocking probe of it fails) and the record names a live process with the start time
+// it had. A record that fails either is stale, whatever its state: ignored, and removed when the
+// probe finds the lock free.
 bool instance_inproc_running(int *pid);
 
 // Sharing that engine with other Saetta Codes (code_share.c). The holder's record
@@ -45,7 +47,7 @@ typedef struct {
 } Inproc;
 Err instance_inproc_publish(InprocState st, uint32_t ctx, const char *model, const char *sock);
 const char *instance_inproc_token(void); // this holder's token, NULL when not the holder
-// The holder's record if its holder is alive (false otherwise).
+// The holder's record if its holder is alive, as instance_inproc_running decides (false otherwise).
 bool instance_inproc_info(Inproc *out);
 // A /model restart of the holder: the record says restarting (dir: the pack it restarts on, may
 // be empty), and the lock stays held across the exec (SAETTA_INPROC_LOCK_FD, which the next

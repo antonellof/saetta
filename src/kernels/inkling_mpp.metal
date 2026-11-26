@@ -465,3 +465,41 @@ kernel void ink_mpp_attn(device half *qh [[buffer(0)]], device const float *rs [
         out[o] = sF[r * 128 + tid] * sc[r] * im_sigm(gate[o]);
     }
 }
+
+// ---- message gates (M:79-96) ------------------------------------------------------------------
+// The two GEMMs of a gate run on mmh_dense (qmm_mpp.metal): d = D [norm(x), norm(m)] with D f16
+// [R][2H], then [f, g] = [F; G] d with F, G f16 [H][R]; these kernels prepare and combine.
+// xc[t] = half([x[t] * rsqrt(mean(x^2) + eps), m[t] * rsqrt(mean(m^2) + eps)]) [T][2H]. Grid T x 256.
+struct ImMsgP { uint H, R, xs, ms; float eps; };
+kernel void ink_mpp_msg_cat(device const float *x [[buffer(0)]], device const float *m [[buffer(1)]], device half *xc [[buffer(2)]],
+                            constant ImMsgP &p [[buffer(3)]], uint t [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                            uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float sh[2][8];
+    device const float *xr = x + (ulong)t * p.xs, *mr = m + (ulong)t * p.ms;
+    float sx = 0.0f, sm = 0.0f;
+    for (uint i = tid; i < p.H; i += 256) {
+        sx += xr[i] * xr[i];
+        sm += mr[i] * mr[i];
+    }
+    sx = simd_sum(sx);
+    sm = simd_sum(sm);
+    if (lane == 0) sh[0][sg] = sx, sh[1][sg] = sm;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    sx = sm = 0.0f;
+    for (uint k = 0; k < 8; k++) sx += sh[0][k], sm += sh[1][k];
+    const float rx = 1.0f / sqrt(sx / float(p.H) + p.eps), rm = 1.0f / sqrt(sm / float(p.H) + p.eps);
+    device half *o = xc + (ulong)t * 2 * p.H;
+    for (uint i = tid; i < p.H; i += 256) {
+        o[i] = half(xr[i] * rx);
+        o[p.H + i] = half(mr[i] * rm);
+    }
+}
+// out[t][c] = (1 - tanh(fg[t][c])) x[t][c] + tanh(fg[t][H + c]) m[t][c]. Grid (H / 256, T) x 256.
+kernel void ink_mpp_msg_comb(device const float *x [[buffer(0)]], device const float *m [[buffer(1)]], device const float *fg [[buffer(2)]],
+                             device float *out [[buffer(3)]], constant ImMsgP &p [[buffer(4)]], uint2 tg [[threadgroup_position_in_grid]],
+                             uint tid [[thread_index_in_threadgroup]]) {
+    const uint c = tg.x * 256 + tid, t = tg.y;
+    if (c >= p.H) return;
+    device const float *f = fg + (ulong)t * 2 * p.H;
+    out[(ulong)t * p.H + c] = (1.0f - tanh(f[c])) * x[(ulong)t * p.xs + c] + tanh(f[p.H + c]) * m[(ulong)t * p.ms + c];
+}

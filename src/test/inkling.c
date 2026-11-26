@@ -18,6 +18,9 @@ static const char ink_src[] = {
 static const char ink_mpp_src[] = {
 #embed "../kernels/inkling_mpp.metal"
     , 0};
+static const char qmm_mpp_src[] = {
+#embed "../kernels/qmm_mpp.metal"
+    , 0};
 
 #define BYTES(p) gpu_bytes_arg((p), sizeof(*(p)))
 static sx_arg BA(sx_buffer *b) { return gpu_buf_arg(b); }
@@ -749,4 +752,81 @@ TEST(ink_mpp_experts) {
                 cs[c].T, sh, (double)eh, (double)ey);
             if (!(eh <= TOL_INK_KERNEL_REL && ey <= TOL_INK_KERNEL_REL)) EXPECT(0);
         }
+}
+
+
+// The message gate on the tensor ops (src/inkling.c enc_gate for prompt chunks: ink_mpp_msg_cat,
+// mmh_dense, to_half, mmh_dense, ink_mpp_msg_comb) against an f64 reference that rounds as the
+// kernels do (the normalized inputs, D, d, F and G to half), within TOL_INK_KERNEL_REL; T = 100.
+TEST(ink_mpp_msg_gate) {
+    Arena a = {0};
+    QgenCtx x;
+    EXPECT_OK(qgen_ctx_init(&a, &x));
+    sx_pipeline *pl;
+    if (qgen_ctx_pipe(&x, ink_mpp_src, "ink_mpp_msg_cat", &pl)) SKIP("accelerator kernels do not compile");
+    const size_t T = 100;
+    float *xs = ARENA_ARRAY(&a, float, T * H), *ms = ARENA_ARRAY(&a, float, T * 4 * H);
+    float *F = ARENA_ARRAY(&a, float, H * R), *G = ARENA_ARRAY(&a, float, H * R), *Df = ARENA_ARRAY(&a, float, R * 2 * H);
+    fill(&x, xs, T * H, -20, 20);
+    fill(&x, ms, T * 4 * H, -2, 2);
+    fill(&x, F, H * R, -0.2f, 0.2f);
+    fill(&x, G, H * R, -0.2f, 0.2f);
+    fill(&x, Df, R * 2 * H, -0.05f, 0.05f);
+    sx_buffer *bx, *bm, *bw, *bxc, *bd, *bdh, *bfg, *bo;
+    EXPECT_OK(fbuf(&x, xs, T * H, &bx));
+    EXPECT_OK(fbuf(&x, ms, T * 4 * H, &bm));
+    EXPECT_OK(gpu_new_buffer(&x.g, (size_t)4 * H * R * 2, &bw)); // D [R][2H], then F, G [H][R], f16
+    _Float16 *w16 = sx_buffer_contents(bw);
+    for (size_t i = 0; i < R * 2 * H; i++) w16[i] = (_Float16)Df[i];
+    for (size_t i = 0; i < H * R; i++) w16[R * 2 * H + i] = (_Float16)F[i], w16[R * 2 * H + H * R + i] = (_Float16)G[i];
+    EXPECT_OK(gpu_new_buffer(&x.g, T * 2 * H * 2, &bxc));
+    EXPECT_OK(fbuf(&x, NULL, T * R, &bd));
+    EXPECT_OK(gpu_new_buffer(&x.g, T * R * 2, &bdh));
+    EXPECT_OK(fbuf(&x, NULL, T * 2 * H, &bfg));
+    EXPECT_OK(fbuf(&x, NULL, T * H, &bo));
+    struct { uint32_t h, r, xs, ms; float eps; } mp = {H, R, H, 4 * H, 1e-6f};
+    uint32_t d1[3] = {2 * H, R, (uint32_t)T}, d2[3] = {R, 2 * H, (uint32_t)T}, nd = (uint32_t)(T * R);
+    {
+        sx_arg a1[] = {BA(bx), BO(bm, 2 * H * 4), BA(bxc), BYTES(&mp)};
+        EXPECT_OK(run_src(&x, ink_mpp_src, "ink_mpp_msg_cat", a1, COUNT(a1), T, 1, 1, 256));
+        sx_arg a2[] = {BA(bxc), BA(bw), BA(bd), gpu_bytes_arg(d1, 12)};
+        EXPECT_OK(run_src(&x, qmm_mpp_src, "mmh_dense", a2, COUNT(a2), R / 32, (T + 63) / 64, 1, 32));
+        sx_arg a3[] = {BA(bd), BA(bdh), BYTES(&nd)};
+        EXPECT_OK(run_src(&x, qmm_mpp_src, "to_half", a3, COUNT(a3), (nd + 255) / 256, 1, 1, 256));
+        sx_arg a4[] = {BA(bdh), BO(bw, R * 2 * H * 2), BA(bfg), gpu_bytes_arg(d2, 12)};
+        EXPECT_OK(run_src(&x, qmm_mpp_src, "mmh_dense", a4, COUNT(a4), 2 * H / 32, (T + 63) / 64, 1, 32));
+        sx_arg a5[] = {BA(bx), BO(bm, 2 * H * 4), BA(bfg), BA(bo), BYTES(&mp)};
+        EXPECT_OK(run_src(&x, ink_mpp_src, "ink_mpp_msg_comb", a5, COUNT(a5), H / 256, T, 1, 256));
+    }
+    // d on the GPU's half inputs (checked), then the output from the GPU's d in half (checked)
+    const _Float16 *xc = sx_buffer_contents(bxc);
+    float *dref = ARENA_ARRAY(&a, float, R), *ref = ARENA_ARRAY(&a, float, H);
+    float worst_d = 0, worst_o = 0;
+    for (size_t t = 0; t < T; t++) {
+        const float *xr = xs + t * H, *mr = ms + t * 4 * H + 2 * H;
+        double sx = 0, sm = 0;
+        for (size_t i = 0; i < H; i++) sx += (double)xr[i] * xr[i], sm += (double)mr[i] * mr[i];
+        const double rx = 1.0 / sqrt(sx / H + 1e-6), rm = 1.0 / sqrt(sm / H + 1e-6);
+        for (size_t i = 0; i < H; i++) {
+            const float wx = (float)(_Float16)(float)(xr[i] * rx), wm = (float)(_Float16)(float)(mr[i] * rm);
+            if (fabsf(wx - (float)xc[t * 2 * H + i]) > 1e-3f * fabsf(wx) || fabsf(wm - (float)xc[t * 2 * H + H + i]) > 1e-3f * fabsf(wm))
+                worst_d = 1; // the normalized inputs beyond one half ulp
+        }
+        for (size_t r = 0; r < R; r++) {
+            double acc = 0;
+            for (size_t i = 0; i < 2 * H; i++) acc += (double)(float)w16[r * 2 * H + i] * (float)xc[t * 2 * H + i];
+            dref[r] = (float)acc;
+        }
+        worst_d = fmaxf(worst_d, rel(gpu_floats(bd) + t * R, dref, R));
+        const _Float16 *dg = (const _Float16 *)sx_buffer_contents(bdh) + t * R;
+        for (size_t c = 0; c < H; c++) {
+            double f = 0, gg = 0;
+            for (size_t k = 0; k < R; k++)
+                f += (double)(float)w16[R * 2 * H + c * R + k] * (float)dg[k], gg += (double)(float)w16[R * 2 * H + H * R + c * R + k] * (float)dg[k];
+            ref[c] = (float)((1 - tanh(f)) * xr[c] + tanh(gg) * mr[c]);
+        }
+        worst_o = fmaxf(worst_o, rel(gpu_floats(bo) + t * H, ref, H));
+    }
+    dbg("ink_mpp msg gate: d rel err %.3g, output rel err %.3g\n", (double)worst_d, (double)worst_o);
+    EXPECT(worst_d <= TOL_INK_KERNEL_REL && worst_o <= TOL_INK_KERNEL_REL);
 }

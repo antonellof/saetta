@@ -113,7 +113,7 @@ typedef struct {
     // prompt chunks on the tensor ops (inkling_mpp.metal; NULL where they do not run)
     sx_pipeline *im_plan, *im_gather, *im_gu_nv, *im_gu_mx, *im_dn_nv, *im_dn_mx;
     sx_pipeline *im_half, *im_dq, *im_mm;
-    sx_pipeline *im_attq, *im_attn; // to_half, dq_f16_gen, mmh_dense (qmm_mpp.metal, qgen_mpp.metal)
+    sx_pipeline *im_attq, *im_attn, *im_mcat, *im_mcomb; // to_half, dq_f16_gen, mmh_dense (qmm_mpp.metal, qgen_mpp.metal)
 } Pipes;
 
 // Scratch regions, floats per token (each region holds PCH rows).
@@ -131,6 +131,7 @@ static_assert(PCH * TOPK / 32 + NE <= PCH);
 // the tensor-op experts' sorted rows (each expert's padded to 32) and tiles of at most 128 rows
 #define MPP_ROWS (PCH * TOPK + 31 * NE)
 #define MPP_TILES (MPP_ROWS / 128 + NE)
+#define MSGW_HALVES ((size_t)4 * H * RANK) // one message gate's f16 weights: D, then F and G
 static size_t region_off[R_N + 1]; // floats
 __attribute__((constructor)) static void regions(void) {
     size_t o = 0;
@@ -202,6 +203,10 @@ struct Model {
     // values in half (kvh [2][PCH][KVD]), the relative bias table per layer (projt [NL][EXT + 1][16]
     // f32: proj transposed, row EXT zeros)
     sx_buffer *qh, *kvh, *projt;
+    // the message gates: f16 copies of each gate's down D [RANK][2H] then [F; G] [2H][RANK]
+    // (msgw, per loop layer and gate), the normalized inputs xc [PCH][2H] half, d in half
+    // (dh [PCH][RANK]), [f, g] (fg [PCH][2H] f32)
+    sx_buffer *msgw, *xc, *dh, *fg;
     // SAETTA_INK_ROUTES=<golden dir>, read at load (verify, src/inkling.h): the reference's
     // experts of every token at every visit and their margins, so the routers' own choices are
     // checked against them and the engine can be run on them: f32 rounding flips the router at
@@ -496,7 +501,8 @@ static bool load_mpp(Gpu *g, Pipes *pp) {
     } kn[] = {{offsetof(Pipes, im_plan), "ink_mpp_plan"},   {offsetof(Pipes, im_gather), "ink_mpp_gather"},
               {offsetof(Pipes, im_gu_nv), "ink_mpp_gu_nv"}, {offsetof(Pipes, im_gu_mx), "ink_mpp_gu_mx"},
               {offsetof(Pipes, im_dn_nv), "ink_mpp_dn_nv"}, {offsetof(Pipes, im_dn_mx), "ink_mpp_dn_mx"},
-              {offsetof(Pipes, im_attq), "ink_mpp_attn_q"}, {offsetof(Pipes, im_attn), "ink_mpp_attn"}};
+              {offsetof(Pipes, im_attq), "ink_mpp_attn_q"}, {offsetof(Pipes, im_attn), "ink_mpp_attn"},
+              {offsetof(Pipes, im_mcat), "ink_mpp_msg_cat"}, {offsetof(Pipes, im_mcomb), "ink_mpp_msg_comb"}};
     bool ok = true;
     for (size_t i = 0; i < COUNT(kn) && ok; i++) {
         ok = gpu_pipeline(g, ink_mpp_src, kn[i].name, (sx_pipeline **)((char *)pp + kn[i].off)) == OK;
@@ -584,6 +590,9 @@ Err model_load(Arena *arena, const Pack *pack, Gpu *g, Model **out) {
         TRY(gpu_new_buffer(g, (size_t)QD * QD * 2, &m->wh));
         TRY(gpu_new_buffer(g, (size_t)NH * PCH * HD * 2, &m->qh));
         TRY(gpu_new_buffer(g, (size_t)2 * PCH * KVD * 2, &m->kvh));
+        TRY(gpu_new_buffer(g, (size_t)PCH * 2 * H * 2, &m->xc));
+        TRY(gpu_new_buffer(g, (size_t)PCH * RANK * 2, &m->dh));
+        TRY(gpu_new_buffer(g, (size_t)PCH * 2 * H * 4, &m->fg));
     } else
         dbg("model: accelerator kernels unavailable, Inkling prompt chunks on f32 tiles\n");
 
@@ -615,6 +624,20 @@ Err model_load(Arena *arena, const Pack *pack, Gpu *g, Model **out) {
             for (size_t i = 0; i < DREL; i++)
                 for (size_t dd = 0; dd < EXT; dd++) pt[(li * (EXT + 1) + dd) * 16 + i] = pj[i * EXT + dd];
         }
+    }
+    if (m->accel) {
+        TRY(gpu_new_buffer(g, (size_t)NLOOP * 4 * MSGW_HALVES * 2, &m->msgw));
+        _Float16 *w16 = sx_buffer_contents(m->msgw);
+        const uint8_t *pb = sx_buffer_contents(m->params);
+        for (size_t li = LS; li < LE; li++)
+            for (size_t k = 0; k < 4; k++) {
+                _Float16 *o = w16 + ((li - LS) * 4 + k) * MSGW_HALVES;
+                const uint16_t *D = (const uint16_t *)(pb + m->L[li].md[k].offset);
+                const float *F = (const float *)(pb + m->L[li].mf[k].offset), *G = (const float *)(pb + m->L[li].mg[k].offset);
+                for (size_t i = 0; i < (size_t)RANK * 2 * H; i++) o[i] = (_Float16)ops_bf16_to_f32(D[i]);
+                o += (size_t)RANK * 2 * H;
+                for (size_t i = 0; i < (size_t)H * RANK; i++) o[i] = (_Float16)F[i], o[H * RANK + i] = (_Float16)G[i];
+            }
     }
     TRY(gpu_new_buffer(g, region_off[R_N] * 4, &m->scratch));
     TRY(gpu_new_buffer(g, (size_t)KMAX * NSPLIT_DEC * NH * (HD + 2) * 4, &m->part));
@@ -743,6 +766,18 @@ static void enc_mix(Model *m, Enc *c, uint32_t n, sx_arg partial, sx_arg query, 
 static void enc_gate(Model *m, Enc *c, const ILayer *L, int k, sx_arg x, uint32_t xs, sx_arg msg, uint32_t ms, sx_arg out,
                      uint32_t T) {
     MsgP p = {H, RANK, xs, ms, EPS};
+    if (T > KMAX && m->half_prefill) {
+        // a prompt chunk on the tensor ops: the two GEMMs in half with f32 sums
+        const size_t li = (size_t)(L - m->L);
+        const sx_arg w = AT(m->msgw, ((li - LS) * 4 + (size_t)k) * MSGW_HALVES * 2), wfg = OFF(w, (size_t)RANK * H); // 2 RANK H halves
+        uint32_t d1[3] = {2 * H, RANK, T}, d2[3] = {RANK, 2 * H, T}, nd = T * RANK;
+        DISP(c, m->p.im_mcat, T, 1, 1, 256, x, msg, B(m->xc), BYTES(p));
+        DISP(c, m->p.im_mm, RANK / 32, (T + 63) / 64, 1, 32, B(m->xc), w, reg(m, R_D), gpu_bytes_arg(d1, 12));
+        DISP(c, m->p.im_half, (nd + 255) / 256, 1, 1, 256, reg(m, R_D), B(m->dh), BYTES(nd));
+        DISP(c, m->p.im_mm, 2 * H / 32, (T + 63) / 64, 1, 32, B(m->dh), wfg, B(m->fg), gpu_bytes_arg(d2, 12));
+        DISP(c, m->p.im_mcomb, H / 256, T, 1, 256, x, msg, B(m->fg), out, BYTES(p));
+        return;
+    }
     DISP(c, m->p.msg_down, RANK / 8, T, 1, 256, x, msg, L->md[k], reg(m, R_D), BYTES(p));
     DISP(c, m->p.msg_out, H / 256, T, 1, 256, x, msg, reg(m, R_D), L->mf[k], L->mg[k], out, BYTES(p));
 }

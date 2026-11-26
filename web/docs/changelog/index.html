@@ -88,6 +88,13 @@
 <h3 id="added"><a class="anchor" href="#added" aria-hidden="true" tabindex="-1">#</a>Added</h3>
 <ul>
 <li><code>saetta download 27b-qwopus</code>: Jackrong&#39;s Qwopus3.8-27B Coder-Flash, a coding fine-tune of Qwen3.8-27B distilled from Qwen3.8-Flash-Max (mlx-community&#39;s 4-bit, 16 GB, Macs with 32 GB or more). <code>27b-qwopus-8bit</code>: 29 GB, 48 GB. Same architecture and quantization as <code>27b-4bit</code> and <code>27b-8bit</code>, no MTP draft head.</li>
+<li>LoRA adapters in Saetta Code without a server: <code>saetta start code 27b-8bit --lora-modules qwen3.8-pi=27b-pi</code> (and <code>saetta code --pack P --lora-modules ...</code>) loads them into the engine in process, as <code>saetta serve</code> does, with <code>--default-chat-template-kwargs</code>; <code>--lora name=path</code> stays as a shorter form. The session runs on the first adapter, <code>--model NAME</code> picks another or the base model.</li>
+<li><code>/model</code> lists LoRA adapters under each downloaded base model they fit (&quot;adapter of Qwen3.8-27B 8-bit&quot;): switching between the base model and the adapters loaded with it happens in place, another adapter starts Saetta Code again on its base, one not downloaded downloads from the list, and one without its base model on this Mac is greyed with the reason. Adapters are found in the download list and in any <code>org/repo</code> folder of the models folder that holds an <code>adapter_config.json</code>.</li>
+<li><code>saetta start</code> takes <code>--lora-modules</code> (several adapters) and <code>--default-chat-template-kwargs</code> for every agent, and a download name right after the agent (<code>saetta start code 27b-8bit</code>).</li>
+</ul>
+<h3 id="changed"><a class="anchor" href="#changed" aria-hidden="true" tabindex="-1">#</a>Changed</h3>
+<ul>
+<li>An adapter that does not fit the base model (the base its <code>adapter_config.json</code> names, its rank or target modules) is refused before the load with the reason, by <code>saetta serve</code>, <code>saetta start</code> and Saetta Code alike.</li>
 </ul>
 <h2 id="0180---2026-11-23"><a class="anchor" href="#0180---2026-11-23" aria-hidden="true" tabindex="-1">#</a>[0.18.0] - 2026-11-23</h2>
 <h3 id="added-1"><a class="anchor" href="#added-1" aria-hidden="true" tabindex="-1">#</a>Added</h3>
@@ -112,7 +119,7 @@
 <li>OAuth sign-in for MCP servers over HTTP, as pi does it (discovery, dynamic registration, PKCE with a loopback callback).</li>
 <li>Documentation on saetta.dev/docs.</li>
 </ul>
-<h3 id="changed"><a class="anchor" href="#changed" aria-hidden="true" tabindex="-1">#</a>Changed</h3>
+<h3 id="changed-1"><a class="anchor" href="#changed-1" aria-hidden="true" tabindex="-1">#</a>Changed</h3>
 <ul>
 <li>macOS 26 or later is enough (it was 27.2): nothing saetta uses needs a newer release.</li>
 </ul>
@@ -132,7 +139,7 @@
 <li>MCP: stdio and Streamable HTTP servers from pi&#39;s mcp.json, their tools offered to the model, the <code>/mcp</code> manager, <code>--no-mcp</code>.</li>
 <li>An update check at start (off with <code>SAETTA_SKIP_VERSION_CHECK=1</code> or <code>PI_OFFLINE=1</code>).</li>
 </ul>
-<h3 id="changed-1"><a class="anchor" href="#changed-1" aria-hidden="true" tabindex="-1">#</a>Changed</h3>
+<h3 id="changed-2"><a class="anchor" href="#changed-2" aria-hidden="true" tabindex="-1">#</a>Changed</h3>
 <ul>
 <li><code>saetta start code</code> and <code>saetta start pi</code> update only their own entries in settings.json and models.json and keep everything else.</li>
 </ul>
@@ -167,7 +174,7 @@
 <ul>
 <li>The installer (<code>curl -fsSL https://saetta.dev/install.sh | sh</code>) no longer ends with &quot;SAETTA_MODELS: unbound variable&quot; after a successful install.</li>
 </ul>
-<h3 id="changed-2"><a class="anchor" href="#changed-2" aria-hidden="true" tabindex="-1">#</a>Changed</h3>
+<h3 id="changed-3"><a class="anchor" href="#changed-3" aria-hidden="true" tabindex="-1">#</a>Changed</h3>
 <ul>
 <li>The installer&#39;s closing message leads with <code>saetta</code>, the guided start.</li>
 <li>Install from saetta.dev; the README and the GitHub page point there.</li>
@@ -182,7 +189,7 @@
 <ul>
 <li><code>saetta</code> (or <code>saetta auto</code>) in a terminal is a guided start: it shows this Mac&#39;s chip, memory and free disk, lists the models best first, downloads the one you pick, finds Claude Code, pi and opencode, offers the official installer for a missing one, and starts it.</li>
 </ul>
-<h3 id="changed-3"><a class="anchor" href="#changed-3" aria-hidden="true" tabindex="-1">#</a>Changed</h3>
+<h3 id="changed-4"><a class="anchor" href="#changed-4" aria-hidden="true" tabindex="-1">#</a>Changed</h3>
 <ul>
 <li>Qwen3.8-27B reads prompts a little faster (16K prompts about 2% faster; the long-prompt attention kernel 7 to 8% faster per layer), with the same output.</li>
 <li>The KV cache keeps a small tail so the attention kernel never reads past it.</li>
@@ -194,7 +201,7 @@
 <li><code>saetta download</code> with no name picks the model that fits this Mac: <code>coder</code> with 96 GB or more, <code>27b-turbo</code> with 36 GB, <code>27b-4bit</code> with 32 GB.</li>
 <li><code>SAETTA_NO_ACCEL=1</code> runs without the tensor-op (neural accelerator) kernels: same output, slower prompt reading.</li>
 </ul>
-<h3 id="changed-4"><a class="anchor" href="#changed-4" aria-hidden="true" tabindex="-1">#</a>Changed</h3>
+<h3 id="changed-5"><a class="anchor" href="#changed-5" aria-hidden="true" tabindex="-1">#</a>Changed</h3>
 <ul>
 <li>A pack too large for this Mac&#39;s memory is refused (<code>SAETTA_IGNORE_MEMORY=1</code> overrides).</li>
 <li>The server caps the context to what memory holds and reports it (<code>max_model_len</code> in <code>/v1/models</code>); <code>saetta start</code> tells the agent the real context and picks a downloaded pack that fits.</li>
@@ -205,7 +212,7 @@
 <ul>
 <li><code>saetta help</code> lists every command.</li>
 </ul>
-<h3 id="changed-5"><a class="anchor" href="#changed-5" aria-hidden="true" tabindex="-1">#</a>Changed</h3>
+<h3 id="changed-6"><a class="anchor" href="#changed-6" aria-hidden="true" tabindex="-1">#</a>Changed</h3>
 <ul>
 <li><code>SAETTA_CTX</code> and <code>--ctx</code> are rounded to a multiple of 128 and checked against the model&#39;s limit (1,024 to 262,144).</li>
 <li>Requests with <code>max_tokens</code> below 1 or above 2^30, or <code>top_p</code> above 1, are rejected with a 400.</li>
@@ -221,7 +228,7 @@
 <li>DeepSeek-V4-Flash-0731 (preview), from its official checkpoint read in place, with <code>saetta info</code>, <code>saetta generate</code> and the checks (<code>make verify-dsv4</code>).</li>
 <li>Streamed experts: a model whose routed experts do not fit in memory keeps the hot ones in a GPU-visible cache and reads the rest from the SSD on demand (<code>SAETTA_EXPERT_CACHE_GB</code> for Flash-Next, as an experiment).</li>
 </ul>
-<h3 id="changed-6"><a class="anchor" href="#changed-6" aria-hidden="true" tabindex="-1">#</a>Changed</h3>
+<h3 id="changed-7"><a class="anchor" href="#changed-7" aria-hidden="true" tabindex="-1">#</a>Changed</h3>
 <ul>
 <li>Flash-Next and Qwen3.8-27B behave exactly as in 0.8.1.</li>
 </ul>
@@ -230,7 +237,7 @@
 <ul>
 <li>Packs and adapters by name: <code>saetta serve coder</code>, <code>saetta serve 27b-8bit --lora-modules qwen3.8-pi=27b-pi</code>, <code>saetta start pi --pack 27b-8bit --lora qwen3.8-pi=27b-pi</code>. Names resolve under your models folder (<code>~/Models</code>, or <code>SAETTA_MODELS</code>).</li>
 </ul>
-<h3 id="changed-7"><a class="anchor" href="#changed-7" aria-hidden="true" tabindex="-1">#</a>Changed</h3>
+<h3 id="changed-8"><a class="anchor" href="#changed-8" aria-hidden="true" tabindex="-1">#</a>Changed</h3>
 <ul>
 <li>The curl installer stops when Homebrew already has saetta and names any other copy on the PATH; <code>saetta update</code> leaves a Homebrew install to <code>brew upgrade saetta</code>.</li>
 </ul>
@@ -245,7 +252,7 @@
       <p class="doc-edit"><a href="https://github.com/antonellof/saetta/blob/main/CHANGELOG.md" rel="noopener">Edit this page on GitHub</a></p>
       <nav class="doc-pager" aria-label="Previous and next"><a class="prev" href="/docs/faq/"><span>Previous</span>FAQ</a><span></span></nav>
     </main>
-    <nav class="doc-toc" aria-label="On this page"><p class="ds-title">On this page</p><ul><li class="d2"><a href="#unreleased">[Unreleased]</a></li><li class="d3"><a href="#added">Added</a></li><li class="d2"><a href="#0180---2026-11-23">[0.18.0] - 2026-11-23</a></li><li class="d3"><a href="#added-1">Added</a></li><li class="d3"><a href="#fixed">Fixed</a></li><li class="d2"><a href="#0171---2026-11-23">[0.17.1] - 2026-11-23</a></li><li class="d3"><a href="#fixed-1">Fixed</a></li><li class="d2"><a href="#0170---2026-11-23">[0.17.0] - 2026-11-23</a></li><li class="d3"><a href="#added-2">Added</a></li><li class="d3"><a href="#changed">Changed</a></li><li class="d3"><a href="#notes">Notes</a></li><li class="d2"><a href="#0160---2026-11-22">[0.16.0] - 2026-11-22</a></li><li class="d3"><a href="#added-3">Added</a></li><li class="d3"><a href="#changed-1">Changed</a></li><li class="d3"><a href="#notes-1">Notes</a></li><li class="d2"><a href="#0150---2026-11-22">[0.15.0] - 2026-11-22</a></li><li class="d3"><a href="#added-4">Added</a></li><li class="d3"><a href="#notes-2">Notes</a></li><li class="d2"><a href="#0140---2026-11-22">[0.14.0] - 2026-11-22</a></li><li class="d3"><a href="#added-5">Added</a></li><li class="d2"><a href="#0132---2026-11-21">[0.13.2] - 2026-11-21</a></li><li class="d3"><a href="#fixed-2">Fixed</a></li><li class="d3"><a href="#changed-2">Changed</a></li><li class="d2"><a href="#0131---2026-11-21">[0.13.1] - 2026-11-21</a></li><li class="d3"><a href="#fixed-3">Fixed</a></li><li class="d2"><a href="#0130---2026-11-21">[0.13.0] - 2026-11-21</a></li><li class="d3"><a href="#added-6">Added</a></li><li class="d3"><a href="#changed-3">Changed</a></li><li class="d2"><a href="#0120---2026-11-21">[0.12.0] - 2026-11-21</a></li><li class="d3"><a href="#added-7">Added</a></li><li class="d3"><a href="#changed-4">Changed</a></li><li class="d2"><a href="#0110---2026-11-21">[0.11.0] - 2026-11-21</a></li><li class="d3"><a href="#added-8">Added</a></li><li class="d3"><a href="#changed-5">Changed</a></li><li class="d3"><a href="#fixed-4">Fixed</a></li><li class="d2"><a href="#090---2026-11-20">[0.9.0] - 2026-11-20</a></li><li class="d3"><a href="#added-9">Added</a></li><li class="d3"><a href="#changed-6">Changed</a></li><li class="d2"><a href="#081---2026-11-20">[0.8.1] - 2026-11-20</a></li><li class="d3"><a href="#added-10">Added</a></li><li class="d3"><a href="#changed-7">Changed</a></li><li class="d2"><a href="#080---2026-11-20">[0.8.0] - 2026-11-20</a></li><li class="d3"><a href="#added-11">Added</a></li></ul></nav>
+    <nav class="doc-toc" aria-label="On this page"><p class="ds-title">On this page</p><ul><li class="d2"><a href="#unreleased">[Unreleased]</a></li><li class="d3"><a href="#added">Added</a></li><li class="d3"><a href="#changed">Changed</a></li><li class="d2"><a href="#0180---2026-11-23">[0.18.0] - 2026-11-23</a></li><li class="d3"><a href="#added-1">Added</a></li><li class="d3"><a href="#fixed">Fixed</a></li><li class="d2"><a href="#0171---2026-11-23">[0.17.1] - 2026-11-23</a></li><li class="d3"><a href="#fixed-1">Fixed</a></li><li class="d2"><a href="#0170---2026-11-23">[0.17.0] - 2026-11-23</a></li><li class="d3"><a href="#added-2">Added</a></li><li class="d3"><a href="#changed-1">Changed</a></li><li class="d3"><a href="#notes">Notes</a></li><li class="d2"><a href="#0160---2026-11-22">[0.16.0] - 2026-11-22</a></li><li class="d3"><a href="#added-3">Added</a></li><li class="d3"><a href="#changed-2">Changed</a></li><li class="d3"><a href="#notes-1">Notes</a></li><li class="d2"><a href="#0150---2026-11-22">[0.15.0] - 2026-11-22</a></li><li class="d3"><a href="#added-4">Added</a></li><li class="d3"><a href="#notes-2">Notes</a></li><li class="d2"><a href="#0140---2026-11-22">[0.14.0] - 2026-11-22</a></li><li class="d3"><a href="#added-5">Added</a></li><li class="d2"><a href="#0132---2026-11-21">[0.13.2] - 2026-11-21</a></li><li class="d3"><a href="#fixed-2">Fixed</a></li><li class="d3"><a href="#changed-3">Changed</a></li><li class="d2"><a href="#0131---2026-11-21">[0.13.1] - 2026-11-21</a></li><li class="d3"><a href="#fixed-3">Fixed</a></li><li class="d2"><a href="#0130---2026-11-21">[0.13.0] - 2026-11-21</a></li><li class="d3"><a href="#added-6">Added</a></li><li class="d3"><a href="#changed-4">Changed</a></li><li class="d2"><a href="#0120---2026-11-21">[0.12.0] - 2026-11-21</a></li><li class="d3"><a href="#added-7">Added</a></li><li class="d3"><a href="#changed-5">Changed</a></li><li class="d2"><a href="#0110---2026-11-21">[0.11.0] - 2026-11-21</a></li><li class="d3"><a href="#added-8">Added</a></li><li class="d3"><a href="#changed-6">Changed</a></li><li class="d3"><a href="#fixed-4">Fixed</a></li><li class="d2"><a href="#090---2026-11-20">[0.9.0] - 2026-11-20</a></li><li class="d3"><a href="#added-9">Added</a></li><li class="d3"><a href="#changed-7">Changed</a></li><li class="d2"><a href="#081---2026-11-20">[0.8.1] - 2026-11-20</a></li><li class="d3"><a href="#added-10">Added</a></li><li class="d3"><a href="#changed-8">Changed</a></li><li class="d2"><a href="#080---2026-11-20">[0.8.0] - 2026-11-20</a></li><li class="d3"><a href="#added-11">Added</a></li></ul></nav>
   </div>
   <div class="ds-scrim" hidden></div>
 

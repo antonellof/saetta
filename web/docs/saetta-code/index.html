@@ -111,7 +111,7 @@ saetta code --mode rpc                  <span class="hljs-comment"># pi&#x27;s r
 <tr><td><code>skills/</code>, <code>SYSTEM.md</code>, <code>APPEND_SYSTEM.md</code>, <code>AGENTS.md</code></td><td>global skills and prompt files</td></tr></tbody></table></div>
 <p>The agent writes its own log to <code>~/.saetta/code.log</code>.</p>
 <h2 id="where-the-model-runs"><a class="anchor" href="#where-the-model-runs" aria-hidden="true" tabindex="-1">#</a>Where the model runs</h2>
-<p>By default the model runs inside the agent. It can also use a running Saetta server, or any OpenAI-compatible chat completions server listed in <code>models.json</code>; <code>/model</code> adds one. LoRA adapters need the server: <code>saetta start code --lora name=adapter</code> starts one. Only one model runs on the Mac at a time: further Saetta Code sessions use the model the first one loaded (<a href="/docs/parallel-agents/">Parallel agents</a>), while <code>saetta start</code> for another agent asks you to close it first, or to start a server that both use.</p>
+<p>By default the model runs inside the agent. It can also use a running Saetta server, or any OpenAI-compatible chat completions server listed in <code>models.json</code>; <code>/model</code> adds one. LoRA adapters load into the engine in process, as <code>saetta serve</code> loads them: <code>saetta start code 27b-8bit --lora-modules qwen3.8-pi=27b-pi</code>, and <code>/model</code> lists the downloaded adapters under their base model (<a href="/docs/lora/#in-saetta-code">LoRA adapters</a>). Only one model runs on the Mac at a time: further Saetta Code sessions use the model the first one loaded (<a href="/docs/parallel-agents/">Parallel agents</a>), while <code>saetta start</code> for another agent asks you to close it first, or to start a server that both use.</p>
 <h2 id="options"><a class="anchor" href="#options" aria-hidden="true" tabindex="-1">#</a>Options</h2>
 <div class="code doc-code"><div class="code-head"><span>text</span><button class="copy" type="button">Copy</button></div><pre><code>saetta code [options] [prompt ...]
 
@@ -134,7 +134,13 @@ saetta code --mode rpc                  <span class="hljs-comment"># pi&#x27;s r
   --pack P                 run the model in this process (a download name such as coder, or a
                            folder): no server, no HTTP; the requests are the same
   --ctx N                  with --pack: the context in tokens (default 204800, as saetta start;
-                           less when this Mac's memory holds less)</code></pre></div>
+                           less when this Mac's memory holds less)
+  --lora-modules name=path [name=path ...]   with --pack: LoRA adapters loaded with the model, as
+                           saetta serve takes them (path: a folder, a download name such as 27b-pi,
+                           or org/repo under ~/Models; also name=path,name=path; --lora name=path);
+                           the session runs on the first, --model NAME picks another or the base
+  --default-chat-template-kwargs JSON   with --pack: chat template values a request leaves out
+                           ({&quot;enable_thinking&quot;: false} also starts with thinking off)</code></pre></div>
 <p>Input piped into <code>saetta code</code> is read as pi reads it: it is joined to the prompt and makes the run a print run.</p>
 <div class="code doc-code"><div class="code-head"><span>shell</span><button class="copy" type="button">Copy</button></div><pre><code>git diff | saetta code <span class="hljs-string">&quot;review this change&quot;</span></code></pre></div>
 <p>The agent checks for a new Saetta release at start. <code>SAETTA_SKIP_VERSION_CHECK=1</code> or <code>PI_OFFLINE=1</code> turns the check off.</p>

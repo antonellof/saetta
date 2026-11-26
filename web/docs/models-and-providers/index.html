@@ -90,7 +90,7 @@
 </ol>
 <p><img src="/assets/code/model.png" alt="/model: a saetta server model, two packs on this Mac, one greyed out as too big for its memory, and the others with their download size" loading="lazy"></p>
 <h2 id="model"><a class="anchor" href="#model" aria-hidden="true" tabindex="-1">#</a>/model</h2>
-<p><code>/model</code> lists everything the agent can use: the packs downloaded on this Mac, the packs it can download (with their size and the free disk shown first; a pack too big for this Mac&#39;s memory is greyed out), a running Saetta server, and the models in <code>models.json</code>. Picking a pack switches to it in the running agent. From the same list you can add, edit or remove an OpenAI-compatible model.</p>
+<p><code>/model</code> lists everything the agent can use: the packs downloaded on this Mac, the packs it can download (with their size and the free disk shown first; a pack too big for this Mac&#39;s memory is greyed out), a running Saetta server, and the models in <code>models.json</code>. Picking a pack switches to it in the running agent. LoRA adapters are listed under each downloaded base model they fit (&quot;adapter of Qwen3.8-27B 8-bit&quot;): picking one runs the base model with it, an adapter not downloaded downloads from the list, and one whose base model is not on this Mac is greyed with the reason (<a href="/docs/lora/#in-saetta-code">LoRA adapters</a>). From the same list you can add, edit or remove an OpenAI-compatible model.</p>
 <p><code>/model provider/id</code> switches without the list, and Ctrl+L opens it.</p>
 <p>From the command line:</p>
 <div class="code doc-code"><div class="code-head"><span>shell</span><button class="copy" type="button">Copy</button></div><pre><code>saetta code --pack coder                          <span class="hljs-comment"># a pack, in this process</span>
@@ -143,8 +143,8 @@ saetta code --model myprovider/my-model:high       <span class="hljs-comment"># 
 <tr><td><code>high</code></td><td>deep reasoning (about 16K tokens)</td></tr></tbody></table></div>
 <p><code>--thinking</code> also accepts <code>xhigh</code> and <code>max</code>. <code>defaultThinkingLevel</code> in settings.json sets the level a session starts with. Ctrl+T hides or shows the thinking blocks.</p>
 <h2 id="the-local-server"><a class="anchor" href="#the-local-server" aria-hidden="true" tabindex="-1">#</a>The local server</h2>
-<p>With a Saetta server running (<code>saetta serve</code>, or one that <code>saetta start</code> started), <code>saetta start code</code> joins it instead of loading the model again, and <code>/model</code> lists its model. A server is needed for LoRA adapters:</p>
-<div class="code doc-code"><div class="code-head"><span>shell</span><button class="copy" type="button">Copy</button></div><pre><code>saetta start code --pack 27b-8bit --lora qwen3.8-pi=27b-pi</code></pre></div>
+<p>With a Saetta server running (<code>saetta serve</code>, or one that <code>saetta start</code> started), <code>saetta start code</code> joins it instead of loading the model again, and <code>/model</code> lists its model. LoRA adapters need no server: with the model in process they load with it, as <code>saetta serve</code> loads them:</p>
+<div class="code doc-code"><div class="code-head"><span>shell</span><button class="copy" type="button">Copy</button></div><pre><code>saetta start code 27b-8bit --lora-modules qwen3.8-pi=27b-pi</code></pre></div>
 <p>See <a href="/docs/lora/">LoRA adapters</a> and <a href="/docs/http-api/">HTTP API</a>.</p>
       </article>
       <p class="doc-edit"><a href="https://github.com/antonellof/saetta/blob/main/docs/models-and-providers.md" rel="noopener">Edit this page on GitHub</a></p>

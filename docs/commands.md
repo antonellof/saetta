@@ -8,7 +8,7 @@ usage: saetta <command> [arguments]
   (no command)                 in a terminal: pick a model and a coding agent, then start (also: saetta auto)
 
 Agents and server (<pack> is a download name, such as coder or 27b-turbo, or a folder):
-  start <claude|pi|opencode|code> [--pack P] [--lora name=adapter] [--port N] [--ctx N] [--keep] [-- agent args]
+  start <claude|pi|opencode|code> [P | --pack P] [--lora-modules name=adapter ...] [--port N] [--ctx N] [--keep] [-- agent args]
   code [-p] [-c] [--mode json] [prompt]   Saetta Code, the built-in coding agent (pi-compatible; saetta code --help)
   serve <pack> [--port N] [--lora-modules name=path ...] [--default-chat-template-kwargs JSON]
   monitor | status | stop      live view, state, stop the running server

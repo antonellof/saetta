@@ -334,6 +334,15 @@ typedef struct {
     // a pack's name and quantization for the footer (code_cfg.h cfg_pack_label), the brief one
     // without "(mixed ...)"; NULL: the footer shows the id, as pi does
     const char *label, *label_brief;
+    // a LoRA adapter (pack is set too): id "<pack>+<adapter>" (the adapter as --lora-modules takes
+    // it) on a downloaded base pack, else the adapter alone (not downloaded, or no base here); note:
+    // what it is ("adapter of Qwen3.8-27B 8-bit"); blocked: why it cannot be chosen (drawn greyed);
+    // then: the id to switch to once it is downloaded
+    bool adapter;
+    const char *note, *blocked, *then;
+    // the engine in this process runs it (its base model, or an adapter loaded with it): chosen
+    // in place, without a restart
+    bool inplace;
 } CodeUiModel;
 typedef struct {
     // Runs one prompt to its end (on the agent thread); events arrive through code_ui_event.

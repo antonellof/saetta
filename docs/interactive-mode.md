@@ -21,7 +21,7 @@ The footer shows the folder as `~/...`, the git branch and status, the time of t
 | command | what it does |
 |---|---|
 | `/settings` | open the settings menu |
-| `/model` | switch model or pack, download a pack, add or edit OpenAI-compatible models |
+| `/model` | switch model, pack or LoRA adapter, download a pack or an adapter, add or edit OpenAI-compatible models |
 | `/scoped-models` | choose the models Ctrl+P cycles through |
 | `/thinking` | set the thinking level |
 | `/theme` | choose the color theme, with a live preview |

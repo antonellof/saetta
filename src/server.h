@@ -17,8 +17,10 @@
 // Loads the pack in dir and serves on 127.0.0.1:port until the process ends. Errors:
 // "AlreadyRunning" (another server holds the lock; message printed), load errors, socket
 // errors.
-// loras: nloras "name=path" LoRA adapters (--lora-modules); path a folder or a Hugging Face id
-// under the models folder. A request whose model is an adapter's name runs with it.
+// loras: nloras "name=path" LoRA adapters (--lora-modules); path a folder, a download name
+// (27b-pi) or a Hugging Face id under the models folder (download_lora_dir). Each is checked
+// against the base model (download_lora_check, then model_lora_load): "LoraDoesNotFit" or the
+// load's error, the reason printed. A request whose model is an adapter's name runs with it.
 // kwargs_default: NULL or a JSON object of chat template kwargs (enable_thinking, ...) used when
 // a request does not set them (vLLM's --default-chat-template-kwargs).
 Err server_serve(Arena *arena, const char *dir, uint16_t port, const char *const *loras, size_t nloras,
@@ -27,10 +29,11 @@ Err server_serve(Arena *arena, const char *dir, uint16_t port, const char *const
 // ---- in process (Saetta Code): the server's engine and request path without a socket --------
 
 typedef struct Engine Engine;
-// Loads the pack in dir as server_serve does (model, tokenizer, conversations sized to this
-// Mac's memory), without a socket, the instance lock or the stats thread. kwargs_default as for
-// server_serve.
-Err server_engine_open(Arena *arena, const char *dir, const char *kwargs_default, Engine **out);
+// Loads the pack in dir as server_serve does (model, its LoRA adapters, tokenizer, conversations
+// sized to this Mac's memory), without a socket, the instance lock or the stats thread. loras,
+// nloras and kwargs_default as for server_serve.
+Err server_engine_open(Arena *arena, const char *dir, const char *const *loras, size_t nloras, const char *kwargs_default,
+                       Engine **out);
 // The model id the engine answers as, and its context in tokens.
 const char *server_engine_model(const Engine *e);
 size_t server_engine_context(const Engine *e);

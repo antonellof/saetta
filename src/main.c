@@ -674,8 +674,7 @@ static Err run(Arena *arena, int argc, char **argv) {
     if (argc >= 3 && eq(cmd, "serve")) {
         uint16_t port = 8080;
         // --lora-modules name=path [name=path ...] (vLLM's form) or name=path,name=path
-        const char **loras = ARENA_ARRAY(arena, const char *, (size_t)argc * 8);
-        size_t nloras = 0;
+        DownloadLoras loras = {0};
         const char *kwargs = NULL;
         for (int i = 3; i < argc; i++) {
             if (eq(argv[i], "--port") && i + 1 < argc) {
@@ -686,19 +685,15 @@ static Err run(Arena *arena, int argc, char **argv) {
             } else if (eq(argv[i], "--default-chat-template-kwargs") && i + 1 < argc) {
                 kwargs = argv[++i];
             } else if (eq(argv[i], "--lora-modules")) {
-                for (; i + 1 < argc && argv[i + 1][0] != '-'; i++) {
-                    char *list = arena_strndup(arena, argv[i + 1], strlen(argv[i + 1]));
-                    for (char *tok = strtok(list, ","); tok; tok = strtok(NULL, ",")) {
-                        if (nloras == (size_t)argc * 8) return "TooManyAdapters";
-                        loras[nloras++] = tok;
-                    }
-                }
+                size_t k = (size_t)i;
+                if (download_lora_args(arena, (const char *const *)argv, (size_t)argc, &k, &loras)) exit(64);
+                i = (int)k;
             } else {
                 dbg("saetta serve: unknown argument %s\n", argv[i]);
                 exit(64);
             }
         }
-        Err err = server_serve(arena, pack_arg(arena, argv[2]), port, loras, nloras, kwargs);
+        Err err = server_serve(arena, pack_arg(arena, argv[2]), port, loras.v, loras.n, kwargs);
         if (err && !strcmp(err, "AlreadyRunning")) exit(1);
         if (err && !strcmp(err, "AddressInUse")) {
             dbg("error: port %u is in use by another program; choose another with --port N\n", port);
@@ -754,7 +749,7 @@ static Err run(Arena *arena, int argc, char **argv) {
                 "  (no command)                 in a terminal: pick a model and a coding agent, then start (also: saetta auto)\n"
                 "\n"
                 "Agents and server (<pack> is a download name, such as coder or 27b-turbo, or a folder):\n"
-                "  start <claude|pi|opencode|code> [--pack P] [--lora name=adapter] [--port N] [--ctx N] [--keep] [-- agent args]\n"
+                "  start <claude|pi|opencode|code> [P | --pack P] [--lora-modules name=adapter ...] [--port N] [--ctx N] [--keep] [-- agent args]\n"
                 "  code [-p] [-c] [--mode json] [prompt]   Saetta Code, the built-in coding agent (pi-compatible; saetta code --help)\n"
                 "  serve <pack> [--port N] [--lora-modules name=path ...] [--default-chat-template-kwargs JSON]\n"
                 "  monitor | status | stop      live view, state, stop the running server\n"

@@ -294,6 +294,7 @@ typedef struct {
     char *re_provider, *re_id; // a model to start again on (/model)
     // a pack download (/model)
     char *dl_name, *dl_title, *dl_models_dir;
+    char *dl_then; // an adapter's: the model to switch to once it is downloaded (CodeUiModel.then)
     unsigned dl_disk, dl_free_gb;
     pid_t dl_pid;
     int dl_fd;
@@ -2204,7 +2205,8 @@ static bool is_default_model(const CodeUiModel *m) {
 static const CodeUiModel *g_sort_models;
 static int model_cmp(const void *a, const void *b) {
     const CodeUiModel *x = &g_sort_models[*(const size_t *)a], *y = &g_sort_models[*(const size_t *)b];
-    bool xc = is_current(x), yc = is_current(y);
+    // the current model first; packs keep their order (their LoRA adapters under them)
+    bool xc = is_current(x) && !x->pack, yc = is_current(y) && !y->pack;
     if (xc != yc) return xc ? -1 : 1;
     bool xd = is_default_model(x), yd = is_default_model(y);
     if (xd != yd) return xd ? -1 : 1;
@@ -2616,8 +2618,8 @@ static void model_filter(ModelSel *ms, const char *query) {
         bool ok = true;
         if (query && *query) {
             Buf hay = {0};
-            buf_printf(&hay, "%s %s/%s %s %s%s%s%s", m->provider, m->provider, m->id, m->provider, m->id, m->name ? " " : "",
-                       m->name ? m->name : "", is_default_model(m) ? " default" : "");
+            buf_printf(&hay, "%s %s/%s %s %s%s%s%s%s%s", m->provider, m->provider, m->id, m->provider, m->id, m->name ? " " : "",
+                       m->name ? m->name : "", is_default_model(m) ? " default" : "", m->note ? " " : "", m->note ? m->note : "");
             for (const char *q = query; *q && ok;) {
                 while (*q == ' ') q++;
                 const char *e = q;
@@ -2685,16 +2687,20 @@ static void model_render(int width, Lines *out) {
         if (is_current(m)) th_fgz(&l, T_ACCENT, "\xe2\x9c\x93 ");
         else buf_adds(&l, "  ");
         if (m->pack) {
-            // a model run on this Mac: its name, where it stands
+            // a model run on this Mac: its name, where it stands; a LoRA adapter under its base model
             const char *nm = m->name ? m->name : m->id;
-            if (m->too_big) th_fgz(&l, T_DIM, nm);
+            bool dim = m->too_big || m->blocked;
+            if (m->adapter) th_fgz(&l, dim ? T_DIM : T_MUTED, "\xe2\x86\xb3 ");
+            if (dim) th_fgz(&l, T_DIM, nm);
             else if (sel) th_fgz(&l, T_ACCENT, nm);
             else buf_adds(&l, nm);
             Buf st = {0};
-            if (m->too_big) buf_printf(&st, " [needs %u GB memory]", m->min_ram_gb);
+            if (m->note) buf_printf(&st, " \xc2\xb7 %s", m->note);
+            if (m->blocked) buf_printf(&st, " [%s]", m->blocked);
+            else if (m->too_big) buf_printf(&st, " [needs %u GB memory]", m->min_ram_gb);
             else if (!m->unavailable) buf_adds(&st, " [on this Mac]");
             else buf_printf(&st, " [not downloaded, %u GB]", m->disk_gb);
-            th_fg(&l, m->too_big ? T_DIM : T_MUTED, buf_str(&st));
+            th_fg(&l, dim ? T_DIM : T_MUTED, buf_str(&st));
             buf_free(&st);
             text_lines(buf_str(&l), 0, width, out);
             buf_free(&l);
@@ -2777,8 +2783,10 @@ static void confirm_download(const CodeUiModel *m) {
     free(U->dl_name);
     free(U->dl_title);
     free(U->dl_models_dir);
+    free(U->dl_then);
     U->dl_name = strdup(m->id);
     U->dl_title = strdup(m->name ? m->name : m->id);
+    U->dl_then = dupz(m->then);
     U->dl_disk = m->disk_gb;
     U->dl_free_gb = (unsigned)(freeb / 1000000000ull);
     U->dl_models_dir = dupz(mdir);
@@ -2934,7 +2942,7 @@ static void download_poll(void) {
         buf_printf(&m, "Downloaded %s", U->dl_title);
         show_status(m.ptr);
         buf_free(&m);
-        restart_model("saetta", U->dl_name);
+        restart_model("saetta", U->dl_then ? U->dl_then : U->dl_name);
     } else if (U->dl_cancelled) {
         show_status("Download stopped; choose the model again to resume it");
     } else {
@@ -2972,6 +2980,14 @@ static void restart_model(const char *provider, const char *id) {
 }
 
 static void choose_model(const CodeUiModel *m, bool persist) {
+    if (m->blocked) {
+        close_selector();
+        Buf b = {0};
+        buf_printf(&b, "%s: %s", m->name ? m->name : m->id, m->blocked);
+        show_status(b.ptr);
+        buf_free(&b);
+        return;
+    }
     if (m->pack && (m->unavailable || m->too_big)) {
         close_selector();
         if (m->too_big) {
@@ -2991,7 +3007,7 @@ static void choose_model(const CodeUiModel *m, bool persist) {
         buf_free(&b);
         return;
     }
-    if (m->pack || U->cfg->engine) {
+    if (!m->inplace && (m->pack || U->cfg->engine)) {
         // another pack, or away from the engine in this process: a restart on it, once confirmed
         close_selector();
         free(U->sw_provider);
@@ -3034,7 +3050,7 @@ static void choose_model(const CodeUiModel *m, bool persist) {
             U->default_provider = strdup(prov);
             U->default_model = strdup(id);
             buf_printf(&b, "Default model: %s/%s", prov, id);
-        } else buf_printf(&b, "Model: %s", id);
+        } else buf_printf(&b, "Model: %s", copy.inplace && copy.label ? copy.label : id);
         show_status(b.ptr);
         buf_free(&b);
     }
@@ -5619,6 +5635,7 @@ Err code_ui_run(const CodeUiConfig *cfg, const CodeUiOps *ops, CodeUiHost *host,
     if (ui.dl_fd >= 0) close(ui.dl_fd);
     free(ui.dl_name);
     free(ui.dl_title);
+    free(ui.dl_then);
     free(ui.dl_models_dir);
     buf_free(&ui.dl_line);
     free(ui.re_provider);

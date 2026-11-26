@@ -97,12 +97,13 @@ saetta start pi -- -p <span class="hljs-string">&quot;fix the failing test&quot;
 <h2 id="the-pi-adapter"><a class="anchor" href="#the-pi-adapter" aria-hidden="true" tabindex="-1">#</a>The pi adapter</h2>
 <p><a href="https://huggingface.co/harness-hub/Qwen3.8-27B-pi-adapted" rel="noopener">harness-hub&#39;s pi adapter</a> is a LoRA adapter for Qwen3.8-27B trained to drive pi (its card: SWE-bench Pro hard 39.2% to 64.7% over the base model).</p>
 <div class="code doc-code"><div class="code-head"><span>shell</span><button class="copy" type="button">Copy</button></div><pre><code>saetta download 27b-8bit &amp;&amp; saetta download 27b-pi
-saetta start pi --pack 27b-8bit --lora qwen3.8-pi=27b-pi</code></pre></div>
-<p>With <code>--lora</code>, thinking is off by default, as the adapter was trained. See <a href="/docs/lora/">LoRA adapters</a>.</p>
+saetta start pi --pack 27b-8bit --lora-modules qwen3.8-pi=27b-pi</code></pre></div>
+<p>With an adapter, thinking is off by default, as the adapter was trained. See <a href="/docs/lora/">LoRA adapters</a>.</p>
 <h2 id="saetta-start"><a class="anchor" href="#saetta-start" aria-hidden="true" tabindex="-1">#</a>saetta start</h2>
 <p><code>saetta start &lt;claude|pi|opencode|code&gt;</code> joins the server on this machine or starts one, waits for the model and runs the agent pointed at it, without touching your agent configuration; the server it started stops with the last session. Several sessions share one server (up to 4 conversations, <code>SAETTA_CONVERSATIONS</code>).</p>
-<div class="doc-table"><table><thead><tr><th>option</th><th>effect</th></tr></thead><tbody><tr><td><code>--pack &lt;name or dir&gt;</code></td><td>the model (default: the first downloaded pack that fits this Mac: coder, full, then the 27B packs)</td></tr>
-<tr><td><code>--lora name=adapter</code></td><td>a LoRA adapter on a 27B pack</td></tr>
+<div class="doc-table"><table><thead><tr><th>option</th><th>effect</th></tr></thead><tbody><tr><td><code>&lt;pack&gt;</code>, <code>--pack &lt;name or dir&gt;</code></td><td>the model (default: the first downloaded pack that fits this Mac: coder, full, then the 27B packs); a download name right after the agent works too (<code>saetta start code 27b-8bit</code>)</td></tr>
+<tr><td><code>--lora-modules name=adapter ...</code></td><td>LoRA adapters on a 27B pack, as <code>saetta serve</code> takes them (<code>--lora name=adapter</code> for one)</td></tr>
+<tr><td><code>--default-chat-template-kwargs JSON</code></td><td>chat template values a request leaves out (with adapters, <code>{&quot;enable_thinking&quot;: false}</code> unless given)</td></tr>
 <tr><td><code>--port N</code>, <code>--ctx N</code></td><td>server port (8080) and context (204800 tokens)</td></tr>
 <tr><td><code>--keep</code></td><td>leave the server running when the agent exits</td></tr></tbody></table></div>
 <p><code>SAETTA_PORT</code> and <code>SAETTA_CTX</code> set the same defaults. When port 8080 is taken by another program, <code>saetta start</code> moves to the next free port; a port you chose is an error instead. A missing agent is reported with its official install command.</p>

@@ -1416,23 +1416,18 @@ static Err engine_open(Arena *arena, const char *dir, const char *const *loras, 
             dbg("saetta: LoRA name %s is taken (the base model or another adapter)\n", name);
             return "BadLoraModule";
         }
-        const char *path = eq + 1;
-        struct stat lst;
-        if (stat(path, &lst) != 0) {
-            // a `saetta download` name (27b-pi), else a Hugging Face id (org/repo, as vLLM
-            // takes it): its folder under the models folder
-            const DownloadPack *dp = download_find(path);
-            char *dir;
-            if (dp && !download_pack_dir(arena, dp, &dir)) path = dir;
-            else {
-                char *md;
-                TRY(download_models_dir(arena, &md));
-                path = path_join(arena, md, path);
-            }
+        char *path;
+        TRY(download_lora_dir(arena, eq + 1, &path));
+        // what its adapter_config.json tells (base model, rank, targets), before the tensors
+        const char *why = download_lora_check(arena, path, model_info(m)->id);
+        if (why) {
+            dbg("saetta: LoRA %s from %s: %s\n", name, path, why);
+            return "LoraDoesNotFit";
         }
         Err le = model_lora_load(arena, m, name, path);
         if (le) {
-            dbg("saetta: LoRA %s from %s: %s\n", name, path, le);
+            const char *what = download_lora_error(le);
+            dbg("saetta: LoRA %s from %s: %s%s%s\n", name, path, le, what ? ": " : "", what ? what : "");
             return le;
         }
     }
@@ -1509,7 +1504,8 @@ static Err engine_open(Arena *arena, const char *dir, const char *const *loras, 
     return OK;
 }
 
-Err server_engine_open(Arena *arena, const char *dir, const char *kwargs_default, Engine **out) {
+Err server_engine_open(Arena *arena, const char *dir, const char *const *loras, size_t nloras, const char *kwargs_default,
+                       Engine **out) {
     // one engine per machine: not beside a server or another in-process engine
     Server srv;
     if (instance_running(&srv)) {
@@ -1527,7 +1523,7 @@ Err server_engine_open(Arena *arena, const char *dir, const char *kwargs_default
     }
     JValue *kwd = NULL;
     if (kwargs_default && (json_parse(arena, str(kwargs_default), true, &kwd) || kwd->kind != J_OBJECT)) return "BadKwargs";
-    return engine_open(arena, dir, NULL, 0, kwd, 0, out);
+    return engine_open(arena, dir, loras, nloras, kwd, 0, out);
 }
 
 const char *server_engine_model(const Engine *e) { return base_id; }

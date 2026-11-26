@@ -21,7 +21,7 @@ saetta start claude -- --continue                                          # res
 saetta start claude --keep                                                 # leave the server running afterwards
 ```
 
-The options of `saetta start` (`--pack`, `--lora`, `--port`, `--ctx`, `--keep`) are on the [pi](pi.md#saetta-start) page; they are the same for every agent.
+The options of `saetta start` (`--pack`, `--lora-modules`, `--port`, `--ctx`, `--keep`) are on the [pi](pi.md#saetta-start) page; they are the same for every agent.
 
 ## What saetta start sets
 

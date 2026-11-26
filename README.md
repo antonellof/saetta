@@ -97,7 +97,7 @@ The interactive view is pi's terminal UI ported to C: differential rendering, an
 
 | command | what it does |
 |---|---|
-| `/model` | switch between downloaded packs in process, download a pack from the list (its size and the free disk shown first), add or edit OpenAI-compatible models |
+| `/model` | switch between downloaded packs and LoRA adapters in process (adapters listed under their base model), download a pack or an adapter from the list (its size and the free disk shown first), add or edit OpenAI-compatible models |
 | `/monitor` | the engine's live stats inside the agent: speed, GPU, memory, prompt-cache reuse, speculation, recent requests |
 | `/compact`, `/resume`, `/new` | compact the context, open another session, start a new one |
 | `/fork`, `/clone`, `/tree` | branch from an earlier message, duplicate the session, move through its tree |
@@ -114,7 +114,7 @@ MCP servers come from pi's `mcp.json` (global, or `.pi/mcp.json` in a trusted pr
 
 ### Which model it uses
 
-By default the model runs inside the agent. It can also use a running Saetta server, or any OpenAI-compatible chat completions server listed in `models.json`; `/model` adds one. LoRA adapters need the server: `saetta start code --lora name=adapter` starts one. Next: sessions kept on disk with the engine's state, and prompts read while tools run.
+By default the model runs inside the agent. It can also use a running Saetta server, or any OpenAI-compatible chat completions server listed in `models.json`; `/model` adds one. LoRA adapters load with the model in process, as `saetta serve` loads them: `saetta start code 27b-8bit --lora-modules qwen3.8-pi=27b-pi` ([LoRA adapters](#lora-adapters)). Next: sessions kept on disk with the engine's state, and prompts read while tools run.
 
 <p align="center"><img src="web/assets/code/model.png" width="900" alt="/model: a saetta server model, two packs on this Mac, one greyed out as too big for its memory, and the others with their download size"></p>
 
@@ -136,8 +136,9 @@ saetta start claude -- -p "fix the failing test"   # anything after -- goes to t
 
 | option | effect |
 |---|---|
-| `--pack <name or dir>` | the model (default: the first downloaded pack that fits this Mac: coder, full, then the 27B packs) |
-| `--lora name=adapter` | a LoRA adapter on a 27B pack |
+| `<pack>`, `--pack <name or dir>` | the model (default: the first downloaded pack that fits this Mac: coder, full, then the 27B packs) |
+| `--lora-modules name=adapter ...` | LoRA adapters on a 27B pack, as `saetta serve` takes them (`--lora name=adapter` for one) |
+| `--default-chat-template-kwargs JSON` | chat template values a request leaves out (with adapters: thinking off unless given) |
 | `--port N`, `--ctx N` | server port (8080) and context (204800 tokens) |
 | `--keep` | leave the server running when the agent exits |
 
@@ -192,12 +193,13 @@ PEFT LoRA adapters run on Qwen3.8-27B at run time, with vLLM's flags. The [pi ad
 
 ```sh
 saetta download 27b-8bit && saetta download 27b-pi
-saetta start pi --pack 27b-8bit --lora qwen3.8-pi=27b-pi                    # pi on it
+saetta start code 27b-8bit --lora-modules qwen3.8-pi=27b-pi                 # Saetta Code on it, no server
+saetta start pi --pack 27b-8bit --lora-modules qwen3.8-pi=27b-pi            # pi on it
 saetta serve 27b-8bit --lora-modules qwen3.8-pi=27b-pi \
     --default-chat-template-kwargs '{"enable_thinking": false}'            # or any client
 ```
 
-A request whose `model` is the adapter's name runs with it, any other with the base model. Supported: LoRA on attention and MLP projections, rank a multiple of 8 up to 128, rsLoRA. `SAETTA_LORA=<folder>` applies one to `saetta generate`.
+A request whose `model` is the adapter's name runs with it, any other with the base model. An adapter's path is a folder, a download name (`27b-pi`) or an `org/repo` under the models folder; one that does not fit the base model (its base, rank or target modules) is refused with the reason. In Saetta Code the session runs on the first adapter (`--model NAME` picks another, or the base), and `/model` lists the downloaded adapters under each base model they fit, downloads the others and switches between them. Supported: LoRA on attention and MLP projections, rank a multiple of 8 up to 128, rsLoRA. `SAETTA_LORA=<folder>` applies one to `saetta generate`.
 
 ## Server
 

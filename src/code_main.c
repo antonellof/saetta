@@ -22,6 +22,7 @@
 #include "code_monitor.h"
 #include "download.h"
 #include "instance.h"
+#include "model.h"
 #include "server.h"
 
 #include <ctype.h>
@@ -46,6 +47,8 @@ static const char *const default_tools[] = {"read", "bash", "edit", "write"};
 
 typedef struct {
     const char *provider, *model, *thinking, *mode, *system_prompt, *tools, *pack, *ctx, *session;
+    const char *kwargs;  // --default-chat-template-kwargs (with --pack)
+    DownloadLoras loras; // --lora-modules and --lora (with --pack)
     bool print, cont, no_session, no_tools, no_skills, no_mcp, subagents;
     int approve; // --approve 1, --no-approve 0, else -1
     VEC(const char *) skills;
@@ -69,6 +72,13 @@ typedef struct {
     JValue *new_messages; // this run's messages, for agent_end
     const char *pack;     // --pack as given (a download name or a folder), NULL over HTTP
     const char *ctx;      // --ctx (a joined session that takes the model over loads it with this)
+    // --lora-modules with --pack: the adapters as given ("name=path"), their names and folders,
+    // loaded with the model; the one the session runs on (its name; NULL: the base model, whose
+    // id is base_id); --default-chat-template-kwargs
+    const char *const *loras;
+    size_t nloras;
+    const char **lora_names, **lora_dirs;
+    const char *lora_cur, *base_id, *want_model, *kwargs;
     bool interactive;     // the screen (only it shares a model it loads: code_share.c)
     const char *const *argv; // the command line after "code", for a restart on another model
     size_t argc;
@@ -118,7 +128,7 @@ static void emit_message(Run *r, const char *type, const JValue *m) {
 
 // ---- arguments (cli/args.ts, the subset print mode needs) -----------------------------------------
 
-static Err parse_args(const char *const *v, size_t n, Args *o) {
+static Err parse_args(Arena *a, const char *const *v, size_t n, Args *o) {
     for (size_t i = 0; i < n; i++) {
         const char *x = v[i];
         bool more = i + 1 < n;
@@ -134,6 +144,9 @@ static Err parse_args(const char *const *v, size_t n, Args *o) {
         else if (!strcmp(x, "--tools") && more) o->tools = v[++i];
         else if (!strcmp(x, "--pack") && more) o->pack = v[++i];
         else if (!strcmp(x, "--ctx") && more) o->ctx = v[++i];
+        else if (!strcmp(x, "--lora-modules")) TRY(download_lora_args(a, v, n, &i, &o->loras));
+        else if (!strcmp(x, "--lora") && more) TRY(download_lora_add(a, v[++i], &o->loras));
+        else if (!strcmp(x, "--default-chat-template-kwargs") && more) o->kwargs = v[++i];
         else if (!strcmp(x, "--session") && more) o->session = v[++i];
         else if (!strcmp(x, "--no-tools") || !strcmp(x, "-nt")) o->no_tools = true;
         else if (!strcmp(x, "--skill") && more) vec_push(&o->skills, v[++i]);
@@ -171,6 +184,12 @@ static Err parse_args(const char *const *v, size_t n, Args *o) {
                    "                           folder): no server, no HTTP; the requests are the same\n"
                    "  --ctx N                  with --pack: the context in tokens (default 204800, as saetta start;\n"
                    "                           less when this Mac's memory holds less)\n"
+                   "  --lora-modules name=path [name=path ...]   with --pack: LoRA adapters loaded with the model, as\n"
+                   "                           saetta serve takes them (path: a folder, a download name such as 27b-pi,\n"
+                   "                           or org/repo under ~/Models; also name=path,name=path; --lora name=path);\n"
+                   "                           the session runs on the first, --model NAME picks another or the base\n"
+                   "  --default-chat-template-kwargs JSON   with --pack: chat template values a request leaves out\n"
+                   "                           ({\"enable_thinking\": false} also starts with thinking off)\n"
                    "\n"
                    "Without -p in a terminal it opens the interactive screen: Enter sends, Shift+Enter (or a\n"
                    "trailing \\) starts a new line, \"/\" lists the commands, \"@\" completes file names, Escape stops a\n"
@@ -182,6 +201,16 @@ static Err parse_args(const char *const *v, size_t n, Args *o) {
         } else vec_push(&o->prompts, x);
     }
     if (o->mode && strcmp(o->mode, "text") && strcmp(o->mode, "json") && strcmp(o->mode, "rpc")) return "UnknownMode";
+    JValue *kw;
+    if (o->kwargs && (json_parse(a, str(o->kwargs), true, &kw) || kw->kind != J_OBJECT)) {
+        dbg("saetta code: --default-chat-template-kwargs wants a JSON object, got %s\n", o->kwargs);
+        return "BadKwargs";
+    }
+    if ((o->loras.n || o->kwargs) && !o->pack) {
+        dbg("saetta code: --lora-modules and --default-chat-template-kwargs go with the model in this process (--pack P),\n"
+            "or to the server (saetta serve P --lora-modules ...)\n");
+        return "UnknownOption";
+    }
     if (o->thinking) {
         static const char *const levels[] = {"off", "minimal", "low", "medium", "high", "xhigh", "max"};
         bool ok = false;
@@ -560,6 +589,7 @@ static bool share_recover(Run *r) {
         }
         if (j < 0) break; // refused (another pack, a holder that keeps the model, Esc): said once, no retry
         dbg("saetta code: the session that held the model exited; loading it here\n");
+        if (r->nloras) r->want_model = r->lora_cur ? r->lora_cur : r->base_id; // the same model again
         Err e = open_engine(r->a, r, r->pack, r->ctx, false, r->interactive);
         if (!e) ok = true;
         else if (strcmp(e, "EngineBusy")) break;
@@ -1144,6 +1174,7 @@ static bool finish_agent(Run *r, bool will_retry, const JValue *last, const char
 
 // The turns of one agent run (runLoop): *last the final assistant message and its entry id.
 static bool switch_model(Run *r, const char *provider, const char *id);
+static void use_adapter(Run *r, const char *name);
 static void apply_thinking(Run *r, const char *level);
 
 // What the user chose in the interactive mode while the run went on: applied here, between turns,
@@ -1418,7 +1449,62 @@ static void host_compact(CodeUiHost *h, const char *instructions) {
     code_ui_event(end);
 }
 
+// Whether two paths name the same folder.
+static bool same_dir(const char *x, const char *y) {
+    char rx[PATH_MAX], ry[PATH_MAX];
+    if (!strcmp(x, y)) return true;
+    return realpath(x, rx) && realpath(y, ry) && !strcmp(rx, ry);
+}
+
+// Whether key (a download name or a folder) is the pack this process runs.
+static bool key_is_current(Arena *a, const Run *r, const char *key) {
+    if (!r->pack) return false;
+    if (!strcmp(r->pack, key)) return true;
+    const DownloadPack *p = download_find(key);
+    char *dir = (char *)key;
+    if (p && download_pack_dir(a, p, &dir)) return false;
+    const DownloadPack *q = download_find(r->pack);
+    char *cur = (char *)r->pack;
+    if (q && download_pack_dir(a, q, &cur)) return false;
+    return same_dir(dir, cur);
+}
+
+// The adapter loaded with the engine whose folder is the one key names (as --lora-modules takes
+// it), or -1.
+static ptrdiff_t loaded_adapter(Arena *a, const Run *r, const char *key) {
+    char *dir;
+    if (!r->lora_dirs || download_lora_dir(a, key, &dir)) return -1;
+    for (size_t i = 0; i < r->nloras; i++)
+        if (same_dir(r->lora_dirs[i], dir)) return (ptrdiff_t)i;
+    return -1;
+}
+
+// /model's ids of the models the engine in this process runs (with adapters loaded): the pack
+// (its base model) and "<pack>+<adapter>". *name: the adapter's name, NULL for the base model.
+static bool inplace_model(Arena *a, const Run *r, const char *id, const char **name) {
+    *name = NULL;
+    if (!r->nloras || !r->pack) return false;
+    const char *plus = strchr(id, '+');
+    if (!plus) return key_is_current(a, r, id);
+    if (!key_is_current(a, r, arena_strndup(a, id, (size_t)(plus - id)))) return false;
+    ptrdiff_t k = loaded_adapter(a, r, plus + 1);
+    if (k < 0) return false;
+    *name = r->lora_names[k];
+    return true;
+}
+
 static bool switch_model(Run *r, const char *provider, const char *id) {
+    const char *lora;
+    if (!strcmp(provider, "saetta") && inplace_model(r->a, r, id, &lora)) {
+        // the same engine: the base model or one of its adapters, picked by the request's model
+        use_adapter(r, lora);
+        r->env.model = r->model.id;
+        JValue *f = json_new(r->a, J_OBJECT);
+        json_put(r->a, f, S("provider"), json_string(r->a, str(r->model.provider)));
+        json_put(r->a, f, S("modelId"), json_string(r->a, str(r->model.id)));
+        (void)code_session_append(r->session, "model_change", f);
+        return true;
+    }
     if (r->model.engine) return !strcmp(provider, r->model.provider) && !strcmp(id, r->model.id);
     Arena *a = r->a;
     CodeModel keep = r->model;
@@ -1442,7 +1528,9 @@ static bool switch_model(Run *r, const char *provider, const char *id) {
 }
 
 // What /model lists: the model packs this Mac can run in process (downloaded or not; the ones that
-// need more memory than it has marked), then the openai-completions models of pi's models.json.
+// need more memory than it has marked), each downloaded one followed by the LoRA adapters that fit
+// it, then the adapters not downloaded or without their base model, then the openai-completions
+// models of pi's models.json.
 static bool pack_is_current(Arena *a, const Run *r, const DownloadPack *p) {
     if (!r->pack) return false;
     if (!strcmp(r->pack, p->name)) return true;
@@ -1450,38 +1538,110 @@ static bool pack_is_current(Arena *a, const Run *r, const DownloadPack *p) {
     return !download_pack_dir(a, p, &dir) && !strcmp(dir, r->pack);
 }
 
+// The adapters that fit the downloaded pack `key` (title, label as the footer shows it, model id
+// mid), after it in out: the ones found on this Mac and those loaded with the engine.
+static void list_adapters(Arena *a, const Run *r, const DownloadAdapter *ads, size_t nads, const CodeUiModel *pk,
+                          const char *key, const char *mid, bool cur, CodeUiModel *out, size_t *n, CodeUiModel *current) {
+    bool *shown = ARENA_ARRAY(a, bool, r->nloras + 1);
+    const char *plabel = pk->label ? pk->label : pk->name, *pbrief = pk->label_brief ? pk->label_brief : plabel;
+    for (size_t i = 0; i < nads + (cur ? r->nloras : 0); i++) {
+        const char *akey, *title, *adir;
+        if (i < nads) {
+            if (!ads[i].have || download_lora_check(a, ads[i].dir, mid)) continue;
+            akey = ads[i].key, title = ads[i].title, adir = ads[i].dir;
+        } else { // loaded from a folder not found by the scan
+            size_t k = i - nads;
+            if (shown[k]) continue;
+            akey = r->lora_dirs[k], title = r->lora_names[k], adir = r->lora_dirs[k];
+        }
+        ptrdiff_t k = cur ? loaded_adapter(a, r, adir) : -1;
+        if (k >= 0) shown[k] = true;
+        const char *served = k >= 0 ? r->lora_names[k] : download_lora_name(a, akey);
+        CodeUiModel m = {.provider = "saetta", .id = arena_printf(a, "%s+%s", key, akey), .name = title, .reasoning = true,
+                         .context_window = 204800, .pack = true, .adapter = true, .too_big = pk->too_big,
+                         .min_ram_gb = pk->min_ram_gb, .note = arena_printf(a, "adapter of %s", pk->name), .inplace = k >= 0,
+                         .label = arena_printf(a, "%s + %s", plabel, served), .label_brief = arena_printf(a, "%s + %s", pbrief, served)};
+        if (k >= 0) m.context_window = r->model.context_window;
+        // a session that uses another one's model: adapters load with the model, in that session
+        if (code_share_joined()) m.blocked = "loads with the model: pick it in the session that loaded the model";
+        if (k >= 0 && r->lora_cur && !strcmp(r->lora_cur, served)) *current = m;
+        out[(*n)++] = m;
+    }
+}
+
+// An adapter's base model for /model: the last part of the name its config gives.
+static const char *base_title(Arena *a, const char *base) {
+    if (!base) return "its base model";
+    const char *sl = strrchr(base, '/');
+    return arena_strdup(a, sl && sl[1] ? sl + 1 : base);
+}
+
 static CodeUiModel *list_models(Arena *a, const Run *r, size_t *n, CodeUiModel *current) {
     *n = 0;
     JValue *models = read_json(a, path_join(a, r->env.agent_dir, "models.json"));
     const JValue *providers = json_get(models, "providers");
-    size_t cap = DOWNLOAD_NPACKS + 1;
+    DownloadAdapter *ads;
+    size_t nads = download_adapters(a, &ads);
+    size_t cap = DOWNLOAD_NPACKS + 1 + (nads + r->nloras + 1) * (DOWNLOAD_NPACKS + 2);
     for (size_t i = 0; providers && json_is(providers, J_OBJECT) && i < providers->obj.len; i++) {
         const JValue *list = json_get(providers->obj.items[i].val, "models");
         cap += json_is(list, J_ARRAY) ? list->arr.len : 0;
     }
     CodeUiModel *out = arena_alloc(a, (cap + 1) * sizeof *out);
     const uint64_t ram = fit_ram_bytes();
+    // the downloaded packs' model ids, for the adapters without a pack that fits
+    const char *have_id[DOWNLOAD_NPACKS] = {0};
     for (size_t i = 0; i < DOWNLOAD_NPACKS; i++) {
         const DownloadPack *p = &download_packs[i];
-        if (!p->min_ram_gb) continue; // adapters are not models
+        if (!p->min_ram_gb) continue; // adapters are listed under their base model
         char *dir;
         bool have = !download_pack_dir(a, p, &dir) && file_exists(path_join(a, dir, "config.json"));
         CodeUiModel m = {.provider = "saetta", .id = p->name, .name = p->title ? p->title : p->name, .reasoning = true,
                          .context_window = 204800, .pack = true, .unavailable = !have,
                          .too_big = ram && ((uint64_t)p->min_ram_gb << 30) > ram, .disk_gb = p->disk_gb, .min_ram_gb = p->min_ram_gb};
         if (have) cfg_pack_label(a, m.name, p->gguf_file, dir, &m.label, &m.label_brief);
-        if (pack_is_current(a, r, p)) {
+        bool cur = pack_is_current(a, r, p);
+        if (cur) {
             m.unavailable = false;
             m.context_window = r->model.context_window;
-            *current = m;
+            m.inplace = r->nloras > 0;
+            if (!r->lora_cur) *current = m;
         }
         out[(*n)++] = m;
+        if (!have) continue;
+        const ModelInfo *mi = model_info_dir(a, dir);
+        have_id[i] = mi ? mi->id : NULL;
+        if (!m.too_big) list_adapters(a, r, ads, nads, &m, p->name, have_id[i], cur, out, n, current);
     }
     if (r->pack && !current->id) { // a pack folder that is not a known download
-        CodeUiModel m = {.provider = "saetta", .id = r->pack, .name = r->model.id, .reasoning = true,
-                         .context_window = r->model.context_window, .pack = true};
+        CodeUiModel m = {.provider = "saetta", .id = r->pack, .name = r->base_id ? r->base_id : r->model.id, .reasoning = true,
+                         .context_window = r->model.context_window, .pack = true, .inplace = r->nloras > 0};
         cfg_pack_label(a, NULL, NULL, r->pack, &m.label, &m.label_brief);
-        *current = m;
+        if (!r->lora_cur) *current = m;
+        out[(*n)++] = m;
+        const ModelInfo *mi = model_info_dir(a, r->pack);
+        list_adapters(a, r, ads, nads, &m, r->pack, mi ? mi->id : NULL, true, out, n, current);
+    }
+    // the adapters not downloaded (a download from the list, then a switch to it on a base model
+    // here), and those whose base model is not here (greyed)
+    for (size_t k = 0; k < nads; k++) {
+        const DownloadAdapter *ad = &ads[k];
+        // the base pack it would run on: the current one when it fits, else the first that does
+        const char *then = NULL;
+        for (int pass = 0; pass < 2 && !then; pass++)
+            for (size_t i = 0; i < DOWNLOAD_NPACKS && !then; i++) {
+                const DownloadPack *p = &download_packs[i];
+                if (!have_id[i] || (ram && ((uint64_t)p->min_ram_gb << 30) > ram) || (pass == 0 && !pack_is_current(a, r, p)))
+                    continue;
+                if (ad->have ? !download_lora_check(a, ad->dir, have_id[i]) : download_lora_base_fits(ad->base, have_id[i]))
+                    then = p->name;
+            }
+        if (ad->have && then) continue; // listed under its base models
+        const char *bt = base_title(a, ad->base);
+        CodeUiModel m = {.provider = "saetta", .id = ad->key, .name = ad->title, .reasoning = true, .context_window = 204800,
+                         .pack = true, .adapter = true, .unavailable = !ad->have, .disk_gb = ad->disk_gb,
+                         .note = arena_printf(a, "adapter of %s", bt), .then = then ? arena_printf(a, "%s+%s", then, ad->key) : NULL,
+                         .blocked = then ? NULL : arena_printf(a, "needs %s, not on this Mac", bt)};
         out[(*n)++] = m;
     }
     for (size_t i = 0; providers && json_is(providers, J_OBJECT) && i < providers->obj.len; i++) {
@@ -1521,11 +1681,17 @@ static void restart_on(Run *r) {
     for (size_t i = 0; i < r->argc; i++) {
         const char *x = r->argv[i];
         bool more = i + 1 < r->argc;
+        if (!strcmp(x, "--lora-modules")) { // the adapters go with the pack they were given for
+            while (i + 1 < r->argc && r->argv[i + 1][0] != '-') i++;
+            continue;
+        }
         bool takes = !strcmp(x, "--provider") || !strcmp(x, "--model") || !strcmp(x, "--pack") || !strcmp(x, "--thinking") ||
                      !strcmp(x, "--mode") || !strcmp(x, "--system-prompt") || !strcmp(x, "--append-system-prompt") ||
-                     !strcmp(x, "--tools") || !strcmp(x, "--ctx") || !strcmp(x, "--session") || !strcmp(x, "--skill");
+                     !strcmp(x, "--tools") || !strcmp(x, "--ctx") || !strcmp(x, "--session") || !strcmp(x, "--skill") ||
+                     !strcmp(x, "--lora") || !strcmp(x, "--default-chat-template-kwargs");
         if (takes && more) {
-            if (strcmp(x, "--provider") && strcmp(x, "--model") && strcmp(x, "--pack") && strcmp(x, "--session")) {
+            if (strcmp(x, "--provider") && strcmp(x, "--model") && strcmp(x, "--pack") && strcmp(x, "--session") &&
+                strcmp(x, "--lora")) {
                 vec_push(&v, x);
                 vec_push(&v, r->argv[i + 1]);
             }
@@ -1533,7 +1699,18 @@ static void restart_on(Run *r) {
         } else if (x[0] == '-' && strcmp(x, "-c") && strcmp(x, "--continue")) vec_push(&v, x);
         // prompts are not run again
     }
-    if (!strcmp(r->restart_provider, "saetta")) {
+    // a LoRA adapter on a pack: "<pack>+<adapter>"
+    const char *plus = !strcmp(r->restart_provider, "saetta") ? strchr(r->restart_id, '+') : NULL;
+    const char *rpack = plus ? arena_strndup(a, r->restart_id, (size_t)(plus - r->restart_id)) : r->restart_id;
+    if (plus) {
+        const char *served = download_lora_name(a, plus + 1);
+        vec_push(&v, "--pack");
+        vec_push(&v, rpack);
+        vec_push(&v, "--lora-modules");
+        vec_push(&v, arena_printf(a, "%s=%s", served, plus + 1));
+        vec_push(&v, "--model");
+        vec_push(&v, served);
+    } else if (!strcmp(r->restart_provider, "saetta")) {
         vec_push(&v, "--pack");
         vec_push(&v, r->restart_id);
     } else {
@@ -1559,9 +1736,9 @@ static void restart_on(Run *r) {
     if (code_share_holding()) {
         char *dir = NULL;
         if (!strcmp(r->restart_provider, "saetta")) {
-            const DownloadPack *pk = download_find(r->restart_id);
+            const DownloadPack *pk = download_find(rpack);
             char rp[PATH_MAX];
-            if (!pk || download_pack_dir(a, pk, &dir)) dir = realpath(r->restart_id, rp) ? arena_strdup(a, rp) : (char *)r->restart_id;
+            if (!pk || download_pack_dir(a, pk, &dir)) dir = realpath(rpack, rp) ? arena_strdup(a, rp) : (char *)rpack;
         }
         (void)instance_inproc_restarting(dir ? dir : "");
     }
@@ -1897,6 +2074,79 @@ static const char *find_pi_docs(Arena *a) {
     return NULL;
 }
 
+// --lora-modules with --pack: each adapter's folder, and whether it fits the pack in dir as its
+// adapter_config.json tells (saetta serve's check, download_lora_check), before the load.
+static Err check_adapters(Arena *a, Run *r, const char *dir) {
+    if (!r->nloras || r->lora_names) return OK;
+    const ModelInfo *mi = model_info_dir(a, dir);
+    const char *mid = mi ? mi->id : NULL;
+    const char **names = ARENA_ARRAY(a, const char *, r->nloras), **dirs = ARENA_ARRAY(a, const char *, r->nloras);
+    for (size_t i = 0; i < r->nloras; i++) {
+        const char *spec = r->loras[i], *eq = strchr(spec, '=');
+        names[i] = arena_strndup(a, spec, (size_t)(eq - spec));
+        bool taken = mid && !strcmp(names[i], mid);
+        for (size_t k = 0; k < i; k++) taken |= !strcmp(names[k], names[i]);
+        if (taken) {
+            fprintf(stderr, "saetta code: the LoRA name %s is taken (the base model or another adapter)\n", names[i]);
+            return "BadLoraModule";
+        }
+        char *ad;
+        TRY(download_lora_dir(a, eq + 1, &ad));
+        dirs[i] = ad;
+        const DownloadPack *dp = download_find(eq + 1);
+        if (!file_exists(path_join(a, ad, "adapter_config.json"))) {
+            fprintf(stderr, "saetta code: no LoRA adapter at %s%s%s\n", ad, dp ? "; download it with: saetta download " : "",
+                    dp ? dp->name : "");
+            return "NoAdapter";
+        }
+        const char *why = download_lora_check(a, ad, mid);
+        if (why) {
+            fprintf(stderr, "saetta code: the LoRA adapter %s (%s) does not fit %s: %s\n", names[i], ad, dir, why);
+            return "LoraDoesNotFit";
+        }
+    }
+    r->lora_names = names;
+    r->lora_dirs = dirs;
+    return OK;
+}
+
+// The model the session runs on, the engine described: the base model, or one of its adapters (a
+// request whose model is an adapter's name runs with it): --model's (the base id or an adapter's
+// name), else the first adapter.
+static void use_adapter(Run *r, const char *name) {
+    r->lora_cur = name;
+    r->model.id = r->model.name = name ? name : r->base_id;
+}
+
+static Err pick_adapter(Run *r) {
+    r->base_id = r->model.id;
+    r->lora_cur = NULL;
+    if (!r->nloras) return OK;
+    const char *sel = r->lora_names[0], *want = r->want_model;
+    if (want) {
+        bool found = !strcmp(want, r->base_id);
+        if (found) sel = NULL;
+        for (size_t i = 0; i < r->nloras && !found; i++)
+            if (!strcmp(want, r->lora_names[i])) sel = r->lora_names[i], found = true;
+        if (!found) {
+            fprintf(stderr, "saetta code: --model %s is neither the base model (%s) nor one of the adapters given\n", want,
+                    r->base_id);
+            return "UnknownModel";
+        }
+    }
+    use_adapter(r, sel);
+    // {"enable_thinking": false}: the session starts with thinking off (each request sets it)
+    JValue *kw = NULL;
+    Arena t = {0};
+    if (r->kwargs && !json_parse(&t, str(r->kwargs), true, &kw)) {
+        const JValue *et = json_get(kw, "enable_thinking");
+        if (et && et->kind == J_BOOL && !et->b) r->model.thinking = "off";
+    }
+    arena_reset(&t);
+    dbg("saetta code: %zu LoRA adapter%s loaded; the session runs on %s\n", r->nloras, r->nloras == 1 ? "" : "s", r->model.id);
+    return OK;
+}
+
 // --pack: the engine in this process, described as `saetta start pi` describes the server to pi
 // (launch.c pi_setup), so the requests stay byte for byte the same. The engine's own log lines
 // go to ~/.saetta/code.log.
@@ -1920,12 +2170,24 @@ static Err open_engine(Arena *a, Run *r, const char *arg, const char *ctx, bool 
         setvbuf(log, NULL, _IOLBF, 0);
         dbg_out = log;
     }
+    TRY(check_adapters(a, r, dir));
+    // adapters load with the model: not on one another Saetta Code runs
+    int hpid = 0;
+    if (r->nloras && !code_share_holding() && instance_inproc_running(&hpid) && hpid != getpid()) {
+        if (!(g_share_recovering && interactive))
+            fprintf(stderr, "saetta code: another Saetta Code (pid %d) runs the model in its process; LoRA adapters load with\n"
+                            "the model: close it first.\n", hpid);
+        return "EngineBusy";
+    }
     // another Saetta Code runs the engine on this Mac: this one uses it (code_share.c)
     int joined = g_share_recovering ? code_share_join_until(a, dir, &r->model, g_share_deadline, r->env.abort)
                                     : code_share_join(a, dir, &r->model);
     if (joined) return joined > 0 ? OK : "EngineBusy";
     Err stub_err;
-    if (code_share_stub(a, dir, &r->model, interactive, &stub_err)) return stub_err; // the tests' stand-in
+    if (code_share_stub(a, dir, &r->model, interactive, &stub_err)) { // the tests' stand-in
+        if (!stub_err) stub_err = pick_adapter(r);
+        return stub_err;
+    }
     // the context saetta start gives a server (204800 tokens), unless --ctx or SAETTA_CTX says
     // otherwise; the engine lowers it to what this Mac's memory holds
     if (ctx) setenv("SAETTA_CTX", ctx, 1);
@@ -1935,7 +2197,7 @@ static Err open_engine(Arena *a, Run *r, const char *arg, const char *ctx, bool 
     Splash *sp = splash ? splash_start(arena_printf(a, "Loading %s ...", pk && pk->title ? pk->title : (strrchr(arg, '/') && strrchr(arg, '/')[1] ? strrchr(arg, '/') + 1 : arg))) : NULL;
     if (!sp && !interactive && isatty(2)) fprintf(stderr, "saetta code: loading %s ...\r", pk ? arg : dir);
     Engine *e;
-    Err err = server_engine_open(a, dir, NULL, &e);
+    Err err = server_engine_open(a, dir, r->loras, r->nloras, r->kwargs, &e);
     splash_stop(sp);
     if (!sp && !interactive && isatty(2)) fprintf(stderr, "\x1b[K");
     if (err && !strcmp(err, "EngineBusy") && g_share_recovering) return err; // another session took the model: join it
@@ -1954,6 +2216,11 @@ static Err open_engine(Arena *a, Run *r, const char *arg, const char *ctx, bool 
             fprintf(stderr, "saetta code: another Saetta Code (pid %d) is running the model; one model runs at a time.\n", pid);
         return err;
     }
+    if (err && r->nloras && download_lora_error(err)) {
+        fprintf(stderr, "saetta code: a LoRA adapter does not load on %s: %s (%s; log: ~/.saetta/code.log)\n", dir,
+                download_lora_error(err), err);
+        return err;
+    }
     if (err) {
         fprintf(stderr, "saetta code: cannot load %s: %s (log: ~/.saetta/code.log)\n", dir, err);
         return err;
@@ -1965,7 +2232,7 @@ static Err open_engine(Arena *a, Run *r, const char *arg, const char *ctx, bool 
     // other Saetta Codes started later use this engine (code_share.c): from an interactive run only
     Err se = code_share_serve(m, interactive);
     if (se) dbg("saetta code: the model is not shared with other sessions: %s\n", se);
-    return OK;
+    return pick_adapter(r);
 }
 
 // --tools a,b,c (pi's order as given), --no-tools, else the defaults
@@ -2131,11 +2398,12 @@ Err code_run(const char *const *args, size_t n, int *code) {
     Arena arena = {0};
     Arena *a = &arena;
     Args o = {.approve = -1};
-    Err e = parse_args(args, n, &o);
+    Err e = parse_args(a, args, n, &o);
     if (e) goto done;
     // a /model restart of the holder handed its lock over: kept with --pack, given up without
     if (!o.pack) instance_inproc_release_inherited();
-    Run r = {.a = a, .json = o.mode && !strcmp(o.mode, "json"), .pack = o.pack, .argv = args, .argc = n};
+    Run r = {.a = a, .json = o.mode && !strcmp(o.mode, "json"), .pack = o.pack, .argv = args, .argc = n,
+             .loras = o.loras.v, .nloras = o.loras.n, .kwargs = o.kwargs, .want_model = o.pack ? o.model : NULL};
     char cwd[PATH_MAX];
     if (!getcwd(cwd, sizeof cwd)) {
         e = "NoCwd";

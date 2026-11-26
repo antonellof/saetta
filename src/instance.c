@@ -10,6 +10,7 @@
 #include <libproc.h>
 #include <limits.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 static Err run_dir(Arena *a, char **out) {
@@ -167,8 +168,15 @@ Err instance_inproc_acquire(const char *dir, int *out) {
     if (fd < 0) fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
     arena_reset(&a);
     if (fd < 0) return err_errno(errno);
-    if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+    // a reader's liveness probe (lock_held) holds the lock for an instant: tried again for 100 ms
+    // before another holder is taken to have it
+    for (int tries = 0; flock(fd, LOCK_EX | LOCK_NB) != 0; tries++) {
         int er = errno;
+        if (er == EWOULDBLOCK && tries < 20) {
+            struct timespec ts = {0, 5000000L};
+            nanosleep(&ts, NULL);
+            continue;
+        }
         close(fd);
         return er == EWOULDBLOCK ? "EngineBusy" : err_errno(er);
     }
@@ -477,8 +485,32 @@ Err instance_inproc_publish(InprocState st, uint32_t ctx, const char *model, con
 
 const char *instance_inproc_token(void) { return g_holder.on ? g_holder.token : NULL; }
 
-// The record, if its holder is alive: the pid it names runs and started when the record says (no
-// lock is probed: a probe could make a real acquire fail).
+// Whether a process holds ~/.saetta/run/inproc.lock: a non-blocking shared flock fails only while
+// someone holds it exclusively (this process's own lock too: a lock is per open file). The probe
+// holds the lock for an instant (instance_inproc_acquire tries again meanwhile). When the probe gets
+// it, nobody holds the lock, so nobody writes the record (a holder writes it only under its lock):
+// the record is stale and is removed under the probe (drop).
+static bool lock_held(bool drop) {
+    Arena a = {0};
+    char *path;
+    bool held = true; // an error other than no file: taken as held (never a live holder ignored)
+    if (!inproc_path(&a, &path)) {
+        int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+        if (fd < 0) held = errno != ENOENT; // no lock file: no holder (the record is left: one may be taking it now)
+        else {
+            held = flock(fd, LOCK_SH | LOCK_NB) != 0;
+            char *rec;
+            if (!held && drop && !rec_path(&a, "inproc.rec", &rec)) unlink(rec);
+            close(fd); // drops the probe's lock
+        }
+    }
+    arena_reset(&a);
+    return held;
+}
+
+// The record, if its holder is alive: it still holds the lock (lock_held), and the pid the record
+// names runs and started when the record says. A record of any state that fails either is stale:
+// ignored, and removed when the lock is free (the next holder writes its own).
 static bool read_record(Inproc *out) {
     Arena a = {0};
     char *path, *text = NULL;
@@ -511,6 +543,7 @@ static bool read_record(Inproc *out) {
             ok = start && proc_start_us(pid) == start;
         }
         free(text);
+        if (!lock_held(true)) ok = false;
     }
     arena_reset(&a);
     return ok;

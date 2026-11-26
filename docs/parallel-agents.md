@@ -13,6 +13,7 @@ saetta start code          # terminal 2: uses the model of terminal 1
 
 - Each session gets its own conversation in the engine (four by default; `SAETTA_CONVERSATIONS` sets up to eight), so switching between them does not reread their prompts. The engine answers one request at a time, in the order they arrive.
 - A session started while the first is still loading waits for it. A session that asks for another pack is refused: one model runs at a time.
+- A session started while the first is exiting or restarting waits for it, at most 30 seconds; then it names the process to close and stops. What a session that is gone left behind (its process ended, or it no longer holds `~/.saetta/run/inproc.lock`) is ignored, whatever it said.
 - When the first session exits while others still use the model, it keeps serving them until the last one exits (Ctrl-C stops it at once). A session whose model went away loads it itself on its next request, and the sessions started after it use it there.
 - `/model` in the session that holds the model asks first when other sessions use it: switching disconnects them. The model stays reserved while it starts again; the other sessions then use the new model, or load theirs if it runs no model.
 - A print, JSON or rpc run that loads the model keeps it to itself: it ends on its own, so it never waits for others.

@@ -2,6 +2,8 @@
 #include "download.h"
 #include "fit.h"
 
+#include <ctype.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <math.h>
@@ -17,6 +19,7 @@
 #include "hash.h"
 #include "json.h"
 #include "metal/shim.h"
+#include "model.h"
 #include "stats.h"
 
 // DavidAU's TURBO fine-tune of Qwen3.8-27B: config and tokenizer from the BF16 repo, weights
@@ -47,7 +50,8 @@ const DownloadPack download_packs[DOWNLOAD_NPACKS] = {
     {.name = "full", .title = "Qwen3.8-Flash-Next", .disk_gb = 110, .min_ram_gb = 128, .repo = "mlx-community/Qwen3.8-Flash-Next-4bit-mtp", .rev = "825df623302aeebc434f44ca9122827b04f9a0f1", .note = "512 experts, the original model, 105 GB"},
     {.name = "27b-8bit", .title = "Qwen3.8-27B 8-bit", .disk_gb = 30, .min_ram_gb = 48, .repo = "mlx-community/Qwen3.8-27B-8bit", .rev = "1159008f24a3f97d7afd366fcfee9a79f3bd2b94", .note = "Qwen3.8-27B dense, 8-bit, 29 GB (for LoRA adapters)"},
     {.name = "27b-4bit", .title = "Qwen3.8-27B 4-bit", .disk_gb = 17, .min_ram_gb = 32, .repo = "mlx-community/Qwen3.8-27B-4bit", .rev = "b935172e4bb5dcd0543774a34748fb92422e3027", .note = "Qwen3.8-27B dense, 4-bit, 16 GB"},
-    {.name = "27b-pi", .title = "Qwen3.8-27B pi adapter", .disk_gb = 1, .repo = "harness-hub/Qwen3.8-27B-pi-adapted", .rev = "80d05c9051dfd2ae464e1daf4329cb15524caf60", .note = "LoRA adapter for the pi agent on Qwen3.8-27B, 0.6 GB"},
+    {.name = "27b-pi", .title = "Qwen3.8-27B pi adapter", .disk_gb = 1, .repo = "harness-hub/Qwen3.8-27B-pi-adapted", .rev = "80d05c9051dfd2ae464e1daf4329cb15524caf60", .note = "LoRA adapter for the pi agent on Qwen3.8-27B, 0.6 GB",
+     .lora_name = "qwen3.8-pi", .lora_base = "Qwen/Qwen3.8-27B"},
     {.name = "27b-turbo", .title = "Qwen3.8-27B TURBO", .disk_gb = 40, .min_ram_gb = 36, .repo = TURBO_REPO, .rev = TURBO_REV, .only = turbo_files, .gguf_repo = TURBO_GGUF_REPO, .gguf_rev = TURBO_GGUF_REV,
      .gguf_file = "Qwen3.8-27B-TurboFCFusion-735-882-Here-Uncen-NEO-CODER-MAX-MTP-Q4_K_M.gguf",
      .dir = "DavidAU/Qwen3.8-27B-TURBO-NEO-CODER-MAX-MTP-Q4_K_M",
@@ -633,4 +637,224 @@ Err download_run(const char *const *args, size_t n) {
     Err e = run_in(&a, args, n);
     arena_reset(&a);
     return e;
+}
+
+// ---- LoRA adapters ---------------------------------------------------------------------------------
+
+static Err lora_push(Arena *a, const char *spec, DownloadLoras *out) {
+    char *list = arena_strdup(a, spec);
+    bool any = false;
+    for (char *tok = strtok(list, ","); tok; tok = strtok(NULL, ",")) {
+        const char *eq = strchr(tok, '=');
+        if (!eq || eq == tok || !eq[1]) {
+            dbg("saetta: --lora-modules wants name=path, got %s\n", tok);
+            return "BadLoraModule";
+        }
+        if (out->n == out->cap) {
+            size_t cap = out->cap ? out->cap * 2 : 4;
+            const char **v = ARENA_ARRAY(a, const char *, cap);
+            if (out->n) memcpy(v, out->v, out->n * sizeof *v);
+            out->v = v;
+            out->cap = cap;
+        }
+        out->v[out->n++] = tok;
+        any = true;
+    }
+    if (!any) {
+        dbg("saetta: --lora-modules wants name=path, got \"%s\"\n", spec);
+        return "BadLoraModule";
+    }
+    return OK;
+}
+
+Err download_lora_add(Arena *a, const char *spec, DownloadLoras *out) { return lora_push(a, spec, out); }
+
+Err download_lora_args(Arena *a, const char *const *args, size_t n, size_t *i, DownloadLoras *out) {
+    size_t k = *i;
+    for (; k + 1 < n && args[k + 1][0] != '-'; k++) TRY(lora_push(a, args[k + 1], out));
+    if (k == *i) {
+        dbg("saetta: --lora-modules wants name=path [name=path ...]\n");
+        return "NoLoraModules";
+    }
+    *i = k;
+    return OK;
+}
+
+Err download_lora_dir(Arena *a, const char *path, char **out) {
+    struct stat st;
+    if (stat(path, &st) == 0) {
+        *out = arena_strdup(a, path);
+        return OK;
+    }
+    const DownloadPack *dp = download_find(path);
+    if (dp) return download_pack_dir(a, dp, out);
+    char *md;
+    TRY(download_models_dir(a, &md));
+    *out = path_join(a, md, path);
+    return OK;
+}
+
+static const char *last_part(const char *p) {
+    size_t n = strlen(p);
+    while (n > 1 && p[n - 1] == '/') n--;
+    size_t b = n;
+    while (b > 0 && p[b - 1] != '/') b--;
+    static _Thread_local char buf[256];
+    snprintf(buf, sizeof buf, "%.*s", (int)(n - b), p + b);
+    return buf;
+}
+
+const char *download_lora_name(Arena *a, const char *path) {
+    const DownloadPack *dp = download_find(path);
+    if (dp && dp->lora_name) return dp->lora_name;
+    char *s = arena_strdup(a, last_part(path));
+    for (char *c = s; *c; c++) *c = (char)tolower((unsigned char)*c);
+    return s;
+}
+
+static JValue *lora_config(Arena *a, const char *dir) {
+    char *text;
+    size_t len;
+    if (read_file(path_join(a, dir, "adapter_config.json"), 1u << 20, &text, &len)) return NULL;
+    JValue *cfg;
+    Err e = json_parse(a, str_n(text, len), true, &cfg);
+    free(text);
+    return e || cfg->kind != J_OBJECT ? NULL : cfg;
+}
+
+const char *download_lora_base(Arena *a, const char *dir) {
+    const JValue *b = json_get(lora_config(a, dir), "base_model_name_or_path");
+    return b && b->kind == J_STRING && b->s.len ? arena_strndup(a, b->s.ptr, b->s.len) : NULL;
+}
+
+bool download_lora_base_fits(const char *base, const char *model_id) {
+    if (!base) return true;
+    if (!model_id) return false;
+    char low[256];
+    snprintf(low, sizeof low, "%s", last_part(base));
+    for (char *c = low; *c; c++) *c = (char)tolower((unsigned char)*c);
+    return strstr(low, model_id) != NULL;
+}
+
+// The projections run-time LoRA applies (dense.c lora_targets).
+static const char *const lora_modules[] = {"q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"};
+
+const char *download_lora_check(Arena *a, const char *dir, const char *model_id) {
+    if (!file_exists(path_join(a, dir, "adapter_config.json")))
+        return arena_printf(a, "no adapter at %s (no adapter_config.json)", dir);
+    JValue *cfg = lora_config(a, dir);
+    if (!cfg) return arena_printf(a, "%s/adapter_config.json does not parse", dir);
+    const char *base = download_lora_base(a, dir);
+    if (!download_lora_base_fits(base, model_id))
+        return arena_printf(a, "it was trained on %s, and this model is %s", base, model_id ? model_id : "another one");
+    const JValue *p = json_get(cfg, "peft_type");
+    if (p && !(p->kind == J_STRING && str_eq(p->s, S("LORA")))) return "it is not a LoRA adapter (peft_type)";
+    const JValue *jd = json_get(cfg, "use_dora"), *jb = json_get(cfg, "bias"), *js = json_get(cfg, "modules_to_save");
+    if (jd && jd->kind == J_BOOL && jd->b) return "DoRA is not supported";
+    if (jb && jb->kind == J_STRING && !str_eq(jb->s, S("none"))) return "LoRA with bias is not supported";
+    if (js && js->kind == J_ARRAY && js->arr.len > 0) return "modules_to_save is not supported";
+    const JValue *rp = json_get(cfg, "rank_pattern"), *ap = json_get(cfg, "alpha_pattern");
+    if ((rp && rp->kind == J_OBJECT && rp->obj.len) || (ap && ap->kind == J_OBJECT && ap->obj.len))
+        return "rank_pattern and alpha_pattern are not supported";
+    const JValue *r = json_get(cfg, "r"), *al = json_get(cfg, "lora_alpha");
+    if (!r || r->kind != J_INTEGER || !al || (al->kind != J_INTEGER && al->kind != J_FLOAT))
+        return "its adapter_config.json has no rank (r) or lora_alpha";
+    // LORA_MAX_R (lora.h)
+    if (r->i <= 0 || r->i % 8 != 0 || r->i > 128)
+        return arena_printf(a, "its rank %lld is not supported (a multiple of 8, at most 128)", (long long)r->i);
+    const JValue *t = json_get(cfg, "target_modules");
+    for (size_t i = 0; t && t->kind == J_ARRAY && i < t->arr.len; i++) {
+        const JValue *m = t->arr.items[i];
+        if (m->kind != J_STRING) continue;
+        bool ok = false;
+        for (size_t k = 0; k < COUNT(lora_modules) && !ok; k++) {
+            Str nm = m->s;
+            ptrdiff_t dot = -1;
+            for (size_t c = 0; c < nm.len; c++)
+                if (nm.ptr[c] == '.') dot = (ptrdiff_t)c;
+            if (dot >= 0) nm = str_sub(nm, (size_t)dot + 1, nm.len);
+            ok = str_eq(nm, str(lora_modules[k]));
+        }
+        if (!ok)
+            return arena_printf(a, "it targets %.*s (supported: the attention and MLP projections, q/k/v/o and gate/up/down_proj)",
+                                (int)m->s.len, m->s.ptr);
+    }
+    return NULL;
+}
+
+void download_model_of(Arena *a, const char *dir, const char **id, const char **name) {
+    const ModelInfo *mi = model_info_dir(a, dir);
+    *id = mi ? mi->id : NULL;
+    *name = mi ? mi->name : NULL;
+}
+
+const char *download_lora_error(Err e) {
+    if (!e) return NULL;
+    if (!strcmp(e, "LoraUnsupported")) return "this model does not take LoRA adapters (Qwen3.8-27B does)";
+    if (!strcmp(e, "TooManyAdapters")) return "too many adapters";
+    if (!strcmp(e, "BadAdapterConfig")) return "its adapter_config.json is not a supported LoRA";
+    if (!strcmp(e, "LoraTargetUnsupported")) return "it targets a layer this model does not have";
+    if (!strcmp(e, "LoraShapeMismatch")) return "its tensors do not match this model's shapes (trained on another base?)";
+    if (!strcmp(e, "LoraUnmatchedTensor")) return "it has a tensor without its pair, or one this model does not take";
+    if (!strcmp(e, "MapFailed")) return "its adapter_model.safetensors cannot be read";
+    return NULL;
+}
+
+static int adapter_cmp(const void *x, const void *y) {
+    return strcmp(((const DownloadAdapter *)x)->dir, ((const DownloadAdapter *)y)->dir);
+}
+
+size_t download_adapters(Arena *a, DownloadAdapter **out) {
+    size_t cap = 8, n = 0;
+    DownloadAdapter *v = ARENA_ARRAY(a, DownloadAdapter, cap);
+    for (size_t i = 0; i < DOWNLOAD_NPACKS; i++) {
+        const DownloadPack *p = &download_packs[i];
+        if (p->min_ram_gb) continue;
+        char *dir;
+        if (download_pack_dir(a, p, &dir)) continue;
+        bool have = file_exists(path_join(a, dir, "adapter_config.json"));
+        if (n == cap) {
+            DownloadAdapter *w = ARENA_ARRAY(a, DownloadAdapter, cap * 2);
+            memcpy(w, v, n * sizeof *v);
+            v = w;
+            cap *= 2;
+        }
+        v[n++] = (DownloadAdapter){.key = p->name, .name = download_lora_name(a, p->name), .title = p->title ? p->title : p->name,
+                                   .dir = dir, .base = have && download_lora_base(a, dir) ? download_lora_base(a, dir) : p->lora_base,
+                                   .dl = p, .have = have, .disk_gb = p->disk_gb};
+    }
+    // the others: <models>/<org>/<repo>/adapter_config.json
+    char *md;
+    if (download_models_dir(a, &md)) goto done;
+    DIR *d = opendir(md);
+    for (struct dirent *e; d && (e = readdir(d));) {
+        if (e->d_name[0] == '.') continue;
+        char *org = path_join(a, md, e->d_name);
+        DIR *od = opendir(org);
+        for (struct dirent *f; od && (f = readdir(od));) {
+            if (f->d_name[0] == '.') continue;
+            char *dir = path_join(a, org, f->d_name);
+            if (!file_exists(path_join(a, dir, "adapter_config.json"))) continue;
+            bool known = false;
+            for (size_t k = 0; k < n && !known; k++) known = !strcmp(v[k].dir, dir);
+            if (known) continue;
+            if (n == cap) {
+                DownloadAdapter *w = ARENA_ARRAY(a, DownloadAdapter, cap * 2);
+                memcpy(w, v, n * sizeof *v);
+                v = w;
+                cap *= 2;
+            }
+            v[n++] = (DownloadAdapter){.key = dir, .name = download_lora_name(a, dir), .title = arena_strdup(a, f->d_name),
+                                       .dir = dir, .base = download_lora_base(a, dir), .have = true};
+        }
+        if (od) closedir(od);
+    }
+    if (d) closedir(d);
+    // the found ones in folder order (readdir's is the file system's)
+    size_t listed = 0;
+    while (listed < n && v[listed].dl) listed++;
+    if (n > listed) qsort(v + listed, n - listed, sizeof *v, adapter_cmp);
+done:
+    *out = v;
+    return n;
 }

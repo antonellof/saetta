@@ -84,11 +84,26 @@
 <h1>LoRA adapters</h1>
 <p>PEFT LoRA adapters run on Qwen3.8-27B at run time, with vLLM&#39;s flags. The base pack stays as it is; the adapter is applied per request.</p>
 <div class="code doc-code"><div class="code-head"><span>shell</span><button class="copy" type="button">Copy</button></div><pre><code>saetta download 27b-8bit &amp;&amp; saetta download 27b-pi
-saetta start pi --pack 27b-8bit --lora qwen3.8-pi=27b-pi                    <span class="hljs-comment"># pi on it</span>
+saetta start code 27b-8bit --lora-modules qwen3.8-pi=27b-pi                <span class="hljs-comment"># Saetta Code on it, no server</span>
+saetta start pi --pack 27b-8bit --lora-modules qwen3.8-pi=27b-pi           <span class="hljs-comment"># pi on it</span>
 saetta serve 27b-8bit --lora-modules qwen3.8-pi=27b-pi \
     --default-chat-template-kwargs <span class="hljs-string">&#x27;{&quot;enable_thinking&quot;: false}&#x27;</span>            <span class="hljs-comment"># or any client</span></code></pre></div>
 <p>A request whose <code>model</code> is the adapter&#39;s name runs with it, any other with the base model. <code>GET /v1/models</code> lists the adapters next to the base model.</p>
-<p>The adapter is a name and a pack name or folder: <code>--lora name=adapter</code> for <code>saetta start</code>, <code>--lora-modules name=path ...</code> for <code>saetta serve</code>. <code>saetta start</code> with <code>--lora</code> turns thinking off by default, as the pi adapter was trained. In Saetta Code an adapter needs the server: <code>saetta start code --lora name=adapter</code> starts one.</p>
+<p>An adapter is a name and a path: <code>--lora-modules name=path [name=path ...]</code> (also <code>name=path,name=path</code>) for <code>saetta serve</code>, <code>saetta start</code> and <code>saetta code</code>, and <code>--lora name=path</code> as a shorter form of the same. The path is a folder, a download name (<code>27b-pi</code>) or a Hugging Face id (<code>org/repo</code>) under the models folder, so an adapter fetched with <code>saetta download</code> works by its name everywhere. <code>saetta start</code> turns thinking off by default when it is given adapters, as the pi adapter was trained; <code>--default-chat-template-kwargs</code> overrides that.</p>
+<p>Before loading, saetta checks each adapter against the base model and refuses one that does not fit, with the reason: the base model its <code>adapter_config.json</code> names, the rank, the target modules, DoRA, bias and saved modules. The tensors&#39; shapes are checked when it loads.</p>
+<h2 id="in-saetta-code"><a class="anchor" href="#in-saetta-code" aria-hidden="true" tabindex="-1">#</a>In Saetta Code</h2>
+<p>With the model in process (<code>saetta start code</code> or <code>saetta code --pack P</code>), the adapters load into Saetta Code&#39;s own engine; no server is started. The session runs on the first adapter; <code>--model NAME</code> picks another one, or the base model by its id (<code>qwen3.8-27b</code>).</p>
+<div class="code doc-code"><div class="code-head"><span>shell</span><button class="copy" type="button">Copy</button></div><pre><code>saetta code --pack 27b-8bit --lora-modules qwen3.8-pi=27b-pi -p <span class="hljs-string">&quot;say hi&quot;</span>
+saetta start code 27b-8bit --lora-modules qwen3.8-pi=27b-pi \
+    --default-chat-template-kwargs <span class="hljs-string">&#x27;{&quot;enable_thinking&quot;: false}&#x27;</span></code></pre></div>
+<p><code>{&quot;enable_thinking&quot;: false}</code> starts the session with thinking off (<code>/thinking</code> changes it). <code>/model</code> lists the downloaded adapters under each base model they fit, marked &quot;adapter of ...&quot; in the list:</p>
+<ul>
+<li>an adapter loaded with the model, or its base model, is switched to in place, without loading anything;</li>
+<li>another one starts Saetta Code again on its base model with that adapter (the conversation goes on);</li>
+<li>one not downloaded shows its size and downloads from the list, then Saetta Code switches to it;</li>
+<li>one whose base model is not on this Mac is greyed, with the reason.</li>
+</ul>
+<p>Adapters are found in the download list (<code>27b-pi</code>) and in any <code>org/repo</code> folder of the models folder that holds an <code>adapter_config.json</code>. Adapters load with the model, so a Saetta Code started with adapters does not join one that already runs the model.</p>
 <h2 id="what-is-supported"><a class="anchor" href="#what-is-supported" aria-hidden="true" tabindex="-1">#</a>What is supported</h2>
 <p>LoRA on attention and MLP projections, rank a multiple of 8 up to 128, and rsLoRA. Adapters apply to the 27B packs; the <code>27b-8bit</code> pack is the one meant for them.</p>
 <h2 id="the-pi-adapter"><a class="anchor" href="#the-pi-adapter" aria-hidden="true" tabindex="-1">#</a>The pi adapter</h2>
@@ -101,7 +116,7 @@ SAETTA_LORA=~/Models/my-adapter saetta generate 27b-8bit 64 &lt;token ids...&gt;
       <p class="doc-edit"><a href="https://github.com/antonellof/saetta/blob/main/docs/lora.md" rel="noopener">Edit this page on GitHub</a></p>
       <nav class="doc-pager" aria-label="Previous and next"><a class="prev" href="/docs/gguf-import/"><span>Previous</span>GGUF import</a><a class="next" href="/docs/performance/"><span>Next</span>Performance</a></nav>
     </main>
-    <nav class="doc-toc" aria-label="On this page"><p class="ds-title">On this page</p><ul><li class="d2"><a href="#what-is-supported">What is supported</a></li><li class="d2"><a href="#the-pi-adapter">The pi adapter</a></li><li class="d2"><a href="#testing-an-adapter">Testing an adapter</a></li></ul></nav>
+    <nav class="doc-toc" aria-label="On this page"><p class="ds-title">On this page</p><ul><li class="d2"><a href="#in-saetta-code">In Saetta Code</a></li><li class="d2"><a href="#what-is-supported">What is supported</a></li><li class="d2"><a href="#the-pi-adapter">The pi adapter</a></li><li class="d2"><a href="#testing-an-adapter">Testing an adapter</a></li></ul></nav>
   </div>
   <div class="ds-scrim" hidden></div>
 

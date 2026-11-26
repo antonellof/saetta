@@ -10,7 +10,7 @@ Saetta Code talks to a model in one of three ways:
 
 ## /model
 
-`/model` lists everything the agent can use: the packs downloaded on this Mac, the packs it can download (with their size and the free disk shown first; a pack too big for this Mac's memory is greyed out), a running Saetta server, and the models in `models.json`. Picking a pack switches to it in the running agent. From the same list you can add, edit or remove an OpenAI-compatible model.
+`/model` lists everything the agent can use: the packs downloaded on this Mac, the packs it can download (with their size and the free disk shown first; a pack too big for this Mac's memory is greyed out), a running Saetta server, and the models in `models.json`. Picking a pack switches to it in the running agent. LoRA adapters are listed under each downloaded base model they fit ("adapter of Qwen3.8-27B 8-bit"): picking one runs the base model with it, an adapter not downloaded downloads from the list, and one whose base model is not on this Mac is greyed with the reason ([LoRA adapters](lora.md#in-saetta-code)). From the same list you can add, edit or remove an OpenAI-compatible model.
 
 `/model provider/id` switches without the list, and Ctrl+L opens it.
 
@@ -91,10 +91,10 @@ For a model with `reasoning`, `/thinking` and Shift+Tab choose a level:
 
 ## The local server
 
-With a Saetta server running (`saetta serve`, or one that `saetta start` started), `saetta start code` joins it instead of loading the model again, and `/model` lists its model. A server is needed for LoRA adapters:
+With a Saetta server running (`saetta serve`, or one that `saetta start` started), `saetta start code` joins it instead of loading the model again, and `/model` lists its model. LoRA adapters need no server: with the model in process they load with it, as `saetta serve` loads them:
 
 ```sh
-saetta start code --pack 27b-8bit --lora qwen3.8-pi=27b-pi
+saetta start code 27b-8bit --lora-modules qwen3.8-pi=27b-pi
 ```
 
 See [LoRA adapters](lora.md) and [HTTP API](http-api.md).

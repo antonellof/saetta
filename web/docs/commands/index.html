@@ -88,7 +88,7 @@
   (no command)                 in a terminal: pick a model and a coding agent, then start (also: saetta auto)
 
 Agents and server (&lt;pack&gt; is a download name, such as coder or 27b-turbo, or a folder):
-  start &lt;claude|pi|opencode|code&gt; [--pack P] [--lora name=adapter] [--port N] [--ctx N] [--keep] [-- agent args]
+  start &lt;claude|pi|opencode|code&gt; [P | --pack P] [--lora-modules name=adapter ...] [--port N] [--ctx N] [--keep] [-- agent args]
   code [-p] [-c] [--mode json] [prompt]   Saetta Code, the built-in coding agent (pi-compatible; saetta code --help)
   serve &lt;pack&gt; [--port N] [--lora-modules name=path ...] [--default-chat-template-kwargs JSON]
   monitor | status | stop      live view, state, stop the running server

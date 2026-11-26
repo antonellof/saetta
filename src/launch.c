@@ -30,13 +30,16 @@ extern char **environ;
 // --lora the adapter's name (the server picks the adapter by the request's model).
 static const char *model_id = MODEL_ID;
 static const char *model_label = "Qwen3.8-Flash-Next (saetta)";
-// --lora name=path, passed to serve as --lora-modules (thinking off by default, as the pi
-// adapter was trained)
-static const char *lora_arg = NULL;
+// --lora-modules name=path ... (or --lora name=path): LoRA adapters, passed to serve or to
+// Saetta Code's engine as --lora-modules, with --default-chat-template-kwargs (thinking off by
+// default, as the pi adapter was trained)
+static DownloadLoras loras;
+static const char *kwargs_arg = NULL;
+#define LORA_KWARGS_DEFAULT "{\"enable_thinking\":false}"
 
 const char *launch_usage(void) {
-    return "usage: saetta start <claude|pi|opencode|code> [--pack coder|full|27b-turbo|27b-coder390|27b-fable5|27b-8bit|27b-4bit|<dir>] [--lora name=path] [--port N] "
-           "[--ctx N] [--keep] [-- <agent args>]\n";
+    return "usage: saetta start <claude|pi|opencode|code> [<pack> | --pack coder|full|27b-turbo|27b-coder390|27b-fable5|27b-8bit|27b-4bit|<dir>]\n"
+           "       [--lora-modules name=path [name=path ...]] [--default-chat-template-kwargs JSON] [--port N] [--ctx N] [--keep] [-- <agent args>]\n";
 }
 
 typedef enum { AGENT_CLAUDE, AGENT_PI, AGENT_OPENCODE, AGENT_CODE } Agent;
@@ -285,13 +288,18 @@ static Err start_server(Arena *a, const char *dir, uint16_t port, uint32_t ctx, 
     env_put(&senv, "SAETTA_CTX", arena_printf(a, "%u", ctx));
     env_put(&senv, "SAETTA_AUTOSTOP", "1"); // stopped by the last `saetta start` session
     char *port_s = arena_printf(a, "%u", port);
-    const char *argv[10] = {exe, "serve", dir, "--port", port_s};
-    if (lora_arg) {
-        argv[5] = "--lora-modules";
-        argv[6] = lora_arg;
-        argv[7] = "--default-chat-template-kwargs";
-        argv[8] = "{\"enable_thinking\":false}";
+    const char **argv = ARENA_ARRAY(a, const char *, loras.n + 10);
+    size_t na = 0;
+    argv[na++] = exe, argv[na++] = "serve", argv[na++] = dir, argv[na++] = "--port", argv[na++] = port_s;
+    if (loras.n) {
+        argv[na++] = "--lora-modules";
+        for (size_t i = 0; i < loras.n; i++) argv[na++] = loras.v[i];
     }
+    if (loras.n || kwargs_arg) {
+        argv[na++] = "--default-chat-template-kwargs";
+        argv[na++] = kwargs_arg ? kwargs_arg : LORA_KWARGS_DEFAULT;
+    }
+    argv[na] = NULL;
     posix_spawn_file_actions_t fa;
     posix_spawn_file_actions_init(&fa);
     posix_spawn_file_actions_addopen(&fa, 0, "/dev/null", O_RDONLY, 0);
@@ -394,7 +402,7 @@ static Err pi_setup(Arena *a, Env *env, Argv *argv, const char *base, uint32_t c
         "\"maxTokensField\":\"max_tokens\",\"thinkingFormat\":\"qwen-chat-template\"},"
         "\"models\":[{\"id\":%s,\"name\":%s,\"reasoning\":%s,\"input\":[\"text\"],\"contextWindow\":%u,"
         "\"maxTokens\":32768,\"cost\":{\"input\":0,\"output\":0,\"cacheRead\":0,\"cacheWrite\":0}}]}",
-        q[0].ptr, q[1].ptr, q[2].ptr, lora_arg ? "false" : "true", ctx);
+        q[0].ptr, q[1].ptr, q[2].ptr, loras.n ? "false" : "true", ctx);
     for (int k = 0; k < 3; k++) buf_free(&q[k]);
     JValue *ev;
     TRY(json_parse(a, str(entry), false, &ev));
@@ -447,6 +455,14 @@ static Err code_in_process(Arena *a, const char *dir, uint32_t ctx, const char *
         vec_push(&argv, dir);
         vec_push(&argv, "--ctx");
         vec_push(&argv, arena_printf(a, "%u", ctx));
+        if (loras.n) {
+            vec_push(&argv, "--lora-modules");
+            for (size_t i = 0; i < loras.n; i++) vec_push(&argv, loras.v[i]);
+        }
+        if (loras.n || kwargs_arg) {
+            vec_push(&argv, "--default-chat-template-kwargs");
+            vec_push(&argv, kwargs_arg ? kwargs_arg : LORA_KWARGS_DEFAULT);
+        }
     }
     for (size_t k = 0; k < n_extra; k++) vec_push(&argv, extra[k]);
     vec_push(&argv, NULL);
@@ -542,7 +558,7 @@ static Err session(Arena *a, Session *ss, Agent agent, const char *pack_arg, uin
     if (!joined) {
         int ipid = 0;
         Inproc in;
-        if (agent == AGENT_CODE && !lora_arg && instance_inproc_info(&in)) {
+        if (agent == AGENT_CODE && !loras.n && instance_inproc_info(&in)) {
             // Saetta Code runs the model in its process (or is still loading it, or is exiting):
             // this Saetta Code shares it, waits for it, or loads it after it (code_share.c; another
             // pack asked for is refused there, at once: the record names the pack from the start)
@@ -559,7 +575,7 @@ static Err session(Arena *a, Session *ss, Agent agent, const char *pack_arg, uin
         const char *dir;
         // Saetta Code in a terminal with nothing downloaded: it guides the first run itself (the
         // model that fits this Mac, downloaded on confirmation), or uses a server of its models.json
-        if (agent == AGENT_CODE && !pack_arg && !lora_arg && isatty(0) && isatty(1) && !any_pack(a))
+        if (agent == AGENT_CODE && !pack_arg && !loras.n && isatty(0) && isatty(1) && !any_pack(a))
             return code_in_process(a, NULL, ctx, extra, n_extra, code);
         TRY(pack_for(a, pack_arg, &dir));
         if (!dir) {
@@ -567,9 +583,8 @@ static Err session(Arena *a, Session *ss, Agent agent, const char *pack_arg, uin
             return OK;
         }
         // Saetta Code without a server: the model runs inside it (saetta code --pack), with the
-        // configuration and sessions `saetta start pi` uses
-        // (an adapter needs the server: it serves the adapter under its own name)
-        if (agent == AGENT_CODE && !lora_arg) return code_in_process(a, dir, ctx, extra, n_extra, code);
+        // configuration and sessions `saetta start pi` uses, and the adapters loaded with it
+        if (agent == AGENT_CODE) return code_in_process(a, dir, ctx, extra, n_extra, code);
         // another program on the port: the default moves to the next free one, a chosen one is an error
         if (!port_free(port)) {
             if (port_set) {
@@ -715,14 +730,19 @@ static Err run_in(Arena *a, const char *const *args, size_t n, int *code) {
             i += 1;
             pack_arg = args[i];
         } else if (i + 1 < n && strcmp(x, "--lora") == 0) {
-            i += 1;
-            const char *eq = strchr(args[i], '=');
-            if (!eq || eq == args[i] || !eq[1]) {
-                dbg("saetta: --lora wants name=path, got %s\n", args[i]);
+            if (download_lora_add(a, args[++i], &loras)) {
                 *code = 64;
                 return OK;
             }
-            lora_arg = args[i];
+        } else if (strcmp(x, "--lora-modules") == 0) {
+            if (download_lora_args(a, args, n, &i, &loras)) {
+                *code = 64;
+                return OK;
+            }
+        } else if (i + 1 < n && strcmp(x, "--default-chat-template-kwargs") == 0) {
+            kwargs_arg = args[++i];
+        } else if (i == 1 && !pack_arg && download_find(x) && download_find(x)->min_ram_gb) {
+            pack_arg = x; // saetta start code 27b-8bit: a download name right after the agent
         } else if (i + 1 < n && strcmp(x, "--port") == 0) {
             i += 1;
             TRY(parse_u16(args[i], &port));
@@ -757,15 +777,41 @@ static Err run_in(Arena *a, const char *const *args, size_t n, int *code) {
             }
         }
     }
-    if (lora_arg) {
-        if (!is27) {
-            dbg("saetta: --lora needs a Qwen3.8-27B pack, e.g. --pack 27b-8bit\n");
+    if (loras.n) {
+        if (!pack_arg) {
+            dbg("saetta: LoRA adapters need their base model: --pack P (such as 27b-8bit)\n");
             *code = 64;
             return OK;
         }
-        const char *eq = strchr(lora_arg, '=');
-        model_id = arena_strndup(a, lora_arg, (size_t)(eq - lora_arg));
-        model_label = arena_printf(a, "%s (Qwen3.8-27B LoRA, saetta)", model_id);
+        const char *dir;
+        TRY(pack_for(a, pack_arg, &dir));
+        if (!dir) {
+            *code = 1;
+            return OK;
+        }
+        // what the server or Saetta Code's engine checks again when they load (download_lora_check)
+        const char *mid = NULL, *mname = NULL;
+        download_model_of(a, dir, &mid, &mname);
+        for (size_t i = 0; i < loras.n; i++) {
+            const char *eq = strchr(loras.v[i], '=');
+            char *ad;
+            TRY(download_lora_dir(a, eq + 1, &ad));
+            const DownloadPack *dp = download_find(eq + 1);
+            if (!file_exists(path_join(a, ad, "adapter_config.json"))) {
+                dbg("saetta: no LoRA adapter at %s%s%s\n", ad, dp ? "; download it with: saetta download " : "", dp ? dp->name : "");
+                *code = 1;
+                return OK;
+            }
+            const char *why = download_lora_check(a, ad, mid);
+            if (why) {
+                dbg("saetta: the LoRA adapter %.*s (%s) does not fit %s: %s\n", (int)(eq - loras.v[i]), loras.v[i], ad, dir, why);
+                *code = 1;
+                return OK;
+            }
+        }
+        const char *eq = strchr(loras.v[0], '=');
+        model_id = arena_strndup(a, loras.v[0], (size_t)(eq - loras.v[0]));
+        model_label = arena_printf(a, "%s (%s LoRA, saetta)", model_id, mname ? mname : "Qwen3.8-27B");
     } else if (is27) {
         model_id = "qwen3.8-27b";
         model_label = "Qwen3.8-27B (saetta)";
@@ -778,9 +824,9 @@ static Err run_in(Arena *a, const char *const *args, size_t n, int *code) {
         if (s.port != port) dbg("saetta: note: the running server is on port %u, not %u\n", s.port, port);
         port = s.port;
         if (pack_arg) dbg("saetta: note: --pack ignored, the running server keeps its model\n");
-        if (lora_arg) {
+        if (loras.n) {
             // the agent would ask for an adapter the running server may not have
-            dbg("saetta: a server is already running (pid %d); --lora needs a new one: stop it first (saetta stop)\n", s.pid);
+            dbg("saetta: a server is already running (pid %d); LoRA adapters need a new one: stop it first (saetta stop)\n", s.pid);
             (void)instance_unregister();
             *code = 1;
             return OK;

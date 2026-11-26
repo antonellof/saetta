@@ -44,7 +44,7 @@ The agent writes its own log to `~/.saetta/code.log`.
 
 ## Where the model runs
 
-By default the model runs inside the agent. It can also use a running Saetta server, or any OpenAI-compatible chat completions server listed in `models.json`; `/model` adds one. LoRA adapters need the server: `saetta start code --lora name=adapter` starts one. Only one model runs on the Mac at a time: further Saetta Code sessions use the model the first one loaded ([Parallel agents](parallel-agents.md)), while `saetta start` for another agent asks you to close it first, or to start a server that both use.
+By default the model runs inside the agent. It can also use a running Saetta server, or any OpenAI-compatible chat completions server listed in `models.json`; `/model` adds one. LoRA adapters load into the engine in process, as `saetta serve` loads them: `saetta start code 27b-8bit --lora-modules qwen3.8-pi=27b-pi`, and `/model` lists the downloaded adapters under their base model ([LoRA adapters](lora.md#in-saetta-code)). Only one model runs on the Mac at a time: further Saetta Code sessions use the model the first one loaded ([Parallel agents](parallel-agents.md)), while `saetta start` for another agent asks you to close it first, or to start a server that both use.
 
 ## Options
 
@@ -71,6 +71,12 @@ saetta code [options] [prompt ...]
                            folder): no server, no HTTP; the requests are the same
   --ctx N                  with --pack: the context in tokens (default 204800, as saetta start;
                            less when this Mac's memory holds less)
+  --lora-modules name=path [name=path ...]   with --pack: LoRA adapters loaded with the model, as
+                           saetta serve takes them (path: a folder, a download name such as 27b-pi,
+                           or org/repo under ~/Models; also name=path,name=path; --lora name=path);
+                           the session runs on the first, --model NAME picks another or the base
+  --default-chat-template-kwargs JSON   with --pack: chat template values a request leaves out
+                           ({"enable_thinking": false} also starts with thinking off)
 ```
 
 Input piped into `saetta code` is read as pi reads it: it is joined to the prompt and makes the run a print run.

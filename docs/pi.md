@@ -25,10 +25,10 @@ To use Saetta from your usual pi setup instead, copy the provider from [`config/
 
 ```sh
 saetta download 27b-8bit && saetta download 27b-pi
-saetta start pi --pack 27b-8bit --lora qwen3.8-pi=27b-pi
+saetta start pi --pack 27b-8bit --lora-modules qwen3.8-pi=27b-pi
 ```
 
-With `--lora`, thinking is off by default, as the adapter was trained. See [LoRA adapters](lora.md).
+With an adapter, thinking is off by default, as the adapter was trained. See [LoRA adapters](lora.md).
 
 ## saetta start
 
@@ -36,8 +36,9 @@ With `--lora`, thinking is off by default, as the adapter was trained. See [LoRA
 
 | option | effect |
 |---|---|
-| `--pack <name or dir>` | the model (default: the first downloaded pack that fits this Mac: coder, full, then the 27B packs) |
-| `--lora name=adapter` | a LoRA adapter on a 27B pack |
+| `<pack>`, `--pack <name or dir>` | the model (default: the first downloaded pack that fits this Mac: coder, full, then the 27B packs); a download name right after the agent works too (`saetta start code 27b-8bit`) |
+| `--lora-modules name=adapter ...` | LoRA adapters on a 27B pack, as `saetta serve` takes them (`--lora name=adapter` for one) |
+| `--default-chat-template-kwargs JSON` | chat template values a request leaves out (with adapters, `{"enable_thinking": false}` unless given) |
 | `--port N`, `--ctx N` | server port (8080) and context (204800 tokens) |
 | `--keep` | leave the server running when the agent exits |
 

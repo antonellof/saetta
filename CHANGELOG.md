@@ -3,6 +3,18 @@
 All notable changes to saetta and Saetta Code (`saetta code`), newest first. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are saetta's.
 
+## [Unreleased]
+
+### Added
+
+- LoRA adapters in Saetta Code without a server: `saetta start code 27b-8bit --lora-modules qwen3.8-pi=27b-pi` (and `saetta code --pack P --lora-modules ...`) loads them into the engine in process, as `saetta serve` does, with `--default-chat-template-kwargs`; `--lora name=path` stays as a shorter form. The session runs on the first adapter, `--model NAME` picks another or the base model.
+- `/model` lists LoRA adapters under each downloaded base model they fit ("adapter of Qwen3.8-27B 8-bit"): switching between the base model and the adapters loaded with it happens in place, another adapter starts Saetta Code again on its base, one not downloaded downloads from the list, and one without its base model on this Mac is greyed with the reason. Adapters are found in the download list and in any `org/repo` folder of the models folder that holds an `adapter_config.json`.
+- `saetta start` takes `--lora-modules` (several adapters) and `--default-chat-template-kwargs` for every agent, and a download name right after the agent (`saetta start code 27b-8bit`).
+
+### Changed
+
+- An adapter that does not fit the base model (the base its `adapter_config.json` names, its rank or target modules) is refused before the load with the reason, by `saetta serve`, `saetta start` and Saetta Code alike.
+
 ## [0.18.0] - 2026-11-23
 
 ### Added

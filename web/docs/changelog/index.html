@@ -46,7 +46,7 @@
     <div class="wrap">
       <a class="brand" href="/">
         <svg viewBox="0 0 32 32" width="20" height="20" aria-hidden="true"><path d="M18.5 3 7 18h7.5L12 29l13-16h-7.8z" fill="currentColor"/></svg>
-        Saetta <span class="ver">v0.18.0</span>
+        Saetta <span class="ver">v0.19.0</span>
       </a>
       <nav class="links">
         <a href="/#models">Models</a>
@@ -84,7 +84,7 @@
 <h1>Changelog</h1>
 <p>All notable changes to saetta and Saetta Code (<code>saetta code</code>), newest first. The format follows
 <a href="https://keepachangelog.com/en/1.1.0/" rel="noopener">Keep a Changelog</a>; versions are saetta&#39;s.</p>
-<h2 id="unreleased"><a class="anchor" href="#unreleased" aria-hidden="true" tabindex="-1">#</a>[Unreleased]</h2>
+<h2 id="0190---2026-11-26"><a class="anchor" href="#0190---2026-11-26" aria-hidden="true" tabindex="-1">#</a>[0.19.0] - 2026-11-26</h2>
 <h3 id="added"><a class="anchor" href="#added" aria-hidden="true" tabindex="-1">#</a>Added</h3>
 <ul>
 <li><code>saetta download 27b-qwopus</code>: Jackrong&#39;s Qwopus3.8-27B Coder-Flash, a coding fine-tune of Qwen3.8-27B distilled from Qwen3.8-Flash-Max (mlx-community&#39;s 4-bit, 16 GB, Macs with 32 GB or more). <code>27b-qwopus-8bit</code>: 29 GB, 48 GB. Same architecture and quantization as <code>27b-4bit</code> and <code>27b-8bit</code>, no MTP draft head.</li>
@@ -96,18 +96,24 @@
 <ul>
 <li>An adapter that does not fit the base model (the base its <code>adapter_config.json</code> names, its rank or target modules) is refused before the load with the reason, by <code>saetta serve</code>, <code>saetta start</code> and Saetta Code alike.</li>
 </ul>
+<h3 id="fixed"><a class="anchor" href="#fixed" aria-hidden="true" tabindex="-1">#</a>Fixed</h3>
+<ul>
+<li>A Saetta Code session no longer waits forever for a shared model whose session has exited: a record counts only while its holder still holds the lock, and a session exiting slowly is waited for at most 30 s.</li>
+<li><code>/model</code> filtering ranks matches the way pi does (best first), so the highlighted model is the one typed, not the current one.</li>
+<li>The README and site lead with Saetta Code and its models; a new ASCII-art banner.</li>
+</ul>
 <h2 id="0180---2026-11-23"><a class="anchor" href="#0180---2026-11-23" aria-hidden="true" tabindex="-1">#</a>[0.18.0] - 2026-11-23</h2>
 <h3 id="added-1"><a class="anchor" href="#added-1" aria-hidden="true" tabindex="-1">#</a>Added</h3>
 <ul>
 <li>Inkling 2 Mini (Thinking Machines, 26B mixture of experts, 3.4B active), first version: <code>saetta download inkling</code> (17 GB, from 32 GB of memory), served with its chat template and JSON tool calls. Checked layer by layer against a numpy reference built from the same weights. Not yet: speculative decoding, the M5&#39;s neural accelerators, reuse of a conversation that does not simply extend the last one.</li>
 <li>M1 to M4: prompt reading with half-precision kernels of their own (simdgroup matrices, from MLX&#39;s and llama.cpp&#39;s designs) and prompt attention that shares each key and value block across tokens (from sushi&#39;s). Measured on an M5 Max forced onto that path: the 27B reads prompts 68% faster, the Coder 52%; not yet measured on an M1 to M4.</li>
 </ul>
-<h3 id="fixed"><a class="anchor" href="#fixed" aria-hidden="true" tabindex="-1">#</a>Fixed</h3>
+<h3 id="fixed-1"><a class="anchor" href="#fixed-1" aria-hidden="true" tabindex="-1">#</a>Fixed</h3>
 <ul>
 <li>A kernel asking for more threads than the GPU allows now fails with its name instead of returning garbage (Metal skips such a dispatch silently; M1 and M2 allow fewer threads for kernels with many registers).</li>
 </ul>
 <h2 id="0171---2026-11-23"><a class="anchor" href="#0171---2026-11-23" aria-hidden="true" tabindex="-1">#</a>[0.17.1] - 2026-11-23</h2>
-<h3 id="fixed-1"><a class="anchor" href="#fixed-1" aria-hidden="true" tabindex="-1">#</a>Fixed</h3>
+<h3 id="fixed-2"><a class="anchor" href="#fixed-2" aria-hidden="true" tabindex="-1">#</a>Fixed</h3>
 <ul>
 <li>M1 to M4: replies were garbage. The prompt kernels written for the M5&#39;s neural accelerators now run only on GPUs that have them; M1 to M4 take the plain GPU kernels automatically (<code>SAETTA_NO_ACCEL=1</code> is no longer needed). <code>SAETTA_ACCEL=1</code> forces the accelerator kernels for testing.</li>
 </ul>
@@ -170,7 +176,7 @@
 <li>The guided start (<code>saetta</code>) lists the new models.</li>
 </ul>
 <h2 id="0132---2026-11-21"><a class="anchor" href="#0132---2026-11-21" aria-hidden="true" tabindex="-1">#</a>[0.13.2] - 2026-11-21</h2>
-<h3 id="fixed-2"><a class="anchor" href="#fixed-2" aria-hidden="true" tabindex="-1">#</a>Fixed</h3>
+<h3 id="fixed-3"><a class="anchor" href="#fixed-3" aria-hidden="true" tabindex="-1">#</a>Fixed</h3>
 <ul>
 <li>The installer (<code>curl -fsSL https://saetta.dev/install.sh | sh</code>) no longer ends with &quot;SAETTA_MODELS: unbound variable&quot; after a successful install.</li>
 </ul>
@@ -180,7 +186,7 @@
 <li>Install from saetta.dev; the README and the GitHub page point there.</li>
 </ul>
 <h2 id="0131---2026-11-21"><a class="anchor" href="#0131---2026-11-21" aria-hidden="true" tabindex="-1">#</a>[0.13.1] - 2026-11-21</h2>
-<h3 id="fixed-3"><a class="anchor" href="#fixed-3" aria-hidden="true" tabindex="-1">#</a>Fixed</h3>
+<h3 id="fixed-4"><a class="anchor" href="#fixed-4" aria-hidden="true" tabindex="-1">#</a>Fixed</h3>
 <ul>
 <li>The guided start (<code>saetta</code>, <code>saetta auto</code>) in a terminal narrower than a model row: rows are cut to the terminal&#39;s width, the list scrolls inside a short terminal, and each model&#39;s status (downloaded, recommended, or why it does not fit) has its own column.</li>
 </ul>
@@ -218,7 +224,7 @@
 <li>Requests with <code>max_tokens</code> below 1 or above 2^30, or <code>top_p</code> above 1, are rejected with a 400.</li>
 <li>Qwen3.8-27B: faster long-prompt attention (64K prompts 758 -&gt; 787 tokens/s), same output.</li>
 </ul>
-<h3 id="fixed-4"><a class="anchor" href="#fixed-4" aria-hidden="true" tabindex="-1">#</a>Fixed</h3>
+<h3 id="fixed-5"><a class="anchor" href="#fixed-5" aria-hidden="true" tabindex="-1">#</a>Fixed</h3>
 <ul>
 <li>Deeply nested JSON, out-of-range numbers, oversized or malformed requests and slow clients get an error instead of crashing or blocking the server; errors after a stream has started end it with an SSE error event; a client that disconnects from a non-streamed request stops it; replies are always valid UTF-8; streamed output no longer leaks the start of a stop string; a <code>count_tokens</code> request whose body arrives after its headers is answered.</li>
 </ul>
@@ -252,7 +258,7 @@
       <p class="doc-edit"><a href="https://github.com/antonellof/saetta/blob/main/CHANGELOG.md" rel="noopener">Edit this page on GitHub</a></p>
       <nav class="doc-pager" aria-label="Previous and next"><a class="prev" href="/docs/faq/"><span>Previous</span>FAQ</a><span></span></nav>
     </main>
-    <nav class="doc-toc" aria-label="On this page"><p class="ds-title">On this page</p><ul><li class="d2"><a href="#unreleased">[Unreleased]</a></li><li class="d3"><a href="#added">Added</a></li><li class="d3"><a href="#changed">Changed</a></li><li class="d2"><a href="#0180---2026-11-23">[0.18.0] - 2026-11-23</a></li><li class="d3"><a href="#added-1">Added</a></li><li class="d3"><a href="#fixed">Fixed</a></li><li class="d2"><a href="#0171---2026-11-23">[0.17.1] - 2026-11-23</a></li><li class="d3"><a href="#fixed-1">Fixed</a></li><li class="d2"><a href="#0170---2026-11-23">[0.17.0] - 2026-11-23</a></li><li class="d3"><a href="#added-2">Added</a></li><li class="d3"><a href="#changed-1">Changed</a></li><li class="d3"><a href="#notes">Notes</a></li><li class="d2"><a href="#0160---2026-11-22">[0.16.0] - 2026-11-22</a></li><li class="d3"><a href="#added-3">Added</a></li><li class="d3"><a href="#changed-2">Changed</a></li><li class="d3"><a href="#notes-1">Notes</a></li><li class="d2"><a href="#0150---2026-11-22">[0.15.0] - 2026-11-22</a></li><li class="d3"><a href="#added-4">Added</a></li><li class="d3"><a href="#notes-2">Notes</a></li><li class="d2"><a href="#0140---2026-11-22">[0.14.0] - 2026-11-22</a></li><li class="d3"><a href="#added-5">Added</a></li><li class="d2"><a href="#0132---2026-11-21">[0.13.2] - 2026-11-21</a></li><li class="d3"><a href="#fixed-2">Fixed</a></li><li class="d3"><a href="#changed-3">Changed</a></li><li class="d2"><a href="#0131---2026-11-21">[0.13.1] - 2026-11-21</a></li><li class="d3"><a href="#fixed-3">Fixed</a></li><li class="d2"><a href="#0130---2026-11-21">[0.13.0] - 2026-11-21</a></li><li class="d3"><a href="#added-6">Added</a></li><li class="d3"><a href="#changed-4">Changed</a></li><li class="d2"><a href="#0120---2026-11-21">[0.12.0] - 2026-11-21</a></li><li class="d3"><a href="#added-7">Added</a></li><li class="d3"><a href="#changed-5">Changed</a></li><li class="d2"><a href="#0110---2026-11-21">[0.11.0] - 2026-11-21</a></li><li class="d3"><a href="#added-8">Added</a></li><li class="d3"><a href="#changed-6">Changed</a></li><li class="d3"><a href="#fixed-4">Fixed</a></li><li class="d2"><a href="#090---2026-11-20">[0.9.0] - 2026-11-20</a></li><li class="d3"><a href="#added-9">Added</a></li><li class="d3"><a href="#changed-7">Changed</a></li><li class="d2"><a href="#081---2026-11-20">[0.8.1] - 2026-11-20</a></li><li class="d3"><a href="#added-10">Added</a></li><li class="d3"><a href="#changed-8">Changed</a></li><li class="d2"><a href="#080---2026-11-20">[0.8.0] - 2026-11-20</a></li><li class="d3"><a href="#added-11">Added</a></li></ul></nav>
+    <nav class="doc-toc" aria-label="On this page"><p class="ds-title">On this page</p><ul><li class="d2"><a href="#0190---2026-11-26">[0.19.0] - 2026-11-26</a></li><li class="d3"><a href="#added">Added</a></li><li class="d3"><a href="#changed">Changed</a></li><li class="d3"><a href="#fixed">Fixed</a></li><li class="d2"><a href="#0180---2026-11-23">[0.18.0] - 2026-11-23</a></li><li class="d3"><a href="#added-1">Added</a></li><li class="d3"><a href="#fixed-1">Fixed</a></li><li class="d2"><a href="#0171---2026-11-23">[0.17.1] - 2026-11-23</a></li><li class="d3"><a href="#fixed-2">Fixed</a></li><li class="d2"><a href="#0170---2026-11-23">[0.17.0] - 2026-11-23</a></li><li class="d3"><a href="#added-2">Added</a></li><li class="d3"><a href="#changed-1">Changed</a></li><li class="d3"><a href="#notes">Notes</a></li><li class="d2"><a href="#0160---2026-11-22">[0.16.0] - 2026-11-22</a></li><li class="d3"><a href="#added-3">Added</a></li><li class="d3"><a href="#changed-2">Changed</a></li><li class="d3"><a href="#notes-1">Notes</a></li><li class="d2"><a href="#0150---2026-11-22">[0.15.0] - 2026-11-22</a></li><li class="d3"><a href="#added-4">Added</a></li><li class="d3"><a href="#notes-2">Notes</a></li><li class="d2"><a href="#0140---2026-11-22">[0.14.0] - 2026-11-22</a></li><li class="d3"><a href="#added-5">Added</a></li><li class="d2"><a href="#0132---2026-11-21">[0.13.2] - 2026-11-21</a></li><li class="d3"><a href="#fixed-3">Fixed</a></li><li class="d3"><a href="#changed-3">Changed</a></li><li class="d2"><a href="#0131---2026-11-21">[0.13.1] - 2026-11-21</a></li><li class="d3"><a href="#fixed-4">Fixed</a></li><li class="d2"><a href="#0130---2026-11-21">[0.13.0] - 2026-11-21</a></li><li class="d3"><a href="#added-6">Added</a></li><li class="d3"><a href="#changed-4">Changed</a></li><li class="d2"><a href="#0120---2026-11-21">[0.12.0] - 2026-11-21</a></li><li class="d3"><a href="#added-7">Added</a></li><li class="d3"><a href="#changed-5">Changed</a></li><li class="d2"><a href="#0110---2026-11-21">[0.11.0] - 2026-11-21</a></li><li class="d3"><a href="#added-8">Added</a></li><li class="d3"><a href="#changed-6">Changed</a></li><li class="d3"><a href="#fixed-5">Fixed</a></li><li class="d2"><a href="#090---2026-11-20">[0.9.0] - 2026-11-20</a></li><li class="d3"><a href="#added-9">Added</a></li><li class="d3"><a href="#changed-7">Changed</a></li><li class="d2"><a href="#081---2026-11-20">[0.8.1] - 2026-11-20</a></li><li class="d3"><a href="#added-10">Added</a></li><li class="d3"><a href="#changed-8">Changed</a></li><li class="d2"><a href="#080---2026-11-20">[0.8.0] - 2026-11-20</a></li><li class="d3"><a href="#added-11">Added</a></li></ul></nav>
   </div>
   <div class="ds-scrim" hidden></div>
 

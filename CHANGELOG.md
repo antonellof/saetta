@@ -3,6 +3,12 @@
 All notable changes to saetta and Saetta Code (`saetta code`), newest first. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are saetta's.
 
+## [0.21.0] - 2026-11-26
+
+### Added
+
+- Durable runs (issue #2, stage A): Saetta Code keeps a journal beside each session while a turn runs, so a run cut off by a crash, a kill or a closed terminal is offered for resuming at the next start. Finished tool calls keep their result, read-only tools run again, and a command, an edit, an MCP tool or a subagent that was running is never run again without asking. Queued messages survive too.
+
 ## [0.20.0] - 2026-11-26
 
 ### Added

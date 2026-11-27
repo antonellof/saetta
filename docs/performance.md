@@ -32,7 +32,7 @@ A coding agent sends the whole conversation on every turn. Saetta keeps each con
 
 ## Speculative decoding
 
-Packs with an MTP head (Flash-Next, and the 27B fine-tunes marked "with MTP" on [Choosing a model](choosing-a-model.md)) draft tokens with it; the server also drafts from text already in the prompt. Greedy requests (`temperature` 0) get the same output as without speculation, and sampled ones use speculative sampling, which keeps the same output distribution. `SAETTA_SPEC=0` and `SAETTA_MTP=0` turn it off.
+Packs with an MTP head (Flash-Next, and the 27B fine-tunes marked "with MTP" on [Choosing a model](choosing-a-model.md)) draft tokens with it; the server also drafts from text already in the prompt. Every drafted token is checked by the model. Greedy requests (`temperature` 0) pick the model's top token as without speculation, but the check runs the drafted tokens as one batch, whose arithmetic rounds slightly differently, so at a near tie a long answer or a later request can take the other token; and sampled ones use speculative sampling, which keeps the same output distribution. `SAETTA_SPEC=0` and `SAETTA_MTP=0` turn it off.
 
 ## Watching it
 

@@ -46,7 +46,7 @@
     <div class="wrap">
       <a class="brand" href="/">
         <svg viewBox="0 0 32 32" width="20" height="20" aria-hidden="true"><path d="M18.5 3 7 18h7.5L12 29l13-16h-7.8z" fill="currentColor"/></svg>
-        Saetta <span class="ver">v0.23.0</span>
+        Saetta <span class="ver">v0.24.0</span>
       </a>
       <nav class="links">
         <a href="/#models">Models</a>
@@ -102,7 +102,7 @@
   &quot;messages&quot;: [{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;Write is_prime in Python&quot;}],
   &quot;stream&quot;: true
 }&#x27;</span></code></pre></div>
-<p>Sampling fields and their defaults: <code>max_tokens</code> or <code>max_completion_tokens</code> (4096), <code>temperature</code> (1.0), <code>top_p</code> (0.95), <code>top_k</code> (20), <code>seed</code>, <code>stop</code>. <code>temperature: 0</code> is greedy decoding, with speculative decoding (the MTP head and prompt lookup) and the same output as without it. Sampled requests use speculative sampling, which keeps the same output distribution.</p>
+<p>Sampling fields and their defaults: <code>max_tokens</code> or <code>max_completion_tokens</code> (4096), <code>temperature</code> (1.0), <code>top_p</code> (0.95), <code>top_k</code> (20), <code>seed</code>, <code>stop</code>. <code>temperature: 0</code> is greedy decoding, with speculative decoding (the MTP head and prompt lookup) which checks every drafted token with the model (its batched check rounds slightly differently, so a near tie can resolve the other way than without speculation; <code>SAETTA_SPEC=0</code> and <code>SAETTA_MTP=0</code> turn it off). Sampled requests use speculative sampling, which keeps the same output distribution.</p>
 <p><code>tool_choice</code>: <code>none</code> leaves the tools out of the prompt; <code>required</code>, or a named function, starts the answer with a tool call. The usage block reports reused prompt tokens as <code>prompt_tokens_details.cached_tokens</code>.</p>
 <h3 id="chat_template_kwargs"><a class="anchor" href="#chat_template_kwargs" aria-hidden="true" tabindex="-1">#</a>chat_template_kwargs</h3>
 <p>The chat template&#39;s options go in <code>chat_template_kwargs</code> (or at the top level of the request):</p>

@@ -46,7 +46,7 @@
     <div class="wrap">
       <a class="brand" href="/">
         <svg viewBox="0 0 32 32" width="20" height="20" aria-hidden="true"><path d="M18.5 3 7 18h7.5L12 29l13-16h-7.8z" fill="currentColor"/></svg>
-        Saetta <span class="ver">v0.23.0</span>
+        Saetta <span class="ver">v0.24.0</span>
       </a>
       <nav class="links">
         <a href="/#models">Models</a>
@@ -100,7 +100,7 @@
 <h2 id="what-makes-follow-up-turns-fast"><a class="anchor" href="#what-makes-follow-up-turns-fast" aria-hidden="true" tabindex="-1">#</a>What makes follow-up turns fast</h2>
 <p>A coding agent sends the whole conversation on every turn. Saetta keeps each conversation&#39;s state and reads only what is new, so turn 2 above, on a 16K conversation, answers in 0.2 s. Up to 4 conversations are kept (<code>SAETTA_CONVERSATIONS</code>), so several agent sessions keep their fast turns.</p>
 <h2 id="speculative-decoding"><a class="anchor" href="#speculative-decoding" aria-hidden="true" tabindex="-1">#</a>Speculative decoding</h2>
-<p>Packs with an MTP head (Flash-Next, and the 27B fine-tunes marked &quot;with MTP&quot; on <a href="/docs/choosing-a-model/">Choosing a model</a>) draft tokens with it; the server also drafts from text already in the prompt. Greedy requests (<code>temperature</code> 0) get the same output as without speculation, and sampled ones use speculative sampling, which keeps the same output distribution. <code>SAETTA_SPEC=0</code> and <code>SAETTA_MTP=0</code> turn it off.</p>
+<p>Packs with an MTP head (Flash-Next, and the 27B fine-tunes marked &quot;with MTP&quot; on <a href="/docs/choosing-a-model/">Choosing a model</a>) draft tokens with it; the server also drafts from text already in the prompt. Every drafted token is checked by the model. Greedy requests (<code>temperature</code> 0) pick the model&#39;s top token as without speculation, but the check runs the drafted tokens as one batch, whose arithmetic rounds slightly differently, so at a near tie a long answer or a later request can take the other token; and sampled ones use speculative sampling, which keeps the same output distribution. <code>SAETTA_SPEC=0</code> and <code>SAETTA_MTP=0</code> turn it off.</p>
 <h2 id="watching-it"><a class="anchor" href="#watching-it" aria-hidden="true" tabindex="-1">#</a>Watching it</h2>
 <p><code>saetta monitor</code> (or <code>/monitor</code> in Saetta Code) shows speed, prompt-cache reuse and speculation live. See <a href="/docs/server/">monitor, status, stop</a>.</p>
 <h2 id="inkling-2-mini-against-llamacpp-and-strata"><a class="anchor" href="#inkling-2-mini-against-llamacpp-and-strata" aria-hidden="true" tabindex="-1">#</a>Inkling 2 Mini against llama.cpp and Strata</h2>

@@ -39,7 +39,7 @@ curl -sN localhost:8080/v1/chat/completions -d '{
 }'
 ```
 
-Sampling fields and their defaults: `max_tokens` or `max_completion_tokens` (4096), `temperature` (1.0), `top_p` (0.95), `top_k` (20), `seed`, `stop`. `temperature: 0` is greedy decoding, with speculative decoding (the MTP head and prompt lookup) and the same output as without it. Sampled requests use speculative sampling, which keeps the same output distribution.
+Sampling fields and their defaults: `max_tokens` or `max_completion_tokens` (4096), `temperature` (1.0), `top_p` (0.95), `top_k` (20), `seed`, `stop`. `temperature: 0` is greedy decoding, with speculative decoding (the MTP head and prompt lookup) which checks every drafted token with the model (its batched check rounds slightly differently, so a near tie can resolve the other way than without speculation; `SAETTA_SPEC=0` and `SAETTA_MTP=0` turn it off). Sampled requests use speculative sampling, which keeps the same output distribution.
 
 `tool_choice`: `none` leaves the tools out of the prompt; `required`, or a named function, starts the answer with a tool call. The usage block reports reused prompt tokens as `prompt_tokens_details.cached_tokens`.
 

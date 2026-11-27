@@ -3,11 +3,15 @@
 All notable changes to saetta and Saetta Code (`saetta code`), newest first. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are saetta's.
 
-## [Unreleased]
+## [0.24.0] - 2026-11-27
 
 ### Added
 
 - Saetta Code feeds the files it reads, edits and writes to the engine's speculation (in process, Qwen3.8-Flash-Next and Qwen3.8-27B). An edit's old and new text are written inside the tool call as JSON strings, where a file's lines are joined by `\n` escapes, so drafting from the conversation alone broke at every line of a copied block; drafting from the file's escaped text follows whole runs. On a six-turn Coder session of edits (greedy), answers come at 87.6 tokens/s instead of 81.7 (2.50 tokens per step instead of 2.12; the two edit turns that replace a whole function 3.3 and 3.0 instead of 2.6 and 2.2), and the turns take 79.2 s instead of 81.4 while writing 5% more. Drafts are checked by the model as before. `SAETTA_FEED=0` turns it off. Not yet for Inkling 2 Mini or over the HTTP API.
+
+### Fixed
+
+- Docs: greedy output with speculation was said to equal output without it. Each token is checked by the model, but the batched check rounds slightly differently, so a near tie can resolve the other way; the performance and HTTP API pages now say so.
 
 ## [0.23.0] - 2026-11-27
 

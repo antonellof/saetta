@@ -46,7 +46,7 @@
     <div class="wrap">
       <a class="brand" href="/">
         <svg viewBox="0 0 32 32" width="20" height="20" aria-hidden="true"><path d="M18.5 3 7 18h7.5L12 29l13-16h-7.8z" fill="currentColor"/></svg>
-        Saetta <span class="ver">v0.25.0</span>
+        Saetta <span class="ver">v0.26.0</span>
       </a>
       <nav class="links">
         <a href="/#models">Models</a>
@@ -104,6 +104,7 @@
 }&#x27;</span></code></pre></div>
 <p>Sampling fields and their defaults: <code>max_tokens</code> or <code>max_completion_tokens</code> (4096), <code>temperature</code> (1.0), <code>top_p</code> (0.95), <code>top_k</code> (20), <code>seed</code>, <code>stop</code>. <code>temperature: 0</code> is greedy decoding, with speculative decoding (the MTP head and prompt lookup) which checks every drafted token with the model (its batched check rounds slightly differently, so a near tie can resolve the other way than without speculation; <code>SAETTA_SPEC=0</code> and <code>SAETTA_MTP=0</code> turn it off). Sampled requests use speculative sampling, which keeps the same output distribution.</p>
 <p><code>tool_choice</code>: <code>none</code> leaves the tools out of the prompt; <code>required</code>, or a named function, starts the answer with a tool call. The usage block reports reused prompt tokens as <code>prompt_tokens_details.cached_tokens</code>.</p>
+<p>With <code>SAETTA_GRAMMAR=1</code> on the server (off by default), tool calls are decoded under a grammar built from the request&#39;s <code>tools</code> (Qwen3.8 models): a call cannot open inside the reasoning, names one of the request&#39;s tools, gives every required argument, writes an argument whose schema type is not text as one JSON value of that type (an <code>edits</code> array, a number), with the declared object keys, item types and required keys, and holds nothing the parser would split; after the last call only another call or the end may follow. <code>enum</code>, <code>const</code> and the schema combinators (<code>anyOf</code>, <code>oneOf</code>, <code>allOf</code>) are not checked, nor an undeclared key written twice in one object, nor an argument whose type is a union with <code>string</code> (its text is free, and text that reads as JSON is passed on as that JSON). The model&#39;s own token is kept whenever the grammar allows it, and only a token it refuses is replaced by the most likely one it allows, so a greedy answer whose calls are already well formed comes out the same.</p>
 <h3 id="chat_template_kwargs"><a class="anchor" href="#chat_template_kwargs" aria-hidden="true" tabindex="-1">#</a>chat_template_kwargs</h3>
 <p>The chat template&#39;s options go in <code>chat_template_kwargs</code> (or at the top level of the request):</p>
 <div class="doc-table"><table><thead><tr><th>key</th><th>values</th><th>effect</th></tr></thead><tbody><tr><td><code>enable_thinking</code></td><td><code>true</code> (default), <code>false</code></td><td>whether the model thinks before answering</td></tr>

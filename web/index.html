@@ -173,23 +173,34 @@
     <section class="hero">
       <canvas id="hero-bg" class="hero-bg" aria-hidden="true"></canvas>
       <div class="wrap">
-        <a class="pill" href="#models">New in Saetta 0.18.0: Inkling 2 Mini, first version <span aria-hidden="true">&rarr;</span></a>
+        <a class="pill" href="/docs/changelog/">New in Saetta 0.25.0: subagents start where their parent left off <span aria-hidden="true">&rarr;</span></a>
         <h1>Saetta: a local coding agent with built-in inference.</h1>
         <p class="lede">A fully native local coding agent in C, combining an inference engine and agent harness in a single runtime, with no Python, Node or server. A port of pi, built for Apple Silicon (M1 or later with 32 GB of memory or more), running Qwen3.8 and Inkling 2 Mini.</p>
         <div class="code hero-cmd install">
           <div class="code-head">
             <div class="itabs" role="tablist" aria-label="Install">
               <button class="itab" type="button" role="tab" aria-selected="true" aria-controls="c0" id="t-c0">Saetta Code</button>
-              <button class="itab" type="button" role="tab" aria-selected="false" aria-controls="c1" id="t-c1">Other agents</button>
-              <button class="itab" type="button" role="tab" aria-selected="false" aria-controls="c2" id="t-c2">From source</button>
+              <button class="itab" type="button" role="tab" aria-selected="false" aria-controls="c1" id="t-c1">Inkling</button>
+              <button class="itab" type="button" role="tab" aria-selected="false" aria-controls="c2" id="t-c2">27B and LoRA</button>
+              <button class="itab" type="button" role="tab" aria-selected="false" aria-controls="c3" id="t-c3">Other agents</button>
+              <button class="itab" type="button" role="tab" aria-selected="false" aria-controls="c4" id="t-c4">Server</button>
+              <button class="itab" type="button" role="tab" aria-selected="false" aria-controls="c5" id="t-c5">From source</button>
             </div>
             <button class="copy" type="button" data-copy="c0">Copy</button>
           </div>
 <pre id="c0" role="tabpanel" aria-labelledby="t-c0">curl -fsSL https://saetta.dev/install.sh | sh
-saetta start code</pre>
+cd ~/src/my-project && saetta start code   <span class="c"># picks, downloads and opens the model that fits this Mac</span></pre>
 <pre id="c1" role="tabpanel" aria-labelledby="t-c1" hidden>curl -fsSL https://saetta.dev/install.sh | sh
+saetta download inkling
+saetta start code --pack inkling</pre>
+<pre id="c2" role="tabpanel" aria-labelledby="t-c2" hidden>curl -fsSL https://saetta.dev/install.sh | sh
+saetta download 27b-8bit && saetta download 27b-pi
+saetta start code --pack 27b-8bit --lora-modules qwen3.8-pi=27b-pi</pre>
+<pre id="c3" role="tabpanel" aria-labelledby="t-c3" hidden>curl -fsSL https://saetta.dev/install.sh | sh
 saetta start claude      <span class="c"># or: saetta start pi, saetta start opencode</span></pre>
-<pre id="c2" role="tabpanel" aria-labelledby="t-c2" hidden>git clone https://github.com/antonellof/saetta.git && cd saetta
+<pre id="c4" role="tabpanel" aria-labelledby="t-c4" hidden>curl -fsSL https://saetta.dev/install.sh | sh
+saetta serve coder       <span class="c"># OpenAI API at http://127.0.0.1:8080/v1, Anthropic at :8080</span></pre>
+<pre id="c5" role="tabpanel" aria-labelledby="t-c5" hidden>git clone https://github.com/antonellof/saetta.git && cd saetta
 make && ./build/bin/saetta start code</pre>
         </div>
         <p class="hint"><code>saetta start code</code> picks the model that fits this Mac, downloads it and opens the agent on it. <code>saetta start code --pack inkling</code> opens it on a pack you downloaded, and <code>/model</code> switches inside the agent.</p>

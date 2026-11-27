@@ -309,6 +309,12 @@ function walk(dir) {
 const extra = walk(OUT).filter((f) => !outputs.has(f));
 const rel = (f) => path.relative(ROOT, f);
 
+// the site's scripts must parse: one syntax error stops every tab, copy button and replay on the page
+for (const js of fs.readdirSync(WEB).filter((f) => f.endsWith(".js"))) {
+  try { execFileSync(process.execPath, ["--check", path.join(WEB, js)], { stdio: "pipe" }); }
+  catch (e) { console.error(`syntax error in web/${js}:\n${e.stderr}`); process.exit(1); }
+}
+
 if (CHECK) {
   const stale = [...outputs].filter(([f, s]) => !fs.existsSync(f) || fs.readFileSync(f, "utf8") !== s).map(([f]) => f);
   if (stale.length || extra.length) {

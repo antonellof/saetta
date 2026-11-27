@@ -42,7 +42,7 @@ Packs with an MTP head (Flash-Next, and the 27B fine-tunes marked "with MTP" on 
 
 ![Inkling 2 Mini on an M5 Max at a 4K prompt: Saetta, llama.cpp and Strata](../web/assets/perf/inkling.svg)
 
-The same 4,096-token prompt and 128 answer tokens, median of 3 interleaved runs (2026-11-26). Saetta answers at 58.6 tokens/s (85.3 with its default prompt lookup), Strata at 54.2 (36.7 with DSpark, on its synthetic benchmark prompt), llama.cpp at 47.2. Strata reads prompts at 2,990 tokens/s, llama.cpp at 685, Saetta at 473: Strata runs Inkling's prompt on the M5's tensor ops, which Saetta does not do for Inkling yet. Each engine uses its own weights: Saetta the mlx-community 4-bit pack (17 GB), llama.cpp Unsloth's UD-Q4_K_XL (17.6 GB), Strata its lossless SQ-20 (19.3 GB).
+The same 4,096-token prompt and 128 answer tokens, median of 3 interleaved runs (2026-11-27). Saetta answers at 58.7 tokens/s (71.5 with its default prompt lookup), Strata at 54.2 (36.7 with DSpark, on its synthetic benchmark prompt), llama.cpp at 47.3. Strata reads prompts at 2,963 tokens/s, Saetta at 2,396, llama.cpp at 685. Since 0.22 Saetta runs Inkling's prompt on the M5's tensor ops (half-precision activations, f32 sums; checked against the reference by KL), up from 473 tokens/s; on M1 to M4 and with `SAETTA_NO_ACCEL=1` it keeps the f32 kernels. Prompt lookup's gain depends on the answer: on this synthetic prompt 0.21 fell into a repetition loop that lookup sped up (85.3 tokens/s). Each engine uses its own weights: Saetta the mlx-community 4-bit pack (17 GB), llama.cpp Unsloth's UD-Q4_K_XL (17.6 GB), Strata its lossless SQ-20 (19.3 GB).
 
 ## M1 to M4
 

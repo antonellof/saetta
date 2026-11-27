@@ -1,36 +1,33 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="900" height="330" viewBox="0 0 900 330" font-family="-apple-system, Segoe UI, Helvetica, Arial, sans-serif">
-<defs><linearGradient id="g" x1="0" x2="1"><stop offset="0" stop-color="#b26bff"/><stop offset="1" stop-color="#ff8a2b"/></linearGradient>
-<style>.t{font-size:16px;font-weight:600;fill:#c9c9d1}.c{font-size:12px;fill:#8a8a95}.n{font-size:13px;fill:#c9c9d1}.v{font-size:12px;fill:#c9c9d1;font-family:ui-monospace,Menlo,monospace}.f{font-size:11px;fill:#8a8a95}</style></defs>
-<rect width="900" height="330" rx="12" fill="#0d0b12"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="294" viewBox="0 0 900 294" font-family="-apple-system, Segoe UI, Helvetica, Arial, sans-serif"><defs><linearGradient id="g" x1="0" x2="1"><stop offset="0" stop-color="#b26bff"/><stop offset="1" stop-color="#ff8a2b"/></linearGradient><style>.t{font-size:16px;font-weight:600;fill:#c9c9d1}.c{font-size:12px;fill:#8a8a95}.n{font-size:13px;fill:#c9c9d1}.v{font-size:12px;fill:#c9c9d1;font-family:ui-monospace,Menlo,monospace}.f{font-size:11px;fill:#8a8a95}</style></defs><rect width="900" height="294" rx="12" fill="#0d0b12"/>
 <text x="30" y="40" class="t">Answering</text>
 <text x="30" y="60" class="c">Inkling 2 Mini, tokens per second, higher is better</text>
 <text x="30" y="97" class="n">Saetta, prompt lookup</text>
-<rect x="180" y="86" width="218.0" height="14" rx="2" fill="url(#g)"/>
-<text x="404.0" y="97" class="v">85.3</text>
-<text x="30" y="127" class="n">Saetta</text>
-<rect x="180" y="116" width="149.8" height="14" rx="2" fill="url(#g)"/>
-<text x="335.8" y="127" class="v">58.6</text>
-<text x="30" y="157" class="n">Strata</text>
-<rect x="180" y="146" width="138.5" height="14" rx="2" fill="#8a8a95"/>
-<text x="324.5" y="157" class="v">54.2</text>
-<text x="30" y="187" class="n">llama.cpp</text>
-<rect x="180" y="176" width="120.6" height="14" rx="2" fill="#8a8a95"/>
-<text x="306.6" y="187" class="v">47.2</text>
-<text x="30" y="217" class="n">Strata, DSpark</text>
-<rect x="180" y="206" width="93.8" height="14" rx="2" fill="#8a8a95"/>
-<text x="279.8" y="217" class="v">36.7</text>
+<rect x="180" y="86" width="182.7" height="14" rx="2" fill="url(#g)"/>
+<text x="368.7" y="97" class="v">71.5</text>
+<text x="30" y="125" class="n">Saetta</text>
+<rect x="180" y="114" width="150.0" height="14" rx="2" fill="url(#g)"/>
+<text x="336.0" y="125" class="v">58.7</text>
+<text x="30" y="153" class="n">Strata</text>
+<rect x="180" y="142" width="138.5" height="14" rx="2" fill="#8a8a95"/>
+<text x="324.5" y="153" class="v">54.2</text>
+<text x="30" y="181" class="n">llama.cpp</text>
+<rect x="180" y="170" width="120.9" height="14" rx="2" fill="#8a8a95"/>
+<text x="306.9" y="181" class="v">47.3</text>
+<text x="30" y="209" class="n">Strata, DSpark</text>
+<rect x="180" y="198" width="93.8" height="14" rx="2" fill="#8a8a95"/>
+<text x="279.8" y="209" class="v">36.7</text>
 <text x="470" y="40" class="t">Prompt reading</text>
 <text x="470" y="60" class="c">4,096-token prompt, tokens per second</text>
 <text x="470" y="97" class="n">Strata</text>
-<rect x="620" y="86" width="229.2" height="14" rx="2" fill="#8a8a95"/>
-<text x="855.2" y="97" class="v">2,990</text>
-<text x="470" y="127" class="n">llama.cpp</text>
-<rect x="620" y="116" width="52.5" height="14" rx="2" fill="#8a8a95"/>
-<text x="678.5" y="127" class="v">685</text>
-<text x="470" y="157" class="n">Saetta</text>
-<rect x="620" y="146" width="36.3" height="14" rx="2" fill="url(#g)"/>
-<text x="662.3" y="157" class="v">473</text>
-<text x="30" y="270" class="f">M5 Max 128 GB, 4,096-token prompt, 128 answer tokens, median of 3 interleaved runs, 2026-11-26. Weights differ: Saetta mlx-community 4-bit (17 GB),</text>
-<text x="30" y="288" class="f">llama.cpp Unsloth UD-Q4_K_XL (17.6 GB), Strata lossless SQ-20 (19.3 GB). Saetta's Inkling prompt reading does not use the M5's tensor ops yet.</text>
-<text x="30" y="306" class="f">Prompt lookup's gain depends on the prompt; Strata's DSpark row ran on its synthetic benchmark prompt.</text>
+<rect x="620" y="86" width="227.2" height="14" rx="2" fill="#8a8a95"/>
+<text x="853.2" y="97" class="v">2,963</text>
+<text x="470" y="125" class="n">Saetta</text>
+<rect x="620" y="114" width="183.7" height="14" rx="2" fill="url(#g)"/>
+<text x="809.7" y="125" class="v">2,396</text>
+<text x="470" y="153" class="n">llama.cpp</text>
+<rect x="620" y="142" width="52.5" height="14" rx="2" fill="#8a8a95"/>
+<text x="678.5" y="153" class="v">685</text>
+<text x="30" y="244" class="f">M5 Max 128 GB, 4,096-token prompt, 128 answer tokens, median of 3 interleaved runs, 2026-11-27. Weights differ: Saetta mlx-community 4-bit (17 GB),</text>
+<text x="30" y="262" class="f">llama.cpp Unsloth UD-Q4_K_XL (17.6 GB), Strata lossless SQ-20 (19.3 GB). Saetta reads Inkling prompts on the M5's tensor ops since 0.22.</text>
+<text x="30" y="280" class="f">Prompt lookup's gain depends on the prompt; Strata's DSpark row ran on its synthetic benchmark prompt.</text>
 </svg>

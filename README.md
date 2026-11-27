@@ -32,11 +32,11 @@ All on an M5 Max with 128 GB; every number is a measured run.
 
 <p align="center"><img src="web/assets/perf/resume.svg" width="900" alt="Time to the first token with the Coder pack: 37.31 s on a cold 64K prompt, 8.24 s on a cold 16K prompt, 0.20 s on a follow-up turn"></p>
 
-<p align="center"><img src="web/assets/perf/inkling.svg" width="900" alt="Inkling 2 Mini on an M5 Max, 4K prompt: answering at 85.3 tokens/s in Saetta with prompt lookup and 58.6 without, Strata 54.2, llama.cpp 47.2, Strata with DSpark 36.7; prompt reading Strata 2,990, llama.cpp 685, Saetta 473 tokens/s"></p>
+<p align="center"><img src="web/assets/perf/inkling.svg" width="900" alt="Inkling 2 Mini on an M5 Max, 4K prompt: answering at 71.5 tokens/s in Saetta with prompt lookup and 58.7 without, Strata 54.2, llama.cpp 47.3, Strata with DSpark 36.7; prompt reading Strata 2,963, Saetta 2,396, llama.cpp 685 tokens/s"></p>
 
 <p align="center"><img src="web/assets/perf/m14.svg" width="900" alt="Prompt reading at 4K on the M1 to M4 kernels, measured on the M5 Max: 27B 152 before 0.18, 256 now, 961 with the M5's accelerators; Coder 487, 742 and 1,538"></p>
 
-Strata reads Inkling prompts faster because it runs them on the M5's tensor ops, which Saetta does not do for Inkling yet. M1 to M4 are not measured on real hardware yet (reports welcome). Details: [Performance](docs/performance.md).
+Since 0.22 Saetta reads Inkling prompts on the M5's tensor ops too, 5 times faster than before; Strata is still 19% ahead there. M1 to M4 are not measured on real hardware yet (reports welcome). Details: [Performance](docs/performance.md).
 
 ## Start
 

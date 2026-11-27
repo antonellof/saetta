@@ -3,6 +3,17 @@
 All notable changes to saetta and Saetta Code (`saetta code`), newest first. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are saetta's.
 
+## [0.22.0] - 2026-11-27
+
+### Added
+
+- Inkling 2 Mini reads prompts on the M5's tensor ops: routed experts, dense projections, prompt attention and the loop's message gates run with half-precision activations and f32 sums, in 2048-token chunks. A 4K prompt reads at 2,396 tokens/s (473 in 0.21), 32K at 1,984 (424). Answering is unchanged. M1 to M4, `SAETTA_NO_ACCEL=1` and `SAETTA_PREFILL_F32=1` keep the f32 kernels; `make verify` checks the half path by KL against the reference.
+- Checkpoints at message boundaries: the engine keeps restart points inside a conversation (at message starts at least 1024 tokens apart, and at each request's start), so a fork, an edit or a retry of an earlier message reads only from the nearest one. On the Coder session benchmark a fork at turn 13 takes 1.96 s instead of 7.77 s, and a retry's first token comes in 0.73 s instead of 1.29 s. Checkpoints stay inside the memory fit; HTTP clients each get their own conversation.
+
+### Fixed
+
+- Flash-Next: prompt lookup's n-gram history could be read while the next chunk was being prepared.
+
 ## [0.21.0] - 2026-11-26
 
 ### Added

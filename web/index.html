@@ -37,7 +37,7 @@
     "description": "Saetta is a local coding agent in C that runs Qwen3.8 and Inkling 2 Mini coding models in its own process on Apple Silicon Macs. Its open-source inference engine, in C and hand-written Metal, also serves Claude Code, pi and opencode.",
     "applicationCategory": "DeveloperApplication",
     "operatingSystem": "macOS 26 or later, Apple Silicon (M1 or later), 32 GB of memory or more",
-    "softwareVersion": "0.21.0",
+    "softwareVersion": "0.22.0",
     "license": "https://opensource.org/licenses/MIT",
     "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
     "downloadUrl": "https://github.com/antonellof/saetta/releases/latest",
@@ -150,7 +150,7 @@
     <div class="wrap">
       <a class="brand" href="#top">
         <svg viewBox="0 0 32 32" width="20" height="20" aria-hidden="true"><path d="M18.5 3 7 18h7.5L12 29l13-16h-7.8z" fill="currentColor"/></svg>
-        Saetta <span class="ver">v0.21.0</span>
+        Saetta <span class="ver">v0.22.0</span>
       </a>
       <nav class="links">
         <a href="#models">Models</a>
@@ -413,9 +413,9 @@ saetta code --mode json -p "list the TODOs"</pre>
         <div class="wrap">
           <h2>Coming next</h2>
           <div class="nope">
-            <div><h3>Sessions that resume at once</h3><p>The engine's state saved with each session, so a resumed session does not read its prompt again.</p></div>
+            <div><h3>Inkling sessions saved</h3><p>The engine's state saved with each Inkling 2 Mini session too, as it already is for Qwen, so a resumed session does not read its prompt again.</p></div>
             <div><h3>Prompts read ahead</h3><p>Tool output and your draft read by the model while the tool runs and while you type.</p></div>
-            <div><h3>Inkling at full speed</h3><p>Speculative decoding and the M5's neural accelerators for Inkling 2 Mini, which now runs in a first version.</p></div>
+            <div><h3>Inkling at full speed</h3><p>Inkling 2 Mini already reads prompts on the M5's tensor ops; next, the last 19% to Strata there and a cheaper DSpark verify pass.</p></div>
             <div><h3>A sandbox for commands</h3><p>The agent's commands and file tools confined to the project by macOS's Seatbelt.</p></div>
           </div>
         </div>
@@ -480,17 +480,17 @@ saetta code --mode json -p "list the TODOs"</pre>
         <h2>Engine speed on an M5 Max</h2>
         <p class="sub">On an M5 Max with 128 GB, through the HTTP API that Claude Code, pi and opencode use: cold prompts of 4K to 64K tokens, follow-up turns and a tool-call edit. M1 to M4 are not measured yet.</p>
         <h3 class="subhead">Inkling 2 Mini: Saetta, llama.cpp and Strata</h3>
-        <p class="sub">The same 4,096-token prompt and 128 answer tokens on an M5 Max, median of 3 interleaved runs (2026-11-26). Each engine uses its own 4-bit or lossless weights: Saetta the mlx-community 4-bit pack (17 GB), llama.cpp Unsloth's UD-Q4_K_XL (17.6 GB), Strata its lossless SQ-20 (19.3 GB).</p>
+        <p class="sub">The same 4,096-token prompt and 128 answer tokens on an M5 Max, median of 3 interleaved runs (2026-11-27). Each engine uses its own 4-bit or lossless weights: Saetta the mlx-community 4-bit pack (17 GB), llama.cpp Unsloth's UD-Q4_K_XL (17.6 GB), Strata its lossless SQ-20 (19.3 GB).</p>
         <div class="charts" style="margin-bottom: 28px">
           <figure class="chart">
             <h3>Answering</h3>
             <p class="cap">tokens per second, higher is better</p>
             <div class="legend"><span><i class="f-a"></i>Saetta</span><span><i class="f-g"></i>other engines</span></div>
             <div class="rows" style="--max: 90">
-              <div class="row"><span class="name">Saetta, lookup</span><span class="track"><span class="fill f-a" style="--v: 85.3"></span>85.3</span></div>
-              <div class="row"><span class="name">Saetta</span><span class="track"><span class="fill f-a" style="--v: 58.6"></span>58.6</span></div>
+              <div class="row"><span class="name">Saetta, lookup</span><span class="track"><span class="fill f-a" style="--v: 71.5"></span>71.5</span></div>
+              <div class="row"><span class="name">Saetta</span><span class="track"><span class="fill f-a" style="--v: 58.7"></span>58.7</span></div>
               <div class="row"><span class="name">Strata</span><span class="track"><span class="fill f-g" style="--v: 54.2"></span>54.2</span></div>
-              <div class="row"><span class="name">llama.cpp</span><span class="track"><span class="fill f-g" style="--v: 47.2"></span>47.2</span></div>
+              <div class="row"><span class="name">llama.cpp</span><span class="track"><span class="fill f-g" style="--v: 47.3"></span>47.3</span></div>
               <div class="row"><span class="name">Strata, DSpark</span><span class="track"><span class="fill f-g" style="--v: 36.7"></span>36.7</span></div>
             </div>
           </figure>
@@ -499,13 +499,13 @@ saetta code --mode json -p "list the TODOs"</pre>
             <p class="cap">prompt tokens per second, higher is better</p>
             <div class="legend"><span><i class="f-a"></i>Saetta</span><span><i class="f-g"></i>other engines</span></div>
             <div class="rows" style="--max: 3000">
-              <div class="row"><span class="name">Strata</span><span class="track"><span class="fill f-g" style="--v: 2990"></span>2,990</span></div>
+              <div class="row"><span class="name">Strata</span><span class="track"><span class="fill f-g" style="--v: 2963"></span>2,963</span></div>
+              <div class="row"><span class="name">Saetta</span><span class="track"><span class="fill f-a" style="--v: 2396"></span>2,396</span></div>
               <div class="row"><span class="name">llama.cpp</span><span class="track"><span class="fill f-g" style="--v: 685"></span>685</span></div>
-              <div class="row"><span class="name">Saetta</span><span class="track"><span class="fill f-a" style="--v: 473"></span>473</span></div>
             </div>
           </figure>
         </div>
-        <p class="note" style="margin: -16px 0 28px">Saetta's prompt reading for Inkling does not use the M5's tensor ops yet; Strata's does. Prompt lookup's gain depends on the prompt, and Strata's DSpark row ran on its synthetic benchmark prompt.</p>
+        <p class="note" style="margin: -16px 0 28px">Since 0.22 Saetta reads Inkling prompts on the M5's tensor ops, 5 times faster than 0.21. Prompt lookup's gain depends on the prompt, and Strata's DSpark row ran on its synthetic benchmark prompt.</p>
         <div class="charts">
           <figure class="chart">
             <h3>Prompt reading</h3>

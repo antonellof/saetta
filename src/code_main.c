@@ -9,6 +9,7 @@
 // utils/shell.ts (killTrackedDetachedChildren), packages/ai/src/utils/transcript.ts
 // (getCurrentSystemMessage, getToolStateChanges), utils/retry.ts (the retryable patterns).
 #include "code.h"
+#include "code_ahead.h"
 #include "code_autocompact.h"
 #include "code_cfg.h"
 #include "code_durable.h"
@@ -84,6 +85,10 @@ typedef struct {
     const char *const *argv; // the command line after "code", for a restart on another model
     size_t argc;
     const JValue *call;   // the tool call running (for its partial results)
+    // prefill ahead (code_ahead.h) while call runs: the round's results before it, and the length of
+    // its output last handed on
+    JValue *const *round_done;
+    size_t round_ndone, ahead_len;
     char *restart_provider, *restart_id; // set by the interactive mode: start again on this model
     CodeAutoCompact ac;   // automatic compaction (code_autocompact.c)
     bool deliver_queued;  // the run continues to deliver queued messages (agent.continue())
@@ -753,11 +758,79 @@ static void error_result(Arena *a, const JValue *call, const char *text, JValue 
     *msg = m;
 }
 
+// ---- prefill ahead of the request (code_ahead.h; in process only) --------------------------------
+
+static CodeAhead *g_ahead;
+static Engine *g_ahead_engine;
+
+// The next request as far as it is known goes to the reader: the session's messages, the round's
+// finished results done[0..ndone), and growing, the result being produced (its tool_call_id is the
+// one the engine treats as still growing). Built as stream_assistant builds the request.
+static void ahead_post(Run *r, JValue *const *done, size_t ndone, const JValue *growing) {
+    Engine *e = r->model.engine;
+    if (!e || !r->env.session_id) return;
+    if (g_ahead_engine != e) {
+        code_ahead_free(g_ahead);
+        g_ahead = code_ahead_new(e);
+        g_ahead_engine = e;
+    }
+    const char *id = json_str(json_get(growing, "toolCallId"));
+    if (!g_ahead || !id) return;
+    Arena t = {0};
+    const JValue *all = code_session_messages(r->session);
+    JValue *system = current_system(&t, all);
+    JValue *conv = json_new(&t, J_ARRAY);
+    for (size_t i = 0; i < all->arr.len; i++)
+        if (!str_eqz(json_strs(json_get(all->arr.items[i], "role")), "system")) json_push(&t, conv, all->arr.items[i]);
+    for (size_t i = 0; i < ndone; i++)
+        if (done[i]) json_push(&t, conv, done[i]);
+    json_push(&t, conv, (JValue *)growing);
+    Buf body = {0};
+    if (!code_oai_body(&t, &r->model, system, conv, current_tools(&t, system), &body))
+        code_ahead_post(g_ahead, buf_str(&body), r->env.session_id, id);
+    buf_free(&body);
+    arena_reset(&t);
+}
+
+// The step of new output (bytes) worth a read ahead: about 128 tokens or more.
+#define AHEAD_STEP 512
+
+// A running bash call's output so far, cut after its last complete line, as the tool result the
+// request will start with: handed on once it grew by AHEAD_STEP. Output cut at its head (over the
+// tool's limits, only its tail is kept) is not: the result's start changes.
+static void ahead_partial(Run *r, const JValue *partial) {
+    if (!r->model.engine || !str_eqz(json_strs(json_get(r->call, "name")), "bash")) return;
+    if (json_get(json_get(partial, "details"), "truncation")) return;
+    const JValue *content = json_get(partial, "content");
+    const JValue *b = json_is(content, J_ARRAY) && content->arr.len == 1 ? content->arr.items[0] : NULL;
+    Str text = json_strs(json_get(b, "text"));
+    while (text.len > 0 && text.ptr[text.len - 1] != '\n') text.len--;
+    if (text.len < r->ahead_len + AHEAD_STEP) return;
+    r->ahead_len = text.len;
+    Arena t = {0};
+    JValue *m = json_new(&t, J_OBJECT), *parts = json_new(&t, J_ARRAY), *tb = json_new(&t, J_OBJECT);
+    json_put(&t, tb, S("type"), json_string(&t, S("text")));
+    json_put(&t, tb, S("text"), json_string(&t, text));
+    json_push(&t, parts, tb);
+    json_put(&t, m, S("role"), json_string(&t, S("toolResult")));
+    json_put(&t, m, S("toolCallId"), (JValue *)json_get(r->call, "id"));
+    json_put(&t, m, S("toolName"), (JValue *)json_get(r->call, "name"));
+    json_put(&t, m, S("content"), parts);
+    json_put(&t, m, S("isError"), json_bool(&t, false));
+    ahead_post(r, r->round_done, r->round_ndone, m);
+    arena_reset(&t);
+}
+
 // tool_execution_update (emitToolExecutionUpdate): a tool's partial result, built in a throwaway
 // arena (a long command sends one every 100 ms)
 static void on_tool_partial(void *ctx, const JValue *partial) {
     Run *r = ctx;
     if (r->call) code_durable_output(r->call, partial);
+    if (r->call && r->model.engine) {
+        if (r->rpc) code_rpc_lock();
+        ahead_partial(r, partial);
+        if (r->rpc) code_rpc_unlock();
+    }
     if (!r->call || (!r->ui && !r->json && !r->rpc)) return;
     if (r->rpc) code_rpc_lock();
     Arena t = {0};
@@ -922,6 +995,9 @@ static Err run_tools(Run *r, const JValue *assistant, JValue *results) {
         }
         prepare_edit_in_place(a, calls.ptr[i]);
         r->call = calls.ptr[i];
+        r->round_done = msgs;
+        r->round_ndone = i;
+        r->ahead_len = 0;
         code_durable_intent(calls.ptr[i], code_durable_safe(name));
         if (r->rpc) {
             CodeEnv env = r->env;
@@ -932,7 +1008,11 @@ static Err run_tools(Run *r, const JValue *assistant, JValue *results) {
         r->call = NULL;
         if (!err) code_durable_result(calls.ptr[i], msgs[i]);
         if (!err && !json_get(msgs[i], "durationMs")) emit_tool_end(r, calls.ptr[i], msgs[i], raws[i]);
+        // more calls to run: the results so far are read while they do
+        if (!err && i + 1 < calls.len && !g_abort) ahead_post(r, msgs, i, msgs[i]);
     }
+    // the request goes next: nothing more is read ahead for this round
+    code_ahead_cancel(g_ahead);
     if (sb) {
         if (r->rpc) code_rpc_unlock();
         Err se = code_subagent_wait(sb);
@@ -2872,6 +2952,9 @@ Err code_run(const char *const *args, size_t n, int *code) {
         }
     }
 done:
+    code_ahead_free(g_ahead);
+    g_ahead = NULL;
+    g_ahead_engine = NULL;
     state_flush();
     code_share_end(false);
     code_mcp_shutdown();

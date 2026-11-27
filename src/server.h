@@ -71,6 +71,18 @@ Err server_engine_chat(Engine *e, Str body, int (*sink)(void *ctx, int status, c
 // another conversation, copying rows, and never overwrites that one.
 Err server_engine_chat_session(Engine *e, Str body, const char *session,
                                int (*sink)(void *ctx, int status, const void *p, size_t n), void *ctx);
+// Prefill ahead of the request (Saetta Code in process): body is the next request of agent session
+// session as far as it is known, its tool message with tool_call_id partial_id still growing (a
+// running tool's output so far). The tokens of the prompt that no continuation of that message
+// changes, less a margin, are read into the conversation this session's last request ran in, after
+// its last reply (nothing when another request used that conversation since, when the prompt does
+// not continue that reply, with a LoRA adapter, or when memory would have to be taken from another
+// conversation), in chunks, checkpoints at message starts as the request would keep them. It
+// yields: before each chunk it stops when another request waits for the engine's turn or *stop is
+// set. The request then continues where the read stopped when its prompt starts with the tokens
+// read (and from where it would otherwise when not): what it generates is the same. *read: the
+// tokens read. Errors: "AheadUnsupported" (Inkling 2 Mini and other chat formats).
+Err server_engine_ahead(Engine *e, Str body, const char *session, const char *partial_id, volatile int *stop, size_t *read);
 // One HTTP connection on fd (accepted on a socket of the caller's) answered as server_serve
 // answers it: the same endpoints and request path. The request is read first (the head and body
 // deadlines; the caller sets the socket's send and receive timeouts: no connection guard here),

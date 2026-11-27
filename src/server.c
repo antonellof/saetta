@@ -120,6 +120,20 @@ typedef struct Engine {
     Turns turns;
     // server_engine_set_token: the token every request of a shared connection must carry
     char token[80];
+    // Prefill ahead (server_engine_ahead): the agent session of the last in-process request each
+    // conversation ran, with its conv_gen then (an ahead read continues only that session's
+    // conversation, and only while no other request has used it since).
+    char owner[MAX_CONV][96];
+    uint64_t owner_gen[MAX_CONV];
+    // live: the session's live state is the one an ahead read left in conversation live_conv at
+    // live_pos, over live_ids[0..live_pos), and nothing ran on the model since (every request's
+    // apply and every switch of conversation clear it). A prompt that starts with those ids
+    // continues there in place (START_LIVE): no restore, so the MTP head's row at live_pos (the
+    // pair of the stream at live_pos - 1, kept by the model, and the prompt's token there) is
+    // written by the next chunk as a prompt read without a stop writes it.
+    bool live;
+    size_t live_conv, live_pos;
+    VecU32 live_ids;
 } Engine;
 
 static uint64_t turn_take(Engine *e) { return turns_take(&e->turns); }
@@ -130,6 +144,7 @@ static void turn_leave(Engine *e, uint64_t t) { turns_leave(&e->turns, t); }
 // The conversation going inactive keeps PT_HELD checkpoints (inside the fit's reserve).
 static void activate(Engine *e, size_t i) {
     if (i == e->active) return;
+    e->live = false;
     session_swap_conv(e->s, &e->held[i]);
     e->held[e->active] = e->held[i];
     e->has[e->active] = true;
@@ -264,6 +279,7 @@ picked:
     activate(e, best);
     if (e->conv_lora[best] != lora) {
         // its state was built with another adapter: start it over
+        e->live = false;
         session_invalidate_from(e->s, 0);
         e->conv_lora[best] = lora;
     }
@@ -273,19 +289,31 @@ picked:
     atomic_store_explicit(&e->st->convs, (uint32_t)e->n_conv, memory_order_release);
 }
 
-typedef enum { START_FRESH, START_CKPT, START_OWN, START_SHARED } StartKind;
+typedef enum { START_FRESH, START_CKPT, START_OWN, START_SHARED, START_LIVE } StartKind;
 typedef struct {
     size_t n;
     StartKind kind;
     size_t src, common;
 } Start;
 
-// Where the active conversation starts reading ids: the longest of a restore point it extends and
-// its own checkpoints (a restore point when they tie), else another conversation's checkpoint (KV
-// rows copied), else 0.
+// Whether a prompt of nids tokens continues the live state an ahead read left in the active
+// conversation (Engine.live): it starts with the ids read, and more than MODEL_SMALL + 1 tokens are
+// left before its last one (a shorter rest would run on the small-chunk kernels, whose rounding
+// differs from a prompt chunk's, and so would the MTP head's rows of a chunk that skips its first
+// row: a prompt read without the stop reads those tokens in a prompt chunk).
+static bool live_continues(const Engine *e, const uint32_t *ids, size_t nids) {
+    size_t p = e->live_pos;
+    return e->live && e->live_conv == e->active && e->s->pos == p && p > 0 && nids >= p + MODEL_SMALL + 3 &&
+           e->live_ids.len >= p && memcmp(ids, e->live_ids.ptr, p * sizeof(uint32_t)) == 0;
+}
+
+// Where the active conversation starts reading ids: the live state of an ahead read it continues
+// when that is the longest; else the longest of a restore point it extends and its own checkpoints
+// (a restore point when they tie), else another conversation's checkpoint (KV rows copied), else 0.
 static Start plan(Engine *e, const uint32_t *ids, size_t nids) {
     size_t r = session_reusable(e->s, ids, nids);
     size_t own = session_shared_point(e->s->ptoks.ptr, e->s->ptoks.len, e->s->pts, ids, nids);
+    if (live_continues(e, ids, nids) && e->live_pos > MAX(r, own)) return (Start){e->live_pos, START_LIVE, 0, 0};
     if (r > 0 && r >= own) return (Start){r, START_CKPT, 0, 0};
     if (own > 0) return (Start){own, START_OWN, 0, 0};
     Start best = {0, START_FRESH, 0, 0};
@@ -309,12 +337,16 @@ static size_t point_budget(Engine *e) {
     return k;
 }
 
-static Err apply(Engine *e, Start st) {
+// request: a request's start (counted in conv_gen); false for an ahead read, which continues the
+// same session's conversation on its behalf.
+static Err apply(Engine *e, Start st, bool request) {
     // rows below st.n stay (from 0 when another conversation's rows are copied in): a background
     // save that still reads this buffer past that point finishes first
     if (e->store) state_store_fence(e->store, sx_buffer_contents(e->s->kv), st.kind == START_SHARED ? 0 : st.n);
+    // the live state is this start's (START_LIVE) or replaced now
+    e->live = false;
     size_t ci = e->active;
-    e->conv_gen[ci] += 1;
+    if (request) e->conv_gen[ci] += 1;
     if (st.kind == START_FRESH || st.kind == START_SHARED) {
         e->ninh[ci] = 0;
         // a conversation that starts over (or from another's rows) learns its own speculation
@@ -335,6 +367,7 @@ static Err apply(Engine *e, Start st) {
             e->active + 1, st.n, st.src + 1, st.common);
         break;
     case START_FRESH: session_reset(e->s); break;
+    case START_LIVE: break; // in place: the live state is at st.n
     }
     session_invalidate_from(e->s, st.n);
     return OK;
@@ -865,7 +898,7 @@ static Err generate_reply(Engine *e, Arena *a, Conn *c, Req *h, Work *w, JValue 
     // chunks; separate calls each paid it). After each chunk the hook keeps a prefix point
     // every PT_EVERY tokens (which another conversation sharing the prefix can start from),
     // updates the monitor's progress, and sends a stream's keep-alive.
-    TRY(apply(e, start));
+    TRY(apply(e, start, true));
     const char *pv = getenv("SAETTA_POINTS");
     bool points_on = pv ? pv[0] != '0' : true;
     if (n - 1 > reused) {
@@ -1267,7 +1300,10 @@ static void state_restore(Engine *e, const uint32_t *ids, size_t n) {
     // the conversation's contents change (or may have): another thread's end-of-turn save for its
     // earlier request in this conversation is no longer its conversation, even if this request
     // fails before apply counts it
-    if (touched) e->conv_gen[i] += 1;
+    if (touched) {
+        e->conv_gen[i] += 1;
+        e->live = false;
+    }
     if (!err && (nn != got || nn >= n)) err = "StateMismatch";
     // the snapshots read are the ones found (the layout's MTP rows were placed at their positions)
     for (size_t s = 0; !err && s < ST_MAX_SNAP; s++)
@@ -1534,10 +1570,13 @@ bool server_engine_controller(const Engine *e, size_t i, Gate *gate, Depth *dept
     return true;
 }
 
-static Err handle(Engine *e, Arena *a, Conn *c, Req *h, Str body, Fmt fmt, Work *w) {
+// The request object a prompt is rendered from: body parsed, tool_choice none leaving the tools out,
+// --default-chat-template-kwargs filling in what it leaves out (handle; server_engine_ahead renders
+// the next request's prefix through this too, so both render the same text).
+static Err request_object(Engine *e, Arena *a, Str body, Fmt fmt, JValue **out, Str *model_name, ToolChoiceKind *choice_out,
+                          Str *named_out) {
     JValue *r;
-    Str model_name;
-    TRY(parse_request(a, body, fmt, &r, &model_name));
+    TRY(parse_request(a, body, fmt, &r, model_name));
     // tool_choice: none leaves the tools out of the prompt; required or a named function
     // starts the answer with the tool call's opening (after an empty thinking block), so
     // the model continues a call (as Strata does: no grammar)
@@ -1558,6 +1597,17 @@ static Err handle(Engine *e, Arena *a, Conn *c, Req *h, Str body, Fmt fmt, Work 
             json_put(a, kw, d->key, d->val);
         }
     }
+    *out = r;
+    *choice_out = choice;
+    *named_out = named;
+    return OK;
+}
+
+static Err handle(Engine *e, Arena *a, Conn *c, Req *h, Str body, Fmt fmt, Work *w) {
+    JValue *r;
+    Str model_name, named;
+    ToolChoiceKind choice;
+    TRY(request_object(e, a, body, fmt, &r, &model_name, &choice, &named));
     Str prompt;
     TRY(chat_render_as(a, model_info(e->m)->chat, r, &prompt));
     Str forced = S("");
@@ -1637,6 +1687,9 @@ static Err handle(Engine *e, Arena *a, Conn *c, Req *h, Str body, Fmt fmt, Work 
                              start, max_tokens);
     last_conv = (LastConv){e, e->active, e->conv_gen[e->active], true, {0}};
     if (c->sink) snprintf(last_conv.session, sizeof last_conv.session, "%s", req_session);
+    // the conversation an ahead read of this session may continue (server_engine_ahead)
+    snprintf(e->owner[e->active], sizeof e->owner[0], "%s", c->sink ? req_session : "");
+    e->owner_gen[e->active] = e->conv_gen[e->active];
     if (err) atomic_store_explicit(&e->st->state, STATE_IDLE, memory_order_release);
     return err;
 }
@@ -2062,6 +2115,167 @@ Err server_engine_chat_session(Engine *e, Str body, const char *session,
     arena_reset(&a);
     free(c);
     return ret;
+}
+
+// ---- prefill ahead ------------------------------------------------------------------------------
+
+// Tokens per chunk of an ahead read: a request that arrives waits for one at most (about 0.8 s on
+// the Coder). Prefill is bitwise the same whatever the chunk boundaries, for chunks of more than
+// MODEL_SMALL tokens (src/test/ahead.c), so these chunks change no computed row.
+#define AHEAD_CHUNK ((size_t)2048)
+// The fewest new tokens an ahead read starts for.
+#define AHEAD_MIN ((size_t)64)
+// Stable tokens left unread at the end of what the partial message gives: its last pre-token may
+// still merge with the text that follows (a newline with the next line's indentation).
+#define AHEAD_MARGIN ((size_t)16)
+
+static bool ahead_on(void) {
+    const char *v = getenv("SAETTA_AHEAD");
+    if (v && v[0] == '0') return false;
+    const char *pv = getenv("SAETTA_POINTS");
+    return !(pv && pv[0] == '0');
+}
+
+// The tool message of body's request whose tool_call_id is id (the last one), or NULL.
+static JValue *partial_message(JValue *r, Str id) {
+    JValue *msgs = field(r, "messages");
+    if (!msgs || msgs->kind != J_ARRAY) return NULL;
+    for (size_t i = msgs->arr.len; i-- > 0;) {
+        JValue *m = msgs->arr.items[i];
+        JValue *ro = field(m, "role"), *tc = field(m, "tool_call_id");
+        if (ro && ro->kind == J_STRING && str_eqz(ro->s, "tool") && tc && tc->kind == J_STRING && str_eq(tc->s, id)) return m;
+    }
+    return NULL;
+}
+
+Err server_engine_ahead(Engine *e, Str body, const char *session, const char *partial_id, volatile int *stop, size_t *read) {
+    *read = 0;
+    if (model_info(e->m)->chat != CHAT_QWEN || e->im_start == UINT32_MAX) return "AheadUnsupported";
+    if (!ahead_on() || !session || !session[0] || strlen(session) >= sizeof e->owner[0] || !partial_id) return OK;
+    uint64_t t0 = now_ns();
+    Arena a = {0};
+    VecU32 ids = {0}, ids2 = {0};
+    Err err = OK;
+    const char *why = NULL;
+    // the prompt with the partial message as it is, and with one more character in it: their common
+    // tokens are the ones no continuation of that message changes (as far as two of them tell; the
+    // request decides in the end), less a margin
+    JValue *r, *m;
+    Str model_name, named, p1, p2;
+    ToolChoiceKind choice;
+    if (request_object(e, &a, body, FMT_OPENAI, &r, &model_name, &choice, &named)) goto out;
+    if (model_name.len > 0 && model_lora_find(e->m, arena_strndup(&a, model_name.ptr, model_name.len)) >= 0) goto out;
+    m = partial_message(r, str(partial_id));
+    JValue *ct = m ? field(m, "content") : NULL;
+    if (!ct || ct->kind != J_STRING) goto out;
+    if (chat_render_as(&a, CHAT_QWEN, r, &p1)) goto out;
+    Str more = str(arena_printf(&a, "%.*s\x01", (int)ct->s.len, ct->s.ptr));
+    json_put(&a, m, S("content"), json_string(&a, more));
+    if (chat_render_as(&a, CHAT_QWEN, r, &p2)) goto out;
+    if (tokenizer_encode(e->tok, p1, &ids) || tokenizer_encode(e->tok, p2, &ids2)) goto out;
+    size_t k = 0;
+    while (k < MIN(ids.len, ids2.len) && ids.ptr[k] == ids2.ptr[k]) k++;
+    if (k <= AHEAD_MARGIN + AHEAD_MIN) goto out;
+    size_t target = k - AHEAD_MARGIN;
+    uint64_t t1 = now_ns();
+
+    // the engine's turn, given up when the caller stops meanwhile
+    uint64_t t = turn_take(e);
+    while (!turn_wait(e, t, 50))
+        if (stop && *stop) {
+            turn_leave(e, t);
+            goto out;
+        }
+    // a request waiting for its turn goes first
+    if ((stop && *stop) || turns_waiting(&e->turns)) {
+        why = stop && *stop ? "stopped" : "a request waits";
+        goto done;
+    }
+    // the conversation this session's last request ran in, unused by any other request since, with
+    // one of its restore points (that request's prompt, or the prompt and its reply) a prefix of the
+    // prompt: a snapshot taken before that request ended continues neither and is refused
+    size_t ci = SIZE_MAX;
+    for (size_t i = 0; i < e->n_conv; i++)
+        if (!strcmp(e->owner[i], session) && e->owner_gen[i] == e->conv_gen[i] && e->conv_lora[i] == -1) ci = i;
+    if (ci == SIZE_MAX) {
+        why = "no conversation of this session unused since";
+        goto done;
+    }
+    const Ckpt *ck = ck_of(e, ci);
+    Reusable ru = session_reusable_in(ck, ids.ptr, k);
+    if (ru.n == 0) {
+        why = "the prompt does not continue the last request";
+        goto done;
+    }
+    activate(e, ci);
+    model_lora_select(e->m, -1);
+    Session *s = e->s;
+    // room in the conversation's capacity, grown only while memory allows without emptying another
+    if (target + CAP_SLACK > s->cap) {
+        size_t cap = MIN(s->max_cap, ALIGN_UP(target + CAP_SLACK, CAP_STEP));
+        if (cap > s->cap && room_for(e, session_kv_bytes(s, cap), 2ull << 30)) (void)session_grow(s, e->g, cap);
+        if (target + CAP_SLACK > s->cap) target = s->cap > CAP_SLACK ? s->cap - CAP_SLACK : 0;
+    }
+    Start st = plan(e, ids.ptr, k);
+    if (st.kind == START_FRESH || st.kind == START_SHARED || st.n < ru.n || target < st.n + AHEAD_MIN) {
+        why = target < st.n + AHEAD_MIN ? NULL : "no start";
+        goto done;
+    }
+    size_t from = st.n;
+    e->live_ids.len = 0;
+    vec_reserve(&e->live_ids, target);
+    memcpy(e->live_ids.ptr, ids.ptr, target * sizeof(uint32_t));
+    e->live_ids.len = target;
+    if (apply(e, st, false)) goto done;
+    // the live state is at from, restored or continued
+    e->live = true;
+    e->live_conv = ci;
+    e->live_pos = from;
+    // the checkpoints the request would keep: at its start (restore point 1, the reply's end) and at
+    // the message starts it reads (session_point_cuts; new buffers only while memory allows, without
+    // taking other conversations' checkpoints)
+    size_t pb = session_point_bytes(s);
+    if (st.kind == START_CKPT) {
+        if (session_save_point(s, e->g, ids.ptr, from, room_for(e, pb, 2ull << 30))) goto broken;
+        int kp = session_point_at(s->pts, from);
+        if (kp >= 0) s->pts[kp].start = true;
+    }
+    size_t cap = (k - from) / PT_GAP + 4;
+    size_t *cuts = ARENA_ARRAY(&a, size_t, cap);
+    size_t nc = session_point_cuts(ids.ptr, k, from, e->im_start, cuts, cap);
+    while (nc > 0 && cuts[nc - 1] >= target) nc--;
+    size_t pos = from, c = 0;
+    float *lg;
+    while (pos < target) {
+        if ((stop && *stop) || turns_waiting(&e->turns)) break;
+        // the segment to the next cut, in equal chunks of at most AHEAD_CHUNK (none of MODEL_SMALL
+        // tokens or fewer: segments are at least PT_GAP - AHEAD_MARGIN long, or AHEAD_MIN)
+        size_t end = c < nc ? cuts[c] : target, len = end - pos, chunks = (len + AHEAD_CHUNK - 1) / AHEAD_CHUNK;
+        size_t T = (len + chunks - 1) / chunks;
+        if (model_prefill_with(e->m, s, ids.ptr + pos, T, NULL, NULL, &lg)) goto broken;
+        pos += T;
+        e->live_pos = pos;
+        if (pos == end && c < nc) {
+            c++;
+            if (session_save_point(s, e->g, ids.ptr, pos, room_for(e, pb, 2ull << 30))) goto broken;
+        }
+    }
+    *read = pos - from;
+    dbg("ahead: conversation %zu read %zu tokens (%zu to %zu of %zu known) in %lld ms (render %lld ms)%s\n", ci + 1, pos - from, from,
+        pos, k, (long long)((now_ns() - t1) / 1000000), (long long)((t1 - t0) / 1000000), pos < target ? ", yielded" : "");
+    goto done;
+broken:
+    // a failed read leaves no live state (the next request restores as usual)
+    e->live = false;
+    dbg("ahead: failed\n");
+done:
+    turn_done(e);
+    if (why) dbg("ahead: nothing read (%s)\n", why);
+out:
+    vec_free(&ids);
+    vec_free(&ids2);
+    arena_reset(&a);
+    return err;
 }
 
 Err server_engine_connection(Engine *e, int fd, void (*authed)(void *ctx), void *ctx) { return connection(e, fd, false, authed, ctx); }

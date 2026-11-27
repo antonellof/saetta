@@ -18,9 +18,10 @@ static const char *const engine_env_rows[] = {
     "SAETTA_SMALL_FUSED",    "SAETTA_SPEC",    "SAETTA_DSPARK",
 };
 
-// Read by the engine's files, and changing nothing a state holds.
+// Read by the engine's files, and changing nothing a state holds. SAETTA_AHEAD (prefill ahead of the
+// request) moves chunk boundaries only, which change no computed row (src/test/ahead.c).
 static const char *const engine_env_other[] = {
-    "HF_TOKEN",          "HOME",               "PATH",                "SAETTA_AUTOSTOP",     "SAETTA_CHUNK_COST",
+    "HF_TOKEN",          "HOME",               "PATH",                "SAETTA_AHEAD",        "SAETTA_AUTOSTOP",     "SAETTA_CHUNK_COST",
     "SAETTA_CONVERSATIONS", "SAETTA_CTX", "SAETTA_DS_DUMP", "SAETTA_DSV4_FORCE",   "SAETTA_DUMP_LOGITS",  "SAETTA_IGNORE_MEMORY",
     "SAETTA_INK_ROUTES", "SAETTA_INPROC_LOCK_FD", "SAETTA_LORA",       "SAETTA_MODELS",       "SAETTA_MTP_K",
     "SAETTA_NLL",        "SAETTA_NLL_STEP",    "SAETTA_PACK",         "SAETTA_PORT",         "SAETTA_PROFILE",

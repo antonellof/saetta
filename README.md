@@ -118,13 +118,14 @@ saetta code --subagents                 # up to 3 child agents at once
 ```
 
 - **Sessions resume instantly**: the engine's state is saved with each session, so `-c`, `/resume` and `/fork` read only what is new ([Sessions](docs/sessions.md)).
+- **Tool output is read while the tool runs**: a command's output goes into the conversation as it streams, so the answer starts sooner when the command ends ([Sessions](docs/sessions.md)).
 - **Interrupted runs come back**: after a crash, a kill or a closed terminal, the next start offers to resume; commands and edits that were running are never re-run without asking.
 - **Parallel agents** share one loaded model ([Parallel agents](docs/parallel-agents.md)); **MCP** servers over stdio or HTTP with OAuth ([MCP](docs/mcp.md)).
 - **The terminal UI** is pi's, in C, with a footer showing the branch, the last turn's time and tok/s, and the model; `/monitor` shows the engine live. All commands: [Commands](docs/commands.md).
 
 <p align="center"><img src="web/assets/code/tools.png" width="900" alt="An edit of src/duration.ts shown as a diff, node --test with 5 tests passing, and the model's summary"></p>
 
-Coming next: prompts read while tools run; commands confined to the project by macOS's Seatbelt.
+Coming next: commands confined to the project by macOS's Seatbelt.
 
 ## Other agents and clients
 

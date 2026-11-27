@@ -3,6 +3,12 @@
 All notable changes to saetta and Saetta Code (`saetta code`), newest first. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are saetta's.
 
+## [Unreleased]
+
+### Added
+
+- Saetta Code reads a running command's output into the conversation while the command runs (in process, Qwen3.8-Flash-Next and Qwen3.8-27B): when it ends, the next request finds most of the result already read and only reads the rest. The request still decides: what was read ahead and does not match is read again from the last point that does, and the answer is the same token for token. A request from another session or agent goes first. `SAETTA_AHEAD=0` turns it off. Not yet for Inkling 2 Mini or over the HTTP API.
+
 ## [0.22.0] - 2026-11-27
 
 ### Added

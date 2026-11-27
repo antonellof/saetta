@@ -59,3 +59,10 @@ void turns_leave(Turns *t, uint64_t n) {
     else t->gone[n % TURNS_MAX] = true;
     pthread_mutex_unlock(&t->mu);
 }
+
+bool turns_waiting(Turns *t) {
+    pthread_mutex_lock(&t->mu);
+    bool w = t->next > t->serving + 1;
+    pthread_mutex_unlock(&t->mu);
+    return w;
+}

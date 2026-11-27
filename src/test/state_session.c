@@ -35,7 +35,7 @@ TEST(state_session_restore_point_after_shared_start) {
     Conv held;
     EXPECT_OK(session_new_conv(s, &g, 8192, &held));
     s->pos = 4096;
-    EXPECT_OK(session_save_point(s, &g, Y, 4096));
+    EXPECT_OK(session_save_point(s, &g, Y, 4096, true));
     session_swap_conv(s, &held); // held: Y's; s: an empty conversation
     // X's restore point at 3000
     s->pos = 3000;
@@ -43,13 +43,17 @@ TEST(state_session_restore_point_after_shared_start) {
     EXPECT_EQ(session_reusable_in(s->ck, X, 5000).n, 3000);
     // Y's request starts here from held's point (what apply does for START_SHARED), then aborts
     EXPECT_EQ(session_shared_point(held.ptoks.ptr, held.ptoks.len, held.pts, Y, 6000), 4096);
-    EXPECT_OK(session_start_from(s, &g, &held, 4096));
+    EXPECT_OK(session_start_from(s, &g, &held, 4096, PT_MAX));
     session_invalidate_from(s, 4096);
     EXPECT_EQ(session_reusable_in(s->ck, X, 5000).n, 0);
     // the end-of-turn save takes the longer restore point: none is left
     EXPECT_EQ(s->ck[0].tokens.len, 0);
     EXPECT_EQ(s->ck[1].tokens.len, 0);
-    // the shared start's own point is valid for Y
+    // the shared start's own point is adopted, valid (offered again once a save past it says which
+    // token follows it: the request's start keeps it so, server.c)
+    EXPECT(session_point_at(s->pts, 4096) >= 0);
+    s->pos = 4096;
+    EXPECT_OK(session_save_point(s, &g, Y, 4096, true));
     EXPECT_EQ(session_shared_point(s->ptoks.ptr, s->ptoks.len, s->pts, Y, 6000), 4096);
     free(X);
     free(Y);
@@ -87,12 +91,12 @@ TEST(state_session_mtp_rows_at_n) {
     uint8_t ident[32] = {4}, shape[32] = {5};
     StateStore *st;
     EXPECT_OK(state_store_open(root, ident, shape, &st));
-    StMeta meta = {.extra_len = 0};
+    StMeta meta = {.nsnap = 1, .snap = {{.pos = n}}};
     meta.lineage[0] = 1;
     EXPECT(state_store_save(st, &la, ids, n, &meta, NULL, 0, NULL, 0, NULL));
     state_store_wait(st);
     char name[33];
-    EXPECT_EQ(state_store_find(st, ids, n + 10, 0, name), n);
+    EXPECT_EQ(state_store_find(st, ids, n + 10, 0, name, NULL), n);
     EXPECT(session_state_layout(b, 1, n, &lb));
     size_t got, nk;
     StMeta mb;
@@ -149,12 +153,12 @@ TEST(state_session_27b_mtp_rows_at_n) {
     uint8_t ident[32] = {6}, shape[32] = {7};
     StateStore *st;
     EXPECT_OK(state_store_open(root, ident, shape, &st));
-    StMeta meta = {.extra_len = 0};
+    StMeta meta = {.nsnap = 1, .snap = {{.pos = n}}};
     meta.lineage[0] = 2;
     EXPECT(state_store_save(st, &la, ids, n, &meta, NULL, 0, NULL, 0, NULL));
     state_store_wait(st);
     char name[33];
-    EXPECT_EQ(state_store_find(st, ids, n + 10, 0, name), n);
+    EXPECT_EQ(state_store_find(st, ids, n + 10, 0, name, NULL), n);
     EXPECT(session_state_layout(b, 1, n, &lb));
     size_t got, nk;
     StMeta mb;
@@ -171,4 +175,111 @@ TEST(state_session_27b_mtp_rows_at_n) {
     snprintf(cmd, sizeof cmd, "rm -rf '%s'", root);
     (void)system(cmd);
     free(ids);
+}
+
+// A conversation starting from another's checkpoint at a position that is no multiple of PT_EVERY
+// or of the pooled block (a message start): the rows below it and the MTP slot's rows at it (K, V,
+// indexer key, the pooled block holding it) are copied, as a state holds them, with the source's
+// valid checkpoints up to it; a checkpoint's slot gives a state layout of its own buffers.
+TEST(state_session_start_from_unaligned_point) {
+    if (!getenv("SAETTA_PACK")) SKIP("SAETTA_PACK not set (allocates session buffers)");
+    Arena arena = {0};
+    Pack empty = {0};
+    Gpu g;
+    EXPECT_OK(gpu_init(&arena, &empty, &g));
+    Session *s;
+    EXPECT_OK(flash_arch.s_create_cap(&g, true, 8192, 8192, &s));
+    uint32_t *X = ids_from(1000, 8000);
+    size_t p = 6001;
+    // X's checkpoints at 2500 and at p in a held conversation, its rows filled
+    Conv held;
+    EXPECT_OK(session_new_conv(s, &g, 8192, &held));
+    s->pos = 2500;
+    EXPECT_OK(session_save_point(s, &g, X, 2500, true));
+    s->pos = p;
+    EXPECT_OK(session_save_point(s, &g, X, p, true));
+    StLayout lx;
+    int k = session_point_at(s->pts, p);
+    EXPECT(k >= 0);
+    EXPECT(session_state_layout(s, 2 + (size_t)k, p, &lx));
+    EXPECT(lx.rec[0] == sx_buffer_contents(s->pts[k].gdn));
+    for (size_t r = 0; r < lx.nreg; r++)
+        for (size_t pl = 0; pl < lx.reg[r].planes; pl++) {
+            uint8_t *b = lx.reg[r].base + pl * lx.reg[r].plane_stride;
+            size_t rows = p / lx.reg[r].per_row + 1;
+            for (size_t i = 0; i < rows * lx.reg[r].row_bytes; i++) b[i] = (uint8_t)(i * 7 + pl + r);
+        }
+    session_swap_conv(s, &held); // held: X's; s: an empty conversation
+    EXPECT_EQ(session_shared_point(held.ptoks.ptr, held.ptoks.len, held.pts, X, 7000), p);
+    EXPECT_OK(session_start_from(s, &g, &held, p, PT_MAX));
+    EXPECT_EQ(s->pos, p);
+    StLayout ls;
+    EXPECT(session_state_layout(s, 1, p, &ls));
+    // every row below p and the MTP rows at p (the rec entries past the recurrent buffers)
+    for (size_t r = 0; r < ls.nreg; r++)
+        for (size_t pl = 0; pl < ls.reg[r].planes; pl++) {
+            size_t rows = p / ls.reg[r].per_row;
+            EXPECT(!memcmp(ls.reg[r].base + pl * ls.reg[r].plane_stride, lx.reg[r].base + pl * lx.reg[r].plane_stride,
+                           rows * ls.reg[r].row_bytes));
+        }
+    StLayout lh;
+    session_swap_conv(s, &held);
+    EXPECT(session_state_layout(s, 1, p, &lh)); // the source's MTP rows at p
+    session_swap_conv(s, &held);
+    for (size_t r = 3; r < ls.nrec; r++) EXPECT(!memcmp(ls.rec[r], lh.rec[r], ls.rec_bytes[r]));
+    // both checkpoints adopted, at their positions
+    EXPECT(session_point_at(s->pts, 2500) >= 0);
+    EXPECT(session_point_at(s->pts, p) >= 0);
+    EXPECT_EQ(session_shared_point(s->ptoks.ptr, s->ptoks.len, s->pts, X, 5000), 2500);
+    // an emptied conversation gives its checkpoints' buffers back
+    EXPECT_OK(session_conv_shrink(s, &g, &held, 4096));
+    for (size_t i = 0; i < PT_MAX; i++) EXPECT(held.pts[i].gdn == NULL && !held.pts[i].valid);
+    free(X);
+    gpu_deinit(&g);
+    arena_reset(&arena);
+}
+
+// Trimming a held conversation releases every checkpoint slot but keep of them (the most recent, the
+// last request's start, the oldest), and the reserve for 4 conversations is 16 + 3 x 3 checkpoints
+// (the 27B's 157 MB each).
+TEST(state_session_trim_points) {
+    if (!getenv("SAETTA_PACK")) SKIP("SAETTA_PACK not set (allocates session buffers)");
+    Arena arena = {0};
+    Pack empty = {0};
+    Gpu g;
+    EXPECT_OK(gpu_init(&arena, &empty, &g));
+    Session *s;
+    EXPECT_OK(dense_arch.s_create_cap(&g, true, 8192, 8192, &s));
+    EXPECT_EQ(session_point_bytes(s), 156893184);
+    EXPECT_EQ(session_points_reserve(s, 4), (uint64_t)(16 + 3 * 3) * 156893184);
+    uint32_t *X = ids_from(1000, 8000);
+    for (size_t p = 300; p <= 300 * 18; p += 300) {
+        s->pos = p;
+        EXPECT_OK(session_save_point(s, &g, X, p, true));
+        // the request starts: 3000 (then a later one at 4500)
+        if (p == 3000 || p == 4500) s->pts[session_point_at(s->pts, p)].start = true;
+    }
+    Conv held;
+    EXPECT_OK(session_new_conv(s, &g, 8192, &held));
+    session_swap_conv(s, &held); // held: the 16 checkpoints
+    size_t n = 0;
+    for (size_t k = 0; k < PT_MAX; k++) n += held.pts[k].gdn != NULL;
+    EXPECT_EQ(n, PT_MAX);
+    EXPECT_EQ(session_conv_trim_points(&held, PT_HELD), PT_MAX - PT_HELD);
+    size_t left = 0;
+    bool has[3] = {false};
+    for (size_t k = 0; k < PT_MAX; k++)
+        if (held.pts[k].gdn) {
+            left++;
+            EXPECT(held.pts[k].valid && held.pts[k].conv != NULL);
+            has[0] |= held.pts[k].pos == 5400; // the most recent
+            has[1] |= held.pts[k].pos == 4500; // the last request's start
+            has[2] |= held.pts[k].pos == 300;  // the oldest
+        }
+    EXPECT_EQ(left, PT_HELD);
+    EXPECT(has[0] && has[1] && has[2]);
+    EXPECT_EQ(session_conv_trim_points(&held, 0), PT_HELD);
+    free(X);
+    gpu_deinit(&g);
+    arena_reset(&arena);
 }

@@ -965,9 +965,15 @@ Err session_new_conv(const Session *s, Gpu *g, size_t cap, Conv *out) { (void)s,
 Err session_conv_shrink(const Session *s, Gpu *g, Conv *cv, size_t cap) { (void)s, (void)g, (void)cv, (void)cap; return NI; }
 void session_swap_conv(Session *s, Conv *cv) { (void)s, (void)cv; }
 bool session_roll_to(Session *s, size_t p, const uint32_t *toks) { (void)s, (void)p, (void)toks; return false; }
-Err session_save_point(Session *s, Gpu *g, const uint32_t *toks, size_t n) { (void)s, (void)g, (void)toks, (void)n; return NI; }
+Err session_save_point(Session *s, Gpu *g, const uint32_t *toks, size_t n, bool may_alloc) {
+    (void)s, (void)g, (void)toks, (void)n, (void)may_alloc;
+    return NI;
+}
 void session_start_at_own_point(Session *s, size_t n) { (void)s, (void)n; }
-Err session_start_from(Session *s, Gpu *g, const Conv *src, size_t n) { (void)s, (void)g, (void)src, (void)n; return NI; }
+Err session_start_from(Session *s, Gpu *g, const Conv *src, size_t n, size_t alloc_max) {
+    (void)s, (void)g, (void)src, (void)n, (void)alloc_max;
+    return NI;
+}
 void session_restore(Session *s) { (void)s; }
 void session_push_history(Session *s, uint32_t token) { (void)s, (void)token; }
 bool session_state_layout(const Session *s, size_t slot, size_t n, StLayout *out) { (void)s, (void)slot, (void)n, (void)out; return false; }

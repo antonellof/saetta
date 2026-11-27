@@ -124,7 +124,7 @@ saetta code --subagents                 # up to 3 child agents at once
 
 <p align="center"><img src="web/assets/code/tools.png" width="900" alt="An edit of src/duration.ts shown as a diff, node --test with 5 tests passing, and the model's summary"></p>
 
-Coming next: prompts read while tools run; the M5's neural accelerators for Inkling 2 Mini; commands confined to the project by macOS's Seatbelt.
+Coming next: prompts read while tools run; commands confined to the project by macOS's Seatbelt.
 
 ## Other agents and clients
 

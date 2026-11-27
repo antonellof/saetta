@@ -40,4 +40,4 @@ Subagents are off by default: pi has no built-in subagents, and with them off Sa
 
 ### How they use the engine
 
-Each subagent's requests start with its parent's: the same system prompt, tools and messages, then its task. The engine reuses the part of the parent's prompt it has kept (in steps of 4,096 tokens, up to 32,768), so a subagent reads mostly its own task. The engine still decodes one request at a time: subagents overlap their tool calls and their waits, not their decoding.
+Each subagent's requests start with its parent's: the same system prompt, tools and messages, then its task. The engine reuses the part of the parent's prompt it has kept (from the checkpoints it keeps at message starts and every 4,096 tokens), so a subagent reads mostly its own task. The engine still decodes one request at a time: subagents overlap their tool calls and their waits, not their decoding.

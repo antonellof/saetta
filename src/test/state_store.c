@@ -133,7 +133,7 @@ static int mode_of(const char *p) {
 static void noop_release(void *p) { (void)p; }
 
 static StMeta meta_of(uint8_t lin, uint32_t a, uint32_t b, uint64_t since) {
-    StMeta m = {.prev = {a, b}, .since_eos = since, .extra_len = 5};
+    StMeta m = {.nsnap = 1, .snap = {{.prev = {a, b}, .since_eos = since}}, .extra_len = 5};
     memset(m.lineage, lin, 16);
     memcpy(m.extra, "spec!", 5);
     return m;
@@ -208,16 +208,16 @@ TEST(state_store_roundtrip) {
     EXPECT(!state_store_save(st, &a.lay, ids, n, &ma, NULL, 0, NULL, 0, noop_release)); // sound and there already
 
     char name[33];
-    EXPECT_EQ(state_store_find(st, ids, n + 50, 0, name), n);
-    EXPECT_EQ(state_store_find(st, ids, n, 0, name), 0);
-    EXPECT_EQ(state_store_find(st, ids, n + 50, n, name), 0);
+    EXPECT_EQ(state_store_find(st, ids, n + 50, 0, name, NULL), n);
+    EXPECT_EQ(state_store_find(st, ids, n, 0, name, NULL), 0);
+    EXPECT_EQ(state_store_find(st, ids, n + 50, n, name, NULL), 0);
     uint32_t *other = malloc(20000 * 4);
     memcpy(other, ids, 20000 * 4);
     other[9000] ^= 1;
-    EXPECT_EQ(state_store_find(st, other, n + 50, 0, name), 0);
+    EXPECT_EQ(state_store_find(st, other, n + 50, 0, name, NULL), 0);
 
     // read into buffers of another capacity, with its metadata
-    EXPECT_EQ(state_store_find(st, ids, n + 50, 0, name), n);
+    EXPECT_EQ(state_store_find(st, ids, n + 50, 0, name, NULL), n);
     Fake b;
     fake_new(&b, 32768, false);
     size_t got = 0, nk = 0;
@@ -230,15 +230,15 @@ TEST(state_store_roundtrip) {
     EXPECT(!tch); // refused before any read into the buffers
     EXPECT(state_store_save(st, &a.lay, ids, n, &ma, NULL, 0, NULL, 0, noop_release)); // it was dropped: again
     state_store_wait(st);
-    EXPECT_EQ(state_store_find(st, ids, n + 50, 0, name), n);
+    EXPECT_EQ(state_store_find(st, ids, n + 50, 0, name, NULL), n);
     EXPECT_OK(state_store_load(st, name, ids, n + 50, &b.lay, &got, &mb, &kk, &nk, &bytes, &tch));
     EXPECT_EQ(got, n);
     EXPECT(tch);
     EXPECT_EQ(nk, 2);
     EXPECT(fake_same(&a, &b, n));
-    EXPECT_EQ(mb.prev[0], 11);
-    EXPECT_EQ(mb.prev[1], 22);
-    EXPECT_EQ(mb.since_eos, 333);
+    EXPECT_EQ(mb.snap[0].prev[0], 11);
+    EXPECT_EQ(mb.snap[0].prev[1], 22);
+    EXPECT_EQ(mb.snap[0].since_eos, 333);
     EXPECT(!memcmp(mb.lineage, ma.lineage, 16));
     EXPECT_EQ(mb.extra_len, 5);
     EXPECT(!memcmp(mb.extra, "spec!", 5));
@@ -255,8 +255,8 @@ TEST(state_store_roundtrip) {
     state_store_wait(st);
     EXPECT_EQ(count_files(D.chunks, ".kv"), 3);
     EXPECT_EQ(count_files(D.states, ".st"), 2);
-    EXPECT_EQ(state_store_find(st, ids, 20000, 0, name), n2);
-    EXPECT_EQ(state_store_find(st, ids, 12000, 0, name), n);
+    EXPECT_EQ(state_store_find(st, ids, 20000, 0, name, NULL), n2);
+    EXPECT_EQ(state_store_find(st, ids, 12000, 0, name, NULL), n);
     // the same ids in another lineage (another computation): its own chunks, none shared
     Fake o;
     fake_new(&o, 16384, true);
@@ -267,7 +267,7 @@ TEST(state_store_roundtrip) {
     EXPECT_EQ(count_files(D.states, ".st"), 3);
     Fake c;
     fake_new(&c, 16384, false);
-    EXPECT_EQ(state_store_find(st, ids, 20000, 0, name), n2);
+    EXPECT_EQ(state_store_find(st, ids, 20000, 0, name, NULL), n2);
     EXPECT_OK(state_store_load(st, name, ids, 20000, &c.lay, &got, &mb, &kk, &nk, &bytes, &tch));
     EXPECT_EQ(got, n2);
     // whichever lineage it was, its rows are its own
@@ -278,7 +278,7 @@ TEST(state_store_roundtrip) {
     // numbers) and saves 13000 tokens under its own lineage C, listing A's chunks 0 and 1 by their
     // keys: A's chunk 2 (same ids, written by A's computation) is not reused, C writes its own
     {
-        EXPECT_EQ(state_store_find(st, ids, 12000, 0, name), n);
+        EXPECT_EQ(state_store_find(st, ids, 12000, 0, name, NULL), n);
         Fake rc;
         fake_new(&rc, 16384, false);
         EXPECT_OK(state_store_load(st, name, ids, 12000, &rc.lay, &got, &mb, &kk, &nk, &bytes, &tch));
@@ -355,13 +355,13 @@ TEST(state_store_roundtrip) {
     Fake d;
     fake_new(&d, 16384, false);
     size_t before = count_files(D.states, ".st");
-    EXPECT_EQ(state_store_find(st, ids, 20000, 0, name), n2);
+    EXPECT_EQ(state_store_find(st, ids, 20000, 0, name, NULL), n2);
     EXPECT_ERR(state_store_load(st, name, ids, 20000, &d.lay, &got, &mb, &kk, &nk, &bytes, &tch), "StateCorrupt");
     EXPECT_EQ(count_files(D.states, ".st"), before - 1);
     EXPECT(access(key0, F_OK) != 0);
-    EXPECT_EQ(state_store_find(st, ids, 20000, 0, name), n);
+    EXPECT_EQ(state_store_find(st, ids, 20000, 0, name, NULL), n);
     EXPECT_ERR(state_store_load(st, name, ids, 20000, &d.lay, &got, &mb, &kk, &nk, &bytes, &tch), "StateMissing");
-    EXPECT_EQ(state_store_find(st, ids, 20000, 0, name), 0);
+    EXPECT_EQ(state_store_find(st, ids, 20000, 0, name, NULL), 0);
     fake_free(&d);
     state_store_close(st);
 
@@ -386,7 +386,7 @@ TEST(state_store_roundtrip) {
     state_store_wait(st);
     EXPECT(first_file(D.states, ".st", path, sizeof path));
     EXPECT_EQ(truncate(path, ST_PAGE + 100), 0);
-    EXPECT_EQ(state_store_find(st, ids, 20000, 0, name), 0); // its sections are not all there
+    EXPECT_EQ(state_store_find(st, ids, 20000, 0, name, NULL), 0); // its sections are not all there
     // a header whose lengths are forged (n of 2^40 tokens, crc made valid): refused without
     // allocating, and removed at the next scan. StateHead: n at byte 160, nchunks at 168.
     EXPECT(state_store_save(st, &a.lay, ids, n + 1, &ma, NULL, 0, NULL, 0, noop_release));
@@ -420,7 +420,7 @@ TEST(state_store_roundtrip) {
         close(fd);
         free(page);
     }
-    EXPECT_EQ(state_store_find(st, ids, 20000, 0, name), 0);
+    EXPECT_EQ(state_store_find(st, ids, 20000, 0, name, NULL), 0);
     state_store_gc(st, (uint64_t)1 << 40, ST_MAX_AGE_S, (int64_t)time(NULL));
     EXPECT(access(path, F_OK) != 0);
 
@@ -463,7 +463,7 @@ TEST(state_store_roundtrip) {
     Dirs DB;
     dirs_for(&DB, sroot, ident, shapeB);
     EXPECT_OK(state_store_open(sroot, ident, shapeB, &st));
-    EXPECT_EQ(state_store_find(st, ids, 20000, 0, name), 0);
+    EXPECT_EQ(state_store_find(st, ids, 20000, 0, name, NULL), 0);
     // even a chunk file of shape A copied under B's name for the same key is not reused: its
     // header names shape A, so B writes its own
     char ka[600], kb[600];
@@ -478,7 +478,7 @@ TEST(state_store_roundtrip) {
     EXPECT_EQ(count_files(DB.chunks, ".kv"), 2);
     Fake r;
     fake_new(&r, 16384, false);
-    EXPECT_EQ(state_store_find(st, ids, 20000, 0, name), n);
+    EXPECT_EQ(state_store_find(st, ids, 20000, 0, name, NULL), n);
     EXPECT_OK(state_store_load(st, name, ids, 20000, &r.lay, &got, &mb, &kk, &nk, &bytes, &tch));
     EXPECT(fake_same(&bb, &r, n));
     // a chunk that fails its header at a load (A's file put back under B's name) is deleted
@@ -672,7 +672,7 @@ TEST(state_store_chunk_times_and_foreign_sweep) {
     EXPECT_EQ(utimes(c0, old), 0);
     EXPECT_EQ(utimes(c1, old), 0);
     char name[33];
-    EXPECT_EQ(state_store_find(st, ids, 12000, 0, name), 10000);
+    EXPECT_EQ(state_store_find(st, ids, 12000, 0, name, NULL), 10000);
     Fake b;
     fake_new(&b, 16384, false);
     size_t got, nk;
@@ -719,4 +719,131 @@ TEST(state_store_chunk_times_and_foreign_sweep) {
     char cmd[400];
     snprintf(cmd, sizeof cmd, "rm -rf '%s'", root);
     (void)system(cmd);
+}
+
+// A state with two snapshots (the restore point at n and the checkpoint before it): a prompt that
+// extends the whole state reads both, one that leaves it between the two reads the second only
+// (rows of the whole state, its snapshot into xrec), one that leaves it before the second none.
+TEST(state_store_two_snapshots) {
+    char root[] = "/tmp/saetta-state-snap-XXXXXX";
+    EXPECT(mkdtemp(root) != NULL);
+    uint8_t ident[32] = {8}, shape[32] = {3};
+    StateStore *st;
+    EXPECT_OK(state_store_open(root, ident, shape, &st));
+    size_t n = 9000, p1 = 6500;
+    uint32_t *ids = malloc(20000 * 4);
+    for (size_t i = 0; i < 20000; i++) ids[i] = (uint32_t)(rnd() % 248000);
+    Fake a;
+    fake_new(&a, 16384, true);
+    uint8_t *x0 = malloc(100000), *x1 = malloc(777);
+    fill(x0, 100000);
+    fill(x1, 777);
+    a.lay.xrec[0] = x0;
+    a.lay.xrec[1] = x1;
+    StMeta ma = meta_of(0xB2, 1, 2, 3);
+    ma.nsnap = 2;
+    ma.snap[1] = (StSnap){p1, {4, 5}, 6, false, true, ids[p1]};
+    // a second snapshot not before n is refused
+    StMeta bad = ma;
+    bad.snap[1].pos = n;
+    EXPECT(!state_store_save(st, &a.lay, ids, n, &bad, NULL, 0, NULL, 0, noop_release));
+    EXPECT(state_store_save(st, &a.lay, ids, n, &ma, NULL, 0, NULL, 0, noop_release));
+    state_store_wait(st);
+    char name[33];
+    size_t at[ST_MAX_SNAP];
+    // the whole state: both snapshots
+    EXPECT_EQ(state_store_find(st, ids, n + 5, 0, name, at), n);
+    EXPECT_EQ(at[0], n);
+    EXPECT_EQ(at[1], p1);
+    Fake b;
+    fake_new(&b, 16384, false);
+    uint8_t *y0 = calloc(1, 100000), *y1 = calloc(1, 777);
+    b.lay.xrec[0] = y0;
+    b.lay.xrec[1] = y1;
+    size_t got, nk;
+    StMeta mb;
+    uint8_t (*kk)[32];
+    uint64_t bytes;
+    bool tch;
+    EXPECT_OK(state_store_load(st, name, ids, n + 5, &b.lay, &got, &mb, &kk, &nk, &bytes, &tch));
+    free(kk);
+    EXPECT_EQ(got, n);
+    EXPECT(fake_same(&a, &b, n));
+    EXPECT(!memcmp(y0, x0, 100000) && !memcmp(y1, x1, 777));
+    EXPECT_EQ(mb.nsnap, 2);
+    EXPECT(mb.snap[0].loaded && mb.snap[1].loaded);
+    EXPECT_EQ(mb.snap[1].pos, p1);
+    EXPECT_EQ(mb.snap[1].prev[1], 5);
+    EXPECT_EQ(mb.snap[1].since_eos, 6);
+    // a prompt that leaves the state at 8000: the second snapshot only
+    uint32_t *other = malloc(20000 * 4);
+    memcpy(other, ids, 20000 * 4);
+    other[8000] ^= 1;
+    EXPECT_EQ(state_store_find(st, other, 12000, 0, name, at), p1);
+    EXPECT_EQ(at[0], 0);
+    EXPECT_EQ(at[1], p1);
+    EXPECT_EQ(state_store_find(st, other, 12000, p1, name, at), 0); // no more than min_n
+    Fake c;
+    fake_new(&c, 16384, false);
+    uint8_t *z0 = calloc(1, 100000), *z1 = calloc(1, 777);
+    c.lay.xrec[0] = z0;
+    c.lay.xrec[1] = z1;
+    c.lay.rec[0] = c.lay.rec[1] = NULL; // snapshot 0 is not read
+    EXPECT_OK(state_store_load(st, name, other, 12000, &c.lay, &got, &mb, &kk, &nk, &bytes, &tch));
+    free(kk);
+    EXPECT_EQ(got, p1);
+    EXPECT(!mb.snap[0].loaded && mb.snap[1].loaded);
+    EXPECT(!memcmp(z0, x0, 100000) && !memcmp(z1, x1, 777));
+    // only the chunks up to the second snapshot (two of 4096 rows; not the tail past 8192)
+    EXPECT_EQ(bytes, 4 * 8192 * 64 + 2 * (8192 / 4) * 32 + 100000 + 777);
+    for (size_t pl = 0; pl < 4; pl++)
+        EXPECT(!memcmp(a.kv + pl * a.cap * 64, c.kv + pl * c.cap * 64, 8192 * 64));
+    // a capacity that holds those rows but not the state's n is enough for it
+    Fake small;
+    fake_new(&small, 8192, false);
+    small.lay.xrec[0] = z0;
+    small.lay.xrec[1] = z1;
+    small.lay.rec[0] = small.lay.rec[1] = NULL;
+    EXPECT_OK(state_store_load(st, name, other, 12000, &small.lay, &got, &mb, &kk, &nk, &bytes, &tch));
+    free(kk);
+    EXPECT_EQ(got, p1);
+    fake_free(&small);
+    // a prompt that is the state's history to the second snapshot exactly: it must leave a token
+    EXPECT_EQ(state_store_find(st, ids, p1, 0, name, at), 0);
+    EXPECT_EQ(state_store_find(st, ids, p1 + 1, 0, name, at), p1);
+    // leaving before the second snapshot: nothing
+    other[8000] ^= 1;
+    other[100] ^= 1;
+    EXPECT_EQ(state_store_find(st, other, 12000, 0, name, at), 0);
+    // a snapshot at n with its next token: used only when the prompt has that token at n (else the
+    // second snapshot)
+    // (ids of its own, leaving the first state at 50)
+    uint32_t *nx = malloc(20000 * 4);
+    memcpy(nx, ids, 20000 * 4);
+    nx[50] ^= 3;
+    StMeta mn = ma;
+    mn.lineage[0] ^= 0x55;
+    mn.snap[0].has_next = true;
+    mn.snap[0].next = 777;
+    mn.snap[1].next = nx[p1];
+    EXPECT(state_store_save(st, &a.lay, nx, n, &mn, NULL, 0, NULL, 0, noop_release));
+    state_store_wait(st);
+    nx[n] = 777;
+    EXPECT_EQ(state_store_find(st, nx, n + 5, 0, name, at), n);
+    EXPECT_EQ(at[0], n);
+    nx[n] = 778;
+    EXPECT_EQ(state_store_find(st, nx, n + 5, 0, name, at), p1);
+    EXPECT_EQ(at[0], 0);
+    EXPECT_OK(state_store_load(st, name, nx, n + 5, &c.lay, &got, &mb, &kk, &nk, &bytes, &tch));
+    free(kk);
+    EXPECT_EQ(got, p1);
+    free(nx);
+    state_store_close(st);
+    char cmd[200];
+    snprintf(cmd, sizeof cmd, "rm -rf '%s'", root);
+    (void)system(cmd);
+    fake_free(&a);
+    fake_free(&b);
+    fake_free(&c);
+    free(x0), free(x1), free(y0), free(y1), free(z0), free(z1), free(ids), free(other);
 }

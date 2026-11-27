@@ -32,6 +32,9 @@ static void *ahead_main(void *arg) {
         memcpy(session, ah->session, sizeof session);
         memcpy(id, ah->id, sizeof id);
         ah->body = NULL;
+        // this read's stop flag: set by a cancel from now on (a post does not clear it for a read
+        // already under way, which then stops at its next chunk)
+        ah->stop = 0;
         pthread_mutex_unlock(&ah->mu);
         size_t got = 0;
         Err err = server_engine_ahead(ah->e, str_n(body, len), session, id, &ah->stop, &got);
@@ -76,7 +79,6 @@ void code_ahead_post(CodeAhead *ah, Str body, const char *session, const char *p
     ah->len = body.len;
     snprintf(ah->session, sizeof ah->session, "%s", session);
     snprintf(ah->id, sizeof ah->id, "%s", partial_id);
-    ah->stop = 0;
     pthread_cond_signal(&ah->cv);
     pthread_mutex_unlock(&ah->mu);
 }

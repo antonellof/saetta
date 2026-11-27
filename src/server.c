@@ -2194,11 +2194,11 @@ Err server_engine_ahead(Engine *e, Str body, const char *session, const char *pa
     // the conversation this session's last request ran in, unused by any other request since, with
     // one of its restore points (that request's prompt, or the prompt and its reply) a prefix of the
     // prompt: a snapshot taken before that request ended continues neither and is refused
-    size_t ci = SIZE_MAX;
-    for (size_t i = 0; i < e->n_conv; i++)
-        if (!strcmp(e->owner[i], session) && e->owner_gen[i] == e->conv_gen[i] && e->conv_lora[i] == -1) ci = i;
-    if (ci == SIZE_MAX) {
-        why = "no conversation of this session unused since";
+    // (the active one only: activating another would trim the active one's checkpoints, taking from
+    // a conversation the read does not serve)
+    size_t ci = e->active;
+    if (!(ci < e->n_conv && !strcmp(e->owner[ci], session) && e->owner_gen[ci] == e->conv_gen[ci] && e->conv_lora[ci] == -1)) {
+        why = "the conversation in use is not this session's, or was used since";
         goto done;
     }
     const Ckpt *ck = ck_of(e, ci);
@@ -2207,7 +2207,6 @@ Err server_engine_ahead(Engine *e, Str body, const char *session, const char *pa
         why = "the prompt does not continue the last request";
         goto done;
     }
-    activate(e, ci);
     model_lora_select(e->m, -1);
     Session *s = e->s;
     // room in the conversation's capacity, grown only while memory allows without emptying another
@@ -2243,7 +2242,12 @@ Err server_engine_ahead(Engine *e, Str body, const char *session, const char *pa
     size_t cap = (k - from) / PT_GAP + 4;
     size_t *cuts = ARENA_ARRAY(&a, size_t, cap);
     size_t nc = session_point_cuts(ids.ptr, k, from, e->im_start, cuts, cap);
-    while (nc > 0 && cuts[nc - 1] >= target) nc--;
+    // (each segment at least AHEAD_MIN long, also when the capacity lowered the target)
+    while (nc > 0 && cuts[nc - 1] + AHEAD_MIN > target) nc--;
+    // a checkpoint saved at a cut holds only once the chunk after it ran: that chunk writes the MTP
+    // head's row at the cut (the stream before it with the token at it), which a restart there does
+    // not rewrite; until then it is kept invalid (a read that stops at the cut leaves the live state)
+    int pending = -1;
     size_t pos = from, c = 0;
     float *lg;
     while (pos < target) {
@@ -2253,11 +2257,15 @@ Err server_engine_ahead(Engine *e, Str body, const char *session, const char *pa
         size_t end = c < nc ? cuts[c] : target, len = end - pos, chunks = (len + AHEAD_CHUNK - 1) / AHEAD_CHUNK;
         size_t T = (len + chunks - 1) / chunks;
         if (model_prefill_with(e->m, s, ids.ptr + pos, T, NULL, NULL, &lg)) goto broken;
+        if (pending >= 0) s->pts[pending].valid = true;
+        pending = -1;
         pos += T;
         e->live_pos = pos;
         if (pos == end && c < nc) {
             c++;
             if (session_save_point(s, e->g, ids.ptr, pos, room_for(e, pb, 2ull << 30))) goto broken;
+            pending = session_point_at(s->pts, pos);
+            if (pending >= 0) s->pts[pending].valid = false;
         }
     }
     *read = pos - from;

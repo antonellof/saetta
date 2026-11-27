@@ -3,7 +3,7 @@
 All notable changes to saetta and Saetta Code (`saetta code`), newest first. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are saetta's.
 
-## [Unreleased]
+## [0.25.0] - 2026-11-27
 
 ### Added
 

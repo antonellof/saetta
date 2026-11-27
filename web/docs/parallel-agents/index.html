@@ -46,7 +46,7 @@
     <div class="wrap">
       <a class="brand" href="/">
         <svg viewBox="0 0 32 32" width="20" height="20" aria-hidden="true"><path d="M18.5 3 7 18h7.5L12 29l13-16h-7.8z" fill="currentColor"/></svg>
-        Saetta <span class="ver">v0.24.0</span>
+        Saetta <span class="ver">v0.25.0</span>
       </a>
       <nav class="links">
         <a href="/#models">Models</a>
@@ -110,7 +110,9 @@ saetta start code          <span class="hljs-comment"># terminal 2: uses the mod
 </ul>
 <p>Subagents are off by default: pi has no built-in subagents, and with them off Saetta Code&#39;s prompt and tools stay pi&#39;s.</p>
 <h3 id="how-they-use-the-engine"><a class="anchor" href="#how-they-use-the-engine" aria-hidden="true" tabindex="-1">#</a>How they use the engine</h3>
-<p>Each subagent&#39;s requests start with its parent&#39;s: the same system prompt, tools and messages, then its task. The engine reuses the part of the parent&#39;s prompt it has kept (from the checkpoints it keeps at message starts and every 4,096 tokens), so a subagent reads mostly its own task. The engine still decodes one request at a time: subagents overlap their tool calls and their waits, not their decoding.</p>
+<p>Each subagent&#39;s requests start with its parent&#39;s: the same system prompt, tools and messages, then its task. With subagents on, each of the parent&#39;s requests that reads 1,024 tokens or more asks the engine for a checkpoint just before its answer starts, where the subagents&#39; prompts leave it: a subagent then copies the parent&#39;s state there and reads only its task, even when the parent read a long tool result right before handing out the tasks. Subagents take other conversations than the parent&#39;s while one is free, so the parent&#39;s next request continues its own. The engine still decodes one request at a time: subagents overlap their tool calls and their waits, not their decoding.</p>
+<p>Sessions that share the model share their prompt the same way: when a request leaves another conversation&#39;s tokens 1,024 tokens or more past where it started (a second session: Saetta Code&#39;s system prompt and tools are the same in every session up to the project instructions and the working folder), the engine keeps a checkpoint there, so the sessions after it start from it instead of reading the system prompt again. The second session still reads it whole: nothing was kept where the two part.</p>
+<p><code>SAETTA_FORK_POINT=0</code> stops Saetta Code asking for the checkpoint before the answer: each one costs the agent&#39;s request one more prompt chunk, about 0.14 s on the Coder, which the subagents of a request that hands out tasks save several times over.</p>
       </article>
       <p class="doc-edit"><a href="https://github.com/antonellof/saetta/blob/main/docs/parallel-agents.md" rel="noopener">Edit this page on GitHub</a></p>
       <nav class="doc-pager" aria-label="Previous and next"><a class="prev" href="/docs/print-json-rpc/"><span>Previous</span>Print, JSON and RPC modes</a><a class="next" href="/docs/themes-and-settings/"><span>Next</span>Themes and settings</a></nav>

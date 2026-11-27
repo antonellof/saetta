@@ -60,6 +60,35 @@ static const char *fx(double x, int prec) {
     return b;
 }
 
+// Speculation fed by the agent (server_engine_feed): per agent session, the texts it fed (a file's
+// content, keyed by its path: fed again, the new text replaces the old), as the token ids of their
+// JSON-escaped form (the form an edit's oldText and newText take in the model's tool call: an array
+// argument is written as JSON, so a file's lines appear joined by \n, which the file's own tokens
+// in a tool result never match), oldest first, and one lookup index over them in that order with a
+// SPEC_SEP between texts. Bounded: FEED_TEXT_TOKENS per text (its head), FEED_TOKENS per session
+// (the oldest texts go first), FEED_SESSIONS sessions (the least recently fed goes). The index is
+// immutable once built: a feed rebuilds it under feed_mu (a few ms for a full session) and swaps it
+// in; a request takes a reference at its start and drops it at its end (feed_mu at both, never per
+// token), so feeding neither waits for the engine's turn nor stops a read ahead.
+#define FEED_SESSIONS 4
+#define FEED_TOKENS ((size_t)131072)
+#define FEED_TEXT_TOKENS ((size_t)65536)
+typedef struct {
+    uint64_t key; // hash of the text's key (its path)
+    VecU32 ids;
+} FeedText;
+typedef struct {
+    Lookup lk;
+    size_t refs; // under feed_mu: the feed's own and each request's
+} FeedIx;
+typedef struct {
+    char session[96]; // "": a free slot
+    uint64_t used;    // the feed clock at its last change
+    VEC(FeedText) texts;
+    size_t ntok;
+    FeedIx *ix; // NULL: nothing fed
+} Feed;
+
 typedef struct Engine {
     Gpu *g;
     Model *m;
@@ -134,12 +163,78 @@ typedef struct Engine {
     bool live;
     size_t live_conv, live_pos;
     VecU32 live_ids;
+    // speculation fed by the agent (Feed above), under feed_mu
+    pthread_mutex_t feed_mu;
+    Feed feed[FEED_SESSIONS];
+    uint64_t feed_clock;
+    size_t last_fed; // the last request's passes that drafted from fed texts (for tests)
 } Engine;
 
 static uint64_t turn_take(Engine *e) { return turns_take(&e->turns); }
 static bool turn_wait(Engine *e, uint64_t t, int ms) { return turns_wait(&e->turns, t, ms); }
 static void turn_done(Engine *e) { turns_done(&e->turns); }
 static void turn_leave(Engine *e, uint64_t t) { turns_leave(&e->turns, t); }
+
+// ---- speculation fed by the agent (Feed; server_engine_feed) ------------------------------------
+
+// SAETTA_FEED=0 turns it off (fed texts are dropped, nothing is drafted from them).
+static bool feed_on(void) {
+    const char *v = getenv("SAETTA_FEED");
+    return !(v && v[0] == '0');
+}
+
+// The fed index of agent session `session` with a reference taken, or NULL (feed_unref drops it).
+static FeedIx *feed_ref(Engine *e, const char *session) {
+    FeedIx *ix = NULL;
+    pthread_mutex_lock(&e->feed_mu);
+    for (size_t i = 0; i < FEED_SESSIONS; i++)
+        if (e->feed[i].session[0] && !strcmp(e->feed[i].session, session) && e->feed[i].ix) {
+            ix = e->feed[i].ix;
+            ix->refs++;
+        }
+    pthread_mutex_unlock(&e->feed_mu);
+    return ix;
+}
+
+// Under feed_mu.
+static void feed_unref_locked(FeedIx *ix) {
+    if (!ix || --ix->refs > 0) return;
+    lookup_free(&ix->lk);
+    free(ix);
+}
+
+static void feed_unref(Engine *e, FeedIx *ix) {
+    if (!ix) return;
+    pthread_mutex_lock(&e->feed_mu);
+    feed_unref_locked(ix);
+    pthread_mutex_unlock(&e->feed_mu);
+}
+
+// Under feed_mu.
+static void feed_release(Feed *f) {
+    for (size_t i = 0; i < f->texts.len; i++) vec_free(&f->texts.ptr[i].ids);
+    vec_free(&f->texts);
+    feed_unref_locked(f->ix);
+    *f = (Feed){0};
+}
+
+// A new index over f's texts, oldest first (a later occurrence of a trigram wins: the newest
+// text), in place of the old one (under feed_mu; a request holding the old keeps it).
+static void feed_index(Feed *f) {
+    feed_unref_locked(f->ix);
+    f->ix = NULL;
+    if (f->ntok == 0) return;
+    FeedIx *ix = xcalloc(1, sizeof *ix);
+    ix->refs = 1;
+    vec_reserve(&ix->lk.hist, f->ntok + f->texts.len);
+    for (size_t i = 0; i < f->texts.len; i++) {
+        const VecU32 *v = &f->texts.ptr[i].ids;
+        for (size_t k = 0; k < v->len; k++) lookup_push(&ix->lk, v->ptr[k]);
+        lookup_push_sep(&ix->lk);
+    }
+    f->ix = ix;
+}
+
 // Makes conversation i the active one.
 // The conversation going inactive keeps PT_HELD checkpoints (inside the fit's reserve).
 static void activate(Engine *e, size_t i) {
@@ -825,6 +920,7 @@ static float depth_ms(const Depth *d, size_t k, uint64_t t0, bool fixed) {
 typedef struct {
     VecU32 ids;
     Lookup lk;
+    FeedIx *fed; // the session's fed texts for prompt lookup (server_engine_feed), or NULL
     Splitter split;
     Out out;
     bool streaming;
@@ -954,6 +1050,11 @@ static Err generate_reply(Engine *e, Arena *a, Conn *c, Req *h, Work *w, JValue 
     bool greedy = sp.temperature <= 0;
     Lookup *lk = &w->lk;
     for (size_t i = 0; i < n; i++) lookup_push(lk, ids[i]);
+    // the texts this agent session fed (server_engine_feed), a second source for prompt lookup
+    // (a reference held to the end of the request, dropped where Work is: the index stays as it was)
+    e->last_fed = 0;
+    if (spec_on && c->sink && req_session[0] && feed_on()) w->fed = feed_ref(e, req_session);
+    const Lookup *flk = w->fed ? &w->fed->lk : NULL;
     Gate *gate = &e->gate[e->active];
     Depth *depth = &e->depth[e->active];
     uint32_t queue[KMAX];
@@ -962,6 +1063,8 @@ static Err generate_reply(Engine *e, Arena *a, Conn *c, Req *h, Work *w, JValue 
     size_t passes = 0;
     uint32_t *gen_ids = ARENA_ARRAY(a, uint32_t, max_tokens + 1);
     size_t n_gen_ids = 0;
+    // speculation counters of this request (the "spec:" log line): passes, drafted, accepted
+    size_t lk_p = 0, lk_d = 0, lk_a = 0, mtp_p = 0, mtp_d = 0, mtp_a = 0, fed_p = 0;
     while (n_gen < max_tokens) {
         uint32_t t = next;
         n_gen += 1;
@@ -1001,7 +1104,22 @@ static Err generate_reply(Engine *e, Arena *a, Conn *c, Req *h, Work *w, JValue 
         // a long prompt-lookup copy first (no head pass), else the MTP head at the depth the
         // controller picks (Depth in src/spec.h)
         uint64_t tr0 = now_ns();
-        size_t nd = spec_on ? lookup_draft(lk, drafts, gate_depth(gate, KMAX - 1)) : 0;
+        size_t nd = 0;
+        bool from_fed = false;
+        if (spec_on && !flk) nd = lookup_draft(lk, drafts, gate_depth(gate, KMAX - 1));
+        else if (spec_on) {
+            // the history's draft, or the fed texts' when its occurrence shares a longer context
+            // with the tokens so far, or when the history has too short a draft
+            size_t dep = gate_depth(gate, KMAX - 1), hm, fm;
+            uint32_t fd[KMAX - 1];
+            nd = lookup_draft_in(lk, lk->hist.ptr, lk->hist.len, drafts, dep, &hm);
+            size_t nf = lookup_draft_in(flk, lk->hist.ptr, lk->hist.len, fd, dep, &fm);
+            if (nf > 0 && (fm > hm || (nd < 3 && nf > nd))) {
+                memcpy(drafts, fd, nf * sizeof *fd);
+                nd = nf;
+                from_fed = true;
+            }
+        }
         bool from_mtp = false;
         if (spec_on && nd < (mi->mtp_no_lookup ? 1u : 3u) && model_has_mtp(e->m)) {
             TRY(model_draft_mtp(e->m, e->s, t, depth_pick(depth, mi->mtp_kmax ? mi->mtp_kmax : KMAX - 1), drafts, &nd));
@@ -1016,6 +1134,8 @@ static Err generate_reply(Engine *e, Arena *a, Conn *c, Req *h, Work *w, JValue 
             }
             if (from_mtp) depth_record(depth, nd, sr.accepted, depth_ms(depth, nd, tr0, fixed));
             else gate_record(gate, sr.accepted + 1);
+            if (from_mtp) mtp_p++, mtp_d += nd, mtp_a += sr.accepted;
+            else lk_p++, lk_d += nd, lk_a += sr.accepted, fed_p += from_fed;
             memcpy(queue, drafts, sr.accepted * sizeof(uint32_t));
             queue[sr.accepted] = sr.next;
             qn = sr.accepted + 1;
@@ -1066,6 +1186,9 @@ static Err generate_reply(Engine *e, Arena *a, Conn *c, Req *h, Work *w, JValue 
         "conversation %zu/%zu\n",
         n, reused, (long long)pre_ms, n_gen, (long long)dec_ms, fx((double)n_gen * 1000.0 / (double)MAX(dec_ms, (int64_t)1), 2),
         passes, finish, fmt == FMT_ANTHROPIC ? " (anthropic)" : "", e->active + 1, e->n_conv);
+    e->last_fed = fed_p;
+    dbg("spec: lookup %zu passes %zu drafted %zu accepted, mtp %zu passes %zu drafted %zu accepted, fed %zu\n", lk_p, lk_d, lk_a,
+        mtp_p, mtp_d, mtp_a, fed_p);
     {
         Done d = {0};
         d.anthropic = fmt == FMT_ANTHROPIC;
@@ -1888,6 +2011,7 @@ static Err connection(Engine *e, int fd, bool guard, void (*authed)(void *), voi
             }
             vec_free(&w.ids);
             lookup_free(&w.lk);
+            feed_unref(e, w.fed);
             split_free(&w.split);
             buf_free(&w.out.ev);
         } else {
@@ -2036,6 +2160,7 @@ static Err engine_open(Arena *arena, const char *dir, const char *const *loras, 
     for (size_t i = 0; i < MAX_CONV; i++) e->conv_lora[i] = -1;
     e->kwargs_default = kwd;
     turns_init(&e->turns);
+    pthread_mutex_init(&e->feed_mu, NULL);
     st->ctx = e->s->max_cap;
     e->opened_ns = t0;
     e->dir = arena_strdup(arena, dir);
@@ -2110,6 +2235,7 @@ Err server_engine_chat_session(Engine *e, Str body, const char *session,
     }
     vec_free(&w.ids);
     lookup_free(&w.lk);
+    feed_unref(e, w.fed);
     split_free(&w.split);
     buf_free(&w.out.ev);
     arena_reset(&a);
@@ -2128,6 +2254,95 @@ Err server_engine_chat_session(Engine *e, Str body, const char *session,
 // Stable tokens left unread at the end of what the partial message gives: its last pre-token may
 // still merge with the text that follows (a newline with the next line's indentation).
 #define AHEAD_MARGIN ((size_t)16)
+
+bool server_engine_feeds(const Engine *e) {
+    return model_info(e->m)->chat == CHAT_QWEN && e->im_start != UINT32_MAX && !model_info(e->m)->no_spec && feed_on();
+}
+
+Err server_engine_feed(Engine *e, const char *session, Str key, Str text) {
+    if (model_info(e->m)->chat != CHAT_QWEN || e->im_start == UINT32_MAX || model_info(e->m)->no_spec) return "FeedUnsupported";
+    if (!feed_on() || !session || !session[0] || strlen(session) >= sizeof e->feed[0].session) return OK;
+    // the JSON-escaped text (chat_json_string, as the template writes a string inside an argument
+    // written as JSON), without its quotes, tokenized on the caller's thread
+    Buf esc = {0};
+    chat_json_string(&esc, text);
+    VecU32 ids = {0};
+    Err err = esc.len >= 2 ? tokenizer_encode_text(e->tok, str_n(esc.ptr + 1, esc.len - 2), &ids) : OK;
+    buf_free(&esc);
+    if (err) {
+        vec_free(&ids);
+        return err;
+    }
+    if (ids.len > FEED_TEXT_TOKENS) { // its head, in memory of its size
+        ids.ptr = xrealloc(ids.ptr, FEED_TEXT_TOKENS * sizeof *ids.ptr);
+        ids.len = ids.cap = FEED_TEXT_TOKENS;
+    }
+    uint64_t k = hash_bytes(key.ptr, key.len);
+    pthread_mutex_lock(&e->feed_mu);
+    Feed *f = NULL;
+    for (size_t i = 0; i < FEED_SESSIONS && !f; i++)
+        if (e->feed[i].session[0] && !strcmp(e->feed[i].session, session)) f = &e->feed[i];
+    if (!f) { // a free slot, else the least recently fed session's
+        f = &e->feed[0];
+        for (size_t i = 0; i < FEED_SESSIONS; i++) {
+            if (!e->feed[i].session[0]) {
+                f = &e->feed[i];
+                break;
+            }
+            if (e->feed[i].used < f->used) f = &e->feed[i];
+        }
+        feed_release(f);
+        snprintf(f->session, sizeof f->session, "%s", session);
+    }
+    f->used = ++e->feed_clock;
+    // the key's old text goes, the new one is the newest, and the oldest go while over the bound
+    for (size_t i = 0; i < f->texts.len; i++)
+        if (f->texts.ptr[i].key == k) {
+            f->ntok -= f->texts.ptr[i].ids.len;
+            vec_free(&f->texts.ptr[i].ids);
+            memmove(f->texts.ptr + i, f->texts.ptr + i + 1, (f->texts.len - i - 1) * sizeof *f->texts.ptr);
+            f->texts.len--;
+            break;
+        }
+    size_t drop = 0;
+    while (drop < f->texts.len && f->ntok + ids.len > FEED_TOKENS) f->ntok -= f->texts.ptr[drop++].ids.len;
+    for (size_t i = 0; i < drop; i++) vec_free(&f->texts.ptr[i].ids);
+    if (drop > 0) memmove(f->texts.ptr, f->texts.ptr + drop, (f->texts.len - drop) * sizeof *f->texts.ptr);
+    f->texts.len -= drop;
+    if (ids.len > 0) {
+        vec_push(&f->texts, ((FeedText){k, ids}));
+        f->ntok += ids.len;
+    } else vec_free(&ids);
+    feed_index(f);
+    pthread_mutex_unlock(&e->feed_mu);
+    return OK;
+}
+
+void server_engine_feed_clear(Engine *e, const char *session) {
+    if (!session || !session[0]) return;
+    pthread_mutex_lock(&e->feed_mu);
+    for (size_t i = 0; i < FEED_SESSIONS; i++)
+        if (e->feed[i].session[0] && !strcmp(e->feed[i].session, session)) feed_release(&e->feed[i]);
+    pthread_mutex_unlock(&e->feed_mu);
+}
+
+size_t server_engine_feed_drafts(const Engine *e) { return e->last_fed; }
+
+size_t server_engine_feed_tokens(Engine *e, const char *session, size_t *texts, size_t *bytes) {
+    pthread_mutex_lock(&e->feed_mu);
+    size_t n = 0, nt = 0, b = 0;
+    for (size_t i = 0; i < FEED_SESSIONS; i++) {
+        const Feed *f = &e->feed[i];
+        if (session && f->session[0] && !strcmp(f->session, session)) n = f->ntok, nt = f->texts.len;
+        for (size_t j = 0; j < f->texts.len; j++) b += f->texts.ptr[j].ids.cap * sizeof(uint32_t);
+        b += f->texts.cap * sizeof(FeedText);
+        if (f->ix) b += sizeof *f->ix + f->ix->lk.hist.cap * sizeof(uint32_t) + f->ix->lk.cap * (sizeof(uint64_t) + sizeof(uint32_t) + 1);
+    }
+    pthread_mutex_unlock(&e->feed_mu);
+    if (texts) *texts = nt;
+    if (bytes) *bytes = b;
+    return n;
+}
 
 static bool ahead_on(void) {
     const char *v = getenv("SAETTA_AHEAD");

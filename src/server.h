@@ -83,6 +83,24 @@ Err server_engine_chat_session(Engine *e, Str body, const char *session,
 // read (and from where it would otherwise when not): what it generates is the same. *read: the
 // tokens read. Errors: "AheadUnsupported" (Inkling 2 Mini and other chat formats).
 Err server_engine_ahead(Engine *e, Str body, const char *session, const char *partial_id, volatile int *stop, size_t *read);
+// Speculation fed by the agent (Saetta Code in process): text the agent session has seen, keyed (a
+// file's content, by its path; fed again under the same key, the new text replaces the old). Its
+// JSON-escaped form (the form an edit's oldText and newText take inside the model's tool call) is
+// tokenized on the caller's thread and kept for that session, bounded (a text's first 65,536 tokens,
+// 131,072 per session, the oldest texts dropped first, 4 sessions, the least recently fed dropped);
+// prompt lookup then also drafts from it in that session's requests. Drafts are verified as every
+// draft is: a greedy request keeps only the model's own argmax tokens, a sampled one keeps the
+// sampling distribution (its tokens depend on the drafts, as with any speculation). Errors:
+// "FeedUnsupported" (Inkling 2 Mini, DeepSeek-V4-Flash), the tokenizer's. Off with SAETTA_FEED=0.
+Err server_engine_feed(Engine *e, const char *session, Str key, Str text);
+// Whether server_engine_feed keeps anything (the model drafts from fed texts, SAETTA_FEED not 0).
+bool server_engine_feeds(const Engine *e);
+// Drops the session's fed texts.
+void server_engine_feed_clear(Engine *e, const char *session);
+// For tests: the session's fed tokens (*texts: its texts), and *bytes: the memory every feed holds.
+size_t server_engine_feed_tokens(Engine *e, const char *session, size_t *texts, size_t *bytes);
+// For tests: the verified passes of the last request whose drafts came from fed texts.
+size_t server_engine_feed_drafts(const Engine *e);
 // One HTTP connection on fd (accepted on a socket of the caller's) answered as server_serve
 // answers it: the same endpoints and request path. The request is read first (the head and body
 // deadlines; the caller sets the socket's send and receive timeouts: no connection guard here),

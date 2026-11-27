@@ -30,6 +30,20 @@ void lookup_push(Lookup *l, uint32_t tok);
 size_t lookup_draft(const Lookup *l, uint32_t *out, size_t n);
 void lookup_free(Lookup *l);
 
+// Drafting from another source (src/server.c, speculation fed by the agent): up to n tokens into
+// out from src, after the most recent occurrence in src of the last SPEC_N tokens of ctx[0..nctx),
+// stopping before a SPEC_SEP; *match: how many tokens of ctx end there, SPEC_N up to SPEC_CTX (an
+// occurrence with a longer common context is the likelier copy). 0 when there is none. With src
+// the history itself (ctx = src->hist) it drafts what lookup_draft drafts.
+#define SPEC_CTX 32
+// Pushed between the texts of one source (not a token id: vocabularies stay under 2^21, which the
+// trigram key packs exactly), so no draft runs from one text into the next.
+#define SPEC_SEP ((uint32_t)((1u << 21) - 1))
+size_t lookup_draft_in(const Lookup *src, const uint32_t *ctx, size_t nctx, uint32_t *out, size_t n, size_t *match);
+// Appends SPEC_SEP without indexing the trigram that ends before it (the last trigram of a text
+// keeps pointing at its earlier occurrences, which have tokens after them).
+void lookup_push_sep(Lookup *l);
+
 // Speculates only while it pays: a verification pass costs about `break_even` decode steps
 // (measured 37 ms against 14 ms: 2.6), so drafting continues while the running average of
 // tokens per pass stays above it, and after a poor stretch pauses for `cooldown` steps.

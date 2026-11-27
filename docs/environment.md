@@ -48,3 +48,4 @@ Saetta Code reads these variables of pi's as pi does, along with its own.
 | `VISUAL`, `EDITOR` | nano | the editor Ctrl+G opens, when settings.json has no `externalEditor` |
 | `SAETTA_STATE` | 1 | `0` turns off the conversation state on disk (`~/.saetta/state`): a resumed session then reads its history again |
 | `SAETTA_AHEAD` | 1 | `0` turns off reading a running command's output into the conversation before the next request ([Sessions](sessions.md)) |
+| `SAETTA_FEED` | 1 | `0` turns off drafting from the files Saetta Code read, edited or wrote ([Sessions](sessions.md)) |

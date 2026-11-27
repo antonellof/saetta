@@ -88,6 +88,26 @@ size_t lookup_draft(const Lookup *l, uint32_t *out, size_t n) {
     return m;
 }
 
+size_t lookup_draft_in(const Lookup *src, const uint32_t *ctx, size_t nctx, uint32_t *out, size_t n, size_t *match) {
+    *match = 0;
+    size_t hn = src->hist.len;
+    if (nctx < SPEC_N + 1) return 0;
+    uint32_t at;
+    if (!map_get(src, key(ctx + nctx - SPEC_N), &at)) return 0;
+    if (at >= hn || at < SPEC_N) return 0;
+    const uint32_t *h = src->hist.ptr;
+    size_t m = 0;
+    while (m < n && at + m < hn && h[at + m] != SPEC_SEP) m++;
+    if (m == 0) return 0;
+    memcpy(out, h + at, m * sizeof *out);
+    size_t c = SPEC_N;
+    while (c < SPEC_CTX && c < at && c < nctx && h[at - c - 1] == ctx[nctx - c - 1]) c++;
+    *match = c;
+    return m;
+}
+
+void lookup_push_sep(Lookup *l) { vec_push(&l->hist, SPEC_SEP); }
+
 void lookup_free(Lookup *l) {
     vec_free(&l->hist);
     free(l->keys);

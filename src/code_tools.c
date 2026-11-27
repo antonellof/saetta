@@ -1585,6 +1585,10 @@ int code_tools_exec(Arena *a, const CodeEnv *env, const char *command, void (*on
     return WIFEXITED(st) ? WEXITSTATUS(st) : WIFSIGNALED(st) ? 128 + WTERMSIG(st) : 1;
 }
 
+char *code_tools_path(Arena *a, const CodeEnv *env, Str p, bool read) {
+    return read ? resolve_read_path(a, env, p) : resolve_to_cwd(a, env, p);
+}
+
 // truncateTail with the defaults (2000 lines, 50 KB).
 Str code_tools_truncate_tail(Str s, bool *truncated) {
     Trunc t = truncate_tail(s, MAX_LINES, MAX_BYTES);

@@ -792,6 +792,52 @@ static void ahead_post(Run *r, JValue *const *done, size_t ndone, const JValue *
     arena_reset(&t);
 }
 
+// ---- speculation fed by the agent (server_engine_feed; in process only) -----------------------
+
+// A file over this is fed by its head (the engine keeps a text's first 65,536 tokens anyway).
+#define FEED_FILE_MAX ((size_t)256 << 10)
+// The session whose files the engine was last fed: feeding another (after /new, /resume or a /fork
+// to a new file) drops its files first.
+static char g_feed_session[96];
+
+// After a read, edit or write that succeeded, the file's content as it now is on disk goes to the
+// engine's prompt lookup for this session: an edit's oldText and newText, which copy it in the form
+// of a JSON string, then draft from it (a read's result holds the file's own text, which they do not
+// match past a line; and an edit or write changed it since).
+static void feed_file(Run *r, const JValue *call, const JValue *msg) {
+    Engine *e = r->model.engine;
+    const char *sid = r->env.session_id;
+    if (!e || !sid || !sid[0] || strlen(sid) >= sizeof g_feed_session || !server_engine_feeds(e)) return;
+    if (!msg || jbool(json_get(msg, "isError"), false)) return;
+    Str name = json_strs(json_get(call, "name"));
+    bool rd = str_eqz(name, "read");
+    if (!rd && !str_eqz(name, "edit") && !str_eqz(name, "write")) return;
+    const JValue *args = json_get(call, "arguments");
+    Str p = json_strs(json_get(args, "path"));
+    if (!p.len) return;
+    if (strcmp(g_feed_session, sid)) {
+        if (g_feed_session[0]) server_engine_feed_clear(e, g_feed_session);
+        snprintf(g_feed_session, sizeof g_feed_session, "%s", sid);
+    }
+    Arena t = {0};
+    // one key per file whichever tool named it (the read's spelling: the file exists now)
+    char *abs = code_tools_path(&t, &r->env, p, true);
+    int fd = open(abs, O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) {
+        char *buf = arena_alloc(&t, FEED_FILE_MAX);
+        size_t n = 0;
+        while (n < FEED_FILE_MAX) {
+            ssize_t k = read(fd, buf + n, FEED_FILE_MAX - n);
+            if (k <= 0) break;
+            n += (size_t)k;
+        }
+        close(fd);
+        // text only (a read of an image returns it as an attachment, nothing an edit copies)
+        if (n > 0 && !memchr(buf, 0, n)) (void)server_engine_feed(e, sid, str(abs), str_n(buf, n));
+    }
+    arena_reset(&t);
+}
+
 // The step of new output (bytes) worth a read ahead: about 128 tokens or more.
 #define AHEAD_STEP 512
 
@@ -1003,8 +1049,12 @@ static Err run_tools(Run *r, const JValue *assistant, JValue *results) {
             CodeEnv env = r->env;
             code_rpc_unlock();
             err = code_tool_run(r->io, &env, calls.ptr[i], &msgs[i], &raws[i]);
+            if (!err) feed_file(r, calls.ptr[i], msgs[i]);
             code_rpc_lock();
-        } else err = code_tool_run(a, &r->env, calls.ptr[i], &msgs[i], &raws[i]);
+        } else {
+            err = code_tool_run(a, &r->env, calls.ptr[i], &msgs[i], &raws[i]);
+            if (!err) feed_file(r, calls.ptr[i], msgs[i]);
+        }
         r->call = NULL;
         if (!err) code_durable_result(calls.ptr[i], msgs[i]);
         if (!err && !json_get(msgs[i], "durationMs")) emit_tool_end(r, calls.ptr[i], msgs[i], raws[i]);

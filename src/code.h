@@ -115,6 +115,9 @@ int code_tools_exec(Arena *a, const CodeEnv *env, const char *command, void (*on
                     volatile int *abort_flag, bool *aborted, const char **thrown);
 // truncateTail with the defaults (2000 lines, 50 KB): the tail kept, *truncated.
 Str code_tools_truncate_tail(Str s, bool *truncated);
+// The file a read (read true: with its macOS spellings that exist, as resolveReadPath) or an edit
+// or write of path p names, absolute.
+char *code_tools_path(Arena *a, const CodeEnv *env, Str p, bool read);
 
 // ---- OpenAI chat completions client (code_oai.c; pi-ai: api/openai-completions.js,
 // transform-messages.js)

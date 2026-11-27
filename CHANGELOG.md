@@ -3,6 +3,17 @@
 All notable changes to saetta and Saetta Code (`saetta code`), newest first. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are saetta's.
 
+## [Unreleased]
+
+### Added
+
+- Subagents start where their parent's prompt leaves off. With `--subagents`, each of the agent's requests that reads 1,024 tokens or more keeps a checkpoint just before its answer, and a subagent (the parent's messages, then its task) copies the state there and reads only its task, even right after the parent read a long tool result. On a five-turn Coder session that hands out seven reads to subagents in three turns (greedy), the turns take 93.4 s instead of 107.6; in the turn whose three subagents follow a 5,000-token read, their first tokens come at 0.5, 2.1 and 3.8 s instead of 2.1, 5.4 and 8.7. Each such checkpoint costs the agent's request about 0.14 s; `SAETTA_FORK_POINT=0` stops asking for it.
+- Sessions that share the model share their system prompt: when a request leaves another conversation's tokens 1,024 tokens or more past its start, the engine keeps a checkpoint there, so the third and later sessions with the same system prompt and tools (and subagents of one parent) start from it. Four Saetta Code sessions over HTTP: the third and fourth read their first request in 0.28 s instead of 0.85; the second pays 0.18 s more.
+
+### Fixed
+
+- A request now starts from the longest checkpoint it matches, its own conversation's or another's: a second batch of subagents, given their earlier conversations back, read again from the first batch's start.
+
 ## [0.24.0] - 2026-11-27
 
 ### Added

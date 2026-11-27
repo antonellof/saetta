@@ -328,6 +328,35 @@ size_t session_point_cuts(const uint32_t *ids, size_t n, size_t pos0, uint32_t i
     return k;
 }
 
+size_t session_point_cuts_add(size_t *cuts, size_t ncuts, size_t cap, size_t pos0, size_t n, size_t x) {
+    // the chunks on both sides of x stay prompt chunks (PT_TAIL tokens or more: bitwise those of a
+    // read without the cut), and x saves at least PT_GAP tokens over the checkpoint before it
+    if (n < 2 || x < pos0 + PT_GAP || x + PT_TAIL > n - 1) return ncuts;
+    size_t at = 0;
+    while (at < ncuts && cuts[at] < x) at++;
+    if (at < ncuts && cuts[at] == x) return ncuts;
+    // a cut before x closer than PT_GAP gives its place to x (the one before that is PT_GAP or more
+    // before it, so before x too; x serves the prompts that leave the history between them as well)
+    if (at > 0 && x - cuts[at - 1] < PT_GAP) {
+        cuts[at - 1] = x;
+        if (at < ncuts && cuts[at] - x < PT_TAIL) {
+            memmove(cuts + at, cuts + at + 1, (ncuts - at - 1) * sizeof *cuts);
+            ncuts--;
+        }
+        return ncuts;
+    }
+    // a later cut closer than PT_TAIL gives its place to x (no later prompt leaves the history
+    // between them that x does not serve as well)
+    if (at < ncuts && cuts[at] - x < PT_TAIL) {
+        cuts[at] = x;
+        return ncuts;
+    }
+    if (ncuts >= cap) return ncuts;
+    memmove(cuts + at + 1, cuts + at, (ncuts - at) * sizeof *cuts);
+    cuts[at] = x;
+    return ncuts + 1;
+}
+
 size_t prefill_chunk_len(const PrefillHook *hook, size_t pos0, size_t n, size_t i) {
     // the segment between the cuts around offset i: [a, b)
     size_t a = 0, b = n;

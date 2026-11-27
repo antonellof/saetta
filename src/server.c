@@ -141,6 +141,10 @@ typedef struct Engine {
     // a count of the requests each conversation ran (apply): an end-of-turn save checks that the
     // conversation its caller's last request used has not been used by another request since
     uint64_t conv_gen[MAX_CONV];
+    // kept[i]: the last request conversation i ran asked for a fork point (saetta_fork_point: Saetta
+    // Code's agent with subagents, whose next request continues it while its children run in other
+    // conversations): route, evict_one and drop_held_points take another one while one is left
+    bool kept[MAX_CONV];
     // One request at a time, in arrival order: the in-process caller (server_engine_chat, from
     // any thread: Saetta Code's agent and its subagents) and the connections of the Saetta Codes
     // that share this process's engine (server_engine_connection, one thread each) take tickets
@@ -254,15 +258,16 @@ static void activate(Engine *e, size_t i) {
 static bool drop_held_points(Engine *e) {
     bool found = false;
     size_t pick = 0;
-    for (size_t i = 0; i < e->n_conv; i++) {
-        if (!e->has[i]) continue;
-        bool any = false;
-        for (size_t k = 0; k < PT_MAX; k++) any |= e->held[i].pts[k].gdn != NULL;
-        if (any && (!found || e->used[i] < e->used[pick])) {
-            pick = i;
-            found = true;
+    for (int pass = 0; pass < 2 && !found; pass++)
+        for (size_t i = 0; i < e->n_conv; i++) {
+            if (!e->has[i] || (pass == 0 && e->kept[i])) continue;
+            bool any = false;
+            for (size_t k = 0; k < PT_MAX; k++) any |= e->held[i].pts[k].gdn != NULL;
+            if (any && (!found || e->used[i] < e->used[pick])) {
+                pick = i;
+                found = true;
+            }
         }
-    }
     if (found) (void)session_conv_trim_points(&e->held[pick], 0);
     return found;
 }
@@ -293,6 +298,14 @@ static bool room_for(Engine *e, uint64_t bytes, uint64_t gpu_margin) {
     len = sizeof(uint64_t);
     (void)sysctlbyname("hw.pagesize", &page, &len, NULL, 0);
     return (uint64_t)free_pages * page >= bytes + (8ull << 30);
+}
+
+// The checkpoint a prompt of nids tokens may start from in a conversation (session_shared_point),
+// with PT_TAIL tokens or more left before its last one: a shorter rest would be read on the
+// decode-style kernels, not as the same tokens read inside a prompt chunk (a checkpoint can lie
+// within PT_TAIL of a later prompt's end since the fork point, session_point_cuts_add).
+static size_t start_point(const VecU32 *ptoks, const Point pts[PT_MAX], const uint32_t *ids, size_t nids) {
+    return nids > PT_TAIL ? session_shared_point(ptoks->ptr, ptoks->len, pts, ids, nids - PT_TAIL) : 0;
 }
 
 // The conversation this thread's last request ran in (the in-process callers run their requests
@@ -333,8 +346,7 @@ static void route(Engine *e, const uint32_t *ids, size_t nids, int lora, bool in
         last_conv.conv < e->n_conv && e->conv_lora[last_conv.conv] == lora && e->conv_gen[last_conv.conv] == last_conv.gen) {
         size_t i = last_conv.conv;
         const Session *s = e->s;
-        size_t p = i == e->active ? session_shared_point(s->ptoks.ptr, s->ptoks.len, s->pts, ids, nids)
-                                  : session_shared_point(e->held[i].ptoks.ptr, e->held[i].ptoks.len, e->held[i].pts, ids, nids);
+        size_t p = i == e->active ? start_point(&s->ptoks, s->pts, ids, nids) : start_point(&e->held[i].ptoks, e->held[i].pts, ids, nids);
         if (p > 0) {
             best = i;
             goto picked;
@@ -365,9 +377,11 @@ static void route(Engine *e, const uint32_t *ids, size_t nids, int lora, bool in
                 }
             }
         }
-        size_t lru = 0;
-        for (size_t i = 0; i < e->n_conv; i++)
-            if (e->used[i] < e->used[lru]) lru = i;
+        // the least recently used, a kept one (a parent's, while its subagents run) only when all are
+        size_t lru = SIZE_MAX;
+        for (int pass = 0; pass < 2 && lru == SIZE_MAX; pass++)
+            for (size_t i = 0; i < e->n_conv; i++)
+                if (!(pass == 0 && e->kept[i]) && (lru == SIZE_MAX || e->used[i] < e->used[lru])) lru = i;
         best = lru;
     }
 picked:
@@ -402,26 +416,30 @@ static bool live_continues(const Engine *e, const uint32_t *ids, size_t nids) {
            e->live_ids.len >= p && memcmp(ids, e->live_ids.ptr, p * sizeof(uint32_t)) == 0;
 }
 
-// Where the active conversation starts reading ids: the live state of an ahead read it continues
-// when that is the longest; else the longest of a restore point it extends and its own checkpoints
-// (a restore point when they tie), else another conversation's checkpoint (KV rows copied), else 0.
-static Start plan(Engine *e, const uint32_t *ids, size_t nids) {
+// Where the active conversation starts reading ids: the longest of the live state of an ahead read
+// it continues, a restore point it extends, its own checkpoints and another conversation's
+// checkpoint (KV rows copied), preferring them in that order when they tie; else 0. (Another
+// conversation's longer checkpoint wins over an own one: e.g. a subagent's conversation, taken
+// again for the parent's next batch of subagents, holds its first task's start, while the parent's
+// conversation holds where the new tasks leave it.) share false: own starts only (an ahead read,
+// which continues this conversation in place).
+static Start plan(Engine *e, const uint32_t *ids, size_t nids, bool share) {
     size_t r = session_reusable(e->s, ids, nids);
-    size_t own = session_shared_point(e->s->ptoks.ptr, e->s->ptoks.len, e->s->pts, ids, nids);
-    if (live_continues(e, ids, nids) && e->live_pos > MAX(r, own)) return (Start){e->live_pos, START_LIVE, 0, 0};
-    if (r > 0 && r >= own) return (Start){r, START_CKPT, 0, 0};
-    if (own > 0) return (Start){own, START_OWN, 0, 0};
+    size_t own = start_point(&e->s->ptoks, e->s->pts, ids, nids);
     Start best = {0, START_FRESH, 0, 0};
-    for (size_t i = 0; i < e->n_conv; i++) {
+    for (size_t i = 0; share && i < e->n_conv; i++) {
         if (!e->has[i] || e->conv_lora[i] != e->conv_lora[e->active]) continue;
         const Conv *cv = &e->held[i];
-        size_t n = session_shared_point(cv->ptoks.ptr, cv->ptoks.len, cv->pts, ids, nids);
+        size_t n = start_point(&cv->ptoks, cv->pts, ids, nids);
         if (n > best.n) {
             size_t lcp = 0;
             while (lcp < MIN(cv->ptoks.len, nids) && cv->ptoks.ptr[lcp] == ids[lcp]) lcp++;
             best = (Start){n, START_SHARED, i, lcp};
         }
     }
+    if (live_continues(e, ids, nids) && e->live_pos > MAX(r, own) && e->live_pos >= best.n) return (Start){e->live_pos, START_LIVE, 0, 0};
+    if (r > 0 && r >= own && r >= best.n) return (Start){r, START_CKPT, 0, 0};
+    if (own > 0 && own >= best.n) return (Start){own, START_OWN, 0, 0};
     return best;
 }
 
@@ -473,13 +491,14 @@ static Err apply(Engine *e, Start st, bool request) {
 static bool evict_one(Engine *e) {
     bool found = false;
     size_t pick = 0;
-    for (size_t i = 0; i < e->n_conv; i++) {
-        if (!e->has[i]) continue;
-        if (e->held[i].cap > MIN(CAP0, e->s->max_cap) && (!found || e->used[i] < e->used[pick])) {
-            pick = i;
-            found = true;
+    for (int pass = 0; pass < 2 && !found; pass++)
+        for (size_t i = 0; i < e->n_conv; i++) {
+            if (!e->has[i] || (pass == 0 && e->kept[i])) continue;
+            if (e->held[i].cap > MIN(CAP0, e->s->max_cap) && (!found || e->used[i] < e->used[pick])) {
+                pick = i;
+                found = true;
+            }
         }
-    }
     if (!found) return false;
     size_t i = pick;
     Conv *cv = &e->held[i];
@@ -936,6 +955,40 @@ typedef struct {
 // client that half-closes after its request must still get the whole stream.
 #define GONE_EVERY 16
 
+// Whether the request asks for a fork point ("saetta_fork_point": true): a checkpoint at its
+// generation prompt, where the prompts of its subagents (its messages, then their task) leave it.
+static bool fork_point_asked(const JValue *r) {
+    const JValue *fp = field((JValue *)r, "saetta_fork_point");
+    return fp && fp->kind == J_BOOL && fp->b;
+}
+
+// The longest prefix ids[0..n) shares with another conversation's tokens (its restore points' and
+// its checkpoints' prefix tokens), and that conversation in *src; 0 if none.
+static size_t shared_elsewhere(const Engine *e, const uint32_t *ids, size_t n, size_t *src) {
+    size_t best = 0;
+    for (size_t i = 0; i < e->n_conv; i++) {
+        if (!e->has[i] || e->conv_lora[i] != e->conv_lora[e->active]) continue;
+        const Conv *cv = &e->held[i];
+        const VecU32 *lists[3] = {&cv->ck[0].tokens, &cv->ck[1].tokens, &cv->ptoks};
+        for (size_t k = 0; k < 3; k++) {
+            size_t m = MIN(n, lists[k]->len), l = 0;
+            if (m <= best) continue;
+            while (l < m && lists[k]->ptr[l] == ids[l]) l++;
+            if (l > best) {
+                best = l;
+                *src = i;
+            }
+        }
+    }
+    return best;
+}
+
+static bool has_cut(const size_t *cuts, size_t n, size_t x) {
+    for (size_t i = 0; i < n; i++)
+        if (cuts[i] == x) return true;
+    return false;
+}
+
 // Prefill hook: a checkpoint at each cut (session_point_cuts), the monitor's progress, a stream's
 // keep-alive, the client's disconnect.
 typedef struct {
@@ -1000,8 +1053,10 @@ static Err generate_reply(Engine *e, Arena *a, Conn *c, Req *h, Work *w, JValue 
     if (n - 1 > reused) {
         // the checkpoints of this prompt: one at its start (where the conversation's history ends
         // and the new messages begin: a retry, an edit or a /fork of this request restarts there; no
-        // cut, the state is in place), and the cuts, where chunks end (a function of the prompt and
-        // its start only, so a resumed conversation reads it as the resident one would)
+        // cut, the state is in place), and the cuts, where chunks end (message starts and multiples
+        // of PT_EVERY, a function of the prompt and its start; and where it leaves another
+        // conversation's tokens or, when asked, its generation prompt: chunks of PT_TAIL or more
+        // either way, so where they end does not change what is computed)
         size_t *cuts = NULL, ncuts = 0;
         if (points_on && model_info(e->m)->chat == CHAT_QWEN) {
             if (reused > 0) {
@@ -1009,9 +1064,29 @@ static Err generate_reply(Engine *e, Arena *a, Conn *c, Req *h, Work *w, JValue 
                 int k = session_point_at(e->s->pts, reused);
                 if (k >= 0) e->s->pts[k].start = true;
             }
-            size_t cap = (n - 1 - reused) / PT_GAP + 4;
+            size_t cap = (n - 1 - reused) / PT_GAP + 6;
             cuts = ARENA_ARRAY(a, size_t, cap);
             ncuts = session_point_cuts(ids, n, reused, e->im_start, cuts, cap);
+            // where the prompt leaves another conversation's tokens (its siblings' start: other
+            // sessions sharing its system prompt and tools, other subagents of its parent), and,
+            // when the caller asks (saetta_fork_point: Saetta Code's agent with subagents, whose
+            // prompts are this one less its generation prompt), just before its generation prompt
+            size_t src = 0, left = shared_elsewhere(e, ids, n, &src);
+            if (left > 0) {
+                size_t k0 = ncuts;
+                ncuts = session_point_cuts_add(cuts, ncuts, cap, reused, n, left - 1);
+                if (ncuts != k0 || has_cut(cuts, ncuts, left - 1))
+                    dbg("saetta: conversation %zu leaves conversation %zu's tokens at %zu: a checkpoint there\n", e->active + 1,
+                        src + 1, left - 1);
+            }
+            if (fork_point_asked(r)) {
+                // at the generation prompt's <|im_start|>, at most n - 1 - PT_TAIL (a later one: the
+                // few tokens of the last message between are read again by the children)
+                size_t x = n - 1 - MIN(n - 1, PT_TAIL), im = n;
+                while (im > reused && ids[im - 1] != e->im_start) im--;
+                if (im > reused && im - 1 < x) x = im - 1;
+                ncuts = session_point_cuts_add(cuts, ncuts, cap, reused, n, x);
+            }
         }
         Hook hk = {e, out, c, ids, cuts, ncuts, 0};
         PrefillHook ph = {&hk, cuts, ncuts, hook_chunk_done};
@@ -1396,7 +1471,7 @@ typedef struct {
 #define SPEC_SAVED_MAGIC 0x53504331u // "SPC1"
 
 static void state_restore(Engine *e, const uint32_t *ids, size_t n) {
-    Start cur = plan(e, ids, n);
+    Start cur = plan(e, ids, n, true);
     char name[33];
     size_t at[ST_MAX_SNAP];
     size_t got = state_store_find(e->store, ids, n, cur.n ? cur.n + RESTORE_GAIN : 0, name, at);
@@ -1804,11 +1879,12 @@ static Err handle(Engine *e, Arena *a, Conn *c, Req *h, Str body, Fmt fmt, Work 
     reply_id = lora >= 0 ? model_lora_name(e->m, (size_t)lora) : base_id;
     TRY(ensure(e, n + max_tokens + CAP_SLACK));
     if (e->store && lora < 0) state_restore(e, w->ids.ptr, n);
-    Start start = plan(e, w->ids.ptr, n);
+    Start start = plan(e, w->ids.ptr, n, true);
     stats_begin(e->st, fmt == FMT_ANTHROPIC, n, start.n, max_tokens);
     Err err = generate_reply(e, a, c, h, w, r, model_name, fmt, forced, thinking, sp, stops, n_stops, stream, tools, id, created,
                              start, max_tokens);
     last_conv = (LastConv){e, e->active, e->conv_gen[e->active], true, {0}};
+    e->kept[e->active] = fork_point_asked(r);
     if (c->sink) snprintf(last_conv.session, sizeof last_conv.session, "%s", req_session);
     // the conversation an ahead read of this session may continue (server_engine_ahead)
     snprintf(e->owner[e->active], sizeof e->owner[0], "%s", c->sink ? req_session : "");
@@ -2430,7 +2506,7 @@ Err server_engine_ahead(Engine *e, Str body, const char *session, const char *pa
         if (cap > s->cap && room_for(e, session_kv_bytes(s, cap), 2ull << 30)) (void)session_grow(s, e->g, cap);
         if (target + CAP_SLACK > s->cap) target = s->cap > CAP_SLACK ? s->cap - CAP_SLACK : 0;
     }
-    Start st = plan(e, ids.ptr, k);
+    Start st = plan(e, ids.ptr, k, false);
     if (st.kind == START_FRESH || st.kind == START_SHARED || st.n < ru.n || target < st.n + AHEAD_MIN) {
         why = target < st.n + AHEAD_MIN ? NULL : "no start";
         goto done;

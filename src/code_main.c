@@ -631,7 +631,12 @@ static Err stream_assistant(Run *r, JValue **out) {
     for (size_t i = 0; i < all->arr.len; i++)
         if (!str_eqz(json_strs(json_get(all->arr.items[i], "role")), "system")) json_push(a, conv, all->arr.items[i]);
     Buf body = {0};
-    TRY(code_oai_body(a, &r->model, system, conv, current_tools(a, system), &body));
+    // with subagents on, the engine keeps a checkpoint where the children's prompts leave this one
+    // (SAETTA_FORK_POINT=0: not asked for)
+    CodeModel bm = r->model;
+    const char *fpv = getenv("SAETTA_FORK_POINT");
+    bm.fork_point = code_subagent_enabled() && !(fpv && fpv[0] == '0');
+    TRY(code_oai_body(a, &bm, system, conv, current_tools(a, system), &body));
     code_durable_request(code_session_leaf(r->session), buf_str(&body));
     Stream st = {.r = r};
     CodeSink sink = {.on_event = on_event, .ctx = &st};

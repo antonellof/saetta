@@ -49,3 +49,4 @@ Saetta Code reads these variables of pi's as pi does, along with its own.
 | `SAETTA_STATE` | 1 | `0` turns off the conversation state on disk (`~/.saetta/state`): a resumed session then reads its history again |
 | `SAETTA_AHEAD` | 1 | `0` turns off reading a running command's output into the conversation before the next request ([Sessions](sessions.md)) |
 | `SAETTA_FEED` | 1 | `0` turns off drafting from the files Saetta Code read, edited or wrote ([Sessions](sessions.md)) |
+| `SAETTA_FORK_POINT` | 1 | `0` stops Saetta Code with `--subagents` asking the engine for a checkpoint before each answer, where its subagents' prompts leave the parent's ([Parallel agents](parallel-agents.md)) |

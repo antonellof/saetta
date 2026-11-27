@@ -40,4 +40,8 @@ Subagents are off by default: pi has no built-in subagents, and with them off Sa
 
 ### How they use the engine
 
-Each subagent's requests start with its parent's: the same system prompt, tools and messages, then its task. The engine reuses the part of the parent's prompt it has kept (from the checkpoints it keeps at message starts and every 4,096 tokens), so a subagent reads mostly its own task. The engine still decodes one request at a time: subagents overlap their tool calls and their waits, not their decoding.
+Each subagent's requests start with its parent's: the same system prompt, tools and messages, then its task. With subagents on, each of the parent's requests that reads 1,024 tokens or more asks the engine for a checkpoint just before its answer starts, where the subagents' prompts leave it: a subagent then copies the parent's state there and reads only its task, even when the parent read a long tool result right before handing out the tasks. Subagents take other conversations than the parent's while one is free, so the parent's next request continues its own. The engine still decodes one request at a time: subagents overlap their tool calls and their waits, not their decoding.
+
+Sessions that share the model share their prompt the same way: when a request leaves another conversation's tokens 1,024 tokens or more past where it started (a second session: Saetta Code's system prompt and tools are the same in every session up to the project instructions and the working folder), the engine keeps a checkpoint there, so the sessions after it start from it instead of reading the system prompt again. The second session still reads it whole: nothing was kept where the two part.
+
+`SAETTA_FORK_POINT=0` stops Saetta Code asking for the checkpoint before the answer: each one costs the agent's request one more prompt chunk, about 0.14 s on the Coder, which the subagents of a request that hands out tasks save several times over.

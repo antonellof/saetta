@@ -221,6 +221,68 @@ TEST(points_cuts) {
     free(ids);
 }
 
+// The cuts added where later prompts are expected to leave this one (session_point_cuts_add):
+// where it leaves another conversation's tokens, and before its generation prompt. Each keeps
+// PT_GAP after the cut before it and PT_TAIL before n - 1 (chunks on both sides stay prompt chunks);
+// a later cut closer than PT_TAIL gives its place; the result stays increasing.
+TEST(points_cuts_add) {
+    size_t n = 20000;
+    size_t cuts[16] = {4096, 5600, 8192, 12000, 16384};
+    size_t k = 5;
+    // the generation prompt's: n - 1 - PT_TAIL, 3605 after 16384
+    k = session_point_cuts_add(cuts, k, 16, 0, n, n - 1 - PT_TAIL);
+    EXPECT_EQ(k, 6);
+    EXPECT_EQ(cuts[5], n - 1 - PT_TAIL);
+    // between 8192 and 12000, 1500 after 8192: inserted in order
+    k = session_point_cuts_add(cuts, k, 16, 0, n, 9692);
+    EXPECT_EQ(k, 7);
+    size_t want[] = {4096, 5600, 8192, 9692, 12000, 16384, n - 1 - PT_TAIL};
+    for (size_t i = 0; i < 7; i++) EXPECT_EQ(cuts[i], want[i]);
+    // under PT_GAP after the start: not taken
+    EXPECT_EQ(session_point_cuts_add(cuts, k, 16, 0, n, 900), 7);
+    EXPECT_EQ(session_point_cuts_add(cuts, k, 16, 4000, n, 4900), 7);
+    // under PT_GAP after the cut before it: that one gives its place (4096 -> 5000; 5600 stays)
+    size_t c1[16] = {4096, 5600, 8192};
+    EXPECT_EQ(session_point_cuts_add(c1, 3, 16, 0, n, 5000), 3);
+    EXPECT_EQ(c1[0], 5000);
+    EXPECT_EQ(c1[1], 5600);
+    // ... and a later one within PT_TAIL goes too (5600 replaced by 5595, 5600 dropped)
+    EXPECT_EQ(session_point_cuts_add(c1, 3, 16, 0, n, 5595), 2);
+    EXPECT_EQ(c1[0], 5595);
+    EXPECT_EQ(c1[1], 8192);
+    // an existing cut: unchanged
+    EXPECT_EQ(session_point_cuts_add(cuts, k, 16, 0, n, 12000), 7);
+    // a later cut within PT_TAIL: replaced by x
+    size_t c2[16] = {4096, 10905};
+    size_t k2 = session_point_cuts_add(c2, 2, 16, 0, n, 10900);
+    EXPECT_EQ(k2, 2);
+    EXPECT_EQ(c2[1], 10900);
+    // under PT_TAIL before n - 1, or past it: not taken; exactly PT_TAIL: taken
+    size_t c3[16] = {0};
+    EXPECT_EQ(session_point_cuts_add(c3, 0, 16, 0, n, n - PT_TAIL), 0);
+    EXPECT_EQ(session_point_cuts_add(c3, 0, 16, 0, n, n + 5), 0);
+    EXPECT_EQ(session_point_cuts_add(c3, 0, 16, 0, n, n - 1 - PT_TAIL), 1);
+    // counted from a later start
+    size_t c4[16] = {0};
+    EXPECT_EQ(session_point_cuts_add(c4, 0, 16, 19000, n, 19500), 0);
+    EXPECT_EQ(session_point_cuts_add(c4, 0, 16, 18000, n, 19500), 1);
+    // no room: unchanged
+    size_t c5[2] = {4096, 8192};
+    EXPECT_EQ(session_point_cuts_add(c5, 2, 2, 0, n, 12000), 2);
+    // the chunks then end at every cut and none is shorter than PT_TAIL
+    PrefillHook ph = {NULL, cuts, k, NULL};
+    size_t prev = 0;
+    for (size_t i = 0; i < n - 1;) {
+        size_t len = prefill_chunk_len(&ph, 0, n - 1, i);
+        EXPECT(len >= PT_TAIL);
+        if (len == 0) break;
+        i += len;
+        for (size_t c = 0; c < k; c++)
+            if (cuts[c] > prev && cuts[c] < i) EXPECT(false); // a cut inside a chunk
+        prev = i;
+    }
+}
+
 // A checkpoint is used only when the prompt's token at its position matches too (its MTP row at pos
 // pairs that token): a prompt that leaves the history exactly there starts at an earlier one.
 TEST(points_match_needs_the_token_at_pos) {

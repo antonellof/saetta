@@ -45,6 +45,10 @@ typedef struct CodeModel {
     // A model another Saetta Code serves: requests go over this Unix socket (src/unix_http.h), not
     // to base_url. NULL: none.
     const char *sock;
+    // Requests ask saetta's engine (engine or sock set; never sent elsewhere) for a checkpoint
+    // just before their generation prompt ("saetta_fork_point", src/server.c): the agent's own
+    // requests while it offers subagents, whose prompts are its prompt less that, plus their task.
+    bool fork_point;
 } CodeModel;
 
 // saetta's version (main.c sets it), for Saetta Code's header.

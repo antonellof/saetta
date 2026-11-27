@@ -48,6 +48,10 @@
 
 // Chunks of at most MODEL_SMALL tokens use the decode-style kernels.
 #define MODEL_SMALL 8
+// The fewest tokens a prefill chunk that ends or starts at a checkpoint keeps: a prompt chunk of 10
+// or more computes bitwise what the same tokens read inside a longer chunk compute (src/test/ahead.c
+// ahead_chunk_boundaries_bitwise), a shorter one runs the decode-style kernels.
+#define PT_TAIL (MODEL_SMALL + 2)
 
 #define SESSION_NO_ROLL ((size_t)-1)
 // n-gram heads of Flash-Next's PLE layer (Session.ple_rows rows).
@@ -389,6 +393,15 @@ size_t session_shared_point(const uint32_t *ptoks, size_t nptoks, const Point pt
 // server keeps one at each request's start, which needs no cut). Returns the count. Depends on ids
 // and pos0 alone, so a prompt read from the same start is cut the same way in any process.
 size_t session_point_cuts(const uint32_t *ids, size_t n, size_t pos0, uint32_t im_start, size_t *out, size_t cap);
+// Adds a checkpoint position x to the cuts session_point_cuts gave (increasing, ncuts of room cap),
+// for a prompt that later prompts are expected to leave there: where it leaves another
+// conversation's tokens (its siblings, e.g. other sessions with the same system prompt and tools,
+// or other subagents of one parent, leave it there too), or its generation prompt (a subagent's
+// prompt is its parent's, less that, plus its task). Taken when x is at least PT_GAP after pos0
+// and PT_TAIL before n - 1 (the chunks stay prompt chunks, which compute bitwise what one chunk
+// does); a cut before it closer than PT_GAP, and a later one closer than PT_TAIL, give their place
+// to x. Returns the new count.
+size_t session_point_cuts_add(size_t *cuts, size_t ncuts, size_t cap, size_t pos0, size_t n, size_t x);
 // Starts at this conversation's own checkpoint at position n (its KV rows below n are in place).
 void session_start_at_own_point(Session *s, size_t n);
 // Before rows from position n on are rewritten: drops the restore points and prefix points

@@ -1832,6 +1832,7 @@ Err code_oai_body(Arena *a, const CodeModel *m, const JValue *system, const JVal
         put(a, p, "stream_options", so);
     }
     if (c.store) put(a, p, "store", json_bool(a, false));
+    if (m->fork_point && (m->engine || m->sock)) put(a, p, "saetta_fork_point", json_bool(a, true));
     double maxt = max_tokens_for(a, m, system, messages);
     bool has_max = maxt != 0;
     if (has_max) put(a, p, !strcmp(c.max_tokens_field, "max_tokens") ? "max_tokens" : "max_completion_tokens", jnum(a, maxt));

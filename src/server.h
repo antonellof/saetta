@@ -101,6 +101,9 @@ void server_engine_feed_clear(Engine *e, const char *session);
 size_t server_engine_feed_tokens(Engine *e, const char *session, size_t *texts, size_t *bytes);
 // For tests: the verified passes of the last request whose drafts came from fed texts.
 size_t server_engine_feed_drafts(const Engine *e);
+// The last request's tokens the tool-call grammar replaced (SAETTA_GRAMMAR=1; for tests): every pick it
+// changed, also in a verification round past where a stop string or max_tokens then cut the reply.
+size_t server_engine_grammar_replaced(const Engine *e);
 // One HTTP connection on fd (accepted on a socket of the caller's) answered as server_serve
 // answers it: the same endpoints and request path. The request is read first (the head and body
 // deadlines; the caller sets the socket's send and receive timeouts: no connection guard here),

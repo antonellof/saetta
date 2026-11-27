@@ -16,6 +16,7 @@ static const char *const engine_env_rows[] = {
     "SAETTA_MTP",            "SAETTA_MV_ROWS",        "SAETTA_POINTS",         "SAETTA_PREFILL_F32",
     "SAETTA_PREP_VERIFY",    "SAETTA_QMMP",           "SAETTA_QSA_SIMD",       "SAETTA_SKIP",
     "SAETTA_SMALL_FUSED",    "SAETTA_SPEC",    "SAETTA_DSPARK",        "SAETTA_FEED",
+    "SAETTA_GRAMMAR",
 };
 
 // Read by the engine's files, and changing nothing a state holds. SAETTA_AHEAD (prefill ahead of the

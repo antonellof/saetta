@@ -1,0 +1,210 @@
+// The tool-call grammar in the engine (SAETTA_GRAMMAR=1, src/server.c). Needs SAETTA_GRAMMAR_TEST_PACK
+// (a Qwen3.8 pack: it loads it and runs prompts on the GPU):
+// - greedy, with speculation on: requests whose calls are well formed (a read, a bash command, an
+//   edit whose edits JSON copies lines of a file, a reply with reasoning) answer byte for byte the
+//   same with the grammar as without, and the grammar replaced no token;
+// - a request whose read tool takes its paths as an array of strings (the model writes a bare path
+//   there unasked): with the grammar the value is a JSON array of strings (tokens replaced), and
+//   every call, greedy and sampled, names a tool of the request with arguments of the schema's types.
+#include "../json.h"
+#include "../server.h"
+#include "../stats.h"
+#include "../test.h"
+
+#include <stdatomic.h>
+#include <stdlib.h>
+
+static int sink_keep(void *ctx, int status, const void *p, size_t n) {
+    (void)status;
+    if (p && n) buf_add((Buf *)ctx, p, n);
+    return 0;
+}
+
+static Engine *shared_engine;
+static Engine *engine_for(const char *pack) {
+    if (shared_engine) return shared_engine;
+    setenv("SAETTA_CONVERSATIONS", "4", 1);
+    setenv("SAETTA_CTX", "32768", 1);
+    setenv("SAETTA_BENCH_GREEDY", "1", 1); // greedy with depths chosen without the clock (the sampled
+                                          // requests turn it off for themselves)
+    static Arena a;
+    if (server_engine_open(&a, pack, NULL, 0, NULL, &shared_engine)) return NULL;
+    return shared_engine;
+}
+
+static const char tools_all[] =
+    "[{\"type\":\"function\",\"function\":{\"name\":\"read\",\"description\":\"Read file contents\",\"parameters\":{\"type\":\"object\","
+    "\"required\":[\"path\"],\"properties\":{\"path\":{\"type\":\"string\"},\"offset\":{\"type\":\"number\"},\"limit\":{\"type\":"
+    "\"number\"}}}}},{\"type\":\"function\",\"function\":{\"name\":\"bash\",\"description\":\"Execute bash commands\",\"parameters\":"
+    "{\"type\":\"object\",\"required\":[\"command\"],\"properties\":{\"command\":{\"type\":\"string\"},\"timeout\":{\"type\":\"number\"}}}}},"
+    "{\"type\":\"function\",\"function\":{\"name\":\"edit\",\"description\":\"Edit a file with exact text replacement\",\"parameters\":"
+    "{\"type\":\"object\",\"required\":[\"path\",\"edits\"],\"properties\":{\"path\":{\"type\":\"string\"},\"edits\":{\"type\":\"array\","
+    "\"items\":{\"type\":\"object\",\"required\":[\"oldText\",\"newText\"],\"properties\":{\"oldText\":{\"type\":\"string\"},"
+    "\"newText\":{\"type\":\"string\"}}}}}}}}]";
+
+static const char tools_two[] =
+    "[{\"type\":\"function\",\"function\":{\"name\":\"read\",\"description\":\"Read file contents\",\"parameters\":{\"type\":\"object\","
+    "\"required\":[\"path\"],\"properties\":{\"path\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}}}}},{\"type\":\"function\",\"function\":{\"name\":\"bash\","
+    "\"description\":\"Execute bash commands\",\"parameters\":{\"type\":\"object\",\"required\":[\"command\"],\"properties\":{\"command\":"
+    "{\"type\":\"string\"}}}}}]";
+
+static char *body_of(const char *user, const char *tools, bool thinking, const char *sampling) {
+    Buf j = {0}, b = {0};
+    json_write_string(&j, str(user));
+    buf_printf(&b, "{\"messages\":[{\"role\":\"user\",\"content\":%s}],\"tools\":%s,\"max_tokens\":500,%s,"
+                   "\"chat_template_kwargs\":{\"enable_thinking\":%s}}",
+               j.ptr, tools, sampling, thinking ? "true" : "false");
+    char *s = strdup(b.ptr);
+    buf_free(&j);
+    buf_free(&b);
+    return s;
+}
+
+typedef struct {
+    char *content, *reasoning, *calls; // calls: "name args\n" per call
+    size_t gen;
+} Reply;
+
+static char *dup_str(const JValue *v) { return v && v->kind == J_STRING ? strndup(v->s.ptr, v->s.len) : strdup(""); }
+
+static Reply chat(Engine *e, const char *body, const char *grammar) {
+    if (grammar) setenv("SAETTA_GRAMMAR", grammar, 1);
+    else unsetenv("SAETTA_GRAMMAR");
+    Buf out = {0};
+    Err err = server_engine_chat_session(e, str(body), "grammar-test", sink_keep, &out);
+    unsetenv("SAETTA_GRAMMAR");
+    Reply r = {0};
+    r.gen = atomic_load(&server_engine_stats(e)->gen);
+    Arena a = {0};
+    JValue *v;
+    Buf calls = {0};
+    if (!err && !json_parse(&a, str_n(out.ptr, out.len), false, &v)) {
+        const JValue *ch = json_get(v, "choices");
+        const JValue *m = ch && ch->kind == J_ARRAY && ch->arr.len ? json_get(ch->arr.items[0], "message") : NULL;
+        r.content = dup_str(m ? json_get(m, "content") : NULL);
+        r.reasoning = dup_str(m ? json_get(m, "reasoning_content") : NULL);
+        const JValue *tc = m ? json_get(m, "tool_calls") : NULL;
+        for (size_t i = 0; tc && tc->kind == J_ARRAY && i < tc->arr.len; i++) {
+            const JValue *f = json_get(tc->arr.items[i], "function");
+            buf_printf(&calls, "%s %s\n", json_str(json_get(f, "name")), json_str(json_get(f, "arguments")));
+        }
+    }
+    r.calls = strdup(calls.ptr ? calls.ptr : "");
+    if (!r.content) r.content = strdup("<error>");
+    if (!r.reasoning) r.reasoning = strdup("");
+    buf_free(&calls);
+    buf_free(&out);
+    arena_reset(&a);
+    return r;
+}
+
+static void reply_free(Reply *r) {
+    free(r->content);
+    free(r->reasoning);
+    free(r->calls);
+}
+
+static const char stats_file[] = "def mean(xs):\n    return sum(xs) / len(xs)\n\n\ndef median(xs):\n    s = sorted(xs)\n    n = len(s)\n"
+                                 "    mid = n // 2\n    if n % 2 == 1:\n        return s[mid]\n    return s[mid]\n";
+
+TEST(grammar_engine_greedy_unchanged) {
+    const char *pack = getenv("SAETTA_GRAMMAR_TEST_PACK");
+    if (!pack) SKIP("SAETTA_GRAMMAR_TEST_PACK not set (loads a model)");
+    Engine *e = engine_for(pack);
+    EXPECT(e != NULL);
+    if (!e) return;
+    Buf edit = {0};
+    buf_printf(&edit, "This is mathkit/stats.py:\n\n%s\nmedian() is wrong for lists of even length. Fix it with the edit tool now.",
+               stats_file);
+    struct {
+        const char *user;
+        bool thinking;
+    } cases[] = {
+        {"Read the file mathkit/stats.py.", false},
+        {"List the files in the current folder with bash, then stop.", false},
+        {edit.ptr, false},
+        {edit.ptr, true},
+        {"What is 17 * 23? Answer in one line, no tools.", true},
+    };
+    for (size_t i = 0; i < COUNT(cases); i++) {
+        char *body = body_of(cases[i].user, tools_all, cases[i].thinking, "\"temperature\":0");
+        Reply off = chat(e, body, NULL);
+        Reply on = chat(e, body, "1");
+        size_t replaced = server_engine_grammar_replaced(e);
+        dbg("grammar case %zu: %zu tokens, calls: %s", i, on.gen, on.calls[0] ? on.calls : "none\n");
+        EXPECT_STR(str(on.content), str(off.content));
+        EXPECT_STR(str(on.reasoning), str(off.reasoning));
+        EXPECT_STR(str(on.calls), str(off.calls));
+        EXPECT_EQ(on.gen, off.gen);
+        EXPECT_EQ(replaced, 0);
+        if (i < 4) EXPECT(on.calls[0] != 0); // the cases that call a tool did
+        reply_free(&off);
+        reply_free(&on);
+        free(body);
+    }
+    buf_free(&edit);
+}
+
+// every call names a tool of tools_two, with its required argument as a string
+static bool valid_calls(const char *calls) {
+    Arena a = {0};
+    bool ok = true;
+    for (const char *p = calls; *p && ok;) {
+        const char *nl = strchr(p, '\n');
+        Str line = str_n(p, nl ? (size_t)(nl - p) : strlen(p));
+        ptrdiff_t sp = str_find_char(line, ' ', 0);
+        JValue *args;
+        if (sp <= 0 || json_parse(&a, str_sub(line, (size_t)sp + 1, line.len), false, &args)) {
+            ok = false;
+            break;
+        }
+        Str name = str_sub(line, 0, (size_t)sp);
+        if (str_eq(name, S("read")))
+            ok = json_is(json_get(args, "path"), J_ARRAY) && json_get(args, "path")->arr.len > 0 &&
+                 json_is(json_get(args, "path")->arr.items[0], J_STRING);
+        else if (str_eq(name, S("bash"))) ok = json_is(json_get(args, "command"), J_STRING);
+        else ok = false;
+        p = nl ? nl + 1 : p + line.len;
+    }
+    arena_reset(&a);
+    return ok;
+}
+
+TEST(grammar_engine_array_argument_masked) {
+    const char *pack = getenv("SAETTA_GRAMMAR_TEST_PACK");
+    if (!pack) SKIP("SAETTA_GRAMMAR_TEST_PACK not set (loads a model)");
+    Engine *e = engine_for(pack);
+    EXPECT(e != NULL);
+    if (!e) return;
+    const char *user = "Read the file mathkit/stats.py.";
+    char *body = body_of(user, tools_two, false, "\"temperature\":0");
+    Reply off = chat(e, body, NULL);
+    Reply on = chat(e, body, "1");
+    size_t replaced = server_engine_grammar_replaced(e);
+    dbg("grammar array argument: without: %s with (%zu replaced): %s", off.calls[0] ? off.calls : "no call\n", replaced,
+        on.calls[0] ? on.calls : "no call\n");
+    EXPECT(on.calls[0] != 0);
+    EXPECT(valid_calls(on.calls));
+    if (!valid_calls(off.calls)) EXPECT(replaced > 0); // the model's own path was not an array
+    reply_free(&off);
+    reply_free(&on);
+    free(body);
+    // the count is the request's own: a request the grammar does not change after one it changed reports 0
+    body = body_of("Read the file mathkit/stats.py.", tools_all, false, "\"temperature\":0");
+    Reply plain = chat(e, body, "1");
+    EXPECT_EQ(server_engine_grammar_replaced(e), 0);
+    reply_free(&plain);
+    free(body);
+    for (int seed = 1; seed <= 3; seed++) {
+        char sampling[96];
+        snprintf(sampling, sizeof sampling, "\"temperature\":1,\"seed\":%d", seed);
+        body = body_of(user, tools_two, false, sampling);
+        setenv("SAETTA_BENCH_GREEDY", "0", 1); // sampled as asked
+        Reply r = chat(e, body, "1");
+        setenv("SAETTA_BENCH_GREEDY", "1", 1);
+        EXPECT(r.calls[0] != 0);
+        EXPECT(valid_calls(r.calls));
+        reply_free(&r);
+        free(body);
+    }
+}

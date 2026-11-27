@@ -179,29 +179,26 @@
         <div class="code hero-cmd install">
           <div class="code-head">
             <div class="itabs" role="tablist" aria-label="Install">
-              <button class="itab" type="button" role="tab" aria-selected="true" aria-controls="c0" id="t-c0">Saetta Code</button>
-              <button class="itab" type="button" role="tab" aria-selected="false" aria-controls="c1" id="t-c1">Inkling</button>
-              <button class="itab" type="button" role="tab" aria-selected="false" aria-controls="c2" id="t-c2">27B and LoRA</button>
-              <button class="itab" type="button" role="tab" aria-selected="false" aria-controls="c3" id="t-c3">Other agents</button>
-              <button class="itab" type="button" role="tab" aria-selected="false" aria-controls="c4" id="t-c4">Server</button>
-              <button class="itab" type="button" role="tab" aria-selected="false" aria-controls="c5" id="t-c5">From source</button>
+              <button class="itab" type="button" role="tab" aria-selected="true" aria-controls="i0" id="t-i0">Saetta Code</button>
+              <button class="itab" type="button" role="tab" aria-selected="false" aria-controls="i1" id="t-i1">Inkling</button>
+              <button class="itab" type="button" role="tab" aria-selected="false" aria-controls="i2" id="t-i2">27B and LoRA</button>
+              <button class="itab" type="button" role="tab" aria-selected="false" aria-controls="i3" id="t-i3">Other agents</button>
+              <button class="itab" type="button" role="tab" aria-selected="false" aria-controls="i4" id="t-i4">Server</button>
             </div>
-            <button class="copy" type="button" data-copy="c0">Copy</button>
+            <button class="copy" type="button" data-copy="i0" aria-label="Copy" title="Copy"><svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg></button>
           </div>
-<pre id="c0" role="tabpanel" aria-labelledby="t-c0">curl -fsSL https://saetta.dev/install.sh | sh
-cd ~/src/my-project && saetta start code   <span class="c"># picks, downloads and opens the model that fits this Mac</span></pre>
-<pre id="c1" role="tabpanel" aria-labelledby="t-c1" hidden>curl -fsSL https://saetta.dev/install.sh | sh
+<pre id="i0" role="tabpanel" aria-labelledby="t-i0">curl -fsSL https://saetta.dev/install.sh | sh
+cd ~/src/my-project && saetta start code</pre>
+<pre id="i1" role="tabpanel" aria-labelledby="t-i1" hidden>curl -fsSL https://saetta.dev/install.sh | sh
 saetta download inkling
 saetta start code --pack inkling</pre>
-<pre id="c2" role="tabpanel" aria-labelledby="t-c2" hidden>curl -fsSL https://saetta.dev/install.sh | sh
+<pre id="i2" role="tabpanel" aria-labelledby="t-i2" hidden>curl -fsSL https://saetta.dev/install.sh | sh
 saetta download 27b-8bit && saetta download 27b-pi
 saetta start code --pack 27b-8bit --lora-modules qwen3.8-pi=27b-pi</pre>
-<pre id="c3" role="tabpanel" aria-labelledby="t-c3" hidden>curl -fsSL https://saetta.dev/install.sh | sh
-saetta start claude      <span class="c"># or: saetta start pi, saetta start opencode</span></pre>
-<pre id="c4" role="tabpanel" aria-labelledby="t-c4" hidden>curl -fsSL https://saetta.dev/install.sh | sh
-saetta serve coder       <span class="c"># OpenAI API at http://127.0.0.1:8080/v1, Anthropic at :8080</span></pre>
-<pre id="c5" role="tabpanel" aria-labelledby="t-c5" hidden>git clone https://github.com/antonellof/saetta.git && cd saetta
-make && ./build/bin/saetta start code</pre>
+<pre id="i3" role="tabpanel" aria-labelledby="t-i3" hidden>curl -fsSL https://saetta.dev/install.sh | sh
+saetta start claude    <span class="c"># or: pi, opencode</span></pre>
+<pre id="i4" role="tabpanel" aria-labelledby="t-i4" hidden>curl -fsSL https://saetta.dev/install.sh | sh
+saetta serve coder       <span class="c"># http://127.0.0.1:8080/v1</span></pre>
         </div>
         <p class="hint"><code>saetta start code</code> picks the model that fits this Mac, downloads it and opens the agent on it. <code>saetta start code --pack inkling</code> opens it on a pack you downloaded, and <code>/model</code> switches inside the agent.</p>
         <div class="actions">
@@ -388,7 +385,7 @@ make && ./build/bin/saetta start code</pre>
           <p class="sub">Saetta Code, the agent in the <code>saetta</code> binary, is a port of the <a href="https://pi.dev">pi</a> coding agent 1.5.2 (MIT): one 2.3 MB binary with no Node.js and no Python. It reads and writes pi's <code>settings.json</code>, <code>models.json</code>, <code>trust.json</code> and <code>mcp.json</code> (in <code>~/.pi/agent</code> with <code>saetta code</code>; <code>saetta start code</code> keeps its own copy in <code>~/.saetta/pi</code>). Its requests and session files match pi's byte for byte on 63 recorded scenarios, its screens are compared with pi's on 75, and its rpc mode with pi's on 12.</p>
           <div class="qs">
             <div class="code">
-              <div class="code-head"><span>run it</span><button class="copy" type="button" data-copy="c3">Copy</button></div>
+              <div class="code-head"><span>run it</span><button class="copy" type="button" data-copy="c3" aria-label="Copy" title="Copy"><svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg></button></div>
 <pre id="c3"><span class="c"># the model inside the agent</span>
 saetta start code
 <span class="c"># the same with a chosen pack</span>
@@ -397,7 +394,7 @@ saetta code --pack coder
 saetta code -c</pre>
             </div>
             <div class="code">
-              <div class="code-head"><span>scripts and CI</span><button class="copy" type="button" data-copy="c4">Copy</button></div>
+              <div class="code-head"><span>scripts and CI</span><button class="copy" type="button" data-copy="c4" aria-label="Copy" title="Copy"><svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg></button></div>
 <pre id="c4"><span class="c"># print mode, as pi -p</span>
 saetta code -p "fix the failing test"
 <span class="c"># pi's JSON event stream</span>

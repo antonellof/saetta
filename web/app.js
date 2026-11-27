@@ -38,9 +38,9 @@ for (const b of document.querySelectorAll(".copy")) {
     const text = document.getElementById(b.dataset.copy).innerText.split("\n").filter((l) => !l.startsWith("#")).join("\n");
     try {
       await navigator.clipboard.writeText(text);
-      b.textContent = "Copied";
-      setTimeout(() => (b.textContent = "Copy"), 1500);
-    } catch (e) { b.textContent = "Select it"; }
+      b.classList.add("done"); b.setAttribute("aria-label", "Copied"); b.title = "Copied";
+      setTimeout(() => { b.classList.remove("done"); b.setAttribute("aria-label", "Copy"); b.title = "Copy"; }, 1500);
+    } catch (e) { b.title = "Select the text to copy it"; }
   });
 }
 

@@ -217,7 +217,8 @@ td.num { font-family: var(--mono); font-size: 13px; white-space: nowrap; }
 .code-head { display: flex; justify-content: space-between; align-items: center; padding: 8px 12px; border-bottom: 1px solid var(--border); font: 11px var(--mono); color: var(--muted); }
 .code pre { margin: 0; padding: 14px 16px; font: 12.5px/1.75 var(--mono); overflow-x: auto; }
 .code .c { color: var(--dim); }
-.copy { font: 500 11px var(--sans); color: var(--muted); background: none; border: 1px solid var(--border); border-radius: 5px; padding: 2px 8px; cursor: pointer; }
+.copy { display: inline-flex; align-items: center; justify-content: center; color: var(--muted); background: none; border: 1px solid var(--border); border-radius: 5px; padding: 4px; cursor: pointer; }
+.copy.done { color: var(--accent, var(--fg)); border-color: currentColor; }
 .copy:hover { color: var(--fg); }
 .agents { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin: 0 0 16px; }
 #agents .replay { margin-top: 16px; }

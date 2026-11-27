@@ -186,5 +186,11 @@
 // near ties whose greedy argmax equals the oracle's (measured 1814 of 1815 after a near-tie flip
 // at token 992 of the 1815-token golden).
 #define TOL_INK_OWN_ARGMAX_AGREE 0.99 // f64
+// Accelerated prompt chunks (half activations) on the oracle's experts: the share of (visit,
+// token) pairs whose router's own top-8 differs from the oracle's (half inputs move the router
+// scores past near ties). Measured in 2048-token chunks (2026-11-27): golden-inkling 0.296% (f16
+// KV) / 0.261% (f32 KV), golden-inkling-long 0.546% / 0.480%, golden-inkling-32k 0.490% / 0.391%;
+// bound 5x the largest, so a regression that multiplies the flips fails.
+#define TOL_INK_HALF_ROUTE_FRAC 0.0275 // f64
 
 #endif

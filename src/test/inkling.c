@@ -15,6 +15,12 @@ static const char ink_src[] = {
     , '\n',
 #embed "../kernels/inkling_moe.metal"
     , 0};
+static const char ink_mpp_src[] = {
+#embed "../kernels/inkling_mpp.metal"
+    , 0};
+static const char qmm_mpp_src[] = {
+#embed "../kernels/qmm_mpp.metal"
+    , 0};
 
 #define BYTES(p) gpu_bytes_arg((p), sizeof(*(p)))
 static sx_arg BA(sx_buffer *b) { return gpu_buf_arg(b); }
@@ -30,9 +36,10 @@ static Err fbuf(QgenCtx *x, const float *src, size_t n, sx_buffer **b) {
     if (src) memcpy(sx_buffer_contents(*b), src, n * 4);
     return OK;
 }
-static Err run(QgenCtx *x, const char *name, const sx_arg *args, size_t nargs, size_t gx, size_t gy, size_t gz, size_t th) {
+static Err run_src(QgenCtx *x, const char *src, const char *name, const sx_arg *args, size_t nargs, size_t gx, size_t gy, size_t gz,
+                   size_t th) {
     sx_pipeline *p;
-    TRY(qgen_ctx_pipe(x, ink_src, name, &p));
+    TRY(qgen_ctx_pipe(x, src, name, &p));
     sx_cmd *c = sx_cmd_begin(x->g.dev);
     sx_cmd_dispatch3(c, p, args, nargs, gx, gy, gz, th);
     char err[512];
@@ -41,6 +48,9 @@ static Err run(QgenCtx *x, const char *name, const sx_arg *args, size_t nargs, s
         return "DispatchFailed";
     }
     return OK;
+}
+static Err run(QgenCtx *x, const char *name, const sx_arg *args, size_t nargs, size_t gx, size_t gy, size_t gz, size_t th) {
+    return run_src(x, ink_src, name, args, nargs, gx, gy, gz, th);
 }
 #define RUN(x, name, gx, gy, gz, th, ...)                                     \
     do {                                                                     \
@@ -299,7 +309,8 @@ TEST(ink_router) {
 // own rows: the window, the relative bias extent, the sink and the gate. half: the cache in f16
 // (the reference then sees the cached keys and values rounded to f16). flash: the prompt-chunk
 // kernel instead of the split-K one.
-static Err attn_case(Arena *a, QgenCtx *x, size_t pos0, size_t T, size_t win, size_t ext, size_t nsplit, bool half, bool flash,
+// flash: 0 the split-K kernels, 1 the prompt tiles, 2 the tensor-op prompt kernel (f16 cache)
+static Err attn_case(Arena *a, QgenCtx *x, size_t pos0, size_t T, size_t win, size_t ext, size_t nsplit, bool half, int flash,
                      float *err) {
     const size_t ld = NKV * HD, P = pos0 + T;
     float *K = ARENA_ARRAY(a, float, P * ld), *V = ARENA_ARRAY(a, float, P * ld);
@@ -347,7 +358,26 @@ static Err attn_case(Arena *a, QgenCtx *x, size_t pos0, size_t T, size_t win, si
     struct { uint32_t nh, nkv, hd, drel, ext, pos0, win, ring, nsplit, span, t; float scale; } p = {
         NH, NKV, HD, DREL, (uint32_t)ext, (uint32_t)pos0, (uint32_t)win, (uint32_t)win, (uint32_t)nsplit, span, (uint32_t)T,
         1.0f / sqrtf((float)HD)};
-    if (flash) {
+    if (flash == 2) {
+        // ink_mpp_attn: the queries per head in half (ink_mpp_attn_q), the chunk's rows in half,
+        // the bias table transposed
+        const uint32_t qrows = (uint32_t)((T + 31) / 32 * 32);
+        sx_buffer *bqh, *bkh, *bvh, *bpt;
+        TRY(gpu_new_buffer(&x->g, (size_t)NH * qrows * HD * 2, &bqh));
+        TRY(gpu_new_buffer(&x->g, T * ld * 2, &bkh));
+        TRY(gpu_new_buffer(&x->g, T * ld * 2, &bvh));
+        TRY(fbuf(x, NULL, (ext + 1) * 16, &bpt));
+        _Float16 *kh = sx_buffer_contents(bkh), *vh = sx_buffer_contents(bvh);
+        for (size_t i = 0; i < T * ld; i++) kh[i] = (_Float16)K[pos0 * ld + i], vh[i] = (_Float16)V[pos0 * ld + i];
+        float *pt = gpu_floats(bpt);
+        memset(pt, 0, (ext + 1) * 16 * 4);
+        for (size_t i = 0; i < DREL; i++)
+            for (size_t dd = 0; dd < ext; dd++) pt[dd * 16 + i] = proj[i * ext + dd];
+        sx_arg aq[] = {BA(bq), BA(bqh), BYTES(&p), BYTES(&qrows)};
+        TRY(run_src(x, ink_mpp_src, "ink_mpp_attn_q", aq, COUNT(aq), qrows, NH, 1, HD));
+        sx_arg am[] = {BA(bqh), BA(br), BA(bpt), BA(bkc), BA(bvc), BA(bkh), BA(bvh), BA(bs), BA(bg), BA(bo), BYTES(&p), BYTES(&qrows)};
+        TRY(run_src(x, ink_mpp_src, "ink_mpp_attn", am, COUNT(am), qrows / 32, NH, 1, 128));
+    } else if (flash) {
         sx_arg af[] = {BA(bq), BA(br), BA(bp), BA(bkc), BA(bvc), BA(bkn), BA(bvn), BA(bs), BA(bg), BA(bo), BYTES(&p)};
         TRY(run(x, half ? "ink_attn_flash_mma" : "ink_attn_flash", af, COUNT(af), NKV, (T + 15) / 16, 1, half ? 192 : 256));
     } else {
@@ -380,12 +410,18 @@ TEST(ink_attention) {
     EXPECT_OK(qgen_ctx_init(&a, &x));
     // decode and chunks; sliding with the ring wrapped (a chunk longer than the window too), full
     // with distances past the bias extent; both kernels, f32 and f16 caches
-    static const struct { size_t pos0, T, win, ext, nsplit; bool flash; } cs[] = {
+    static const struct { size_t pos0, T, win, ext, nsplit; int flash; } cs[] = {
         {0, 1, 64, 64, 1, false},    {200, 1, 64, 64, 3, false},  {130, 7, 64, 64, 2, false}, {40, 150, 64, 64, 4, false},
         {300, 1, 0, 96, 8, false},   {90, 20, 0, 96, 4, false},   {0, 37, 64, 64, 1, true},   {130, 70, 64, 64, 1, true},
-        {40, 150, 64, 64, 1, true},  {90, 50, 0, 96, 1, true},    {2000, 33, 0, 96, 1, true}, {5000, 1, 0, 96, 64, false}};
+        {40, 150, 64, 64, 1, true},  {90, 50, 0, 96, 1, true},    {2000, 33, 0, 96, 1, true}, {5000, 1, 0, 96, 64, false},
+        // the tensor-op kernel (f16 cache only; skipped without tensor ops)
+        {0, 37, 64, 64, 1, 2},       {130, 70, 64, 64, 1, 2},     {40, 150, 64, 64, 1, 2},    {90, 50, 0, 96, 1, 2},
+        {2000, 33, 0, 96, 1, 2},     {1000, 300, 0, 96, 1, 2}};
+    sx_pipeline *mp;
+    const bool accel = qgen_ctx_pipe(&x, ink_mpp_src, "ink_mpp_attn", &mp) == OK;
     for (int half = 0; half < 2; half++)
         for (size_t i = 0; i < COUNT(cs); i++) {
+            if (cs[i].flash == 2 && (!half || !accel)) continue;
             float e;
             EXPECT_OK(attn_case(&a, &x, cs[i].pos0, cs[i].T, cs[i].win, cs[i].ext, cs[i].nsplit, half, cs[i].flash, &e));
             // the f16-cache prompt kernel multiplies half Q, K, V and P
@@ -548,5 +584,270 @@ TEST(ink_e4m3) {
         const int e = (b >> 3) & 15, m = b & 7;
         const double want = (e == 0 ? m / 8.0 * pow(2, -6) : (1 + m / 8.0) * pow(2, e - 7)) * ((b & 0x80) ? -1 : 1);
         EXPECT(v == (float)want);
+    }
+}
+
+// The tensor-op chunk experts (src/kernels/inkling_mpp.metal) on random data: the plan (every
+// pair once, grouped by expert in token order, rows padded to 32, tiles of one expert), gate_up's
+// half activations against the f64 reference on the half-rounded inputs (the weights are exact in
+// half, so an activation must be the half rounding of a value within TOL_INK_KERNEL_REL of the
+// reference, relative to the largest), and down from the kernel's own activations within
+// TOL_INK_KERNEL_REL.
+static float half_ulp(float v) {
+    int e;
+    (void)frexpf(v, &e); // v in [2^(e-1), 2^e)
+    return ldexpf(1.0f, MAX(e - 11, -24));
+}
+static Err mpp_expert_case(Arena *a, QgenCtx *x, bool mx, size_t sh, size_t T, size_t E, size_t K, float *eh, float *ey) {
+    const size_t I = 1152, in_gu = H, in_dn = I;
+    const size_t gw_row = mx ? in_gu : in_gu / 2, gs_row = mx ? in_gu / 32 : in_gu / 16;
+    const size_t dw_row = mx ? in_dn : in_dn / 2, ds_row = mx ? in_dn / 32 : in_dn / 16;
+    const size_t gwE = 2 * I * gw_row, gsE = 2 * I * gs_row, dwE = H * dw_row, dsE = H * ds_row;
+    uint8_t *gw = ARENA_ARRAY(a, uint8_t, E * gwE), *gs = ARENA_ARRAY(a, uint8_t, E * gsE);
+    uint8_t *dw = ARENA_ARRAY(a, uint8_t, E * dwE), *ds = ARENA_ARRAY(a, uint8_t, E * dsE);
+    if (mx) {
+        rand_e4m3(x, gw, E * gwE, 0, 15);
+        rand_e4m3(x, dw, E * dwE, 0, 15);
+        // block scales from 2^-27 to 2^-8: products down to the half subnormals
+        for (size_t i = 0; i < E * gsE; i++) gs[i] = (uint8_t)(100 + qgen_prng_next(&x->rng) % 20);
+        for (size_t i = 0; i < E * dsE; i++) ds[i] = (uint8_t)(100 + qgen_prng_next(&x->rng) % 20);
+    } else {
+        qgen_prng_bytes(&x->rng, gw, E * gwE);
+        qgen_prng_bytes(&x->rng, dw, E * dwE);
+        rand_e4m3(x, gs, E * gsE, 0, 12);
+        rand_e4m3(x, ds, E * dsE, 0, 12);
+    }
+    float *gf = ARENA_ARRAY(a, float, E), *df = ARENA_ARRAY(a, float, E);
+    for (size_t e = 0; e < E; e++) gf[e] = ur(x, 1e-4f, 1e-3f), df[e] = ur(x, 1e-4f, 1e-3f);
+    float *xs = ARENA_ARRAY(a, float, T * H), *wts = ARENA_ARRAY(a, float, T * K);
+    uint32_t *idx = ARENA_ARRAY(a, uint32_t, T * K);
+    fill(x, xs, T * H, -2, 2);
+    if (mx) // MXFP8 sums are larger: keep them in the softcaps' working range
+        for (size_t i = 0; i < T * H; i++) xs[i] *= 0.1f;
+    fill(x, wts, T * K, 0.1f, 2);
+    // distinct experts per token, skewed so some experts fill several tiles
+    for (size_t t = 0; t < T; t++)
+        for (size_t k = 0; k < K; k++) {
+            uint32_t e;
+            bool dup;
+            do {
+                const uint64_t r = qgen_prng_next(&x->rng);
+                e = (uint32_t)(r % 3 == 0 ? r / 3 % 2 : r / 3 % E);
+                dup = false;
+                for (size_t j = 0; j < k; j++) dup = dup || idx[t * K + j] == e;
+            } while (dup);
+            idx[t * K + k] = e;
+        }
+    sx_buffer *b[4];
+    const uint8_t *src[4] = {gw, gs, dw, ds};
+    const size_t len[4] = {E * gwE, E * gsE, E * dwE, E * dsE};
+    for (int k = 0; k < 4; k++) {
+        TRY(gpu_new_buffer(&x->g, len[k] + 64, &b[k]));
+        memcpy((uint8_t *)sx_buffer_contents(b[k]) + sh, src[k], len[k]);
+    }
+    const size_t n = T * K, rows_cap = n + 31 * E, tiles_cap = rows_cap / 128 + E;
+    sx_buffer *bgf, *bdf, *bx, *bi, *bw, *bsrt, *bt, *bm, *bxs, *bhs, *by;
+    TRY(fbuf(x, gf, E, &bgf));
+    TRY(fbuf(x, df, E, &bdf));
+    TRY(fbuf(x, xs, T * H, &bx));
+    TRY(gpu_new_buffer(&x->g, n * 4, &bi));
+    memcpy(sx_buffer_contents(bi), idx, n * 4);
+    TRY(fbuf(x, wts, n, &bw));
+    TRY(gpu_new_buffer(&x->g, rows_cap * 4, &bsrt));
+    TRY(gpu_new_buffer(&x->g, tiles_cap * 16, &bt));
+    TRY(gpu_new_buffer(&x->g, 16, &bm));
+    TRY(gpu_new_buffer(&x->g, rows_cap * H * 2, &bxs));
+    TRY(gpu_new_buffer(&x->g, rows_cap * I * 2, &bhs));
+    TRY(fbuf(x, NULL, n * H, &by));
+    struct { uint32_t e, n; } pp = {(uint32_t)E, (uint32_t)n};
+    uint32_t gp2[2] = {H, (uint32_t)K};
+    struct { uint32_t h, i, k, sh_w, sh_s; uint64_t wsE, ssE; float gcap, ucap; } gp = {H, I, (uint32_t)K, (uint32_t)sh, (uint32_t)sh, gwE, gsE, 4.0f, 25.0f},
+                                                                                       dp = {H, I, (uint32_t)K, (uint32_t)sh, (uint32_t)sh, dwE, dsE, 4.0f, 25.0f};
+    {
+        sx_arg ap[] = {BA(bi), BA(bsrt), BA(bt), BA(bm), BYTES(&pp)};
+        TRY(run_src(x, ink_mpp_src, "ink_mpp_plan", ap, COUNT(ap), 1, 1, 1, 1024));
+        sx_arg ag0[] = {BA(bx), BA(bsrt), BA(bm), BA(bxs), gpu_bytes_arg(gp2, 8)};
+        TRY(run_src(x, ink_mpp_src, "ink_mpp_gather", ag0, COUNT(ag0), rows_cap, 1, 1, 256));
+        sx_arg ag[] = {BA(b[0]), BA(b[1]), BA(bgf), BA(bxs), BA(bt), BA(bm), BA(bhs), BYTES(&gp)};
+        TRY(run_src(x, ink_mpp_src, mx ? "ink_mpp_gu_mx" : "ink_mpp_gu_nv", ag, COUNT(ag), 2 * I / 64, tiles_cap, 1, 128));
+        sx_arg ad[] = {BA(b[2]), BA(b[3]), BA(bdf), BA(bhs), BA(bt), BA(bm), BA(bsrt), BA(bw), BA(by), BYTES(&dp)};
+        TRY(run_src(x, ink_mpp_src, mx ? "ink_mpp_dn_mx" : "ink_mpp_dn_nv", ad, COUNT(ad), H / 64, tiles_cap, 1, 128));
+    }
+    // the plan
+    const int32_t *srt = sx_buffer_contents(bsrt);
+    const uint32_t *meta = sx_buffer_contents(bm), (*tl)[4] = sx_buffer_contents(bt);
+    const size_t rows = meta[1], ntl = meta[0];
+    if (rows > rows_cap || ntl > tiles_cap || rows % 32) return "BadPlan";
+    size_t *row_of = ARENA_ARRAY(a, size_t, n);
+    for (size_t i = 0; i < n; i++) row_of[i] = SIZE_MAX;
+    int64_t prev = -1;
+    uint32_t pe = 0;
+    for (size_t r = 0; r < rows; r++) {
+        if (srt[r] < 0) continue;
+        const size_t i = (size_t)srt[r];
+        if (i >= n || row_of[i] != SIZE_MAX) return "BadPlan";
+        row_of[i] = r;
+        if (prev >= 0 && (idx[i] < pe || (idx[i] == pe && (int64_t)i <= prev))) return "BadPlan";
+        prev = (int64_t)i, pe = idx[i];
+    }
+    for (size_t i = 0; i < n; i++)
+        if (row_of[i] == SIZE_MAX) return "BadPlan";
+    size_t covered = 0;
+    for (size_t j = 0; j < ntl; j++) {
+        if (tl[j][3] - tl[j][1] > 128 || (tl[j][3] - tl[j][1]) % 32 || tl[j][2] > tl[j][3]) return "BadPlan";
+        for (size_t r = tl[j][1]; r < tl[j][3]; r++)
+            if (srt[r] >= 0 && idx[srt[r]] != tl[j][0]) return "BadPlan";
+        covered += tl[j][3] - tl[j][1];
+    }
+    if (covered != rows) return "BadPlan";
+    // activations and down
+    float *row = ARENA_ARRAY(a, float, H), *hr = ARENA_ARRAY(a, float, I), *hg = ARENA_ARRAY(a, float, I), *yr = ARENA_ARRAY(a, float, H);
+    const _Float16 *hs = sx_buffer_contents(bhs);
+    *eh = *ey = 0;
+    for (size_t i = 0; i < n; i++) {
+        const size_t t = i / K, e = idx[i], r = row_of[i];
+        float hmax = 0;
+        for (size_t j = 0; j < I; j++) {
+            double g = 0, u = 0;
+            if (mx) ink_ref_row_mx(gw + e * gwE, gs + e * gsE, H, 2 * j, row);
+            else ink_ref_row_nv(gw + e * gwE, gs + e * gsE, gf[e], H, 2 * j, row);
+            for (size_t c = 0; c < H; c++) g += (double)row[c] * (float)(_Float16)xs[t * H + c];
+            if (mx) ink_ref_row_mx(gw + e * gwE, gs + e * gsE, H, 2 * j + 1, row);
+            else ink_ref_row_nv(gw + e * gwE, gs + e * gsE, gf[e], H, 2 * j + 1, row);
+            for (size_t c = 0; c < H; c++) u += (double)row[c] * (float)(_Float16)xs[t * H + c];
+            hr[j] = ink_ref_swiglu((float)g, (float)u, 4.0f, 25.0f);
+            hmax = fmaxf(hmax, fabsf(hr[j]));
+            hg[j] = (float)hs[r * I + j];
+        }
+        for (size_t j = 0; j < I; j++) {
+            const float d = TOL_INK_KERNEL_REL * hmax, bound = 0.5f * half_ulp(fabsf(hr[j]) + d) + d;
+            const float over = fabsf(hg[j] - hr[j]) - bound;
+            *eh = fmaxf(*eh, over > 0 ? over / fmaxf(hmax, 1e-30f) + TOL_INK_KERNEL_REL : 0);
+        }
+        for (size_t c = 0; c < H; c++) {
+            if (mx) ink_ref_row_mx(dw + e * dwE, ds + e * dsE, I, c, row);
+            else ink_ref_row_nv(dw + e * dwE, ds + e * dsE, df[e], I, c, row);
+            double acc = 0;
+            for (size_t j = 0; j < I; j++) acc += (double)row[j] * hg[j];
+            yr[c] = (float)(acc * wts[i]);
+        }
+        *ey = fmaxf(*ey, rel(gpu_floats(by) + i * H, yr, H));
+    }
+    return OK;
+}
+
+TEST(ink_mpp_experts) {
+    Arena a = {0};
+    QgenCtx x;
+    EXPECT_OK(qgen_ctx_init(&a, &x));
+    sx_pipeline *p;
+    if (qgen_ctx_pipe(&x, ink_mpp_src, "ink_mpp_plan", &p)) SKIP("accelerator kernels do not compile");
+    static const struct { size_t T, E, K; } cs[] = {{1, 3, 2}, {40, 5, 3}, {300, 9, 8}};
+    for (int mx = 0; mx < 2; mx++)
+        for (size_t c = 0; c < COUNT(cs); c++) {
+            const size_t sh = (c * 5 + (size_t)mx * 3) % 16;
+            float eh, ey;
+            EXPECT_OK(mpp_expert_case(&a, &x, mx, sh, cs[c].T, cs[c].E, cs[c].K, &eh, &ey));
+            dbg("ink_mpp experts %s T %zu shift %zu: gate_up beyond the half rounding %.3g, down rel err %.3g\n", mx ? "mxfp8" : "nvfp4",
+                cs[c].T, sh, (double)eh, (double)ey);
+            if (!(eh <= TOL_INK_KERNEL_REL && ey <= TOL_INK_KERNEL_REL)) EXPECT(0);
+        }
+}
+
+
+// The message gate on the tensor ops (src/inkling.c enc_gate for prompt chunks: ink_mpp_msg_cat,
+// mmh_dense, to_half, mmh_dense, ink_mpp_msg_comb) against an f64 reference that rounds as the
+// kernels do (the normalized inputs, D, d, F and G to half), within TOL_INK_KERNEL_REL; T = 100.
+TEST(ink_mpp_msg_gate) {
+    Arena a = {0};
+    QgenCtx x;
+    EXPECT_OK(qgen_ctx_init(&a, &x));
+    sx_pipeline *pl;
+    if (qgen_ctx_pipe(&x, ink_mpp_src, "ink_mpp_msg_cat", &pl)) SKIP("accelerator kernels do not compile");
+    const size_t T = 100;
+    float *xs = ARENA_ARRAY(&a, float, T * H), *ms = ARENA_ARRAY(&a, float, T * 4 * H);
+    float *F = ARENA_ARRAY(&a, float, H * R), *G = ARENA_ARRAY(&a, float, H * R), *Df = ARENA_ARRAY(&a, float, R * 2 * H);
+    fill(&x, xs, T * H, -20, 20);
+    fill(&x, ms, T * 4 * H, -2, 2);
+    fill(&x, F, H * R, -0.2f, 0.2f);
+    fill(&x, G, H * R, -0.2f, 0.2f);
+    fill(&x, Df, R * 2 * H, -0.05f, 0.05f);
+    sx_buffer *bx, *bm, *bw, *bxc, *bd, *bdh, *bfg, *bo;
+    EXPECT_OK(fbuf(&x, xs, T * H, &bx));
+    EXPECT_OK(fbuf(&x, ms, T * 4 * H, &bm));
+    EXPECT_OK(gpu_new_buffer(&x.g, (size_t)4 * H * R * 2, &bw)); // D [R][2H], then F, G [H][R], f16
+    _Float16 *w16 = sx_buffer_contents(bw);
+    for (size_t i = 0; i < R * 2 * H; i++) w16[i] = (_Float16)Df[i];
+    for (size_t i = 0; i < H * R; i++) w16[R * 2 * H + i] = (_Float16)F[i], w16[R * 2 * H + H * R + i] = (_Float16)G[i];
+    EXPECT_OK(gpu_new_buffer(&x.g, T * 2 * H * 2, &bxc));
+    EXPECT_OK(fbuf(&x, NULL, T * R, &bd));
+    EXPECT_OK(gpu_new_buffer(&x.g, T * R * 2, &bdh));
+    EXPECT_OK(fbuf(&x, NULL, T * 2 * H, &bfg));
+    EXPECT_OK(fbuf(&x, NULL, T * H, &bo));
+    struct { uint32_t h, r, xs, ms; float eps; } mp = {H, R, H, 4 * H, 1e-6f};
+    uint32_t d1[3] = {2 * H, R, (uint32_t)T}, d2[3] = {R, 2 * H, (uint32_t)T}, nd = (uint32_t)(T * R);
+    {
+        sx_arg a1[] = {BA(bx), BO(bm, 2 * H * 4), BA(bxc), BYTES(&mp)};
+        EXPECT_OK(run_src(&x, ink_mpp_src, "ink_mpp_msg_cat", a1, COUNT(a1), T, 1, 1, 256));
+        sx_arg a2[] = {BA(bxc), BA(bw), BA(bd), gpu_bytes_arg(d1, 12)};
+        EXPECT_OK(run_src(&x, qmm_mpp_src, "mmh_dense", a2, COUNT(a2), R / 32, (T + 63) / 64, 1, 32));
+        sx_arg a3[] = {BA(bd), BA(bdh), BYTES(&nd)};
+        EXPECT_OK(run_src(&x, qmm_mpp_src, "to_half", a3, COUNT(a3), (nd + 255) / 256, 1, 1, 256));
+        sx_arg a4[] = {BA(bdh), BO(bw, R * 2 * H * 2), BA(bfg), gpu_bytes_arg(d2, 12)};
+        EXPECT_OK(run_src(&x, qmm_mpp_src, "mmh_dense", a4, COUNT(a4), 2 * H / 32, (T + 63) / 64, 1, 32));
+        sx_arg a5[] = {BA(bx), BO(bm, 2 * H * 4), BA(bfg), BA(bo), BYTES(&mp)};
+        EXPECT_OK(run_src(&x, ink_mpp_src, "ink_mpp_msg_comb", a5, COUNT(a5), H / 256, T, 1, 256));
+    }
+    // d on the GPU's half inputs (checked), then the output from the GPU's d in half (checked)
+    const _Float16 *xc = sx_buffer_contents(bxc);
+    float *dref = ARENA_ARRAY(&a, float, R), *ref = ARENA_ARRAY(&a, float, H);
+    float worst_d = 0, worst_o = 0;
+    for (size_t t = 0; t < T; t++) {
+        const float *xr = xs + t * H, *mr = ms + t * 4 * H + 2 * H;
+        double sx = 0, sm = 0;
+        for (size_t i = 0; i < H; i++) sx += (double)xr[i] * xr[i], sm += (double)mr[i] * mr[i];
+        const double rx = 1.0 / sqrt(sx / H + 1e-6), rm = 1.0 / sqrt(sm / H + 1e-6);
+        for (size_t i = 0; i < H; i++) {
+            const float wx = (float)(_Float16)(float)(xr[i] * rx), wm = (float)(_Float16)(float)(mr[i] * rm);
+            if (fabsf(wx - (float)xc[t * 2 * H + i]) > 1e-3f * fabsf(wx) || fabsf(wm - (float)xc[t * 2 * H + H + i]) > 1e-3f * fabsf(wm))
+                worst_d = 1; // the normalized inputs beyond one half ulp
+        }
+        for (size_t r = 0; r < R; r++) {
+            double acc = 0;
+            for (size_t i = 0; i < 2 * H; i++) acc += (double)(float)w16[r * 2 * H + i] * (float)xc[t * 2 * H + i];
+            dref[r] = (float)acc;
+        }
+        worst_d = fmaxf(worst_d, rel(gpu_floats(bd) + t * R, dref, R));
+        const _Float16 *dg = (const _Float16 *)sx_buffer_contents(bdh) + t * R;
+        for (size_t c = 0; c < H; c++) {
+            double f = 0, gg = 0;
+            for (size_t k = 0; k < R; k++)
+                f += (double)(float)w16[R * 2 * H + c * R + k] * (float)dg[k], gg += (double)(float)w16[R * 2 * H + H * R + c * R + k] * (float)dg[k];
+            ref[c] = (float)((1 - tanh(f)) * xr[c] + tanh(gg) * mr[c]);
+        }
+        worst_o = fmaxf(worst_o, rel(gpu_floats(bo) + t * H, ref, H));
+    }
+    dbg("ink_mpp msg gate: d rel err %.3g, output rel err %.3g\n", (double)worst_d, (double)worst_o);
+    EXPECT(worst_d <= TOL_INK_KERNEL_REL && worst_o <= TOL_INK_KERNEL_REL);
+}
+
+// The tensor-op file's own code decodes (inkling_mpp.metal im_e4m3, the NVFP4 table) over every
+// byte against the reference: E4M3 exact in f32 and in half (subnormal codes included, through
+// half bit patterns converted to f32), both E2M1 values of each byte exact.
+TEST(ink_mpp_codes) {
+    Arena a = {0};
+    QgenCtx x;
+    EXPECT_OK(qgen_ctx_init(&a, &x));
+    sx_pipeline *pl;
+    if (qgen_ctx_pipe(&x, ink_mpp_src, "ink_mpp_codes", &pl)) SKIP("accelerator kernels do not compile");
+    sx_buffer *b;
+    EXPECT_OK(fbuf(&x, NULL, 1024, &b));
+    sx_arg ar[] = {BA(b)};
+    EXPECT_OK(run_src(&x, ink_mpp_src, "ink_mpp_codes", ar, 1, 1, 1, 1, 128));
+    static const float e2m1[16] = {0, 0.5f, 1, 1.5f, 2, 3, 4, 6, -0.0f, -0.5f, -1, -1.5f, -2, -3, -4, -6};
+    const float *o = gpu_floats(b);
+    for (int c = 0; c < 256; c++) {
+        if ((c & 0x7f) != 0x7f) EXPECT(o[c] == ink_ref_e4m3((uint8_t)c) && o[256 + c] == o[c]);
+        EXPECT(o[512 + c] == e2m1[c & 15] && o[768 + c] == e2m1[c >> 4]);
     }
 }

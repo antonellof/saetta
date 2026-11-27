@@ -23,5 +23,12 @@ bool inkling_has_routes(const Model *m);
 void inkling_set_routes(Model *m, InkRouteMode mode);
 // The counts since the last call (then reset).
 InkRouteStats inkling_route_stats(Model *m);
+// Prompt chunks on the tensor ops with half activations (M5 and later; not with SAETTA_NO_ACCEL=1):
+// whether their kernels loaded, and switching them on (the default) or off (the exact f32 chunks).
+bool inkling_half_available(const Model *m);
+void inkling_set_half(Model *m, bool on);
+bool inkling_half(const Model *m);
+// Tokens per prompt chunk.
+size_t inkling_prompt_chunk(void);
 
 #endif

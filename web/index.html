@@ -37,7 +37,7 @@
     "description": "Saetta is a local coding agent in C that runs Qwen3.8 and Inkling 2 Mini coding models in its own process on Apple Silicon Macs. Its open-source inference engine, in C and hand-written Metal, also serves Claude Code, pi and opencode.",
     "applicationCategory": "DeveloperApplication",
     "operatingSystem": "macOS 26 or later, Apple Silicon (M1 or later), 32 GB of memory or more",
-    "softwareVersion": "0.22.0",
+    "softwareVersion": "0.23.0",
     "license": "https://opensource.org/licenses/MIT",
     "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
     "downloadUrl": "https://github.com/antonellof/saetta/releases/latest",
@@ -150,7 +150,7 @@
     <div class="wrap">
       <a class="brand" href="#top">
         <svg viewBox="0 0 32 32" width="20" height="20" aria-hidden="true"><path d="M18.5 3 7 18h7.5L12 29l13-16h-7.8z" fill="currentColor"/></svg>
-        Saetta <span class="ver">v0.22.0</span>
+        Saetta <span class="ver">v0.23.0</span>
       </a>
       <nav class="links">
         <a href="#models">Models</a>
@@ -414,7 +414,7 @@ saetta code --mode json -p "list the TODOs"</pre>
           <h2>Coming next</h2>
           <div class="nope">
             <div><h3>Inkling sessions saved</h3><p>The engine's state saved with each Inkling 2 Mini session too, as it already is for Qwen, so a resumed session does not read its prompt again.</p></div>
-            <div><h3>Prompts read ahead</h3><p>Tool output and your draft read by the model while the tool runs and while you type.</p></div>
+            <div><h3>Your draft read ahead</h3><p>Tool output is already read while the tool runs; next, your draft read by the model while you type.</p></div>
             <div><h3>Inkling at full speed</h3><p>Inkling 2 Mini already reads prompts on the M5's tensor ops; next, the last 19% to Strata there and a cheaper DSpark verify pass.</p></div>
             <div><h3>A sandbox for commands</h3><p>The agent's commands and file tools confined to the project by macOS's Seatbelt.</p></div>
           </div>

@@ -46,7 +46,7 @@
     <div class="wrap">
       <a class="brand" href="/">
         <svg viewBox="0 0 32 32" width="20" height="20" aria-hidden="true"><path d="M18.5 3 7 18h7.5L12 29l13-16h-7.8z" fill="currentColor"/></svg>
-        Saetta <span class="ver">v0.22.0</span>
+        Saetta <span class="ver">v0.23.0</span>
       </a>
       <nav class="links">
         <a href="/#models">Models</a>
@@ -112,7 +112,8 @@
 <tr><td><code>SAETTA_DURABLE</code></td><td><code>1</code></td><td><code>0</code> keeps no journal of the run, so an interrupted run cannot be resumed (<a href="/docs/sessions/#interrupted-runs">Interrupted runs</a>)</td></tr>
 <tr><td><code>SAETTA_DURABLE_SYNC</code></td><td><code>barrier</code></td><td>how a journal record reaches the disk before a tool that is never run again starts: <code>barrier</code> (F_BARRIERFSYNC), <code>full</code> (F_FULLFSYNC), <code>none</code> (survives a crash of the process, not a power loss)</td></tr>
 <tr><td><code>VISUAL</code>, <code>EDITOR</code></td><td>nano</td><td>the editor Ctrl+G opens, when settings.json has no <code>externalEditor</code></td></tr>
-<tr><td><code>SAETTA_STATE</code></td><td>1</td><td><code>0</code> turns off the conversation state on disk (<code>~/.saetta/state</code>): a resumed session then reads its history again</td></tr></tbody></table></div>
+<tr><td><code>SAETTA_STATE</code></td><td>1</td><td><code>0</code> turns off the conversation state on disk (<code>~/.saetta/state</code>): a resumed session then reads its history again</td></tr>
+<tr><td><code>SAETTA_AHEAD</code></td><td>1</td><td><code>0</code> turns off reading a running command&#39;s output into the conversation before the next request (<a href="/docs/sessions/">Sessions</a>)</td></tr></tbody></table></div>
       </article>
       <p class="doc-edit"><a href="https://github.com/antonellof/saetta/blob/main/docs/environment.md" rel="noopener">Edit this page on GitHub</a></p>
       <nav class="doc-pager" aria-label="Previous and next"><a class="prev" href="/docs/commands/"><span>Previous</span>Commands</a><a class="next" href="/docs/faq/"><span>Next</span>FAQ</a></nav>

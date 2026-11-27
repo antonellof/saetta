@@ -43,6 +43,8 @@ Sampling fields and their defaults: `max_tokens` or `max_completion_tokens` (409
 
 `tool_choice`: `none` leaves the tools out of the prompt; `required`, or a named function, starts the answer with a tool call. The usage block reports reused prompt tokens as `prompt_tokens_details.cached_tokens`.
 
+With `SAETTA_GRAMMAR=1` on the server (off by default), tool calls are decoded under a grammar built from the request's `tools` (Qwen3.8 models): a call cannot open inside the reasoning, names one of the request's tools, gives every required argument, writes an argument whose schema type is not text as one JSON value of that type (an `edits` array, a number), with the declared object keys, item types and required keys, and holds nothing the parser would split; after the last call only another call or the end may follow. `enum`, `const` and the schema combinators (`anyOf`, `oneOf`, `allOf`) are not checked, nor an undeclared key written twice in one object, nor an argument whose type is a union with `string` (its text is free, and text that reads as JSON is passed on as that JSON). The model's own token is kept whenever the grammar allows it, and only a token it refuses is replaced by the most likely one it allows, so a greedy answer whose calls are already well formed comes out the same.
+
 ### chat_template_kwargs
 
 The chat template's options go in `chat_template_kwargs` (or at the top level of the request):

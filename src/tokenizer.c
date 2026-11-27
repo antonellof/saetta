@@ -419,6 +419,34 @@ void tokenizer_decode_append(const Tokenizer *t, uint32_t id, Buf *out) {
     }
 }
 
+size_t tokenizer_token_bytes(const Tokenizer *t, uint32_t id, char *out, size_t cap) {
+    if (id >= t->n_ids) return 0;
+    Str s = t->id_text[id];
+    for (size_t k = 0; k < t->n_specials; k++)
+        if (t->specials[k].id == id) {
+            if (s.len > cap) {
+                memcpy(out, s.ptr, cap);
+                return cap + 1;
+            }
+            memcpy(out, s.ptr, s.len);
+            return s.len;
+        }
+    size_t i = 0, o = 0;
+    while (i < s.len) {
+        int n = utf8_seq_len((uint8_t)s.ptr[i]);
+        if (n == 0 || i + (size_t)n > s.len) n = 1;
+        uint32_t cp = (uint8_t)s.ptr[i];
+        if (n > 1) {
+            cp = (uint8_t)s.ptr[i] & (0x7F >> n);
+            for (int k = 1; k < n; k++) cp = cp << 6 | ((uint8_t)s.ptr[i + k] & 0x3F);
+        }
+        if (o == cap) return cap + 1;
+        out[o++] = cp < 512 && t->cp_byte[cp] >= 0 ? (char)t->cp_byte[cp] : '?';
+        i += (size_t)n;
+    }
+    return o;
+}
+
 // ---- pre-tokenizer: qwen_split as a state machine, alternatives tried in order --------
 
 typedef struct {

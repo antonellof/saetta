@@ -3,6 +3,12 @@
 All notable changes to saetta and Saetta Code (`saetta code`), newest first. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are saetta's.
 
+## [Unreleased]
+
+### Added
+
+- `SAETTA_GRAMMAR=1` (off by default) decodes tool calls under a grammar built from the request's tools, for Qwen3.8 models, in process and over HTTP: a call cannot open inside the reasoning, names one of the request's tools, gives every required argument, writes a typed argument as JSON of its type and holds nothing the parser would split; after the last call only another call or the end may follow. The model's own token is kept whenever the grammar allows it, so a greedy answer whose calls are already well formed comes out the same. On 30 small coding tasks with the Coder pack (Saetta Code and pi, greedy and sampled, 180 runs, measured on an earlier revision of the switch), it took the malformed calls from 17 to none and the tasks lost to them from 3 to none, at no measurable cost per token; the released revision, run again greedy, also gave no malformed call. It stays off by default because the seconds per task did not fall.
+
 ## [0.25.0] - 2026-11-27
 
 ### Added

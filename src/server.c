@@ -31,6 +31,7 @@
 #include "engine_id.h"
 #include "engine_env.h"
 #include "split.h"
+#include "grammar.h"
 #include "stats.h"
 #include "tokenizer.h"
 #include "toolcall.h"
@@ -172,6 +173,7 @@ typedef struct Engine {
     Feed feed[FEED_SESSIONS];
     uint64_t feed_clock;
     size_t last_fed; // the last request's passes that drafted from fed texts (for tests)
+    size_t last_replaced; // the last request's tokens the tool-call grammar replaced (for tests)
 } Engine;
 
 static uint64_t turn_take(Engine *e) { return turns_take(&e->turns); }
@@ -690,6 +692,120 @@ uint32_t server_sample_pick(void *ctx, const float *row, bool has_draft, uint32_
     return draw(c->rng, c->cand, p, n, tot);
 }
 
+// ---- the tool-call grammar (SAETTA_GRAMMAR=1, src/grammar.h) -----------------------------------
+//
+// A token the grammar refuses is replaced, and only then: greedy takes the model's argmax whenever
+// it is valid (so a reply whose calls are well formed is unchanged), else the valid token with the
+// highest logit; sampling draws as without the grammar and, when the draw is refused, draws again
+// from the distribution restricted to valid tokens (the two steps together sample that restricted
+// distribution exactly). No allocation: the state is copied on the stack for each check.
+
+// The first replacements of a request, for its log line (refused token, the one taken, the reply's
+// token index), kept without allocation.
+typedef struct {
+    size_t n;
+    uint32_t refused[4], taken[4];
+    size_t at[4];
+    size_t gen; // tokens emitted so far (the index of the next one)
+} GramLog;
+
+static void gram_note(GramLog *l, size_t ahead, uint32_t refused, uint32_t taken) {
+    if (!l || l->n >= 4) return;
+    l->refused[l->n] = refused;
+    l->taken[l->n] = taken;
+    l->at[l->n] = l->gen + ahead;
+    l->n++;
+}
+
+static bool grammar_switch(void) {
+    const char *v = getenv("SAETTA_GRAMMAR");
+    return v && v[0] && v[0] != '0';
+}
+
+// The valid token with the highest logit of row, first (the model's own choice) when it is valid:
+// the top 256 in order, then the whole vocabulary.
+static uint32_t gram_best_of(const Grammar *g, const GState *st, const float *row, size_t len, uint32_t first, uint32_t *cand) {
+    size_t n = server_top_k(row, len, 256, cand);
+    for (size_t i = 0; i < n; i++)
+        if (grammar_ok(g, st, cand[i])) return cand[i];
+    uint32_t best = first;
+    bool any = false;
+    for (size_t i = 0; i < len; i++)
+        if ((!any || row[i] > row[best]) && grammar_ok(g, st, (uint32_t)i)) {
+            best = (uint32_t)i;
+            any = true;
+        }
+    return best;
+}
+
+static uint32_t gram_best(const Grammar *g, const GState *st, const float *row, size_t len, uint32_t first, uint32_t *cand,
+                          size_t *masked, GramLog *lg, size_t ahead) {
+    if (grammar_ok(g, st, first)) return first;
+    *masked += 1;
+    uint32_t t = gram_best_of(g, st, row, len, first, cand);
+    gram_note(lg, ahead, first, t);
+    return t;
+}
+
+// A sampled token t refused by the grammar: a draw from the distribution of row restricted to
+// valid tokens (the greedy best when none of its candidates is valid).
+static uint32_t gram_redraw(QgenPrng *rng, const Grammar *g, const GState *st, const float *row, size_t len, Sampling sp,
+                            uint32_t t, uint32_t *cand, size_t *masked, GramLog *lg, size_t ahead) {
+    float p[256];
+    size_t n = dist(row, len, sp, cand, p);
+    float tot = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (!grammar_ok(g, st, cand[i])) p[i] = 0;
+        tot += p[i];
+    }
+    if (tot > 0) {
+        *masked += 1;
+        uint32_t d = draw(rng, cand, p, n, tot);
+        gram_note(lg, ahead, t, d);
+        return d;
+    }
+    return gram_best(g, st, row, len, t, cand, masked, lg, ahead);
+}
+
+static uint32_t gram_sample(Engine *e, const Grammar *g, const GState *st, const float *logits, size_t len, Sampling sp,
+                            uint32_t *cand, size_t *masked, GramLog *lg) {
+    uint32_t t = sample(e, logits, len, sp, cand);
+    if (grammar_ok(g, st, t)) return t;
+    if (sp.temperature <= 0) return gram_best(g, st, logits, len, t, cand, masked, lg, 0);
+    return gram_redraw(&e->rng, g, st, logits, len, sp, t, cand, masked, lg, 0);
+}
+
+// The token rule of a speculation round under the grammar (a SpecPick): the rule of the round
+// without it (argmax, or SampleChooser's) when its token is valid, else as gram_sample; st walks
+// the tokens picked, from the state after the round's first token.
+typedef struct {
+    const Grammar *g;
+    GState st;
+    QgenPrng *rng;
+    Sampling sp;
+    uint32_t *cand;
+    size_t vocab;
+    size_t masked;
+    GramLog *log;
+    size_t row; // rows picked so far (the token index past the round's first token)
+} GramPick;
+
+static uint32_t gram_pick(void *ctx, const float *row, bool has_draft, uint32_t d) {
+    GramPick *p = ctx;
+    uint32_t t;
+    if (p->sp.temperature <= 0)
+        t = gram_best(p->g, &p->st, row, p->vocab, model_argmax(row, p->vocab), p->cand, &p->masked, p->log, p->row);
+    else {
+        SampleChooser c = {p->rng, p->sp, p->cand, p->vocab};
+        t = server_sample_pick(&c, row, has_draft, d);
+        if (!grammar_ok(p->g, &p->st, t))
+            t = gram_redraw(p->rng, p->g, &p->st, row, p->vocab, p->sp, t, p->cand, &p->masked, p->log, p->row);
+    }
+    grammar_feed(p->g, &p->st, t);
+    p->row++;
+    return t;
+}
+
 // ---- requests ---------------------------------------------------------------------------------
 
 typedef enum { FMT_OPENAI, FMT_ANTHROPIC } Fmt;
@@ -1134,7 +1250,20 @@ static Err generate_reply(Engine *e, Arena *a, Conn *c, Req *h, Work *w, JValue 
     Depth *depth = &e->depth[e->active];
     uint32_t queue[KMAX];
     size_t qn = 0, qi = 0;
-    uint32_t next = sample(e, logits, model_info(e->m)->vocab, sp, cand);
+    // SAETTA_GRAMMAR=1: tool calls decoded under the grammar of the request's tools (Qwen chat
+    // format only); gs is the state after the tokens emitted so far
+    Grammar *gr = NULL;
+    GState gs = {0};
+    size_t g_masked = 0;
+    GramLog glog = {0};
+    const size_t vocab = model_info(e->m)->vocab;
+    e->last_replaced = 0;
+    if (grammar_switch() && tools && model_info(e->m)->chat == CHAT_QWEN) {
+        gr = grammar_build(a, tools, e->tok, model_info(e->m)->eos, model_info(e->m)->n_eos);
+        if (gr->n_tools > 0) gs = grammar_start(gr, thinking, forced);
+        else gr = NULL; // no tool a call could name: nothing to hold the reply to
+    }
+    uint32_t next = gr ? gram_sample(e, gr, &gs, logits, vocab, sp, cand, &g_masked, &glog) : sample(e, logits, vocab, sp, cand);
     size_t passes = 0;
     uint32_t *gen_ids = ARENA_ARRAY(a, uint32_t, max_tokens + 1);
     size_t n_gen_ids = 0;
@@ -1145,6 +1274,10 @@ static Err generate_reply(Engine *e, Arena *a, Conn *c, Req *h, Work *w, JValue 
         n_gen += 1;
         atomic_store_explicit(&e->st->gen, (uint32_t)n_gen, memory_order_release);
         gen_ids[n_gen_ids++] = t;
+        if (gr) {
+            grammar_feed(gr, &gs, t);
+            glog.gen = n_gen;
+        }
         bool eos = false;
         const ModelInfo *mi = model_info(e->m);
         for (size_t i = 0; i < mi->n_eos; i++)
@@ -1202,7 +1335,11 @@ static Err generate_reply(Engine *e, Arena *a, Conn *c, Req *h, Work *w, JValue 
         } else if (nd > 0 && !gate_allow(gate)) nd = 0;
         if (nd > 0) {
             SpecResult sr;
-            if (greedy) TRY(model_spec_greedy(e->m, e->s, t, drafts, nd, &sr));
+            if (gr) {
+                GramPick gp = {gr, gs, &e->rng, sp, cand, vocab, 0, &glog, 0};
+                TRY(model_spec_verify(e->m, e->s, t, drafts, nd, gram_pick, &gp, &sr));
+                g_masked += gp.masked;
+            } else if (greedy) TRY(model_spec_greedy(e->m, e->s, t, drafts, nd, &sr));
             else {
                 SampleChooser ch = {&e->rng, sp, cand, model_info(e->m)->vocab};
                 TRY(model_spec_verify(e->m, e->s, t, drafts, nd, server_sample_pick, &ch, &sr));
@@ -1218,7 +1355,7 @@ static Err generate_reply(Engine *e, Arena *a, Conn *c, Req *h, Work *w, JValue 
             qi = 1;
         } else {
             TRY(model_step(e->m, e->s, t, &logits));
-            next = sample(e, logits, model_info(e->m)->vocab, sp, cand);
+            next = gr ? gram_sample(e, gr, &gs, logits, vocab, sp, cand, &g_masked, &glog) : sample(e, logits, vocab, sp, cand);
             if (spec_on && model_has_mtp(e->m)) depth_record(depth, 0, 0, depth_ms(depth, 0, tr0, fixed));
         }
     }
@@ -1262,8 +1399,27 @@ static Err generate_reply(Engine *e, Arena *a, Conn *c, Req *h, Work *w, JValue 
         n, reused, (long long)pre_ms, n_gen, (long long)dec_ms, fx((double)n_gen * 1000.0 / (double)MAX(dec_ms, (int64_t)1), 2),
         passes, finish, fmt == FMT_ANTHROPIC ? " (anthropic)" : "", e->active + 1, e->n_conv);
     e->last_fed = fed_p;
+    e->last_replaced = g_masked;
     dbg("spec: lookup %zu passes %zu drafted %zu accepted, mtp %zu passes %zu drafted %zu accepted, fed %zu\n", lk_p, lk_d, lk_a,
         mtp_p, mtp_d, mtp_a, fed_p);
+    if (gr) {
+        // the first replacements: the refused token's text, the one taken, and where (token index)
+        char line[640];
+        size_t o = (size_t)snprintf(line, sizeof line, "grammar: %zu tokens replaced", g_masked);
+        for (size_t i = 0; i < glog.n && o < sizeof line - 160; i++) {
+            char rb[48], tb[48];
+            size_t rn = tokenizer_token_bytes(e->tok, glog.refused[i], rb, sizeof rb - 1);
+            size_t tn = tokenizer_token_bytes(e->tok, glog.taken[i], tb, sizeof tb - 1);
+            Buf q = {0};
+            chat_json_string(&q, str_n(rb, MIN(rn, sizeof rb - 1)));
+            buf_adds(&q, " -> ");
+            chat_json_string(&q, str_n(tb, MIN(tn, sizeof tb - 1)));
+            o += (size_t)snprintf(line + o, sizeof line - o, "%s %.*s at %zu", i ? "," : ":", (int)MIN(q.len, (size_t)120), q.ptr,
+                                  glog.at[i]);
+            buf_free(&q);
+        }
+        dbg("%s\n", line);
+    }
     {
         Done d = {0};
         d.anthropic = fmt == FMT_ANTHROPIC;
@@ -2403,6 +2559,7 @@ void server_engine_feed_clear(Engine *e, const char *session) {
 }
 
 size_t server_engine_feed_drafts(const Engine *e) { return e->last_fed; }
+size_t server_engine_grammar_replaced(const Engine *e) { return e->last_replaced; }
 
 size_t server_engine_feed_tokens(Engine *e, const char *session, size_t *texts, size_t *bytes) {
     pthread_mutex_lock(&e->feed_mu);

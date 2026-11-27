@@ -53,6 +53,9 @@ Err tokenizer_encode_text(const Tokenizer *t, Str raw, VecU32 *out);
 
 // Appends the bytes of token `id` to out (nothing for an id out of range).
 void tokenizer_decode_append(const Tokenizer *t, uint32_t id, Buf *out);
+// The same into out (room for cap bytes, no allocation): the length, cap + 1 when the token is
+// longer (out then holds its first cap bytes), 0 for an id out of range.
+size_t tokenizer_token_bytes(const Tokenizer *t, uint32_t id, char *out, size_t cap);
 
 // End of the pre-tokenizer piece that starts at byte i < s.len, for Qwen's regex and for
 // o200k (exposed for tests).

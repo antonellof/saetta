@@ -328,9 +328,10 @@ static Err verify_dsv4(Arena *a, FILE *out, const Pack *pack, const char *pack_d
 //   dumped positions; the chunked prefill's last-token KL and argmax (TOL_PREFILL_FAST_KL); a
 //   verification chunk;
 // - where the tensor ops run, the accelerated prompt chunks (half activations, the default there)
-//   on the f16 KV cache: last-token KL (TOL_PREFILL_FAST_KL) and argmax on both routings, and the
-//   per-visit bound TOL_PREFILL_FAST_LAYER_REL on the oracle's experts (the exact checks above run
-//   with them off).
+//   in whole prompt chunks: last-token KL (TOL_PREFILL_FAST_KL) and argmax on the f16 KV cache with
+//   both routings and on an f32 cache with the oracle's; on the oracle's experts also the
+//   per-visit bound TOL_PREFILL_FAST_LAYER_REL and the router differences TOL_INK_HALF_ROUTE_FRAC
+//   (the exact checks above run with them off).
 // Goldens longer than a prompt chunk are run in pieces (the prefill trace of a piece only).
 
 #define INK_PIECE 1024
@@ -391,15 +392,15 @@ static Err ink_decode(Arena *a, FILE *out, Model *m, Session *s, const DsGolden 
     return OK;
 }
 
-// The prefill over the golden in pieces: per-visit worst at the dumped positions; the last
-// logits in *plog.
-static Err ink_prefill(Model *m, Session *s, sx_buffer *tb, const DsGolden *G, const uint32_t *tokens, const size_t *pidx,
-                       float *pw, float **plog) {
+// The prefill over the golden in pieces of `piece` tokens: per-visit worst at the dumped
+// positions; the last logits in *plog.
+static Err ink_prefill_in(Model *m, Session *s, sx_buffer *tb, const DsGolden *G, const uint32_t *tokens, const size_t *pidx,
+                          size_t piece, float *pw, float **plog) {
     const size_t L = G->layers, W = G->width, N = G->ntok;
     for (size_t li = 0; li < L; li++) pw[li] = 0;
     session_reset(s);
-    for (size_t t0 = 0; t0 < N; t0 += INK_PIECE) {
-        const size_t n = MIN((size_t)INK_PIECE, N - t0);
+    for (size_t t0 = 0; t0 < N; t0 += piece) {
+        const size_t n = MIN(piece, N - t0);
         TRY(model_prefill(m, s, tokens + t0, n, tb, plog));
         const float *tr = gpu_floats(tb);
         for (size_t t = t0; t < t0 + n; t++) {
@@ -409,6 +410,10 @@ static Err ink_prefill(Model *m, Session *s, sx_buffer *tb, const DsGolden *G, c
         }
     }
     return OK;
+}
+static Err ink_prefill(Model *m, Session *s, sx_buffer *tb, const DsGolden *G, const uint32_t *tokens, const size_t *pidx, float *pw,
+                       float **plog) {
+    return ink_prefill_in(m, s, tb, G, tokens, pidx, INK_PIECE, pw, plog);
 }
 
 // The routers' own top-8 against the oracle's over the last run: a difference at a clear margin fails.
@@ -492,7 +497,9 @@ static Err verify_inkling(Arena *a, FILE *out, const Pack *pack, const char *pac
         ok = ink_routes_ok(out, m, "decode routers", &rs) && ok;
     }
     float *plog = NULL;
-    if (!err) err = gpu_new_buffer(&g, L * INK_PIECE * W * 4, &tb);
+    // the trace of a piece: INK_PIECE tokens, or a whole prompt chunk (the accelerated checks)
+    const size_t tb_rows = half_av ? MAX((size_t)INK_PIECE, inkling_prompt_chunk()) : (size_t)INK_PIECE;
+    if (!err) err = gpu_new_buffer(&g, L * tb_rows * W * 4, &tb);
     static const char *const chunks[2] = {NULL, "200"};
     for (int k = 0; k < 2 && !err; k++) {
         if (chunks[k]) setenv("SAETTA_INK_PCH", chunks[k], 1);
@@ -587,29 +594,38 @@ static Err verify_inkling(Arena *a, FILE *out, const Pack *pack, const char *pac
         fprintf(out, "prefill (chunks), its own experts: worst visit rel err %s (not gated), last-token KL(ref||engine) %s, argmax %s%s\n",
                 e3(b1, pmax), e3d(b2, k), eq ? "equal" : "DIFFERENT", pok ? "" : "  FAIL");
     }
-    // the accelerated prompt chunks (the default where the tensor ops run) on the default f16 KV
-    // cache, gated as the other models' accelerated prefill: last-token KL and argmax, and on the
-    // oracle's experts the per-visit bound for gross errors (TOL_PREFILL_FAST_LAYER_REL); the
-    // routers' own choices are reported (half activations move their scores by more than the
-    // exact paths' route margins)
+    // the accelerated prompt chunks (the default where the tensor ops run), in whole prompt chunks
+    // as served (a chunk wider than the window writes the ring), gated as the other models'
+    // accelerated prefill: last-token KL and argmax; on the oracle's experts also the per-visit
+    // bound for gross errors (TOL_PREFILL_FAST_LAYER_REL) and the share of (visit, token) pairs
+    // whose router differs from the oracle's (half activations move the scores by more than the
+    // exact paths' route margins: bounded by TOL_INK_HALF_ROUTE_FRAC, not by them). On the f16 KV
+    // cache (the default) with both routings, and once on an f32 cache (SAETTA_KV_F32: the
+    // exact attention tiles after half projections).
     if (!err && half_av) {
         inkling_set_half(m, true);
-        for (int own = 0; own < 2 && !err; own++) {
+        const size_t piece = inkling_prompt_chunk();
+        static const struct { bool own, f32kv; } runs[3] = {{false, false}, {true, false}, {false, true}};
+        for (int r = 0; r < 3 && !err; r++) {
+            const bool own = runs[r].own;
             inkling_set_routes(m, own ? INK_ROUTES_OWN : INK_ROUTES_REPLAY);
-            err = ink_prefill(m, sh, tb, G, tokens, pidx, pw, &plog);
+            err = ink_prefill_in(m, runs[r].f32kv ? s : sh, tb, G, tokens, pidx, piece, pw, &plog);
             if (err) break;
             const InkRouteStats hs = inkling_route_stats(m);
             float pmax = 0;
             for (size_t li = 0; li < L; li++) pmax = fmaxf(pmax, pw[li]);
             const double k = kl(last, plog, V);
             const bool eq = argmax_scan(plog, V) == want_last;
-            const bool pok = k <= TOL_PREFILL_FAST_KL && eq && (own || pmax <= TOL_PREFILL_FAST_LAYER_REL);
+            const uint32_t flips = hs.flips_sure + hs.flips_near;
+            const double frac = (double)flips / ((double)L * (double)N);
+            const bool pok = k <= TOL_PREFILL_FAST_KL && eq && (own || (pmax <= TOL_PREFILL_FAST_LAYER_REL && frac <= TOL_INK_HALF_ROUTE_FRAC));
             ok = ok && pok;
             fprintf(out,
-                    "prefill (chunks), accelerated (tensor ops, half activations, f16 KV), %s: worst visit rel err %s%s, last-token "
-                    "KL(ref||engine) %s, argmax %s; routers differ from the oracle's at %u (visit, token) pairs (not gated)%s\n",
-                    own ? "its own experts" : "the oracle's experts", e3(b1, pmax), own ? " (not gated)" : "", e3d(b2, k),
-                    eq ? "equal" : "DIFFERENT", hs.flips_sure + hs.flips_near, pok ? "" : "  FAIL");
+                    "prefill (%zu-token chunks), accelerated (tensor ops, half activations, %s KV), %s: worst visit rel err %s%s, "
+                    "last-token KL(ref||engine) %s, argmax %s; routers differ from the oracle's at %u (visit, token) pairs (%.3f%%%s)%s\n",
+                    piece, runs[r].f32kv ? "f32" : "f16", own ? "its own experts" : "the oracle's experts", e3(b1, pmax),
+                    own ? " (not gated)" : "", e3d(b2, k), eq ? "equal" : "DIFFERENT", flips, 100.0 * frac, own ? ", not gated" : "",
+                    pok ? "" : "  FAIL");
             if (!own && getenv("SAETTA_VERIFY_LAYERS"))
                 for (size_t li = 0; li < L; li++) fprintf(out, "  accel visit %2zu: %s\n", li, e3(b1, pw[li]));
         }

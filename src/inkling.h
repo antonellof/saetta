@@ -28,5 +28,7 @@ InkRouteStats inkling_route_stats(Model *m);
 bool inkling_half_available(const Model *m);
 void inkling_set_half(Model *m, bool on);
 bool inkling_half(const Model *m);
+// Tokens per prompt chunk.
+size_t inkling_prompt_chunk(void);
 
 #endif

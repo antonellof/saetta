@@ -608,7 +608,7 @@ static Err mpp_expert_case(Arena *a, QgenCtx *x, bool mx, size_t sh, size_t T, s
     if (mx) {
         rand_e4m3(x, gw, E * gwE, 0, 15);
         rand_e4m3(x, dw, E * dwE, 0, 15);
-        // block scales on both sides of the kernel's half / f32 switch (105..134)
+        // block scales from 2^-27 to 2^-8: products down to the half subnormals
         for (size_t i = 0; i < E * gsE; i++) gs[i] = (uint8_t)(100 + qgen_prng_next(&x->rng) % 20);
         for (size_t i = 0; i < E * dsE; i++) ds[i] = (uint8_t)(100 + qgen_prng_next(&x->rng) % 20);
     } else {
@@ -829,4 +829,25 @@ TEST(ink_mpp_msg_gate) {
     }
     dbg("ink_mpp msg gate: d rel err %.3g, output rel err %.3g\n", (double)worst_d, (double)worst_o);
     EXPECT(worst_d <= TOL_INK_KERNEL_REL && worst_o <= TOL_INK_KERNEL_REL);
+}
+
+// The tensor-op file's own code decodes (inkling_mpp.metal im_e4m3, the NVFP4 table) over every
+// byte against the reference: E4M3 exact in f32 and in half (subnormal codes included, through
+// half bit patterns converted to f32), both E2M1 values of each byte exact.
+TEST(ink_mpp_codes) {
+    Arena a = {0};
+    QgenCtx x;
+    EXPECT_OK(qgen_ctx_init(&a, &x));
+    sx_pipeline *pl;
+    if (qgen_ctx_pipe(&x, ink_mpp_src, "ink_mpp_codes", &pl)) SKIP("accelerator kernels do not compile");
+    sx_buffer *b;
+    EXPECT_OK(fbuf(&x, NULL, 1024, &b));
+    sx_arg ar[] = {BA(b)};
+    EXPECT_OK(run_src(&x, ink_mpp_src, "ink_mpp_codes", ar, 1, 1, 1, 1, 128));
+    static const float e2m1[16] = {0, 0.5f, 1, 1.5f, 2, 3, 4, 6, -0.0f, -0.5f, -1, -1.5f, -2, -3, -4, -6};
+    const float *o = gpu_floats(b);
+    for (int c = 0; c < 256; c++) {
+        if ((c & 0x7f) != 0x7f) EXPECT(o[c] == ink_ref_e4m3((uint8_t)c) && o[256 + c] == o[c]);
+        EXPECT(o[512 + c] == e2m1[c & 15] && o[768 + c] == e2m1[c >> 4]);
+    }
 }

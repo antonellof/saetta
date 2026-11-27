@@ -12,8 +12,11 @@
 // values go to the ring only after its attention (src/kernels/inkling_attn.metal), so chunks
 // longer than the window never read rows overwritten by their own later tokens.
 // The attention residuals keep up to 5 block states per token, within the token's pass only.
-// One command buffer per chunk (decode: T = 1); all activations f32; the dense linears run on
-// the run-time affine kernels (src/qgen.h), the rest on src/kernels/inkling_*.metal.
+// One command buffer per chunk (decode: T = 1). Decode, verification chunks and, without tensor
+// ops (or with SAETTA_PREFILL_F32 / SAETTA_NO_ACCEL), prompt chunks are f32: the dense linears on
+// the run-time affine kernels (src/qgen.h), the rest on src/kernels/inkling_*.metal. Where the
+// tensor ops run, prompt chunks take half activations with f32 sums (src/kernels/inkling_mpp.metal,
+// mmh_dense): the experts, dense projections, message gates and, on an f16 cache, attention.
 #include "model.h"
 
 #include "config_inkling.h"
@@ -199,6 +202,7 @@ struct Model {
     sx_buffer *xs_h, *hs_h, *msrt, *mtiles, *mmeta;
     // the dense projections: their input in half (xh [PCH][QD]), the weights unpacked to f16 (wh)
     sx_buffer *xh, *wh;
+    sx_arg xh_of; // the input xh holds (none: {0}); reset at each visit and around o_proj
     // the prompt attention: queries in half per head (qh [NH][PCH][HD]), the chunk's keys and
     // values in half (kvh [2][PCH][KVD]), the relative bias table per layer (projt [NL][EXT + 1][16]
     // f32: proj transposed, row EXT zeros)
@@ -508,6 +512,11 @@ static bool load_mpp(Gpu *g, Pipes *pp) {
         ok = gpu_pipeline(g, ink_mpp_src, kn[i].name, (sx_pipeline **)((char *)pp + kn[i].off)) == OK;
         kernel_names[kn[i].off / sizeof(sx_pipeline *)] = kn[i].name;
     }
+    // ink_mpp_plan runs as one threadgroup of 1024 threads
+    if (ok && gpu_require_threads(pp->im_plan, 1024) != OK) {
+        dbg("model: ink_mpp_plan cannot run 1024 threads a threadgroup\n");
+        ok = false;
+    }
     if (ok) {
         ok = gpu_pipeline(g, qmm_mpp_src, "to_half", &pp->im_half) == OK && gpu_pipeline(g, qmm_mpp_src, "mmh_dense", &pp->im_mm) == OK &&
              gpu_pipeline(g, qgen_mpp_src, "dq_f16_gen", &pp->im_dq) == OK;
@@ -595,6 +604,7 @@ Err model_load(Arena *arena, const Pack *pack, Gpu *g, Model **out) {
         TRY(gpu_new_buffer(g, (size_t)PCH * 2 * H * 4, &m->fg));
     } else
         dbg("model: accelerator kernels unavailable, Inkling prompt chunks on f32 tiles\n");
+    if (m->half_prefill) dbg("model: Inkling prompt chunks on the tensor ops (half activations, f32 sums)\n");
 
     TRY(lin(pack, PFX, "embed_tokens", CONFIG_VOCAB_SIZE, H, &m->embed));
     TRY(lin(pack, "", "lm_head", CONFIG_VOCAB_SIZE, H, &m->lm_head));
@@ -720,12 +730,11 @@ static_assert(sizeof(MoeP) == 48);
 // one simdgroup per output row and token, the same bits for a token in either; prompt chunks: f32
 // tiles). out rows of W (lm_head: the unpadded vocabulary).
 // The input of the half matmuls: x [T][in] (f32) to half in Model.xh, once for the projections
-// that share it (xh_of: the input it holds).
-static sx_arg xh_of;
+// that share it (Model.xh_of: the input it holds).
 static void enc_xh(Model *m, Enc *c, sx_arg x, uint32_t n) {
-    if (xh_of.buffer == x.buffer && xh_of.offset == x.offset) return;
+    if (m->xh_of.buffer == x.buffer && m->xh_of.offset == x.offset) return;
     DISP(c, m->p.im_half, (n + 255) / 256, 1, 1, 256, x, B(m->xh), BYTES(n));
-    xh_of = x;
+    m->xh_of = x;
 }
 static void enc_lin(Model *m, Enc *c, const Linear *l, sx_arg x, sx_arg y, uint32_t T, uint32_t out) {
     uint32_t sh[3], q[2] = {l->bits, l->group_size}, in = (uint32_t)l->in_features;
@@ -798,7 +807,7 @@ static void enc_visit(Model *m, InkSession *d, Enc *c, size_t v, uint32_t T, uin
     const bool msg = vis_pass[v] > 0, boundary = li % NBLK == 0, full = L->full;
     const uint32_t PH = PCH * H; // stride of the block-state planes
     const sx_arg h = reg(m, R_H), bs = reg(m, R_BS), conv = AT(d->bk, v * CONV_VIS * 4);
-    xh_of = (sx_arg){0};
+    m->xh_of = (sx_arg){0};
     // the messages of this loop layer from the previous pass's states (M:1407, 145-173)
     if (msg) {
         sx_arg q = OFF(m->msg_q, (li - LS) * 4 * H);
@@ -920,9 +929,9 @@ static void enc_visit(Model *m, InkSession *d, Enc *c, size_t v, uint32_t T, uin
             DISP(c, d->kv_half ? m->p.kv_store_h : m->p.kv_store, KVD / 256, T, 1, 256, reg(m, R_KN), reg(m, R_VN), kc, vc, BYTES(sp));
         }
     }
-    xh_of = (sx_arg){0};
+    m->xh_of = (sx_arg){0};
     enc_lin(m, c, &L->o, reg(m, R_ATT), reg(m, R_A), T, H);
-    xh_of = (sx_arg){0};
+    m->xh_of = (sx_arg){0};
     // post-attention conv and the residual (M:899-905)
     {
         CrP p = {H, boundary, T == 1 && !m->spec_chunk, sqrtf(5.0f)};
@@ -1870,6 +1879,7 @@ const ModelArch inkling_arch = MODEL_ARCH_TABLE({
 bool inkling_half_available(const Model *m) { return m->arch == &inkling_arch && m->accel; }
 void inkling_set_half(Model *m, bool on) { m->half_prefill = on && m->accel; }
 bool inkling_half(const Model *m) { return m->half_prefill; }
+size_t inkling_prompt_chunk(void) { return PCH; }
 bool inkling_has_routes(const Model *m) { return m->arch == &inkling_arch && m->routes != NULL; }
 void inkling_set_routes(Model *m, InkRouteMode mode) { m->replay = mode == INK_ROUTES_REPLAY; }
 InkRouteStats inkling_route_stats(Model *m) {

@@ -503,3 +503,18 @@ kernel void ink_mpp_msg_comb(device const float *x [[buffer(0)]], device const f
     device const float *f = fg + (ulong)t * 2 * p.H;
     out[(ulong)t * p.H + c] = (1.0f - tanh(f[c])) * x[(ulong)t * p.xs + c] + tanh(f[p.H + c]) * m[(ulong)t * p.ms + c];
 }
+
+// ---- unit test only (src/test/inkling.c ink_mpp_codes) ----------------------------------------
+// Every byte through this file's decodes: out[b] = im_e4m3(b), out[256 + b] = half(im_e4m3(b)),
+// out[512 + b] and out[768 + b] = the NVFP4 table's two values for byte b. One threadgroup of 128.
+kernel void ink_mpp_codes(device float *out [[buffer(0)]], uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup uint lut[256];
+    im_lut<false>(lut, tid);
+    for (uint b = tid; b < 256; b += 128) {
+        out[b] = im_e4m3(b);
+        out[256 + b] = float(half(im_e4m3(b)));
+        const half2 v = as_type<half2>(lut[b]);
+        out[512 + b] = float(v.x);
+        out[768 + b] = float(v.y);
+    }
+}

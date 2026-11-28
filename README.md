@@ -30,7 +30,7 @@ saetta download inkling && saetta start code --pack inkling     # or name a pack
 By memory it picks `coder` (Qwen3.8-Flash-Next, 76 GB) from 96 GB, `27b-turbo` (20 GB) from 36 GB, `27b-4bit` (16 GB) from 32 GB. Inside the agent, `/model` downloads and switches packs. Needs macOS 26 or later. Docs: [saetta.dev/docs](https://saetta.dev/docs/).
 
 <p align="center">
-  <img src="docs/assets/tour.gif" width="900" alt="A tour in six slides: Saetta, the coding agent with the model inside; 1.6 times faster than pi on the same model, 1.8 times faster with the model inside the agent than over HTTP, 3.5 times less memory than mlx-lm; the same agent session against mlx-lm, llama.cpp and Strata, Saetta first in each; /monitor; install in one line">
+  <img src="docs/assets/tour.gif" width="900" alt="A tour of Saetta: Saetta, the coding agent with the model inside; 1.6 times faster than pi on the same model, 1.8 times faster with the model inside the agent than over HTTP, 3.5 times less memory than mlx-lm; the same agent session against mlx-lm, llama.cpp and Strata, Saetta first in each; /monitor; install in one line">
 </p>
 
 ## Performance

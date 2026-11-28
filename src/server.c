@@ -775,6 +775,75 @@ static uint32_t gram_sample(Engine *e, const Grammar *g, const GState *st, const
     return gram_redraw(&e->rng, g, st, logits, len, sp, t, cand, masked, lg, 0);
 }
 
+// ---- the reasoning budget (thinking_token_budget, src/server.h ReqNumbers) -------------------------
+//
+// A reply that opens in the reasoning may write that many tokens of it; then the engine writes the
+// tokens of "\n</think>\n\n" in place of the model's, and the answer goes on as the model writes it.
+// The model's own </think> before that ends the budget's watch. Its state is a small value: a
+// speculation round walks a copy, the reply's tokens advance the real one. No allocation per token.
+typedef struct {
+    bool on, done, forced;
+    size_t left;           // reasoning tokens still allowed
+    const uint32_t *close; // the tokens written at the limit, and how many of them are written
+    size_t nclose, fi;
+    const Tokenizer *tok;
+    char win[7]; // the last bytes of the reasoning (a </think> split over tokens)
+    size_t wl;
+    uint8_t u8need; // continuation bytes the reasoning's last character still needs: the close waits
+    uint8_t waited; // tokens it waited for them (at most BUDGET_WAIT)
+} Budget;
+
+enum { BUDGET_WAIT = 4 };
+
+// the close is written at the budget, after the character the reasoning is in (the reply's text, and
+// the history the next request renders from it, stay valid UTF-8)
+static bool budget_forcing(const Budget *b) {
+    return b->on && !b->done && b->left == 0 && (b->fi > 0 || b->u8need == 0 || b->waited >= BUDGET_WAIT);
+}
+
+static void budget_feed(Budget *b, uint32_t t) {
+    if (!b->on || b->done) return;
+    if (budget_forcing(b)) {
+        b->forced = true;
+        if (++b->fi == b->nclose) b->done = true;
+        return;
+    }
+    char w[sizeof b->win + 256];
+    memcpy(w, b->win, b->wl);
+    size_t n = tokenizer_token_bytes(b->tok, t, w + b->wl, 256);
+    size_t tot = b->wl + MIN(n, (size_t)256);
+    for (size_t i = b->wl; i < tot; i++) {
+        unsigned char u = (unsigned char)w[i];
+        if (b->u8need && (u & 0xC0) == 0x80) b->u8need--;
+        else b->u8need = u >= 0xF0 ? 3 : u >= 0xE0 ? 2 : u >= 0xC0 ? 1 : 0;
+    }
+    if (memmem(w, tot, "</think>", 8)) {
+        b->done = true;
+        return;
+    }
+    b->wl = MIN(tot, sizeof b->win);
+    memmove(b->win, w + tot - b->wl, b->wl);
+    if (b->left > 0) b->left--;
+    else b->waited++;
+}
+
+// The token rule of a speculation round with a budget and no grammar: the budget's token when it
+// writes one, else the rule of the round without it (argmax, or SampleChooser's).
+typedef struct {
+    Budget b;
+    SampleChooser ch;
+    bool greedy;
+} BudPick;
+
+static uint32_t bud_pick(void *ctx, const float *row, bool has_draft, uint32_t d) {
+    BudPick *p = ctx;
+    uint32_t t = budget_forcing(&p->b) ? p->b.close[p->b.fi]
+               : p->greedy           ? model_argmax(row, p->ch.n)
+                                     : server_sample_pick(&p->ch, row, has_draft, d);
+    budget_feed(&p->b, t);
+    return t;
+}
+
 // The token rule of a speculation round under the grammar (a SpecPick): the rule of the round
 // without it (argmax, or SampleChooser's) when its token is valid, else as gram_sample; st walks
 // the tokens picked, from the state after the round's first token.
@@ -787,13 +856,16 @@ typedef struct {
     size_t vocab;
     size_t masked;
     GramLog *log;
-    size_t row; // rows picked so far (the token index past the round's first token)
+    size_t row;  // rows picked so far (the token index past the round's first token)
+    Budget *bud; // the reasoning budget's copy for this round (NULL: none)
 } GramPick;
 
 static uint32_t gram_pick(void *ctx, const float *row, bool has_draft, uint32_t d) {
     GramPick *p = ctx;
     uint32_t t;
-    if (p->sp.temperature <= 0)
+    if (p->bud && budget_forcing(p->bud))
+        t = p->bud->close[p->bud->fi];
+    else if (p->sp.temperature <= 0)
         t = gram_best(p->g, &p->st, row, p->vocab, model_argmax(row, p->vocab), p->cand, &p->masked, p->log, p->row);
     else {
         SampleChooser c = {p->rng, p->sp, p->cand, p->vocab};
@@ -802,6 +874,7 @@ static uint32_t gram_pick(void *ctx, const float *row, bool has_draft, uint32_t 
             t = gram_redraw(p->rng, p->g, &p->st, row, p->vocab, p->sp, t, p->cand, &p->masked, p->log, p->row);
     }
     grammar_feed(p->g, &p->st, t);
+    if (p->bud) budget_feed(p->bud, t);
     p->row++;
     return t;
 }
@@ -1136,7 +1209,7 @@ static Err anthropic_end(Arena *a, Conn *c, Req *h, Out *out, Splitter *sp, Pars
 // The generation after the prompt is routed: prefill, decode, the response.
 static Err generate_reply(Engine *e, Arena *a, Conn *c, Req *h, Work *w, JValue *r, Str model_name, Fmt fmt, Str forced,
                           bool thinking, Sampling sp, const Str *stops, size_t n_stops, bool stream, const JValue *tools,
-                          const char *id, int64_t created, Start start, size_t max_tokens) {
+                          const char *id, int64_t created, Start start, size_t max_tokens, const ReqNumbers *rn) {
     const uint32_t *ids = w->ids.ptr;
     size_t n = w->ids.len;
     size_t reused = start.n;
@@ -1263,6 +1336,17 @@ static Err generate_reply(Engine *e, Arena *a, Conn *c, Req *h, Work *w, JValue 
         if (gr->n_tools > 0) gs = grammar_start(gr, thinking, forced);
         else gr = NULL; // no tool a call could name: nothing to hold the reply to
     }
+    // thinking_token_budget above 0 on a reply that opens in the reasoning (Qwen chat format; 0 closed
+    // it in the prompt)
+    Budget bud = {0};
+    if (rn->has_budget && rn->think_budget > 0 && thinking && model_info(e->m)->chat == CHAT_QWEN) {
+        VecU32 cl = {0};
+        if (!tokenizer_encode(e->tok, S("\n</think>\n\n"), &cl) && cl.len > 0) {
+            bud = (Budget){.on = true, .left = rn->think_budget, .nclose = cl.len, .tok = e->tok};
+            bud.close = arena_dup(a, cl.ptr, cl.len * sizeof *cl.ptr);
+        }
+        vec_free(&cl);
+    }
     uint32_t next = gr ? gram_sample(e, gr, &gs, logits, vocab, sp, cand, &g_masked, &glog) : sample(e, logits, vocab, sp, cand);
     size_t passes = 0;
     uint32_t *gen_ids = ARENA_ARRAY(a, uint32_t, max_tokens + 1);
@@ -1278,6 +1362,7 @@ static Err generate_reply(Engine *e, Arena *a, Conn *c, Req *h, Work *w, JValue 
             grammar_feed(gr, &gs, t);
             glog.gen = n_gen;
         }
+        budget_feed(&bud, t);
         bool eos = false;
         const ModelInfo *mi = model_info(e->m);
         for (size_t i = 0; i < mi->n_eos; i++)
@@ -1335,10 +1420,15 @@ static Err generate_reply(Engine *e, Arena *a, Conn *c, Req *h, Work *w, JValue 
         } else if (nd > 0 && !gate_allow(gate)) nd = 0;
         if (nd > 0) {
             SpecResult sr;
+            Budget bc = bud; // the round's copy
+            bool bud_open = bud.on && !bud.done;
             if (gr) {
-                GramPick gp = {gr, gs, &e->rng, sp, cand, vocab, 0, &glog, 0};
+                GramPick gp = {gr, gs, &e->rng, sp, cand, vocab, 0, &glog, 0, bud_open ? &bc : NULL};
                 TRY(model_spec_verify(e->m, e->s, t, drafts, nd, gram_pick, &gp, &sr));
                 g_masked += gp.masked;
+            } else if (bud_open) {
+                BudPick bp = {bc, {&e->rng, sp, cand, vocab}, greedy};
+                TRY(model_spec_verify(e->m, e->s, t, drafts, nd, bud_pick, &bp, &sr));
             } else if (greedy) TRY(model_spec_greedy(e->m, e->s, t, drafts, nd, &sr));
             else {
                 SampleChooser ch = {&e->rng, sp, cand, model_info(e->m)->vocab};
@@ -1355,7 +1445,8 @@ static Err generate_reply(Engine *e, Arena *a, Conn *c, Req *h, Work *w, JValue 
             qi = 1;
         } else {
             TRY(model_step(e->m, e->s, t, &logits));
-            next = gr ? gram_sample(e, gr, &gs, logits, vocab, sp, cand, &g_masked, &glog) : sample(e, logits, vocab, sp, cand);
+            if (budget_forcing(&bud)) next = bud.close[bud.fi];
+            else next = gr ? gram_sample(e, gr, &gs, logits, vocab, sp, cand, &g_masked, &glog) : sample(e, logits, vocab, sp, cand);
             if (spec_on && model_has_mtp(e->m)) depth_record(depth, 0, 0, depth_ms(depth, 0, tr0, fixed));
         }
     }
@@ -1402,6 +1493,9 @@ static Err generate_reply(Engine *e, Arena *a, Conn *c, Req *h, Work *w, JValue 
     e->last_replaced = g_masked;
     dbg("spec: lookup %zu passes %zu drafted %zu accepted, mtp %zu passes %zu drafted %zu accepted, fed %zu\n", lk_p, lk_d, lk_a,
         mtp_p, mtp_d, mtp_a, fed_p);
+    if (rn->has_budget)
+        dbg("thinking budget: %zu tokens, %s\n", rn->think_budget,
+            !thinking ? "no reasoning" : bud.forced ? "closed by the engine" : bud.done ? "closed by the model" : "not closed");
     if (gr) {
         // the first replacements: the refused token's text, the one taken, and where (token index)
         char line[640];
@@ -1601,6 +1695,15 @@ Err server_request_numbers(const JValue *r, ReqNumbers *out) {
         // any integer an i64 holds (a negative one wraps to its u64 bits)
         if (!(v >= -0x1p63 && v < 0x1p63) || v != floor(v)) return "BadSeed";
         out->seed = (uint64_t)(int64_t)v;
+    }
+    // thinking_token_budget: null is no budget, anything but a number is refused
+    const JValue *tb = field(r, "thinking_token_budget");
+    out->has_budget = num(tb, &v);
+    out->think_budget = 0;
+    if (tb && tb->kind != J_NULL && !out->has_budget) return "BadThinkingBudget";
+    if (out->has_budget) {
+        if (!(v >= 0 && v <= (double)SESSION_CTX_MAX) || v != floor(v)) return "BadThinkingBudget";
+        out->think_budget = (size_t)v;
     }
     return OK;
 }
@@ -1986,14 +2089,19 @@ static Err handle(Engine *e, Arena *a, Conn *c, Req *h, Str body, Fmt fmt, Work 
         else forced = S("<tool_call>\n");
         prompt = str(arena_printf(a, "%.*s%.*s", (int)prompt.len, prompt.ptr, (int)forced.len, forced.ptr));
     }
+    ReqNumbers rn;
+    TRY(server_request_numbers(r, &rn));
+    // thinking_token_budget 0 (Saetta Code's SAETTA_EFFORT=auto after a tool result): the reasoning
+    // is closed in the prompt, as the template renders a reply that has none (Qwen chat format)
+    if (rn.has_budget && rn.think_budget == 0 && forced.len == 0 && model_info(e->m)->chat == CHAT_QWEN &&
+        str_ends(prompt, S("<think>\n")))
+        prompt = str(arena_printf(a, "%.*s\n</think>\n\n", (int)prompt.len, prompt.ptr));
     // the only tokenizer error (TokenNotInVocab: byte-level BPE covers every byte) is the
     // tokenizer's, not the request's
     w->status = 500;
     TRY(tokenizer_encode(e->tok, prompt, &w->ids));
     w->status = 400;
     bool thinking = forced.len == 0 && str_ends(prompt, S("<think>\n")) && !str_ends(prompt, S("</think>\n\n"));
-    ReqNumbers rn;
-    TRY(server_request_numbers(r, &rn));
     size_t asked = rn.max_tokens;
     Sampling sp = rn.sp;
     // SAETTA_BENCH_GREEDY=1, for benchmarks only (tools/code/session_bench.py): greedy decoding
@@ -2038,7 +2146,7 @@ static Err handle(Engine *e, Arena *a, Conn *c, Req *h, Str body, Fmt fmt, Work 
     Start start = plan(e, w->ids.ptr, n, true);
     stats_begin(e->st, fmt == FMT_ANTHROPIC, n, start.n, max_tokens);
     Err err = generate_reply(e, a, c, h, w, r, model_name, fmt, forced, thinking, sp, stops, n_stops, stream, tools, id, created,
-                             start, max_tokens);
+                             start, max_tokens, &rn);
     last_conv = (LastConv){e, e->active, e->conv_gen[e->active], true, {0}};
     e->kept[e->active] = fork_point_asked(r);
     if (c->sink) snprintf(last_conv.session, sizeof last_conv.session, "%s", req_session);

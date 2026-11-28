@@ -138,4 +138,17 @@ TEST(server_request_numbers_are_validated) {
     EXPECT_ERR(numbers("{\"seed\":0.5}", &rn), "BadSeed");
     EXPECT_ERR(numbers("{\"temperature\":-1}", &rn), "BadTemperature");
     EXPECT_ERR(numbers("{\"top_p\":2}", &rn), "BadTopP");
+    EXPECT_OK(numbers("{}", &rn));
+    EXPECT(!rn.has_budget);
+    EXPECT_OK(numbers("{\"thinking_token_budget\":null}", &rn));
+    EXPECT(!rn.has_budget);
+    EXPECT_OK(numbers("{\"thinking_token_budget\":0}", &rn));
+    EXPECT(rn.has_budget && rn.think_budget == 0);
+    EXPECT_OK(numbers("{\"thinking_token_budget\":256}", &rn));
+    EXPECT(rn.has_budget && rn.think_budget == 256);
+    EXPECT_ERR(numbers("{\"thinking_token_budget\":-3}", &rn), "BadThinkingBudget");
+    EXPECT_ERR(numbers("{\"thinking_token_budget\":1.5}", &rn), "BadThinkingBudget");
+    EXPECT_ERR(numbers("{\"thinking_token_budget\":1e300}", &rn), "BadThinkingBudget");
+    EXPECT_ERR(numbers("{\"thinking_token_budget\":\"12\"}", &rn), "BadThinkingBudget");
+    EXPECT_ERR(numbers("{\"thinking_token_budget\":true}", &rn), "BadThinkingBudget");
 }

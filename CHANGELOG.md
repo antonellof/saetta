@@ -3,6 +3,14 @@
 All notable changes to saetta and Saetta Code (`saetta code`), newest first. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are saetta's.
 
+## [Unreleased]
+
+### Added
+
+- The engine takes `thinking_token_budget` on chat requests (Qwen3.8 models): the reply may reason that many tokens, then the engine closes the reasoning and the model answers; 0 starts the answer with the reasoning closed, as a reply without reasoning reads in the history, so the next request reuses the cache.
+
+- `SAETTA_EFFORT=auto` (off by default) lets Saetta Code choose the reasoning per turn, with the model in process: a turn that follows tool results which all succeeded answers without reasoning (`SAETTA_EFFORT_BUDGET` sets a budget instead), while the turn the user starts and every turn after a failed tool call reason in full. On 30 small coding tasks with the Coder pack the agent took 489.6 s instead of 818.6 greedy (the same 29 of 30 passed) and 414.9 s instead of 858.6 and 882.2 sampled, writing about half the tokens, but the sampled run lost one task (29 of 30 against 30 of 30 in both baseline runs), so it is not the default.
+
 ## [0.26.0] - 2026-11-27
 
 ### Added

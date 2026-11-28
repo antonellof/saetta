@@ -49,6 +49,9 @@ typedef struct CodeModel {
     // just before their generation prompt ("saetta_fork_point", src/server.c): the agent's own
     // requests while it offers subagents, whose prompts are its prompt less that, plus their task.
     bool fork_point;
+    // Fields added to the request body, for saetta's engine only (engine or sock set): Saetta
+    // Code's own switches ("thinking_token_budget", SAETTA_EFFORT=auto). NULL: none.
+    const JValue *extra;
 } CodeModel;
 
 // saetta's version (main.c sets it), for Saetta Code's header.

@@ -132,13 +132,17 @@ typedef struct {
 
 // The numbers of an OpenAI-shaped request: max_completion_tokens or max_tokens (default 4096;
 // an integer from 1 to SESSION_CTX_MAX), temperature (1; 0 to 1e6), top_p (0.95; 0 to 1),
-// top_k (20; below 1 means 256, the most kept), seed (any integer an i64 holds). Errors:
-// "BadMaxTokens", "BadTemperature", "BadTopP", "BadTopK", "BadSeed".
+// top_k (20; below 1 means 256, the most kept), seed (any integer an i64 holds),
+// thinking_token_budget (none; an integer from 0 to SESSION_CTX_MAX: the reasoning tokens the reply
+// may write before the engine closes it with "\n</think>\n\n"). Errors: "BadMaxTokens",
+// "BadTemperature", "BadTopP", "BadTopK", "BadSeed", "BadThinkingBudget".
 typedef struct {
     size_t max_tokens;
     Sampling sp;
     bool has_seed;
     uint64_t seed;
+    bool has_budget;
+    size_t think_budget;
 } ReqNumbers;
 Err server_request_numbers(const JValue *r, ReqNumbers *out);
 

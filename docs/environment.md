@@ -51,3 +51,5 @@ Saetta Code reads these variables of pi's as pi does, along with its own.
 | `SAETTA_FEED` | 1 | `0` turns off drafting from the files Saetta Code read, edited or wrote ([Sessions](sessions.md)) |
 | `SAETTA_FORK_POINT` | 1 | `0` stops Saetta Code with `--subagents` asking the engine for a checkpoint before each answer, where its subagents' prompts leave the parent's ([Parallel agents](parallel-agents.md)) |
 | `SAETTA_GRAMMAR` | 0 | `1` decodes tool calls under a grammar built from the request's tools (Qwen chat format), so a call always names a tool of the request, gives its required arguments and parses; the model's own token is kept whenever it is valid ([HTTP API](http-api.md#chat-completions)) |
+| `SAETTA_EFFORT` | unset | Saetta Code with the model in process (or another Saetta Code's, over its socket): `auto` gives a request that follows tool results which all succeeded a reasoning budget of `SAETTA_EFFORT_BUDGET` tokens (default 0: no reasoning); a turn the user starts and one after a tool error reason in full |
+| `SAETTA_EFFORT_BUDGET` | 0 | The budget the per-turn effort gives (tokens of reasoning before the engine closes it) |

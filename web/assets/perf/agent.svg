@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="220" viewBox="0 0 900 220" font-family="-apple-system, Segoe UI, Helvetica, Arial, sans-serif"><defs><linearGradient id="g" x1="0" x2="1"><stop offset="0" stop-color="#b26bff"/><stop offset="1" stop-color="#ff8a2b"/></linearGradient><style>.t{font-size:16px;font-weight:600;fill:#c9c9d1}.c{font-size:12px;fill:#8a8a95}.n{font-size:13px;fill:#c9c9d1}.v{font-size:12px;fill:#c9c9d1;font-family:ui-monospace,Menlo,monospace}.f{font-size:11px;fill:#8a8a95}</style></defs><rect width="900" height="220" rx="12" fill="#0d0b12"/>
+<text x="30" y="40" class="t">30 coding tasks</text>
+<text x="30" y="60" class="c">Coder pack, greedy, total seconds, lower is better</text>
+<text x="30" y="97" class="n">Saetta Code 0.27</text>
+<rect x="180" y="86" width="108.8" height="14" rx="2" fill="url(#g)"/>
+<text x="294.8" y="97" class="v">489.6 s</text>
+<text x="30" y="125" class="n">pi 1.5.2</text>
+<rect x="180" y="114" width="172.3" height="14" rx="2" fill="#8a8a95"/>
+<text x="358.3" y="125" class="v">775.2 s</text>
+<text x="30" y="153" class="n">Saetta Code 0.26</text>
+<rect x="180" y="142" width="181.9" height="14" rx="2" fill="#5b5b66"/>
+<text x="367.9" y="153" class="v">818.6 s</text>
+<text x="470" y="40" class="t">Agent session</text>
+<text x="470" y="60" class="c">Coder, 15 turns with restarts, a fork, a retry; seconds</text>
+<text x="470" y="97" class="n">in one process</text>
+<rect x="640" y="86" width="59.9" height="14" rx="2" fill="url(#g)"/>
+<text x="705.9" y="97" class="v">89.8 s</text>
+<text x="470" y="125" class="n">HTTP, server up</text>
+<rect x="640" y="114" width="110.7" height="14" rx="2" fill="#8a8a95"/>
+<text x="756.7" y="125" class="v">166.0 s</text>
+<text x="470" y="153" class="n">HTTP, server restarted</text>
+<rect x="640" y="142" width="170.2" height="14" rx="2" fill="#5b5b66"/>
+<text x="816.2" y="153" class="v">255.3 s</text>
+<text x="30" y="188" class="f">M5 Max 128 GB, single runs. Tasks: pi talks to saetta serve on the same pack; 29 of 30 passed for Saetta Code both times, 30 for pi;</text>
+<text x="30" y="206" class="f">0.27 answers without reasoning after successful tool results. Session: the same Saetta Code in process or over HTTP to saetta serve.</text>
+</svg>

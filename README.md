@@ -28,6 +28,12 @@ Saetta Code is a C port of the [pi](https://pi.dev) coding agent with the model 
 
 All on an M5 Max with 128 GB; every number is a measured run.
 
+<p align="center"><img src="web/assets/perf/agent.svg" width="900" alt="Saetta Code as an agent on an M5 Max, Coder pack: 30 coding tasks in 489.6 s with 0.27, 775.2 s for pi on the same engine, 818.6 s with 0.26; a 15-turn session with restarts, a fork and a retry in 89.8 s in one process, 166.0 s over HTTP to a running server, 255.3 s to a restarted one"></p>
+
+<p align="center"><img src="web/assets/perf/engines.svg" width="900" alt="The same agent session against other engines: Qwen3.8-27B 279.0 s in Saetta Code, 289.9 s for pi on mlx-lm; Inkling 2 Mini 617.2 s, 789.8 s for pi on llama.cpp; Flash-Next full session 118.1 s against 130.3 s for pi on Strata, edit 86.4 s against 68.5 s"></p>
+
+Since 0.27 Saetta Code reasons in full only on the turn you start and after a failed tool call, which took 30 small coding tasks from 818.6 to 489.6 s at the same 29 of 30 passed (`SAETTA_EFFORT=off` turns it off). Running the model in the agent's process pays on restarts, forks and retries; Strata is still faster on a single edit (68.5 against 86.4 s). Engine speed:
+
 <p align="center"><img src="web/assets/perf/qwen.svg" width="900" alt="Qwen3.8 on an M5 Max: prompt reading Coder 1,656 to 1,927 tokens/s, full 1,738 to 1,808, 27B 940 to 787; answering full 142 and Coder 139 tokens/s on a code edit, full 85 and Coder 66 at 16K, 27B TURBO 52, 27B 4-bit 32"></p>
 
 <p align="center"><img src="web/assets/perf/resume.svg" width="900" alt="Time to the first token with the Coder pack: 37.31 s on a cold 64K prompt, 8.24 s on a cold 16K prompt, 0.20 s on a follow-up turn"></p>

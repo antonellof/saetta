@@ -6,6 +6,18 @@ Saetta is tuned and measured on an M5 Max with 128 GB. M1 to M4 have half-precis
 
 ![Time to the first token: cold 64K and 16K prompts against a follow-up turn](../web/assets/perf/resume.svg)
 
+## Saetta Code as an agent
+
+Measured as seconds for whole tasks and sessions on the Coder pack, M5 Max 128 GB, single runs (2026-11-27 and 28):
+
+| | Saetta Code 0.27 | Saetta Code 0.26 | pi 1.5.2 on `saetta serve` |
+|---|---:|---:|---:|
+| 30 small coding tasks, greedy | 489.6 s, 29 passed | 818.6 s, 29 passed | 775.2 s, 30 passed |
+
+0.27 reasons in full only on the turn you start and after a failed tool call (`SAETTA_EFFORT=off` turns it off); the time goes down because the agent writes about half the tokens.
+
+Running the model in the agent's own process pays on restarts, forks and retries: a 15-turn Coder session takes 89.8 s in process, 166.0 s for the same agent over HTTP to a running `saetta serve` and 255.3 s to a restarted one. Against other engines on the same session: Qwen3.8-27B 279.0 s against 289.9 s for pi on mlx-lm (same weights), Inkling 617.2 s against 789.8 s for pi on llama.cpp, Flash-Next full 118.1 s against 130.3 s for pi on Strata; Strata is faster on a single edit (68.5 against 86.4 s). Every condition and its caveats: [Integration evaluation](integration-eval.md).
+
 ## Flash-Next on an M5 Max
 
 A six-request coding-agent workload through the HTTP API, seconds (first token / total):

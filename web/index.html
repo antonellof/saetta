@@ -487,6 +487,31 @@ saetta code --mode json -p "list the TODOs"</pre>
         <span class="eyebrow">Benchmarks</span>
         <h2>Engine speed on an M5 Max</h2>
         <p class="sub">On an M5 Max with 128 GB, through the HTTP API that Claude Code, pi and opencode use: cold prompts of 4K to 64K tokens, follow-up turns and a tool-call edit. M1 to M4 are not measured yet.</p>
+        <h3 class="subhead">Saetta Code as an agent</h3>
+        <p class="sub">What the project is measured on: seconds for a whole agent task or session, on the Coder pack, single runs (2026-11-27 and 28). pi 1.5.2 talks to <code>saetta serve</code> on the same pack; the session has 15 turns with restarts, a fork and a retry.</p>
+        <div class="charts" style="margin-bottom: 28px">
+          <figure class="chart">
+            <h3>30 coding tasks</h3>
+            <p class="cap">total seconds, greedy, lower is better</p>
+            <div class="legend"><span><i class="f-a"></i>Saetta Code</span><span><i class="f-g"></i>other setups</span></div>
+            <div class="rows" style="--max: 900">
+              <div class="row"><span class="name">Saetta Code 0.27</span><span class="track"><span class="fill f-a" style="--v: 489.6"></span>489.6 s</span></div>
+              <div class="row"><span class="name">pi 1.5.2</span><span class="track"><span class="fill f-g" style="--v: 775.2"></span>775.2 s</span></div>
+              <div class="row"><span class="name">Saetta Code 0.26</span><span class="track"><span class="fill f-g" style="--v: 818.6"></span>818.6 s</span></div>
+            </div>
+          </figure>
+          <figure class="chart">
+            <h3>Agent session</h3>
+            <p class="cap">seconds, lower is better</p>
+            <div class="legend"><span><i class="f-a"></i>Saetta Code</span><span><i class="f-g"></i>other setups</span></div>
+            <div class="rows" style="--max: 270">
+              <div class="row"><span class="name">in one process</span><span class="track"><span class="fill f-a" style="--v: 89.8"></span>89.8 s</span></div>
+              <div class="row"><span class="name">HTTP, server up</span><span class="track"><span class="fill f-g" style="--v: 166.0"></span>166.0 s</span></div>
+              <div class="row"><span class="name">HTTP, restarted</span><span class="track"><span class="fill f-g" style="--v: 255.3"></span>255.3 s</span></div>
+            </div>
+          </figure>
+        </div>
+        <p class="note" style="margin: -16px 0 28px">Since 0.27 Saetta Code reasons in full only on the turn you start and after a failed tool call: the same 29 of 30 tasks passed in 40% less time (<code>SAETTA_EFFORT=off</code> turns it off). Against other engines, the same session: Qwen3.8-27B 279.0 s against 289.9 s for pi on mlx-lm (same weights, 27.5 GB of memory against 96.6); Inkling 617.2 s against 789.8 s for pi on llama.cpp; Flash-Next full 118.1 s against 130.3 s for pi on Strata, while Strata is faster on a single edit, 68.5 against 86.4 s. Details: <a href="/docs/integration-eval/">Integration evaluation</a>.</p>
         <h3 class="subhead">Inkling 2 Mini: Saetta, llama.cpp and Strata</h3>
         <p class="sub">The same 4,096-token prompt and 128 answer tokens on an M5 Max, median of 3 interleaved runs (2026-11-27). Each engine uses its own 4-bit or lossless weights: Saetta the mlx-community 4-bit pack (17 GB), llama.cpp Unsloth's UD-Q4_K_XL (17.6 GB), Strata its lossless SQ-20 (19.3 GB).</p>
         <div class="charts" style="margin-bottom: 28px">

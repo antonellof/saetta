@@ -19,6 +19,16 @@
 
 Saetta Code is a C port of the [pi](https://pi.dev) coding agent with the model running in the same process: one 3 MB binary, no Python, no Node, no server. Its inference engine (C and hand-written Metal) is built for agent work: long shared-prefix prompts, short answers, tool calls. Any Apple Silicon Mac with 32 GB of memory or more; it picks the model that fits.
 
+## Start
+
+```sh
+curl -fsSL https://saetta.dev/install.sh | sh    # into ~/.local/bin; later: saetta update
+cd ~/src/my-project && saetta start code          # downloads the model that fits this Mac, then opens the agent
+saetta download inkling && saetta start code --pack inkling     # or name a pack
+```
+
+By memory it picks `coder` (Qwen3.8-Flash-Next, 76 GB) from 96 GB, `27b-turbo` (20 GB) from 36 GB, `27b-4bit` (16 GB) from 32 GB. Inside the agent, `/model` downloads and switches packs. Needs macOS 26 or later. Docs: [saetta.dev/docs](https://saetta.dev/docs/).
+
 <p align="center">
   <img src="docs/assets/tour.gif" width="900" alt="A tour in six slides: Saetta, the coding agent with the model inside; 1.6 times faster than pi on the same model, 1.8 times faster with the model inside the agent than over HTTP, 3.5 times less memory than mlx-lm; the same agent session against mlx-lm, llama.cpp and Strata, Saetta first in each; /monitor; install in one line">
 </p>
@@ -42,16 +52,6 @@ Since 0.27 Saetta Code reasons in full only on the turn you start and after a fa
 <p align="center"><img src="web/assets/perf/m14.svg" width="900" alt="Prompt reading at 4K on the M1 to M4 kernels, measured on the M5 Max: 27B 152 before 0.18, 256 now, 961 with the M5's accelerators; Coder 487, 742 and 1,538"></p>
 
 Since 0.22 Saetta reads Inkling prompts on the M5's tensor ops too, 5 times faster than before; Strata is still 19% ahead there. M1 to M4 are not measured on real hardware yet (reports welcome). Details: [Performance](docs/performance.md). What running the agent and the model in one process buys, against an agent talking to a server over HTTP (Saetta, mlx-lm, llama.cpp, Strata): [Integration evaluation](docs/integration-eval.md).
-
-## Start
-
-```sh
-curl -fsSL https://saetta.dev/install.sh | sh    # into ~/.local/bin; later: saetta update
-cd ~/src/my-project && saetta start code          # downloads the model that fits this Mac, then opens the agent
-saetta download inkling && saetta start code --pack inkling     # or name a pack
-```
-
-By memory it picks `coder` (Qwen3.8-Flash-Next, 76 GB) from 96 GB, `27b-turbo` (20 GB) from 36 GB, `27b-4bit` (16 GB) from 32 GB. Inside the agent, `/model` downloads and switches packs. Needs macOS 26 or later. Docs: [saetta.dev/docs](https://saetta.dev/docs/).
 
 ## Models
 

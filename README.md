@@ -36,7 +36,7 @@ All on an M5 Max with 128 GB; every number is a measured run.
 
 <p align="center"><img src="web/assets/perf/m14.svg" width="900" alt="Prompt reading at 4K on the M1 to M4 kernels, measured on the M5 Max: 27B 152 before 0.18, 256 now, 961 with the M5's accelerators; Coder 487, 742 and 1,538"></p>
 
-Since 0.22 Saetta reads Inkling prompts on the M5's tensor ops too, 5 times faster than before; Strata is still 19% ahead there. M1 to M4 are not measured on real hardware yet (reports welcome). Details: [Performance](docs/performance.md).
+Since 0.22 Saetta reads Inkling prompts on the M5's tensor ops too, 5 times faster than before; Strata is still 19% ahead there. M1 to M4 are not measured on real hardware yet (reports welcome). Details: [Performance](docs/performance.md). What running the agent and the model in one process buys, against an agent talking to a server over HTTP (Saetta, mlx-lm, llama.cpp, Strata): [Integration evaluation](docs/integration-eval.md).
 
 ## Start
 

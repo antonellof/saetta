@@ -40,6 +40,7 @@
         { "slug": "gguf-import", "title": "GGUF import" },
         { "slug": "lora", "title": "LoRA adapters" },
         { "slug": "performance", "title": "Performance" },
+        { "slug": "integration-eval", "title": "Integration evaluation" },
         { "slug": "build-from-source", "title": "Build from source" }
       ]
     },

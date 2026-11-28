@@ -3,13 +3,13 @@
 All notable changes to saetta and Saetta Code (`saetta code`), newest first. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are saetta's.
 
-## [Unreleased]
+## [0.27.0] - 2026-11-28
 
 ### Added
 
 - `SAETTA_EDIT_MATCH=1` (off by default) holds Saetta Code's edits to the files it knows: with the model in process (or another Saetta Code's), each request sends the files the session read, edited or wrote, as they are on disk (up to 256 KB each, 1 MB in all), and while the model writes an edit call for one of them, its `oldText` can only be text that occurs exactly once in that file, so the edit always finds its match. It runs on the tool-call grammar (`SAETTA_GRAMMAR`), which it turns on for those requests; the model's own token is kept whenever it is valid. Files the session has not touched are left free. On ten exact-edit tasks (blocks repeated word for word, trailing spaces, tab-aligned columns, CRLF, typographic quotes, a file past the first page of a read), the Coder pack made no failed edit with or without it, so there it changes nothing measurable (greedy; the seconds of those runs are not comparable, see the project's notes).
 - The engine takes `thinking_token_budget` on chat requests (Qwen3.8 models): the reply may reason that many tokens, then the engine closes the reasoning and the model answers; 0 starts the answer with the reasoning closed, as a reply without reasoning reads in the history, so the next request reuses the cache.
-- `SAETTA_EFFORT=auto` (off by default) lets Saetta Code choose the reasoning per turn, with the model in process: a turn that follows tool results which all succeeded answers without reasoning (`SAETTA_EFFORT_BUDGET` sets a budget instead), while the turn the user starts and every turn after a failed tool call reason in full. On 30 small coding tasks with the Coder pack the agent took 489.6 s instead of 818.6 greedy (the same 29 of 30 passed) and 414.9 s instead of 858.6 and 882.2 sampled, writing about half the tokens, but the sampled run lost one task (29 of 30 against 30 of 30 in both baseline runs), so it is not the default.
+- Per-turn effort, on by default (`SAETTA_EFFORT=off` turns it off): Saetta Code chooses the reasoning per turn, with the model in process: a turn that follows tool results which all succeeded answers without reasoning (`SAETTA_EFFORT_BUDGET` sets a budget instead), while the turn the user starts and every turn after a failed tool call reason in full. On 30 small coding tasks with the Coder pack the agent took 489.6 s instead of 818.6 greedy (the same 29 of 30 passed) and 414.9 s instead of 858.6 and 882.2 sampled, writing about half the tokens; the sampled run lost one task (29 of 30 against 30 of 30 in both baseline runs).
 
 ## [0.26.0] - 2026-11-27
 

@@ -697,10 +697,10 @@ static JValue *edit_match_spec(Arena *a, const Run *r, const JValue *conv) {
 // The reasoning budget of the next request (src/server.h thinking_token_budget): after tool results
 // that all succeeded, SAETTA_EFFORT_BUDGET tokens (default 0: no reasoning); a turn the user starts
 // and one after a tool error (a failed edit, a malformed call, a failing command) reason in full.
-// Off unless SAETTA_EFFORT=auto: every turn reasons in full (pi's behaviour).
+// On by default (user decision 2026-11-28); SAETTA_EFFORT=off or 0: every turn reasons in full (pi's behaviour).
 static bool effort_budget(const JValue *conv, size_t *budget) {
     const char *v = getenv("SAETTA_EFFORT");
-    if (!v || strcmp(v, "auto") || !json_is(conv, J_ARRAY) || conv->arr.len == 0) return false;
+    if ((v && (!strcmp(v, "off") || !strcmp(v, "0"))) || !json_is(conv, J_ARRAY) || conv->arr.len == 0) return false;
     size_t k = conv->arr.len;
     if (!str_eqz(json_strs(json_get(conv->arr.items[k - 1], "role")), "toolResult")) return false;
     for (; k > 0 && str_eqz(json_strs(json_get(conv->arr.items[k - 1], "role")), "toolResult"); k--)

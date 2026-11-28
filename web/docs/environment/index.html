@@ -46,7 +46,7 @@
     <div class="wrap">
       <a class="brand" href="/">
         <svg viewBox="0 0 32 32" width="20" height="20" aria-hidden="true"><path d="M18.5 3 7 18h7.5L12 29l13-16h-7.8z" fill="currentColor"/></svg>
-        Saetta <span class="ver">v0.26.0</span>
+        Saetta <span class="ver">v0.27.0</span>
       </a>
       <nav class="links">
         <a href="/#models">Models</a>
@@ -116,7 +116,10 @@
 <tr><td><code>SAETTA_AHEAD</code></td><td>1</td><td><code>0</code> turns off reading a running command&#39;s output into the conversation before the next request (<a href="/docs/sessions/">Sessions</a>)</td></tr>
 <tr><td><code>SAETTA_FEED</code></td><td>1</td><td><code>0</code> turns off drafting from the files Saetta Code read, edited or wrote (<a href="/docs/sessions/">Sessions</a>)</td></tr>
 <tr><td><code>SAETTA_FORK_POINT</code></td><td>1</td><td><code>0</code> stops Saetta Code with <code>--subagents</code> asking the engine for a checkpoint before each answer, where its subagents&#39; prompts leave the parent&#39;s (<a href="/docs/parallel-agents/">Parallel agents</a>)</td></tr>
-<tr><td><code>SAETTA_GRAMMAR</code></td><td>0</td><td><code>1</code> decodes tool calls under a grammar built from the request&#39;s tools (Qwen chat format), so a call always names a tool of the request, gives its required arguments and parses; the model&#39;s own token is kept whenever it is valid (<a href="/docs/http-api/#chat-completions">HTTP API</a>)</td></tr></tbody></table></div>
+<tr><td><code>SAETTA_GRAMMAR</code></td><td>0</td><td><code>1</code> decodes tool calls under a grammar built from the request&#39;s tools (Qwen chat format), so a call always names a tool of the request, gives its required arguments and parses; the model&#39;s own token is kept whenever it is valid (<a href="/docs/http-api/#chat-completions">HTTP API</a>)</td></tr>
+<tr><td><code>SAETTA_EDIT_MATCH</code></td><td>0</td><td>Saetta Code with the model in process (or another Saetta Code&#39;s, over its socket): <code>1</code> holds an edit call&#39;s <code>oldText</code> to text that occurs exactly once in its file, for the files the session read, edited or wrote (each up to 256 KB, 1 MB in all, as it is on disk at the request); it turns on the tool-call grammar for those requests (<code>SAETTA_GRAMMAR</code>). A file the session has not touched, or a path written after the edits, is left unconstrained</td></tr>
+<tr><td><code>SAETTA_EFFORT</code></td><td>auto</td><td>Saetta Code with the model in process (or another Saetta Code&#39;s, over its socket): <code>off</code> (or <code>0</code>) makes every turn reason in full, as pi does; the default, <code>auto</code>, gives a request that follows tool results which all succeeded a reasoning budget of <code>SAETTA_EFFORT_BUDGET</code> tokens (default 0: no reasoning); a turn the user starts and one after a tool error reason in full</td></tr>
+<tr><td><code>SAETTA_EFFORT_BUDGET</code></td><td>0</td><td>The budget the per-turn effort gives (tokens of reasoning before the engine closes it)</td></tr></tbody></table></div>
       </article>
       <p class="doc-edit"><a href="https://github.com/antonellof/saetta/blob/main/docs/environment.md" rel="noopener">Edit this page on GitHub</a></p>
       <nav class="doc-pager" aria-label="Previous and next"><a class="prev" href="/docs/commands/"><span>Previous</span>Commands</a><a class="next" href="/docs/faq/"><span>Next</span>FAQ</a></nav>

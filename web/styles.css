@@ -159,8 +159,8 @@ h2 { font-size: clamp(28px, 3.6vw, 38px); line-height: 1.12; letter-spacing: -0.
 .subhead { font-size: 17px; font-weight: 600; margin: 28px 0 4px; }
 .row { display: grid; grid-template-columns: 110px 1fr; align-items: center; gap: 12px; font-size: 12px; }
 .row .name { color: var(--muted); }
-.track { display: flex; align-items: center; gap: 8px; font: 10.5px var(--mono); color: var(--muted); }
-.fill { height: 10px; border-radius: 2px; width: calc(var(--v) / var(--max) * 85%); flex: 0 0 auto; }
+.track { display: flex; align-items: center; gap: 8px; font: 10.5px var(--mono); color: var(--muted); white-space: nowrap; }
+.fill { height: 10px; border-radius: 2px; width: calc(var(--v) / var(--max) * 72%); flex: 0 0 auto; }
 .f-a { background: var(--accent); }
 .f-a2 { background: color-mix(in srgb, var(--accent) 55%, var(--bg)); }
 .f-o { background: var(--orange); }
@@ -348,3 +348,11 @@ td.num { font-family: var(--mono); font-size: 13px; white-space: nowrap; }
 }
 @media (prefers-reduced-motion: reduce) { .cursor { animation: none; } html { scroll-behavior: auto; } }
 .lede-sm { font-size: 15px; color: var(--muted); line-height: 1.6; max-width: 820px; margin: 8px 0 16px; }
+
+/* performance: which way is better, and the winner */
+.chart h3 { display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; }
+.better { font: 600 10.5px var(--mono); color: var(--orange); background: color-mix(in srgb, var(--orange) 14%, transparent); border-radius: 4px; padding: 2px 7px; white-space: nowrap; }
+.row.win .name { color: var(--fg); font-weight: 600; }
+.row.win .track { color: var(--fg); font-weight: 700; }
+.best { font: 700 9.5px var(--mono); letter-spacing: 0.08em; text-transform: uppercase; color: var(--orange); }
+.rows .group { font: 500 10px var(--mono); letter-spacing: 0.08em; text-transform: uppercase; color: var(--dim); margin-top: 4px; }

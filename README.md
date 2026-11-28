@@ -17,11 +17,11 @@
   <img src="https://img.shields.io/badge/Apple%20Silicon-M1%20to%20M5%2C%2032%20GB%2B-111" alt="Apple Silicon M1 to M5, 32 GB or more">
 </p>
 
-Saetta Code is a C port of the [pi](https://pi.dev) coding agent with the model running in the same process: one 2.3 MB binary, no Python, no Node, no server. Its inference engine (C and hand-written Metal) is built for agent work: long shared-prefix prompts, short answers, tool calls. Any Apple Silicon Mac with 32 GB of memory or more; it picks the model that fits.
+Saetta Code is a C port of the [pi](https://pi.dev) coding agent with the model running in the same process: one 3 MB binary, no Python, no Node, no server. Its inference engine (C and hand-written Metal) is built for agent work: long shared-prefix prompts, short answers, tool calls. Any Apple Silicon Mac with 32 GB of memory or more; it picks the model that fits.
 
 <p align="center">
-  <img src="docs/assets/demo-code.gif" width="900" alt="saetta start code: the agent loads the model, writes a one-page site for a coffee roastery, checks and fixes it; the page it wrote at the end">
-  <br><sub><code>saetta start code</code> writes a landing page in one HTML file, checks it and fixes what it finds (waits cut, checks at 8x).</sub>
+  <img src="web/assets/code/tools.png" width="900" alt="Saetta Code fixes parseDuration in src/duration.ts with the edit tool, shows the diff, runs node --test: 5 pass, 0 fail">
+  <br><sub>Saetta Code edits a function, shows the diff and runs the tests, with the model in the same process.</sub>
 </p>
 
 ## Performance
@@ -130,7 +130,7 @@ saetta code --subagents                 # up to 3 child agents at once
 - **Parallel agents** share one loaded model ([Parallel agents](docs/parallel-agents.md)); **MCP** servers over stdio or HTTP with OAuth ([MCP](docs/mcp.md)).
 - **The terminal UI** is pi's, in C, with a footer showing the branch, the last turn's time and tok/s, and the model; `/monitor` shows the engine live. All commands: [Commands](docs/commands.md).
 
-<p align="center"><img src="web/assets/code/tools.png" width="900" alt="An edit of src/duration.ts shown as a diff, node --test with 5 tests passing, and the model's summary"></p>
+<p align="center"><img src="docs/assets/monitor.png" width="900" alt="/monitor: speed, GPU load, GPU memory, system RAM, prompt cache reuse, speculation, context and sessions, with the recent requests"></p>
 
 Coming next: commands confined to the project by macOS's Seatbelt.
 

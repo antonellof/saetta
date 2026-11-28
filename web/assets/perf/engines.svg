@@ -1,34 +1,44 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="900" height="248" viewBox="0 0 900 248" font-family="-apple-system, Segoe UI, Helvetica, Arial, sans-serif"><defs><linearGradient id="g" x1="0" x2="1"><stop offset="0" stop-color="#b26bff"/><stop offset="1" stop-color="#ff8a2b"/></linearGradient><style>.t{font-size:16px;font-weight:600;fill:#c9c9d1}.c{font-size:12px;fill:#8a8a95}.n{font-size:13px;fill:#c9c9d1}.v{font-size:12px;fill:#c9c9d1;font-family:ui-monospace,Menlo,monospace}.f{font-size:11px;fill:#8a8a95}</style></defs><rect width="900" height="248" rx="12" fill="#0d0b12"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="262" viewBox="0 0 900 262" font-family="-apple-system, Segoe UI, Helvetica, Arial, sans-serif"><defs><linearGradient id="g" x1="0" x2="1"><stop offset="0" stop-color="#b26bff"/><stop offset="1" stop-color="#ff8a2b"/></linearGradient><style>.t{font-size:16px;font-weight:600;fill:#c9c9d1}.c{font-size:12px;fill:#8a8a95}.n{font-size:13px;fill:#c9c9d1}.v{font-size:12px;fill:#c9c9d1;font-family:ui-monospace,Menlo,monospace}.f{font-size:11px;fill:#8a8a95}.nw{font-size:13px;font-weight:700;fill:#ffffff}.vw{font-size:12px;font-weight:700;fill:#ffffff;font-family:ui-monospace,Menlo,monospace}.w{font-size:10px;font-weight:700;fill:#ff8a2b;letter-spacing:.06em}.b{font-size:11px;font-weight:700;fill:#ff8a2b}</style></defs><rect width="900" height="262" rx="12" fill="#0d0b12"/>
 <text x="30" y="40" class="t">Qwen3.8-27B</text>
 <text x="30" y="60" class="c">session, same weights, seconds</text>
-<text x="30" y="97" class="n">Saetta Code</text>
-<rect x="140" y="86" width="38.4" height="14" rx="2" fill="url(#g)"/>
-<text x="184.4" y="97" class="v">279.0 s</text>
-<text x="30" y="125" class="n">pi on mlx-lm</text>
-<rect x="140" y="114" width="39.9" height="14" rx="2" fill="#8a8a95"/>
-<text x="185.9" y="125" class="v">289.9 s</text>
+<rect x="30" y="70" width="108" height="18" rx="4" fill="#ff8a2b" fill-opacity="0.14"/>
+<text x="36" y="83" class="b">↓ lower is better</text>
+<text x="30" y="111" class="nw">Saetta Code</text>
+<rect x="140" y="100" width="27.9" height="14" rx="2" fill="url(#g)"/>
+<text x="173.9" y="111" class="vw">279.0 s</text>
+<text x="231.0" y="111" class="w">BEST</text>
+<text x="30" y="139" class="n">pi on mlx-lm</text>
+<rect x="140" y="128" width="29.0" height="14" rx="2" fill="#8a8a95"/>
+<text x="175.0" y="139" class="v">289.9 s</text>
 <text x="320" y="40" class="t">Inkling 2 Mini</text>
 <text x="320" y="60" class="c">session, seconds</text>
-<text x="320" y="97" class="n">Saetta Code</text>
-<rect x="440" y="86" width="84.9" height="14" rx="2" fill="url(#g)"/>
-<text x="530.9" y="97" class="v">617.2 s</text>
-<text x="320" y="125" class="n">pi on llama.cpp</text>
-<rect x="440" y="114" width="108.6" height="14" rx="2" fill="#8a8a95"/>
-<text x="554.6" y="125" class="v">789.8 s</text>
+<rect x="320" y="70" width="108" height="18" rx="4" fill="#ff8a2b" fill-opacity="0.14"/>
+<text x="326" y="83" class="b">↓ lower is better</text>
+<text x="320" y="111" class="nw">Saetta Code</text>
+<rect x="440" y="100" width="61.7" height="14" rx="2" fill="url(#g)"/>
+<text x="507.7" y="111" class="vw">617.2 s</text>
+<text x="564.8" y="111" class="w">BEST</text>
+<text x="320" y="139" class="n">pi on llama.cpp</text>
+<rect x="440" y="128" width="79.0" height="14" rx="2" fill="#8a8a95"/>
+<text x="525.0" y="139" class="v">789.8 s</text>
 <text x="610" y="40" class="t">Flash-Next full</text>
 <text x="610" y="60" class="c">seconds, against Strata</text>
-<text x="610" y="97" class="n">Saetta, session</text>
-<rect x="730" y="86" width="84.4" height="14" rx="2" fill="url(#g)"/>
-<text x="820.4" y="97" class="v">118.1 s</text>
-<text x="610" y="125" class="n">Strata, session</text>
-<rect x="730" y="114" width="93.1" height="14" rx="2" fill="#8a8a95"/>
-<text x="829.1" y="125" class="v">130.3 s</text>
-<text x="610" y="153" class="n">Saetta, edit</text>
-<rect x="730" y="142" width="61.7" height="14" rx="2" fill="url(#g)"/>
-<text x="797.7" y="153" class="v">86.4 s</text>
-<text x="610" y="181" class="n">Strata, edit</text>
-<rect x="730" y="170" width="48.9" height="14" rx="2" fill="#8a8a95"/>
-<text x="784.9" y="181" class="v">68.5 s</text>
-<text x="30" y="216" class="f">M5 Max 128 GB, the same multi-turn session through each engine; Saetta Code runs the model in its own process, pi talks to the</text>
-<text x="30" y="234" class="f">other engine's server. 27B: median of 2 to 3 runs; Inkling and Strata: 1 run, each engine with its own 4-bit or lossless weights.</text>
+<rect x="610" y="70" width="108" height="18" rx="4" fill="#ff8a2b" fill-opacity="0.14"/>
+<text x="616" y="83" class="b">↓ lower is better</text>
+<text x="610" y="111" class="nw">Saetta, session</text>
+<rect x="725" y="100" width="59.0" height="14" rx="2" fill="url(#g)"/>
+<text x="790.0" y="111" class="vw">118.1 s</text>
+<text x="847.1" y="111" class="w">BEST</text>
+<text x="610" y="139" class="n">Strata, session</text>
+<rect x="725" y="128" width="65.2" height="14" rx="2" fill="#8a8a95"/>
+<text x="796.1" y="139" class="v">130.3 s</text>
+<text x="610" y="167" class="n">Saetta, edit</text>
+<rect x="725" y="156" width="43.2" height="14" rx="2" fill="url(#g)"/>
+<text x="774.2" y="167" class="v">86.4 s</text>
+<text x="610" y="195" class="nw">Strata, edit</text>
+<rect x="725" y="184" width="34.2" height="14" rx="2" fill="#8a8a95"/>
+<text x="765.2" y="195" class="vw">68.5 s</text>
+<text x="815.0" y="195" class="w">BEST</text>
+<text x="30" y="230" class="f">M5 Max 128 GB, the same multi-turn session through each engine; Saetta Code runs the model in its own process, pi talks to the</text>
+<text x="30" y="248" class="f">other engine's server. 27B: median of 2 to 3 runs; Inkling and Strata: 1 run, each engine with its own 4-bit or lossless weights.</text>
 </svg>

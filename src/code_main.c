@@ -692,6 +692,33 @@ static JValue *edit_match_spec(Arena *a, const Run *r, const JValue *conv) {
     return spec;
 }
 
+// ---- per-turn effort (SAETTA_EFFORT=auto; saetta's engine: in process or over the share socket) --
+
+// The reasoning budget of the next request (src/server.h thinking_token_budget): after tool results
+// that all succeeded, SAETTA_EFFORT_BUDGET tokens (default 0: no reasoning); a turn the user starts
+// and one after a tool error (a failed edit, a malformed call, a failing command) reason in full.
+// Off unless SAETTA_EFFORT=auto: every turn reasons in full (pi's behaviour).
+static bool effort_budget(const JValue *conv, size_t *budget) {
+    const char *v = getenv("SAETTA_EFFORT");
+    if (!v || strcmp(v, "auto") || !json_is(conv, J_ARRAY) || conv->arr.len == 0) return false;
+    size_t k = conv->arr.len;
+    if (!str_eqz(json_strs(json_get(conv->arr.items[k - 1], "role")), "toolResult")) return false;
+    for (; k > 0 && str_eqz(json_strs(json_get(conv->arr.items[k - 1], "role")), "toolResult"); k--)
+        if (jbool(json_get(conv->arr.items[k - 1], "isError"), false)) return false;
+    // digits only (anything else is 0: no reasoning), at most 1 << 20
+    const char *b = getenv("SAETTA_EFFORT_BUDGET");
+    size_t n = 0;
+    for (const char *p = b ? b : ""; *p; p++) {
+        if (*p < '0' || *p > '9') {
+            n = 0;
+            break;
+        }
+        n = MIN(n * 10 + (size_t)(*p - '0'), (size_t)1 << 20);
+    }
+    *budget = n;
+    return true;
+}
+
 static Err stream_assistant(Run *r, JValue **out) {
     Arena *a = r->a;
     const JValue *all = code_session_messages(r->session);
@@ -714,6 +741,9 @@ static Err stream_assistant(Run *r, JValue **out) {
         JValue *spec = edit_match_spec(&xa, r, conv);
         if (spec) json_put(&xa, extra, S("saetta_edit_match"), spec);
     }
+    size_t budget;
+    if ((bm.engine || bm.sock) && bm.reasoning && bm.thinking && strcmp(bm.thinking, "off") && effort_budget(conv, &budget))
+        json_put(&xa, extra, S("thinking_token_budget"), json_int(&xa, (int64_t)budget));
     if (extra->obj.len) bm.extra = extra;
     Err be = code_oai_body(a, &bm, system, conv, tools, &body);
     arena_reset(&xa);

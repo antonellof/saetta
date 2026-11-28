@@ -295,3 +295,103 @@ TEST(grammar_engine_edit_match) {
     free(other);
     buf_free(&user);
 }
+
+
+// ---- the reasoning budget (thinking_token_budget) -------------------------------------------------
+// Greedy, with speculation on: a budget the reasoning stays under leaves the reply byte for byte as
+// without one; a budget of 0 gives a reply with no reasoning (closed in the prompt) that still
+// answers; a small budget cuts the reasoning (the engine writes the close) and the answer follows,
+// with and without the tool-call grammar, greedy and sampled.
+
+static const char tools_rb[] =
+    "[{\"type\":\"function\",\"function\":{\"name\":\"read\",\"description\":\"Read file contents\",\"parameters\":{\"type\":\"object\","
+    "\"required\":[\"path\"],\"properties\":{\"path\":{\"type\":\"string\"}}}}},{\"type\":\"function\",\"function\":{\"name\":\"bash\","
+    "\"description\":\"Execute bash commands\",\"parameters\":{\"type\":\"object\",\"required\":[\"command\"],\"properties\":{\"command\":"
+    "{\"type\":\"string\"}}}}}]";
+
+// budget < 0: none
+static char *budget_body(const char *user, long budget, const char *sampling) {
+    Buf j = {0}, b = {0};
+    json_write_string(&j, str(user));
+    buf_printf(&b, "{\"messages\":[{\"role\":\"user\",\"content\":%s}],\"tools\":%s,\"max_tokens\":1500,%s,"
+                   "\"chat_template_kwargs\":{\"enable_thinking\":true}",
+               j.ptr, tools_rb, sampling);
+    if (budget >= 0) buf_printf(&b, ",\"thinking_token_budget\":%ld", budget);
+    buf_adds(&b, "}");
+    char *s = strdup(b.ptr);
+    buf_free(&j);
+    buf_free(&b);
+    return s;
+}
+
+static const char *const budget_prompts[] = {
+    "A train leaves at 9:40 and arrives at 13:15. How long is the trip? Think it through, then answer in one line, no tools.",
+    "Find out which Python files in the current folder import os, using bash.",
+};
+
+static bool answered(const Reply *r) { return strcmp(r->content, "<error>") && (r->content[0] || r->calls[0]); }
+
+TEST(grammar_engine_budget_under_unchanged_zero_and_small) {
+    const char *pack = getenv("SAETTA_GRAMMAR_TEST_PACK");
+    if (!pack) SKIP("SAETTA_GRAMMAR_TEST_PACK not set (loads a model)");
+    Engine *e = engine_for(pack);
+    EXPECT(e != NULL);
+    if (!e) return;
+    for (size_t i = 0; i < COUNT(budget_prompts); i++) {
+        char *b_none = budget_body(budget_prompts[i], -1, "\"temperature\":0");
+        char *b_big = budget_body(budget_prompts[i], 100000, "\"temperature\":0");
+        char *b_zero = budget_body(budget_prompts[i], 0, "\"temperature\":0");
+        char *b_small = budget_body(budget_prompts[i], 12, "\"temperature\":0");
+        Reply none = chat(e, b_none, NULL), big = chat(e, b_big, NULL), zero = chat(e, b_zero, NULL), small = chat(e, b_small, NULL);
+        dbg("budget case %zu: reasoning %zu bytes (none), %zu (0), %zu (12); answer (12): %.80s; calls (12): %s", i,
+            strlen(none.reasoning), strlen(zero.reasoning), strlen(small.reasoning), small.content, small.calls);
+        EXPECT(answered(&none) && answered(&big) && answered(&zero) && answered(&small));
+        EXPECT(strlen(none.reasoning) > 100); // the case reasons, past the small budget
+        EXPECT_STR(str(big.content), str(none.content));
+        EXPECT_STR(str(big.reasoning), str(none.reasoning));
+        EXPECT_STR(str(big.calls), str(none.calls));
+        EXPECT_EQ(big.gen, none.gen);
+        EXPECT_EQ(strlen(zero.reasoning), 0);
+        // 12 tokens of reasoning are far under 12 * 32 bytes; the close is not in the reply's text
+        EXPECT(strlen(small.reasoning) > 0 && strlen(small.reasoning) < 12 * 32);
+        EXPECT(!strstr(small.reasoning, "</think>") && !strstr(small.content, "</think>"));
+        if (i == 1) EXPECT(zero.calls[0] && small.calls[0]);
+        reply_free(&none), reply_free(&big), reply_free(&zero), reply_free(&small);
+        free(b_none), free(b_big), free(b_zero), free(b_small);
+    }
+}
+
+TEST(grammar_engine_budget_with_grammar_and_sampled) {
+    const char *pack = getenv("SAETTA_GRAMMAR_TEST_PACK");
+    if (!pack) SKIP("SAETTA_GRAMMAR_TEST_PACK not set (loads a model)");
+    Engine *e = engine_for(pack);
+    EXPECT(e != NULL);
+    if (!e) return;
+    char *body = budget_body(budget_prompts[1], 12, "\"temperature\":0");
+    Reply g = chat(e, body, "1");
+    Reply p = chat(e, body, NULL);
+    EXPECT(answered(&g) && answered(&p));
+    EXPECT(g.calls[0] != 0);
+    EXPECT_STR(str(g.reasoning), str(p.reasoning)); // the close is valid in the grammar's reasoning
+    reply_free(&g), reply_free(&p);
+    free(body);
+    setenv("SAETTA_BENCH_GREEDY", "0", 1); // sampled as asked
+    for (int seed = 1; seed <= 3; seed++) {
+        char sampling[96];
+        snprintf(sampling, sizeof sampling, "\"temperature\":1,\"seed\":%d", seed);
+        body = budget_body(budget_prompts[1], 12, sampling);
+        Reply r = chat(e, body, NULL);
+        EXPECT(answered(&r));
+        EXPECT(strlen(r.reasoning) < 12 * 32 && !strstr(r.content, "</think>"));
+        reply_free(&r);
+        free(body);
+    }
+    setenv("SAETTA_BENCH_GREEDY", "1", 1);
+    // a budget that is no integer from 0 to SESSION_CTX_MAX is refused
+    Buf out = {0};
+    char *bad = budget_body(budget_prompts[0], -1, "\"temperature\":0,\"thinking_token_budget\":-3");
+    (void)server_engine_chat_session(e, str(bad), "grammar-test", sink_keep, &out); // a request error is the answer
+    EXPECT(out.ptr && strstr(out.ptr, "BadThinkingBudget"));
+    buf_free(&out);
+    free(bad);
+}

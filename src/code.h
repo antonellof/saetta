@@ -50,7 +50,7 @@ typedef struct CodeModel {
     // requests while it offers subagents, whose prompts are its prompt less that, plus their task.
     bool fork_point;
     // Fields added to the request body, for saetta's engine only (engine or sock set): Saetta
-    // Code's own switches ("saetta_edit_match", SAETTA_EDIT_MATCH=1). NULL: none.
+    // Code's own switches ("saetta_edit_match", SAETTA_EDIT_MATCH=1; "thinking_token_budget", SAETTA_EFFORT=auto). NULL: none.
     const JValue *extra;
 } CodeModel;
 

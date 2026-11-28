@@ -1589,6 +1589,31 @@ char *code_tools_path(Arena *a, const CodeEnv *env, Str p, bool read) {
     return read ? resolve_read_path(a, env, p) : resolve_to_cwd(a, env, p);
 }
 
+static Str normalize_lf(Arena *a, Str s);
+
+bool code_tools_edit_text(Arena *a, const char *abs, size_t max, Str *out) {
+    int fd = open(abs, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return false;
+    struct stat st;
+    if (fstat(fd, &st) || !S_ISREG(st.st_mode) || (size_t)st.st_size > max) {
+        close(fd);
+        return false;
+    }
+    Buf data = {0};
+    int e = read_all(fd, &data);
+    close(fd);
+    if (e || data.len > max) {
+        buf_free(&data);
+        return false;
+    }
+    // as tool_edit reads it
+    Str raw = u8_text(a, data.ptr, data.len, true);
+    buf_free(&data);
+    Str content = str_starts(raw, S("\xef\xbb\xbf")) ? str_n(raw.ptr + 3, raw.len - 3) : raw;
+    *out = normalize_lf(a, content);
+    return true;
+}
+
 // truncateTail with the defaults (2000 lines, 50 KB).
 Str code_tools_truncate_tail(Str s, bool *truncated) {
     Trunc t = truncate_tail(s, MAX_LINES, MAX_BYTES);

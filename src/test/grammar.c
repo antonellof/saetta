@@ -8,6 +8,7 @@
 #include "../grammar.h"
 #include "../json.h"
 #include "../toolcall.h"
+#include "../chat.h"
 
 static const char pi_tools[] =
     "[{\"type\":\"function\",\"function\":{\"name\":\"read\",\"parameters\":{\"type\":\"object\",\"required\":[\"path\"],"
@@ -330,5 +331,188 @@ TEST(grammar_random_walks_no_dead_end) {
     EXPECT_EQ(dead_ends, 0);
     EXPECT_EQ(bad_parse, 0);
     EXPECT(completed > 0);
+    arena_reset(&a);
+}
+
+// ---- edit match (grammar_edit_files) --------------------------------------------------------
+
+// a CRLF file (as Saetta Code sends it: without the BOM the tool drops), two identical "    return 1"
+// lines, escapes and a non-ASCII character
+#define EM_FILE "def a():\r\n    return 1\r\n\r\ndef b():\r\n    return 1\r\n    # \"q\" \\ tab\there \xc3\xa9 ABC\r\n"
+// the same as the edit tool matches it
+#define EM_TEXT "def a():\n    return 1\n\ndef b():\n    return 1\n    # \"q\" \\ tab\there \xc3\xa9 ABC\n"
+
+static Grammar *em_grammar(Arena *a, JValue **tools) {
+    Grammar *g = pi_grammar(a, tools);
+    Buf b = {0};
+    buf_adds(&b, "{\"cwd\":\"/w\",\"home\":\"/h\",\"files\":[{\"path\":\"/w/pkg/m.py\",\"text\":");
+    chat_json_string(&b, S(EM_FILE));
+    buf_adds(&b, "},{\"path\":\"/h/notes.txt\",\"text\":\"hello world\\n\"},{\"path\":\"/w/empty\",\"text\":\"\"}]}");
+    JValue *spec;
+    if (json_parse(a, buf_str(&b), true, &spec)) die("em spec: bad JSON\n");
+    buf_free(&b);
+    grammar_edit_files(g, a, spec);
+    return g;
+}
+
+#define EMP(path) "<tool_call>\n<function=edit>\n<parameter=path>\n" path "\n</parameter>\n<parameter=edits>\n"
+#define EMQ(path, old) EMP(path) "[{\"oldText\": \"" old
+#define EMC(path, old) EMQ(path, old) "\", \"newText\": \"x\"}]\n</parameter>\n</function>\n</tool_call>"
+
+TEST(grammar_edit_match_holds_old_text_to_its_file) {
+    Arena a = {0};
+    JValue *tools;
+    Grammar *g = em_grammar(&a, &tools);
+    EXPECT_EQ(g->n_files, 2); // the empty file is left out
+    EXPECT_STR(g->files[0].text, S(EM_TEXT));
+    static const char *const ok[] = {
+        EMC("pkg/m.py", "def b():\\n    return 1"),
+        EMC("./pkg/../pkg/m.py", "def a"),
+        EMC("@pkg/m.py", "    return 1\\n\\ndef"),
+        EMC("/w/pkg/m.py", "# \\\"q\\\" \\\\ tab\\there \xc3\xa9"),
+        EMC("pkg/m.py", "\\u0064ef a():\\n"),       // an escape below 0x80
+        EMC("~/notes.txt", "world"),
+        EMC("/w/other.py", "anything \\r \\u00e9"),    // a file not listed: unconstrained
+        EMC("pkg/m.py\nx", "zzz"),                     // a path naming no file: unconstrained
+        // the edits before the path: unconstrained
+        "<tool_call>\n<function=edit>\n<parameter=edits>\n[{\"oldText\": \"zzz\", \"newText\": \"\"}]\n</parameter>\n"
+        "<parameter=path>\npkg/m.py\n</parameter>\n</function>\n</tool_call>",
+        // two edits, each held
+        EMP("pkg/m.py") "[{\"oldText\": \"def a\", \"newText\": \"x\"}, {\"newText\": \"y\", \"oldText\": \"ABC\"}]\n</parameter>\n</function>\n</tool_call>",
+    };
+    for (size_t i = 0; i < COUNT(ok); i++) {
+        Str t = str(ok[i]);
+        EXPECT_EQ(first_bad(g, false, t), -1);
+        EXPECT_EQ(first_dead_end(g, false, t), -1);
+        EXPECT(may_end_after(g, false, t));
+        Parsed p = toolcall_parse(&a, t, tools);
+        EXPECT_EQ(p.n_calls, 1);
+    }
+    // refused at the first byte that leaves the text, or at a close that is empty or not unique
+    static const struct {
+        const char *text, *bad_at;
+    } bad[] = {
+        {EMC("pkg/m.py", "    return 2"), EMQ("pkg/m.py", "    return ")},
+        {EMC("pkg/m.py", "    return 1"), EMQ("pkg/m.py", "    return 1")}, // twice in the file
+        {EMC("pkg/m.py", ""), EMQ("pkg/m.py", "")},                          // empty
+        {EMC("pkg/m.py", "\\u00e9"), EMQ("pkg/m.py", "\\u00")},              // an escape past ASCII
+        {EMC("pkg/m.py", "\\u0100"), EMQ("pkg/m.py", "\\u0")},
+        {EMC("pkg/m.py", "\\u0020x"), EMQ("pkg/m.py", "\\u0020")},           // a space, then no x
+        {EMC("pkg/m.py", "():\\r\\n"), EMQ("pkg/m.py", "():\\")},           // a CR (the text has LF)
+        {EMC("pkg/m.py", "():\r"), EMQ("pkg/m.py", "():")},                  // a raw CR (JSON's rule refuses it first)
+        {EMC("pkg/m.py", "\xc3\xa8"), EMQ("pkg/m.py", "\xc3")},              // a raw character not in the text
+        {EMC("~/notes.txt", "world\\n\\n"), EMQ("~/notes.txt", "world\\n")},    // the end: not even an escape
+        {EMC("pkg/m.py", "\\/"), EMQ("pkg/m.py", "\\")},                     // decodes to '/', not in the text
+    };
+    for (size_t i = 0; i < COUNT(bad); i++) {
+        Str t = str(bad[i].text);
+        EXPECT_EQ(first_bad(g, false, t), (ptrdiff_t)strlen(bad[i].bad_at));
+        EXPECT_EQ(first_dead_end(g, false, t), -1);
+    }
+    // an escape needs an ASCII byte after it: after "here " only "\xc3\xa9" follows (without the
+    // match an escape is valid there)
+    GState s = grammar_start(g, false, S(EMQ("pkg/m.py", "here ")));
+    EXPECT(grammar_in_edit(&s));
+    EXPECT(!grammar_ok_bytes(g, &s, S("\\")));
+    EXPECT(grammar_ok_bytes(g, &s, S("\xc3\xa9")));
+    GState s0 = grammar_start(pi_grammar(&a, &tools), false, S(EMQ("pkg/m.py", "here ")));
+    EXPECT(grammar_ok_bytes(pi_grammar(&a, &tools), &s0, S("\\")));
+    // a repeated path: the parser keeps the first, so does the match
+    EXPECT_EQ(first_bad(g, false, S("<tool_call>\n<function=edit>\n<parameter=path>\n~/notes.txt\n</parameter>\n<parameter=path>\npkg/m.py\n"
+                                    "</parameter>\n<parameter=edits>\n[{\"oldText\": \"world\", \"newText\": \"x\"}]\n</parameter>\n</function>\n</tool_call>")),
+              -1);
+    EXPECT(first_bad(g, false, S("<tool_call>\n<function=edit>\n<parameter=path>\n~/notes.txt\n</parameter>\n<parameter=path>\npkg/m.py\n"
+                                 "</parameter>\n<parameter=edits>\n[{\"oldText\": \"def a\", \"newText\": \"x\"}]\n</parameter>\n</function>\n</tool_call>")) >= 0);
+    // paths the tool reads otherwise (Unicode spaces, URLs): unconstrained
+    EXPECT_EQ(first_bad(g, false, S(EMC("pkg/m\xc2\xa0.py", "zzz"))), -1);
+    EXPECT_EQ(first_bad(g, false, S(EMC("file:///w/pkg/m.py", "zzz"))), -1);
+    // past the close the call goes on as without the match
+    GState e = grammar_start(g, false, S(EMQ("pkg/m.py", "def a") "\""));
+    EXPECT(!grammar_in_edit(&e));
+    EXPECT(grammar_ok_bytes(g, &e, S(", \"newText\": \"anything \\r \\u00e9\"}]")));
+    arena_reset(&a);
+}
+
+// Random walks inside an oldText held to a file: at every prefix some byte is valid, and every
+// oldText the grammar closes decodes to text that occurs exactly once in the file.
+// Occurrences counted as the tool counts them: from the left, without overlap ("aa" is once in "aaa").
+TEST(grammar_edit_match_counts_as_the_tool) {
+    Arena a = {0};
+    JValue *tools;
+    Grammar *g = pi_grammar(&a, &tools);
+    JValue *spec;
+    EXPECT_OK(json_parse(&a, S("{\"cwd\":\"/w\",\"files\":[{\"path\":\"/w/r\",\"text\":\"aaa ababab\\n\"}]}"), true, &spec));
+    grammar_edit_files(g, &a, spec);
+    EXPECT_EQ(first_bad(g, false, S(EMC("r", "aa"))), -1);     // at 0 and 1: once without overlap
+    EXPECT_EQ(first_bad(g, false, S(EMC("r", "abab"))), -1);   // at 4 and 6: once
+    EXPECT_EQ(first_bad(g, false, S(EMC("r", "ab"))), (ptrdiff_t)strlen(EMQ("r", "ab"))); // three times
+    EXPECT_EQ(first_bad(g, false, S(EMC("r", "a"))), (ptrdiff_t)strlen(EMQ("r", "a")));
+    arena_reset(&a);
+}
+
+TEST(grammar_edit_match_random_walks) {
+    Arena a = {0};
+    JValue *tools;
+    Grammar *g = em_grammar(&a, &tools);
+    static const char *const pieces[] = {"\\n", "\\t", "\\\"", "\\\\", "\\/", "\\u00", "\\u0041", "\\u000a", "\"", "    ",
+                                         "return 1", "def ", "\xc3\xa9", "\\r", "\\u00e9", "\\"};
+    Str text = S(EM_TEXT);
+    uint64_t r = 0x2545f4914f6cdd1dull;
+    size_t dead_ends = 0, closed = 0, wrong = 0;
+    for (int walk = 0; walk < 5000; walk++) {
+        const char *open = walk % 3 ? EMQ("pkg/m.py", "") : EMQ("~/notes.txt", "");
+        Str want = walk % 3 ? text : S("hello world\n");
+        Buf val = {0};
+        GState s = grammar_start(g, false, str(open));
+        bool done = false;
+        for (int step = 0; step < 200 && !done; step++) {
+            r = r * 6364136223846793005ull + 1442695040888963407ull;
+            uint32_t x = (uint32_t)(r >> 33);
+            char one;
+            Str piece;
+            if (x % 4 == 0) piece = str(pieces[(x >> 2) % COUNT(pieces)]);
+            else {
+                // a byte of the text (the walk then often goes along it), or any byte
+                one = x % 4 == 1 ? (char)(1 + (x >> 2) % 255) : want.ptr[(x >> 2) % want.len];
+                piece = str_n(&one, 1);
+            }
+            if (!grammar_ok_bytes(g, &s, piece)) continue;
+            for (size_t i = 0; i < piece.len && !done; i++) {
+                grammar_feed_bytes(g, &s, str_n(piece.ptr + i, 1));
+                if (!grammar_in_edit(&s)) {
+                    done = true; // the closing quote
+                    break;
+                }
+                buf_add(&val, piece.ptr + i, 1);
+                bool any = false;
+                for (int c = 1; c < 256 && !any; c++) {
+                    char cc = (char)c;
+                    any = grammar_ok_bytes(g, &s, str_n(&cc, 1));
+                }
+                if (!any) dead_ends++;
+            }
+        }
+        if (done) {
+            closed++;
+            Buf js = {0};
+            buf_addc(&js, '"');
+            buf_addstr(&js, buf_str(&val));
+            buf_addc(&js, '"');
+            JValue *v;
+            if (json_parse(&a, buf_str(&js), true, &v) || v->kind != J_STRING || v->s.len == 0) wrong++;
+            else {
+                size_t n = 0;
+                // as the tool counts: from the left, without overlap
+                for (ptrdiff_t at = str_find(want, v->s, 0); at >= 0; at = str_find(want, v->s, (size_t)at + v->s.len)) n++;
+                wrong += n != 1;
+            }
+            buf_free(&js);
+        }
+        buf_free(&val);
+    }
+    dbg("edit match walks: %zu dead ends, %zu closed, %zu wrong\n", dead_ends, closed, wrong);
+    EXPECT_EQ(dead_ends, 0);
+    EXPECT_EQ(wrong, 0);
+    EXPECT(closed > 100);
     arena_reset(&a);
 }

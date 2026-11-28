@@ -208,3 +208,90 @@ TEST(grammar_engine_array_argument_masked) {
         free(body);
     }
 }
+
+// ---- edit match ("saetta_edit_match", Saetta Code's SAETTA_EDIT_MATCH=1) -------------------------
+
+// body_of's request with "saetta_edit_match": mathkit/stats.py in /w holds text
+static char *body_em(const char *user, const char *text) {
+    char *plain = body_of(user, tools_all, false, "\"temperature\":0");
+    Buf t = {0}, b = {0};
+    json_write_string(&t, str(text));
+    buf_printf(&b, "%.*s,\"saetta_edit_match\":{\"cwd\":\"/w\",\"home\":\"/h\",\"files\":[{\"path\":\"/w/mathkit/stats.py\",\"text\":%s}]}}",
+               (int)strlen(plain) - 1, plain, t.ptr);
+    char *s = strdup(b.ptr);
+    free(plain);
+    buf_free(&t);
+    buf_free(&b);
+    return s;
+}
+
+// every edit call's oldTexts occur exactly once in text
+static bool old_texts_in(const char *calls, const char *text, size_t *edits) {
+    Arena a = {0};
+    bool ok = true;
+    *edits = 0;
+    for (const char *p = calls; *p && ok;) {
+        const char *nl = strchr(p, '\n');
+        Str line = str_n(p, nl ? (size_t)(nl - p) : strlen(p));
+        p = nl ? nl + 1 : p + line.len;
+        if (!str_starts(line, S("edit "))) continue;
+        JValue *args;
+        if (json_parse(&a, str_sub(line, 5, line.len), false, &args)) {
+            ok = false;
+            break;
+        }
+        const JValue *es = json_get(args, "edits");
+        for (size_t i = 0; json_is(es, J_ARRAY) && i < es->arr.len && ok; i++) {
+            const JValue *o = json_get(es->arr.items[i], "oldText");
+            size_t n = 0;
+            if (json_is(o, J_STRING) && o->s.len)
+                for (ptrdiff_t at = str_find(str(text), o->s, 0); at >= 0; at = str_find(str(text), o->s, (size_t)at + o->s.len)) n++;
+            ok = n == 1;
+            ++*edits;
+        }
+    }
+    arena_reset(&a);
+    return ok;
+}
+
+TEST(grammar_engine_edit_match) {
+    const char *pack = getenv("SAETTA_GRAMMAR_TEST_PACK");
+    if (!pack) SKIP("SAETTA_GRAMMAR_TEST_PACK not set (loads a model)");
+    Engine *e = engine_for(pack);
+    EXPECT(e != NULL);
+    if (!e) return;
+    Buf user = {0};
+    buf_printf(&user, "This is mathkit/stats.py:\n\n%s\nmedian() is wrong for lists of even length. Fix it with the edit tool now.",
+               stats_file);
+    // the file as the prompt shows it: the reply is the grammar's alone, nothing replaced
+    char *plain = body_of(user.ptr, tools_all, false, "\"temperature\":0");
+    char *same = body_em(user.ptr, stats_file);
+    Reply g = chat(e, plain, "1");
+    Reply m = chat(e, same, NULL); // the field turns the grammar on by itself
+    size_t replaced = server_engine_grammar_replaced(e);
+    size_t edits;
+    dbg("edit match, same file: %s", m.calls);
+    EXPECT_STR(str(m.calls), str(g.calls));
+    EXPECT_STR(str(m.content), str(g.content));
+    EXPECT_EQ(replaced, 0);
+    EXPECT(old_texts_in(m.calls, stats_file, &edits));
+    EXPECT(edits > 0);
+    // the file on disk differs from what the model was shown: its oldText follows the file
+    static const char disk[] = "def mean(xs):\n    return sum(xs) / len(xs)\n\n\ndef median(xs):\n    s = sorted(xs)\n    n = len(s)\n"
+                               "    mid = n // 2\n    if n % 2:\n        return s[mid]\n    return s[mid]\n";
+    char *other = body_em(user.ptr, disk);
+    Reply d = chat(e, other, NULL);
+    replaced = server_engine_grammar_replaced(e);
+    dbg("edit match, other file (%zu replaced): %s", replaced, d.calls);
+    EXPECT(old_texts_in(d.calls, disk, &edits));
+    EXPECT(edits > 0);
+    size_t ge;
+    if (!old_texts_in(g.calls, disk, &ge)) EXPECT(replaced > 0);
+    reply_free(&g);
+    reply_free(&m);
+    reply_free(&d);
+    free(plain);
+    free(same);
+    free(other);
+    buf_free(&user);
+}

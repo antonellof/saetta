@@ -49,6 +49,9 @@ typedef struct CodeModel {
     // just before their generation prompt ("saetta_fork_point", src/server.c): the agent's own
     // requests while it offers subagents, whose prompts are its prompt less that, plus their task.
     bool fork_point;
+    // Fields added to the request body, for saetta's engine only (engine or sock set): Saetta
+    // Code's own switches ("saetta_edit_match", SAETTA_EDIT_MATCH=1). NULL: none.
+    const JValue *extra;
 } CodeModel;
 
 // saetta's version (main.c sets it), for Saetta Code's header.
@@ -122,6 +125,9 @@ Str code_tools_truncate_tail(Str s, bool *truncated);
 // The file a read (read true: with its macOS spellings that exist, as resolveReadPath) or an edit
 // or write of path p names, absolute.
 char *code_tools_path(Arena *a, const CodeEnv *env, Str p, bool read);
+// The text the edit tool matches an oldText in (the file at abs as UTF-8, its BOM dropped, LF line
+// endings), or false when it cannot be read or is larger than max bytes.
+bool code_tools_edit_text(Arena *a, const char *abs, size_t max, Str *out);
 
 // ---- OpenAI chat completions client (code_oai.c; pi-ai: api/openai-completions.js,
 // transform-messages.js)

@@ -125,3 +125,31 @@ for (const t of document.querySelectorAll(".tab")) {
   });
 }
 loop();
+
+// tour carousel: arrows, dots, swipe, keyboard; auto-advance every 5 s while visible, paused on hover or focus
+for (const c of document.querySelectorAll(".carousel")) {
+  const slides = [...c.querySelectorAll(".slide")], dots = [...c.querySelectorAll(".dot")];
+  let i = 0, timer = null, paused = false;
+  const show = (n) => {
+    i = (n + slides.length) % slides.length;
+    slides.forEach((s, k) => s.classList.toggle("on", k === i));
+    dots.forEach((d, k) => d.classList.toggle("on", k === i));
+  };
+  const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  const start = () => { if (!reduce && !timer) timer = setInterval(() => { if (!paused) show(i + 1); }, 5000); };
+  const stop = () => { clearInterval(timer); timer = null; };
+  c.querySelector(".prev").addEventListener("click", () => { show(i - 1); stop(); start(); });
+  c.querySelector(".next").addEventListener("click", () => { show(i + 1); stop(); start(); });
+  dots.forEach((d, k) => d.addEventListener("click", () => { show(k); stop(); start(); }));
+  c.addEventListener("mouseenter", () => { paused = true; });
+  c.addEventListener("mouseleave", () => { paused = false; });
+  c.addEventListener("focusin", () => { paused = true; });
+  c.addEventListener("focusout", () => { paused = false; });
+  c.tabIndex = 0;
+  c.addEventListener("keydown", (e) => { if (e.key === "ArrowLeft") show(i - 1); if (e.key === "ArrowRight") show(i + 1); });
+  let x0 = null;
+  c.addEventListener("touchstart", (e) => { x0 = e.touches[0].clientX; }, { passive: true });
+  c.addEventListener("touchend", (e) => { if (x0 === null) return; const dx = e.changedTouches[0].clientX - x0; if (Math.abs(dx) > 40) show(i + (dx < 0 ? 1 : -1)); x0 = null; });
+  if ("IntersectionObserver" in window) new IntersectionObserver((es) => es.forEach((en) => en.isIntersecting ? start() : stop())).observe(c);
+  else start();
+}

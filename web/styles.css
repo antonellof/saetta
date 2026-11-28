@@ -356,3 +356,16 @@ td.num { font-family: var(--mono); font-size: 13px; white-space: nowrap; }
 .row.win .track { color: var(--fg); font-weight: 700; }
 .best { font: 700 9.5px var(--mono); letter-spacing: 0.08em; text-transform: uppercase; color: var(--orange); }
 .rows .group { font: 500 10px var(--mono); letter-spacing: 0.08em; text-transform: uppercase; color: var(--dim); margin-top: 4px; }
+
+/* tour: the launch slides as a carousel */
+.carousel { position: relative; border-radius: 14px; overflow: hidden; border: 1px solid var(--border); background: #0d0b12; aspect-ratio: 1270 / 760; }
+.carousel .slide { position: absolute; inset: 0; margin: 0; opacity: 0; transition: opacity .6s ease; }
+.carousel .slide.on { opacity: 1; }
+.carousel .slide img { width: 100%; height: 100%; display: block; object-fit: cover; }
+.cnav { position: absolute; top: 50%; transform: translateY(-50%); width: 40px; height: 40px; border-radius: 50%; border: 1px solid rgba(255,255,255,.18); background: rgba(10,8,16,.55); color: #fff; font-size: 26px; line-height: 1; cursor: pointer; display: flex; align-items: center; justify-content: center; padding-bottom: 3px; }
+.cnav:hover { background: rgba(10,8,16,.8); }
+.cnav.prev { left: 12px; } .cnav.next { right: 12px; }
+.carousel .dots { position: absolute; left: 0; right: 0; bottom: 10px; display: flex; justify-content: center; gap: 8px; }
+.carousel .dot { width: 8px; height: 8px; border-radius: 50%; border: 0; padding: 0; background: rgba(255,255,255,.35); cursor: pointer; }
+.carousel .dot.on { background: #fff; width: 22px; border-radius: 4px; }
+@media (max-width: 640px) { .cnav { width: 32px; height: 32px; font-size: 20px; } }

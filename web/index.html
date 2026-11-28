@@ -223,6 +223,24 @@ saetta serve coder       <span class="c"># http://127.0.0.1:8080/v1</span></pre>
       </div>
     </div>
 
+    <section class="block" id="tour">
+      <div class="wrap">
+        <span class="eyebrow">Tour</span>
+        <h2>Saetta in six slides</h2>
+        <div class="carousel" aria-roledescription="carousel" aria-label="Saetta tour">
+          <figure class="slide on" aria-roledescription="slide" aria-label="1 of 6"><img src="/assets/tour/cover.jpg" alt="Saetta, the coding agent with the model inside: 1.6 times faster than pi, no servers, 3.5 times less memory than mlx-lm" width="1270" height="760"></figure>
+          <figure class="slide" aria-roledescription="slide" aria-label="2 of 6"><img src="/assets/tour/slide-1.jpg" alt="Saetta: the agent and the model in one C binary; 1.6 times faster than pi on the same model, 1.8 times faster with the model inside the agent, 3.5 times less memory than mlx-lm" width="1270" height="760" loading="lazy"></figure>
+          <figure class="slide" aria-roledescription="slide" aria-label="3 of 6"><img src="/assets/tour/slide-2.jpg" alt="Same model, less waiting: 30 coding tasks in 489.6 s against 775.2 s for pi; a 15-turn session in 89.8 s with the model inside against 166.0 s over HTTP" width="1270" height="760" loading="lazy"></figure>
+          <figure class="slide" aria-roledescription="slide" aria-label="4 of 6"><img src="/assets/tour/slide-3.jpg" alt="The same agent session against other engines: Saetta 279.0 s against mlx-lm 289.9 s on Qwen3.8-27B, 617.2 s against llama.cpp 789.8 s on Inkling 2 Mini, 118.1 s against Strata 130.3 s on Flash-Next" width="1270" height="760" loading="lazy"></figure>
+          <figure class="slide" aria-roledescription="slide" aria-label="5 of 6"><img src="/assets/tour/slide-4.jpg" alt="/monitor: speed, GPU load and memory live, prompt cache reuse, speculative decoding, sessions resumed in a fraction of a second" width="1270" height="760" loading="lazy"></figure>
+          <figure class="slide" aria-roledescription="slide" aria-label="6 of 6"><img src="/assets/tour/slide-5.jpg" alt="Any Apple Silicon Mac with 32 GB or more: install in one line, Qwen3.8 and Inkling 2 Mini, open source under MIT" width="1270" height="760" loading="lazy"></figure>
+          <button class="cnav prev" aria-label="Previous slide">&#8249;</button>
+          <button class="cnav next" aria-label="Next slide">&#8250;</button>
+          <div class="dots"><button class="dot on" aria-label="Slide 1"></button><button class="dot" aria-label="Slide 2"></button><button class="dot" aria-label="Slide 3"></button><button class="dot" aria-label="Slide 4"></button><button class="dot" aria-label="Slide 5"></button><button class="dot" aria-label="Slide 6"></button></div>
+        </div>
+      </div>
+    </section>
+
     <section class="block" id="models">
       <div class="wrap">
         <span class="eyebrow">Models</span>
@@ -729,7 +747,7 @@ logits       max rel err 6.7e-7</pre>
     </div>
   </footer>
 
-  <script src="/app.js" defer></script>
+  <script src="/app.js?v=tour" defer></script>
   <script src="/hero.js" defer></script>
 </body>
 </html>

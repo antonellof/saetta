@@ -20,8 +20,7 @@
 Saetta Code is a C port of the [pi](https://pi.dev) coding agent with the model running in the same process: one 3 MB binary, no Python, no Node, no server. Its inference engine (C and hand-written Metal) is built for agent work: long shared-prefix prompts, short answers, tool calls. Any Apple Silicon Mac with 32 GB of memory or more; it picks the model that fits.
 
 <p align="center">
-  <img src="web/assets/code/tools.png" width="900" alt="Saetta Code fixes parseDuration in src/duration.ts with the edit tool, shows the diff, runs node --test: 5 pass, 0 fail">
-  <br><sub>Saetta Code edits a function, shows the diff and runs the tests, with the model in the same process.</sub>
+  <img src="docs/assets/tour.gif" width="900" alt="A tour in six slides: Saetta, the coding agent with the model inside; 1.6 times faster than pi on the same model, 1.8 times faster with the model inside the agent than over HTTP, 3.5 times less memory than mlx-lm; the same agent session against mlx-lm, llama.cpp and Strata, Saetta first in each; /monitor; install in one line">
 </p>
 
 ## Performance
@@ -116,6 +115,11 @@ saetta code --model myprovider/my-model
 ## The agent
 
 pi 1.5.2's tools, system prompt, `AGENTS.md`/`CLAUDE.md`, skills, prompt files, sessions and terminal UI, sharing pi's `~/.pi/agent` setup: each continues the other's sessions. Requests and session files match pi's byte for byte on 63 recorded scenarios, the interactive screens on 82, rpc mode on 12. Not supported: pi's TypeScript extensions, image input.
+
+<p align="center">
+  <img src="web/assets/code/tools.png" width="900" alt="Saetta Code fixes parseDuration in src/duration.ts with the edit tool, shows the diff, runs node --test: 5 pass, 0 fail">
+  <br><sub>Saetta Code edits a function, shows the diff and runs the tests, with the model in the same process.</sub>
+</p>
 
 ```sh
 saetta code -c                          # continue this folder's last session

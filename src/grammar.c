@@ -149,6 +149,7 @@ static bool tool_name_ok(Str n) {
 
 Grammar *grammar_build(Arena *a, const JValue *tools, const Tokenizer *tok, const uint32_t *eos, size_t n_eos) {
     Grammar *g = ARENA_NEW(a, Grammar);
+    g->em_tool = -1;
     g->tok = tok;
     g->eos = eos;
     g->n_eos = n_eos;
@@ -181,6 +182,141 @@ Grammar *grammar_build(Arena *a, const JValue *tools, const Tokenizer *tok, cons
     vec_free(&b.props);
     vec_free(&ts);
     return g;
+}
+
+// ---- edit match: the files -----------------------------------------------------------------
+
+// The suffix array of t (prefix doubling with counting sorts, O(n log n); a suffix that is a prefix
+// of another sorts first). NULL when out of memory.
+static uint32_t *suffix_array(Arena *a, const unsigned char *t, size_t n) {
+    uint32_t *sa = ARENA_ARRAY(a, uint32_t, n);
+    size_t m = MAX(n, (size_t)256) + 1;
+    uint32_t *rk = malloc(n * sizeof *rk), *tmp = malloc(n * sizeof *tmp), *cnt = malloc(m * sizeof *cnt);
+    if (!rk || !tmp || !cnt) {
+        free(rk), free(tmp), free(cnt);
+        return NULL;
+    }
+    memset(cnt, 0, m * sizeof *cnt);
+    for (size_t i = 0; i < n; i++) cnt[t[i]]++;
+    for (size_t c = 1; c < 256; c++) cnt[c] += cnt[c - 1];
+    for (size_t i = n; i-- > 0;) sa[--cnt[t[i]]] = (uint32_t)i;
+    rk[sa[0]] = 0;
+    for (size_t i = 1; i < n; i++) rk[sa[i]] = rk[sa[i - 1]] + (t[sa[i]] != t[sa[i - 1]]);
+    for (size_t k = 1; rk[sa[n - 1]] < n - 1 && k < n; k <<= 1) {
+        // by the rank of the second half (past the end first), then stably by the first half's
+        size_t p = 0;
+        for (size_t i = n - k; i < n; i++) tmp[p++] = (uint32_t)i;
+        for (size_t j = 0; j < n; j++)
+            if (sa[j] >= k) tmp[p++] = sa[j] - (uint32_t)k;
+        size_t nr = (size_t)rk[sa[n - 1]] + 1;
+        memset(cnt, 0, nr * sizeof *cnt);
+        for (size_t i = 0; i < n; i++) cnt[rk[i]]++;
+        for (size_t c = 1; c < nr; c++) cnt[c] += cnt[c - 1];
+        for (size_t j = n; j-- > 0;) sa[--cnt[rk[tmp[j]]]] = tmp[j];
+        // new ranks (tmp): equal when both halves are
+        tmp[sa[0]] = 0;
+        for (size_t j = 1; j < n; j++) {
+            uint32_t x = sa[j - 1], y = sa[j];
+            int64_t xs = x + k < n ? (int64_t)rk[x + k] : -1, ys = y + k < n ? (int64_t)rk[y + k] : -1;
+            tmp[y] = tmp[x] + (rk[x] != rk[y] || xs != ys);
+        }
+        memcpy(rk, tmp, n * sizeof *rk);
+    }
+    free(rk), free(tmp), free(cnt);
+    return sa;
+}
+
+// UTF-8 as json_parse takes it (the rules of string_byte)
+static bool utf8_ok(Str t) {
+    for (size_t i = 0; i < t.len;) {
+        unsigned char u = (unsigned char)t.ptr[i];
+        size_t need = 0;
+        unsigned char lo = 0x80, hi = 0xBF;
+        if (u < 0x80) need = 0;
+        else if (u >= 0xC2 && u <= 0xDF) need = 1;
+        else if (u == 0xE0) need = 2, lo = 0xA0;
+        else if ((u >= 0xE1 && u <= 0xEC) || u == 0xEE || u == 0xEF) need = 2;
+        else if (u == 0xED) need = 2, hi = 0x9F;
+        else if (u == 0xF0) need = 3, lo = 0x90;
+        else if (u >= 0xF1 && u <= 0xF3) need = 3;
+        else if (u == 0xF4) need = 3, hi = 0x8F;
+        else return false;
+        i++;
+        for (size_t k = 0; k < need; k++, i++) {
+            if (i >= t.len) return false;
+            unsigned char v = (unsigned char)t.ptr[i];
+            if (v < lo || v > hi) return false;
+            lo = 0x80, hi = 0xBF;
+        }
+    }
+    return true;
+}
+
+// CRLF and CR as LF (normalizeToLF), as the edit tool matches (the caller sends the text without the
+// BOM the tool drops)
+static Str edit_text(Arena *a, Str t) {
+    if (!memchr(t.ptr, '\r', t.len)) return t;
+    char *o = arena_alloc(a, t.len);
+    size_t n = 0;
+    for (size_t i = 0; i < t.len; i++) {
+        if (t.ptr[i] == '\r') {
+            o[n++] = '\n';
+            if (i + 1 < t.len && t.ptr[i + 1] == '\n') i++;
+        } else o[n++] = t.ptr[i];
+    }
+    return str_n(o, n);
+}
+
+static int prop_index(const Grammar *g, uint16_t node, Str name);
+static bool fold_path(Str base, Str p, char *out, size_t cap, size_t *len);
+
+enum { EM_FILE_MAX = 1 << 20, EM_TOTAL_MAX = 4 << 20, EM_FILES_MAX = 256 };
+
+void grammar_edit_files(Grammar *g, Arena *a, const JValue *spec) {
+    if (!spec || spec->kind != J_OBJECT) return;
+    const JValue *cwd = json_get(spec, "cwd"), *home = json_get(spec, "home"), *fs = json_get(spec, "files");
+    if (!cwd || cwd->kind != J_STRING || !cwd->s.len || cwd->s.ptr[0] != '/' || !fs || fs->kind != J_ARRAY) return;
+    // pi's edit tool: path (text), edits (an array of objects with an oldText string)
+    int16_t tool = -1;
+    for (size_t i = 0; i < g->n_tools; i++)
+        if (str_eq(g->tools[i].name, S("edit"))) tool = (int16_t)i;
+    if (tool < 0) return;
+    uint16_t tn = g->tools[tool].node;
+    int pp = prop_index(g, tn, S("path")), pe = prop_index(g, tn, S("edits"));
+    if (pp < 0 || pe < 0 || pp >= 64 || pe >= 64) return;
+    const GNode *pn = &g->nodes[g->props[g->nodes[tn].prop0 + (size_t)pp].node];
+    const GNode *en = &g->nodes[g->props[g->nodes[tn].prop0 + (size_t)pe].node];
+    if (!pn->text || en->text || en->kinds != GK_ARR || en->items == 0) return;
+    const GNode *in = &g->nodes[en->items];
+    int po = in->kinds == GK_OBJ ? prop_index(g, en->items, S("oldText")) : -1;
+    if (po < 0 || g->nodes[g->props[in->prop0 + (size_t)po].node].kinds != GK_STR) return;
+    Str home_s = home && home->kind == J_STRING && home->s.len && home->s.ptr[0] == '/' ? home->s : S("/");
+    GFile *files = ARENA_ARRAY(a, GFile, MIN(fs->arr.len, (size_t)EM_FILES_MAX));
+    size_t nf = 0, total = 0;
+    for (size_t i = 0; i < fs->arr.len && nf < EM_FILES_MAX; i++) {
+        const JValue *f = fs->arr.items[i];
+        const JValue *p = json_get(f, "path"), *t = json_get(f, "text");
+        if (!p || p->kind != J_STRING || !t || t->kind != J_STRING) continue;
+        Str text = edit_text(a, t->s);
+        if (text.len == 0 || text.len > EM_FILE_MAX || total + text.len > EM_TOTAL_MAX || !utf8_ok(text)) continue;
+        char out[4096];
+        size_t n;
+        if (!p->s.len || p->s.ptr[0] != '/' || !fold_path(S("/"), p->s, out, sizeof out, &n)) continue;
+        uint32_t *sa = suffix_array(a, (const unsigned char *)text.ptr, text.len);
+        if (!sa) continue;
+        files[nf++] = (GFile){str(arena_strndup(a, out, n)), text, sa};
+        total += text.len;
+    }
+    if (nf == 0) return;
+    g->em_tool = tool;
+    g->em_path = (uint16_t)pp;
+    g->em_edits = (uint16_t)pe;
+    g->em_item = en->items;
+    g->em_old = (uint16_t)po;
+    g->files = files;
+    g->n_files = nf;
+    g->cwd = cwd->s;
+    g->home = home_s;
 }
 
 // ---- the automaton ----------------------------------------------------------------------
@@ -238,33 +374,104 @@ static uint16_t child_node(const Grammar *g, const GState *s) {
     return g->props[n->prop0 + (size_t)s->jkey].node;
 }
 
-static void open_string(GState *s, bool key) {
+// ---- edit match: suffixes of the file's text ---------------------------------------------
+
+// the byte at depth d of suffix i of the text, -1 past its end (shorter suffixes sort first)
+static int em_key(const GFile *f, uint32_t i, uint32_t d) {
+    size_t p = (size_t)f->sa[i] + d;
+    return p < f->text.len ? (unsigned char)f->text.ptr[p] : -1;
+}
+
+// the first index in [lo, hi) whose byte at depth d is at least c
+static uint32_t em_lower(const GFile *f, uint32_t lo, uint32_t hi, uint32_t d, int c) {
+    while (lo < hi) {
+        uint32_t mid = lo + (hi - lo) / 2;
+        if (em_key(f, mid, d) < c) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo;
+}
+
+// whether a substring of the text continues the bytes so far with a byte in [lo, hi]
+static bool em_can(const Grammar *g, const GState *s, int lo, int hi) {
+    const GFile *f = &g->files[s->efile];
+    uint32_t i = em_lower(f, s->elo, s->ehi, s->edep, lo);
+    return i < s->ehi && em_key(f, i, s->edep) <= hi;
+}
+
+// a decoded byte of the oldText: the suffixes that continue with it (none: refused; a CR is refused,
+// the tool reads it as LF)
+static void em_byte(const Grammar *g, GState *s, char ch) {
+    if (s->mode == GM_DEAD) return;
+    int c = (unsigned char)ch;
+    if (c == '\r') return dead(s);
+    const GFile *f = &g->files[s->efile];
+    uint32_t lo = em_lower(f, s->elo, s->ehi, s->edep, c), hi = em_lower(f, lo, s->ehi, s->edep, c + 1);
+    if (lo == hi) return dead(s);
+    s->elo = lo;
+    s->ehi = hi;
+    s->edep++;
+}
+
+// Whether the oldText so far (not empty) occurs once as the tool counts (count_occurrences: from the
+// left, each match past the previous one's end). More than EM_ONCE_MAX overlapping occurrences: no.
+enum { EM_ONCE_MAX = 64 };
+static bool em_once(const Grammar *g, const GState *s) {
+    size_t k = s->ehi - s->elo;
+    if (s->edep == 0 || k == 0 || k > EM_ONCE_MAX) return false;
+    if (k == 1) return true;
+    uint32_t at[EM_ONCE_MAX];
+    const GFile *f = &g->files[s->efile];
+    for (size_t i = 0; i < k; i++) {
+        uint32_t x = f->sa[s->elo + i];
+        size_t j = i;
+        for (; j > 0 && at[j - 1] > x; j--) at[j] = at[j - 1];
+        at[j] = x;
+    }
+    size_t n = 1;
+    for (size_t i = 1, end = (size_t)at[0] + s->edep; i < k; i++)
+        if (at[i] >= end) n++, end = (size_t)at[i] + s->edep;
+    return n == 1;
+}
+
+static void open_string(const Grammar *g, GState *s, bool key) {
     s->jmode = J_STR;
     s->jstr = key;
     s->u8need = 0;
     if (key) s->nlen = 0;
+    // an edit's oldText (depth 2: the edits array, then one edit's object) in the call to a known file
+    s->em = 0;
+    if (!key && s->efile >= 0 && s->tool == g->em_tool && s->param == (int16_t)g->em_edits && s->depth == 2 &&
+        s->jkind[0] == '[' && s->jkind[1] == '{' && s->jnode[1] == g->em_item && s->jkey == (int16_t)g->em_old) {
+        s->em = 1;
+        s->elo = 0;
+        s->ehi = (uint32_t)g->files[s->efile].text.len;
+        s->edep = 0;
+    }
 }
 
-// a key's byte (decoded), for matching it against the schema's names as json_parse reads it
-static void key_byte(GState *s, char c) {
+// a string's byte (decoded): a key's, for matching it against the schema's names as json_parse reads
+// it; an oldText's, held to the file
+static void key_byte(const Grammar *g, GState *s, char c) {
+    if (s->em) return em_byte(g, s, c);
     if (!s->jstr) return;
     if (s->nlen < GR_NAME) s->name[s->nlen] = c;
     if (s->nlen <= GR_NAME) s->nlen++;
 }
 
 // a key's code point from a \u escape, as UTF-8 (json.c put_utf8)
-static void key_cp(GState *s, uint32_t u) {
-    if (u < 0x80) key_byte(s, (char)u);
-    else if (u < 0x800) key_byte(s, (char)(0xC0 | u >> 6)), key_byte(s, (char)(0x80 | (u & 0x3F)));
+static void key_cp(const Grammar *g, GState *s, uint32_t u) {
+    if (u < 0x80) key_byte(g, s, (char)u);
+    else if (u < 0x800) key_byte(g, s, (char)(0xC0 | u >> 6)), key_byte(g, s, (char)(0x80 | (u & 0x3F)));
     else if (u < 0x10000) {
-        key_byte(s, (char)(0xE0 | u >> 12));
-        key_byte(s, (char)(0x80 | (u >> 6 & 0x3F)));
-        key_byte(s, (char)(0x80 | (u & 0x3F)));
+        key_byte(g, s, (char)(0xE0 | u >> 12));
+        key_byte(g, s, (char)(0x80 | (u >> 6 & 0x3F)));
+        key_byte(g, s, (char)(0x80 | (u & 0x3F)));
     } else {
-        key_byte(s, (char)(0xF0 | u >> 18));
-        key_byte(s, (char)(0x80 | (u >> 12 & 0x3F)));
-        key_byte(s, (char)(0x80 | (u >> 6 & 0x3F)));
-        key_byte(s, (char)(0x80 | (u & 0x3F)));
+        key_byte(g, s, (char)(0xF0 | u >> 18));
+        key_byte(g, s, (char)(0x80 | (u >> 12 & 0x3F)));
+        key_byte(g, s, (char)(0x80 | (u >> 6 & 0x3F)));
+        key_byte(g, s, (char)(0x80 | (u & 0x3F)));
     }
 }
 
@@ -288,11 +495,18 @@ static void string_byte(const Grammar *g, GState *s, char c) {
         s->u8need--;
         s->u8lo = 0x80;
         s->u8hi = 0xBF;
-        key_byte(s, c);
+        key_byte(g, s, c);
         return;
     }
-    if (c == '"') return close_string(g, s);
+    if (c == '"') {
+        // an oldText closes when it is not empty and occurs once in the file
+        if (s->em && !em_once(g, s)) return dead(s);
+        s->em = 0;
+        return close_string(g, s);
+    }
     if (c == '\\') {
+        // in an oldText an escape decodes to ASCII: some ASCII byte must continue it
+        if (s->em && !em_can(g, s, 0, 0x7f)) return dead(s);
         s->jmode = J_STR_ESC;
         return;
     }
@@ -309,7 +523,7 @@ static void string_byte(const Grammar *g, GState *s, char c) {
         else if (u == 0xF4) s->u8need = 3, s->u8hi = 0x8F;
         else return dead(s);
     }
-    key_byte(s, c);
+    key_byte(g, s, c);
 }
 
 static void json_char(const Grammar *g, GState *s, char c) {
@@ -327,7 +541,7 @@ static void json_char(const Grammar *g, GState *s, char c) {
         const GNode *n = &g->nodes[s->jexp];
         if (!json_type_ok(n, c)) return dead(s);
         if (c == '"') {
-            open_string(s, false);
+            open_string(g, s, false);
         } else if (c == '-' || (c >= '0' && c <= '9')) {
             s->jmode = J_NUM;
             s->jk = c == '-' ? N_SIGN : c == '0' ? N_ZERO : N_INT;
@@ -359,7 +573,7 @@ static void json_char(const Grammar *g, GState *s, char c) {
             s->uval = 0;
         } else if (c && strchr("\"\\/bfnrt", c)) {
             static const char from[] = "\"\\/bfnrt", to[] = "\"\\/\b\f\n\r\t";
-            key_byte(s, to[strchr(from, c) - from]);
+            key_byte(g, s, to[strchr(from, c) - from]);
             s->jmode = J_STR;
         } else {
             dead(s);
@@ -371,6 +585,9 @@ static void json_char(const Grammar *g, GState *s, char c) {
         if (h < 0) return dead(s);
         s->uval = (uint16_t)(s->uval << 4 | (unsigned)h);
         ++s->jk;
+        // in an oldText only \u0000 to \u007f, digit by digit along the bytes the text continues with
+        if (s->em && s->jmode == J_STR_U && ((s->jk <= 2 && s->uval != 0) || (s->jk == 3 && (s->uval > 7 || !em_can(g, s, s->uval << 4, (s->uval << 4) | 15)))))
+            return dead(s);
         // checked digit by digit, so no prefix is a dead end: \uDC.. to \uDF.. alone is a lone low
         // surrogate, and a high surrogate's low half is \uDC.. to \uDF..
         if (s->jmode == J_STR_U && s->jk == 2 && s->uval >= 0xDC && s->uval <= 0xDF) return dead(s);
@@ -378,7 +595,7 @@ static void json_char(const Grammar *g, GState *s, char c) {
         if (s->jk < 4) return;
         if (s->jmode == J_STR_LO) {
             if (s->uval < 0xDC00 || s->uval > 0xDFFF) return dead(s);
-            key_cp(s, 0x10000 + ((uint32_t)(s->uhi - 0xD800) << 10) + (uint32_t)(s->uval - 0xDC00));
+            key_cp(g, s, 0x10000 + ((uint32_t)(s->uhi - 0xD800) << 10) + (uint32_t)(s->uval - 0xDC00));
             s->jmode = J_STR;
         } else if (s->uval >= 0xDC00 && s->uval <= 0xDFFF) {
             return dead(s); // a lone low surrogate
@@ -386,7 +603,7 @@ static void json_char(const Grammar *g, GState *s, char c) {
             s->uhi = s->uval;
             s->jmode = J_STR_LO_BS; // a high surrogate: its low half must follow
         } else {
-            key_cp(s, s->uval);
+            key_cp(g, s, s->uval);
             s->jmode = J_STR;
         }
         return;
@@ -501,7 +718,7 @@ static void json_char(const Grammar *g, GState *s, char c) {
         }
         if (c != '"') return dead(s);
         s->jflag = 0;
-        open_string(s, true);
+        open_string(g, s, true);
         return;
     case J_COLON:
         if (json_ws(c)) return;
@@ -591,6 +808,69 @@ static bool required_given(const Grammar *g, const GState *s) {
     return (s->seen & n->required) == n->required;
 }
 
+// path.resolve as the edit tool resolves (src/code_tools.c path_resolve): segments "." and empty
+// dropped, ".." folded; false when it does not fit
+static bool fold_path(Str base, Str p, char *out, size_t cap, size_t *len) {
+    char in[4096];
+    size_t n = 0;
+    if (!(p.len && p.ptr[0] == '/')) {
+        if (base.len + 1 > sizeof in) return false;
+        memcpy(in, base.ptr, base.len);
+        n = base.len;
+        in[n++] = '/';
+    }
+    if (n + p.len > sizeof in) return false;
+    memcpy(in + n, p.ptr, p.len);
+    n += p.len;
+    size_t o = 0, i = 0;
+    while (i <= n) {
+        size_t j = i;
+        while (j < n && in[j] != '/') j++;
+        size_t sl = j - i;
+        if (sl == 0 || (sl == 1 && in[i] == '.')) {
+        } else if (sl == 2 && in[i] == '.' && in[i + 1] == '.') {
+            while (o > 0 && out[o - 1] != '/') o--;
+            if (o > 0) o--;
+        } else {
+            if (o + 1 + sl > cap) return false;
+            out[o++] = '/';
+            memcpy(out + o, in + i, sl);
+            o += sl;
+        }
+        i = j + 1;
+    }
+    if (o == 0) out[o++] = '/';
+    *len = o;
+    return true;
+}
+
+// The listed file the edit's path names (the value in name[], its closer included), or -1.
+static int16_t edit_file(const Grammar *g, const GState *s) {
+    size_t cl = lits[L_PCLOSE].len;
+    if (s->nlen > GR_NAME || s->nlen < cl) return -1;
+    Str v = str_n(s->name, s->nlen - cl);
+    // the parser's framing (src/toolcall.c unframe), then the tool's (resolve_to_cwd)
+    if (str_starts(v, S("\r\n"))) v = str_n(v.ptr + 2, v.len - 2);
+    else if (str_starts(v, S("\n"))) v = str_n(v.ptr + 1, v.len - 1);
+    if (str_ends(v, S("\r\n"))) v.len -= 2;
+    else if (str_ends(v, S("\n"))) v.len -= 1;
+    // the tool maps Unicode spaces to ' ' and reads file:// URLs: such a path is left unconstrained
+    for (size_t i = 0; i < v.len; i++)
+        if ((unsigned char)v.ptr[i] >= 0x80) return -1;
+    if (v.len && v.ptr[0] == '@') v = str_n(v.ptr + 1, v.len - 1);
+    if (str_starts(v, S("file:"))) return -1;
+    char out[4096];
+    size_t n;
+    bool ok;
+    if (str_eq(v, S("~"))) ok = fold_path(S("/"), g->home, out, sizeof out, &n);
+    else if (str_starts(v, S("~/"))) ok = fold_path(g->home, str_n(v.ptr + 2, v.len - 2), out, sizeof out, &n);
+    else ok = fold_path(g->cwd, v, out, sizeof out, &n);
+    if (!ok) return -1;
+    for (size_t i = 0; i < g->n_files; i++)
+        if (str_eq(g->files[i].path, str_n(out, n))) return (int16_t)i;
+    return -1;
+}
+
 static void feed_char(const Grammar *g, GState *s, char c) {
     switch ((GMode)s->mode) {
     case GM_DEAD: return;
@@ -629,6 +909,7 @@ static void feed_char(const Grammar *g, GState *s, char c) {
             if (!tool_named(g, str_n(s->name, name_len(s)), &t)) return dead(s);
             s->tool = (int16_t)t;
             s->seen = 0;
+            s->efile = -1;
             s->mode = GM_PCHOICE;
             s->k = 0;
             s->alive = 0;
@@ -673,6 +954,8 @@ static void feed_char(const Grammar *g, GState *s, char c) {
             int pi = nl <= GR_NAME ? prop_index(g, tn, str_n(s->name, nl)) : -1;
             s->param = (int16_t)pi;
             uint16_t vn = 0;
+            // the parser keeps a parameter's first value and skips repeats (src/toolcall.c)
+            bool first = pi >= 0 && pi < 64 && !(s->seen & 1ull << pi);
             if (pi >= 0) {
                 if (pi < 64) s->seen |= 1ull << pi;
                 vn = g->props[g->nodes[tn].prop0 + (size_t)pi].node;
@@ -681,6 +964,9 @@ static void feed_char(const Grammar *g, GState *s, char c) {
             if (g->nodes[vn].text) {
                 s->mode = GM_VSTR;
                 s->k = 0;
+                // the edit's path: its bytes go to name[] (free while a text value is read)
+                s->ecap = g->n_files > 0 && s->tool == g->em_tool && pi == (int)g->em_path && first;
+                if (s->ecap) s->efile = -1, s->nlen = 0;
             } else {
                 s->mode = GM_VJSON;
                 s->jmode = J_VALUE;
@@ -698,7 +984,12 @@ static void feed_char(const Grammar *g, GState *s, char c) {
         s->kt = lit_step(L_PARAM, s->kt, c);
         if (s->kt == lits[L_PARAM].len) return dead(s);
         s->k = lit_step(L_PCLOSE, s->k, c);
+        if (s->ecap) name_store(s, c);
         if (s->k == lits[L_PCLOSE].len) {
+            if (s->ecap) {
+                s->ecap = 0;
+                s->efile = edit_file(g, s);
+            }
             s->mode = GM_PCHOICE;
             s->k = 0;
             s->alive = 0;
@@ -720,7 +1011,7 @@ static void feed_char(const Grammar *g, GState *s, char c) {
 }
 
 GState grammar_start(const Grammar *g, bool thinking, Str forced) {
-    GState s = {.mode = thinking ? GM_REASON : GM_TEXT, .tool = -1, .param = -1};
+    GState s = {.mode = thinking ? GM_REASON : GM_TEXT, .tool = -1, .param = -1, .efile = -1};
     grammar_feed_bytes(g, &s, forced);
     return s;
 }
@@ -746,6 +1037,8 @@ bool grammar_may_end(const GState *s) {
     default: return false;
     }
 }
+
+bool grammar_in_edit(const GState *s) { return s->mode == GM_VJSON && s->em; }
 
 bool grammar_in_call(const GState *s) { return s->mode != GM_DEAD && s->mode != GM_REASON && s->mode != GM_TEXT; }
 

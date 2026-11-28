@@ -707,6 +707,7 @@ typedef struct {
     uint32_t refused[4], taken[4];
     size_t at[4];
     size_t gen; // tokens emitted so far (the index of the next one)
+    size_t em;  // replacements inside an edit's oldText held to a file (SAETTA_EDIT_MATCH)
 } GramLog;
 
 static void gram_note(GramLog *l, size_t ahead, uint32_t refused, uint32_t taken) {
@@ -742,6 +743,7 @@ static uint32_t gram_best(const Grammar *g, const GState *st, const float *row, 
                           size_t *masked, GramLog *lg, size_t ahead) {
     if (grammar_ok(g, st, first)) return first;
     *masked += 1;
+    if (lg && grammar_in_edit(st)) lg->em++;
     uint32_t t = gram_best_of(g, st, row, len, first, cand);
     gram_note(lg, ahead, first, t);
     return t;
@@ -760,6 +762,7 @@ static uint32_t gram_redraw(QgenPrng *rng, const Grammar *g, const GState *st, c
     }
     if (tot > 0) {
         *masked += 1;
+        if (lg && grammar_in_edit(st)) lg->em++;
         uint32_t d = draw(rng, cand, p, n, tot);
         gram_note(lg, ahead, t, d);
         return d;
@@ -1140,7 +1143,6 @@ static Err generate_reply(Engine *e, Arena *a, Conn *c, Req *h, Work *w, JValue 
     const uint32_t *ids = w->ids.ptr;
     size_t n = w->ids.len;
     size_t reused = start.n;
-    (void)r;
     Out *out = NULL;
     if (stream) {
         if (c->sink) c->status = 200; // in process: no head
@@ -1258,8 +1260,13 @@ static Err generate_reply(Engine *e, Arena *a, Conn *c, Req *h, Work *w, JValue 
     GramLog glog = {0};
     const size_t vocab = model_info(e->m)->vocab;
     e->last_replaced = 0;
-    if (grammar_switch() && tools && model_info(e->m)->chat == CHAT_QWEN) {
+    // "saetta_edit_match" (Saetta Code with SAETTA_EDIT_MATCH=1): an edit's oldText held to the
+    // files the agent knows, on the grammar (which the field turns on for this request)
+    const JValue *emv = field(r, "saetta_edit_match");
+    bool em_on = emv && emv->kind == J_OBJECT;
+    if ((grammar_switch() || em_on) && tools && model_info(e->m)->chat == CHAT_QWEN) {
         gr = grammar_build(a, tools, e->tok, model_info(e->m)->eos, model_info(e->m)->n_eos);
+        if (em_on) grammar_edit_files(gr, a, emv);
         if (gr->n_tools > 0) gs = grammar_start(gr, thinking, forced);
         else gr = NULL; // no tool a call could name: nothing to hold the reply to
     }
@@ -1406,6 +1413,7 @@ static Err generate_reply(Engine *e, Arena *a, Conn *c, Req *h, Work *w, JValue 
         // the first replacements: the refused token's text, the one taken, and where (token index)
         char line[640];
         size_t o = (size_t)snprintf(line, sizeof line, "grammar: %zu tokens replaced", g_masked);
+        if (em_on) o += (size_t)snprintf(line + o, sizeof line - o, " (edit match: %zu files, %zu in an oldText)", gr->n_files, glog.em);
         for (size_t i = 0; i < glog.n && o < sizeof line - 160; i++) {
             char rb[48], tb[48];
             size_t rn = tokenizer_token_bytes(e->tok, glog.refused[i], rb, sizeof rb - 1);

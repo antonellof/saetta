@@ -3,6 +3,12 @@
 All notable changes to saetta and Saetta Code (`saetta code`), newest first. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are saetta's.
 
+## [Unreleased]
+
+### Added
+
+- `SAETTA_EDIT_MATCH=1` (off by default) holds Saetta Code's edits to the files it knows: with the model in process (or another Saetta Code's), each request sends the files the session read, edited or wrote, as they are on disk (up to 256 KB each, 1 MB in all), and while the model writes an edit call for one of them, its `oldText` can only be text that occurs exactly once in that file, so the edit always finds its match. It runs on the tool-call grammar (`SAETTA_GRAMMAR`), which it turns on for those requests; the model's own token is kept whenever it is valid. Files the session has not touched are left free. On ten exact-edit tasks (blocks repeated word for word, trailing spaces, tab-aligned columns, CRLF, typographic quotes, a file past the first page of a read), the Coder pack made no failed edit with or without it, so there it changes nothing measurable (greedy; the seconds of those runs are not comparable, see the project's notes).
+
 ## [0.26.0] - 2026-11-27
 
 ### Added

@@ -67,6 +67,14 @@ typedef struct {
     uint16_t node; // object node of its parameters
 } GTool;
 
+// A file an edit call's oldText is held to (grammar_edit_files): its absolute path and its text as
+// the edit tool matches it (no BOM, LF line endings), with the suffix array of the text.
+typedef struct {
+    Str path;
+    Str text;
+    uint32_t *sa;
+} GFile;
+
 typedef struct {
     const Tokenizer *tok;
     const uint32_t *eos;
@@ -77,6 +85,13 @@ typedef struct {
     size_t n_props;
     GTool *tools; // the request's tools with names of 1 to GR_NAME bytes
     size_t n_tools;
+    // edit match (grammar_edit_files): the edit tool (-1: none), its path and edits parameters
+    // (property indexes), the node of an edit and its oldText key; the files, cwd and home
+    int16_t em_tool;
+    uint16_t em_path, em_edits, em_item, em_old;
+    GFile *files;
+    size_t n_files;
+    Str cwd, home;
 } Grammar;
 
 typedef struct {
@@ -101,11 +116,42 @@ typedef struct {
     uint8_t jkind[GR_DEPTH];  // '[' or '{'
     uint64_t jseen[GR_DEPTH]; // per open object: properties given
     int16_t jkey;             // the property of the key just read (-1: not in the schema)
+    // edit match: the file the call's path names (-1: none or not known yet); while an oldText
+    // string is read (em), the suffixes of its text that start with the bytes decoded so far:
+    // sa[elo..ehi), edep bytes long; ecap: the path's bytes are being stored in name[]
+    int16_t efile;
+    uint8_t em, ecap;
+    uint32_t elo, ehi, edep;
 } GState;
 
 // Builds the grammar of a request's tools array (OpenAI "tools"). eos: the model's end tokens.
 // Lives in the arena. With n_tools 0 no call is valid: the caller does not use it then.
 Grammar *grammar_build(Arena *a, const JValue *tools, const Tokenizer *tok, const uint32_t *eos, size_t n_eos);
+
+// Edit match (Saetta Code with SAETTA_EDIT_MATCH=1, the request's "saetta_edit_match"): holds the
+// oldText of an edit call (pi's edit tool: "path" a text parameter, "edits" an array of objects with
+// an "oldText" string) to text that occurs exactly once in the file its path names, when that file
+// is one of files ([{"path": absolute, "text": its content as the tool matches it: no BOM}]). The
+// path is the call's first "path" (the parser keeps the first), resolved as the edit tool resolves
+// it (src/code_tools.c resolve_to_cwd: the parser's framing newlines dropped, a leading '@' dropped,
+// "~" and "~/" from home, else against cwd, "." and ".." folded); a path written after the edits,
+// longer than GR_NAME bytes with its closer, with a byte past ASCII (the tool maps Unicode spaces),
+// starting "file:" (the tool reads URLs) or naming no listed file leaves the call unconstrained.
+// The text is read with CRLF or CR as LF (normalizeToLF), as the tool matches it. While the oldText
+// string is read: every decoded byte must extend a substring of the text, the string may close only
+// when it is not empty and occurs once counted as the tool counts (from the left, matches that do
+// not overlap; more than 64 overlapping occurrences: refused), and, so that no prefix is a dead end,
+// a CR is refused (the tool reads CR as LF: the LF is written instead) and an escape must decode to
+// ASCII (\u0000 to \u007f; other characters as their UTF-8 bytes). Not checked: the tool's fuzzy
+// count (it counts after trimming trailing whitespace and folding quotes and dashes, which can find
+// more than one), edits of one call that overlap, and a file the reply's earlier calls change (each
+// call is held to the file as the request found it). Files that are empty, larger than 1 MB, past
+// 4 MB in all or the 256th, or not UTF-8 are left out. Building the files' suffix arrays delays the
+// request's first token (unmeasured here; a CPU harness in review gave 0.06 to 0.14 s per MB).
+void grammar_edit_files(Grammar *g, Arena *a, const JValue *spec);
+
+// Whether s is inside an oldText held to a file (tests, logs).
+bool grammar_in_edit(const GState *s);
 
 // The state at the start of a reply: in reasoning or not, then forced (the reply's forced
 // opening, may be empty) fed.

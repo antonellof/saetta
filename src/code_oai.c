@@ -1920,6 +1920,9 @@ Err code_oai_body(Arena *a, const CodeModel *m, const JValue *system, const JVal
         put(a, po, "gateway", g);
         put(a, p, "providerOptions", po);
     }
+    // Saetta Code's own fields last: a compat setting does not replace them
+    if (json_is(m->extra, J_OBJECT) && (m->engine || m->sock))
+        for (size_t i = 0; i < m->extra->obj.len; i++) json_put(a, p, m->extra->obj.items[i].key, m->extra->obj.items[i].val);
     code_oai_js_write(out, p);
     return OK;
 }

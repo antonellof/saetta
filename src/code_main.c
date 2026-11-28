@@ -623,6 +623,75 @@ static bool share_recover(Run *r) {
     return ok;
 }
 
+// ---- edit match (SAETTA_EDIT_MATCH=1; saetta's engine: in process or over the share socket) ---
+
+// A file over this is not offered (the engine would refuse an oldText past the part it was given);
+// nor files past the total.
+#define EDIT_MATCH_FILE_MAX ((size_t)256 << 10)
+#define EDIT_MATCH_TOTAL_MAX ((size_t)1 << 20)
+
+static bool edit_match_on(void) {
+    const char *v = getenv("SAETTA_EDIT_MATCH");
+    return v && v[0] && v[0] != '0';
+}
+
+static bool has_tool(const JValue *tools, const char *name) {
+    for (size_t i = 0; json_is(tools, J_ARRAY) && i < tools->arr.len; i++) {
+        const JValue *t = tools->arr.items[i], *f = json_get(t, "function");
+        if (str_eqz(json_strs(json_get(f ? f : t, "name")), name)) return true;
+    }
+    return false;
+}
+
+// "saetta_edit_match" for a request on conv (src/grammar.h grammar_edit_files): the files the
+// session's read, edit and write calls succeeded on, as they are on disk now (the edit tool's
+// view of them), so the engine holds an edit's oldText to text that is in its file. NULL: none.
+static JValue *edit_match_spec(Arena *a, const Run *r, const JValue *conv) {
+    JValue *files = json_new(a, J_ARRAY);
+    VecStr seen = {0};
+    size_t total = 0;
+    for (size_t i = 0; json_is(conv, J_ARRAY) && i < conv->arr.len; i++) {
+        const JValue *m = conv->arr.items[i], *ct = json_get(m, "content");
+        if (!str_eqz(json_strs(json_get(m, "role")), "assistant")) continue;
+        for (size_t k = 0; json_is(ct, J_ARRAY) && k < ct->arr.len; k++) {
+            const JValue *b = ct->arr.items[k];
+            Str name = json_strs(json_get(b, "name"));
+            if (!str_eqz(json_strs(json_get(b, "type")), "toolCall") ||
+                !(str_eqz(name, "read") || str_eqz(name, "edit") || str_eqz(name, "write")))
+                continue;
+            Str id = json_strs(json_get(b, "id")), p = json_strs(json_get(json_get(b, "arguments"), "path"));
+            if (!id.len || !p.len) continue;
+            bool ok = false;
+            for (size_t j = i + 1; j < conv->arr.len && !ok; j++) {
+                const JValue *t = conv->arr.items[j];
+                ok = str_eqz(json_strs(json_get(t, "role")), "toolResult") && str_eq(json_strs(json_get(t, "toolCallId")), id) &&
+                     !jbool(json_get(t, "isError"), false);
+            }
+            if (!ok) continue;
+            // the edit tool's resolution of the path (the engine resolves the edit's path the same way)
+            char *abs = code_tools_path(a, &r->env, p, false);
+            bool dup = false;
+            for (size_t q = 0; q < seen.len && !dup; q++) dup = str_eqz(seen.ptr[q], abs);
+            if (dup) continue;
+            vec_push(&seen, str(abs));
+            Str text;
+            if (!code_tools_edit_text(a, abs, EDIT_MATCH_FILE_MAX, &text) || !text.len || total + text.len > EDIT_MATCH_TOTAL_MAX) continue;
+            total += text.len;
+            JValue *f = json_new(a, J_OBJECT);
+            json_put(a, f, S("path"), json_string(a, str(abs)));
+            json_put(a, f, S("text"), json_string(a, text));
+            json_push(a, files, f);
+        }
+    }
+    vec_free(&seen);
+    if (files->arr.len == 0) return NULL;
+    JValue *spec = json_new(a, J_OBJECT);
+    json_put(a, spec, S("cwd"), json_string(a, str(r->env.cwd)));
+    json_put(a, spec, S("home"), json_string(a, str(r->env.home ? r->env.home : "")));
+    json_put(a, spec, S("files"), files);
+    return spec;
+}
+
 static Err stream_assistant(Run *r, JValue **out) {
     Arena *a = r->a;
     const JValue *all = code_session_messages(r->session);
@@ -636,7 +705,19 @@ static Err stream_assistant(Run *r, JValue **out) {
     CodeModel bm = r->model;
     const char *fpv = getenv("SAETTA_FORK_POINT");
     bm.fork_point = code_subagent_enabled() && !(fpv && fpv[0] == '0');
-    TRY(code_oai_body(a, &bm, system, conv, current_tools(a, system), &body));
+    const JValue *tools = current_tools(a, system);
+    // Saetta Code's own request fields (saetta's engine only), in an arena of this request (the run's
+    // arena lives as long as the run: the files' texts would pile up there turn after turn)
+    Arena xa = {0};
+    JValue *extra = json_new(&xa, J_OBJECT);
+    if (edit_match_on() && (bm.engine || bm.sock) && has_tool(tools, "edit")) {
+        JValue *spec = edit_match_spec(&xa, r, conv);
+        if (spec) json_put(&xa, extra, S("saetta_edit_match"), spec);
+    }
+    if (extra->obj.len) bm.extra = extra;
+    Err be = code_oai_body(a, &bm, system, conv, tools, &body);
+    arena_reset(&xa);
+    TRY(be);
     code_durable_request(code_session_leaf(r->session), buf_str(&body));
     Stream st = {.r = r};
     CodeSink sink = {.on_event = on_event, .ctx = &st};
